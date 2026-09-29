@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/ratchet-orchestrator/scripts/ratchet.py\" hook stop --host auto", "timeout": 30 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/ratchet-orchestrator/scripts/ratchet.py\" hook prompt --host auto", "timeout": 15 } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|Read|Grep|Glob|apply_patch",
+        "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/ratchet-orchestrator/scripts/ratchet.py\" hook guard --host auto", "timeout": 15 } ] }
+    ]
+  }
+}

@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ratchet Checkpoints</title>
+<style>
+:root{
+  --bg:#f7f7f5; --surface:#ffffff; --surface-2:#f1f1ee; --text:#1b1b19; --muted:#6b6b66; --line:#e3e3de;
+  --accent:#3b5bdb; --accent-soft:#e7ecff;
+  --ok:#2f9e44; --ok-soft:#e3f5e6; --bad:#d6336c; --bad-soft:#fde8ef; --warn:#e67700; --warn-soft:#fff1dc;
+  --idle:#adb5bd; --idle-soft:#eef0f2;
+  --radius:12px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#121211; --surface:#1b1b1a; --surface-2:#232321; --text:#ecece8; --muted:#9a9a93; --line:#2f2f2c;
+    --accent:#7c93ff; --accent-soft:#1e2540; --ok:#51cf66; --ok-soft:#15301b; --bad:#f06595; --bad-soft:#3a1624;
+    --warn:#ffa94d; --warn-soft:#3a2810; --idle:#6c7178; --idle-soft:#26282b;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#121211; --surface:#1b1b1a; --surface-2:#232321; --text:#ecece8; --muted:#9a9a93; --line:#2f2f2c;
+  --accent:#7c93ff; --accent-soft:#1e2540; --ok:#51cf66; --ok-soft:#15301b; --bad:#f06595; --bad-soft:#3a1624;
+  --warn:#ffa94d; --warn-soft:#3a2810; --idle:#6c7178; --idle-soft:#26282b;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+.wrap{max-width:980px;margin:0 auto;padding:28px 16px 80px}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;justify-content:space-between;margin-bottom:20px}
+.eyebrow{font:600 12px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+h1{font-size:26px;line-height:1.2;margin:6px 0 0;letter-spacing:-.01em}
+.meta{color:var(--muted);font-size:13px}
+.callout{border-radius:var(--radius);padding:16px 18px;margin:0 0 22px;border:1px solid var(--line);background:var(--surface);display:flex;gap:14px;align-items:flex-start}
+.callout .dot{width:10px;height:10px;border-radius:50%;margin-top:7px;flex:none;background:var(--accent)}
+.callout.you .dot{background:var(--warn);box-shadow:0 0 0 5px var(--warn-soft)}
+.callout.blocked .dot{background:var(--bad);box-shadow:0 0 0 5px var(--bad-soft)}
+.callout.done .dot{background:var(--ok)}
+.callout b{display:block;margin-bottom:2px}
+.callout p{margin:0;color:var(--muted)}
+.progress{display:flex;gap:4px;margin:0 0 26px}
+.progress i{flex:1;height:6px;border-radius:3px;background:var(--idle-soft)}
+.progress i.done{background:var(--ok)} .progress i.active{background:var(--accent)} .progress i.bad{background:var(--bad)}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:18px;overflow-x:auto}
+.tabs button{background:none;border:0;border-bottom:2px solid transparent;padding:10px 12px;color:var(--muted);font:inherit;font-weight:600;cursor:pointer;white-space:nowrap}
+.tabs button[aria-selected="true"]{color:var(--text);border-color:var(--accent)}
+.cp{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);margin-bottom:12px;overflow:hidden}
+.cp.active{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.cp summary{list-style:none;cursor:pointer;padding:16px 18px;display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:center}
+.cp summary::-webkit-details-marker{display:none}
+.num{font:700 13px/1 var(--mono);width:38px;height:38px;border-radius:10px;display:grid;place-items:center;background:var(--surface-2);color:var(--muted)}
+.cp.done .num{background:var(--ok-soft);color:var(--ok)} .cp.active .num{background:var(--accent-soft);color:var(--accent)}
+.title{font-weight:650;font-size:16px}
+.sum{color:var(--muted);font-size:14px;margin-top:2px}
+.gates{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.chip{font:600 11px/1 var(--mono);padding:6px 8px;border-radius:999px;background:var(--idle-soft);color:var(--muted);white-space:nowrap}
+.chip.passed{background:var(--ok-soft);color:var(--ok)} .chip.failed,.chip.invalid{background:var(--bad-soft);color:var(--bad)}
+.chip.stale{background:var(--warn-soft);color:var(--warn)} .chip.skipped{opacity:.45;text-decoration:line-through}
+.chip.current{background:var(--accent-soft);color:var(--accent)}
+.body{padding:0 18px 18px 70px;display:grid;grid-template-columns:minmax(0,1fr);gap:16px}
+.body h4{margin:0 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.body ul{margin:0;padding-left:18px} .body li{margin:3px 0}
+.scope{background:var(--surface-2);border-radius:8px;padding:10px 12px;font-size:14px}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th,td{text-align:left;padding:8px 8px;border-top:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:12px;border-top:0}
+td code,.mono{font-family:var(--mono);font-size:12px;overflow-wrap:anywhere}
+.body>div{min-width:0}
+.tag{display:inline-block;font:600 10.5px/1 var(--mono);padding:4px 6px;border-radius:6px;background:var(--surface-2);color:var(--muted);margin-right:4px}
+.tag.edge{background:var(--warn-soft);color:var(--warn)} .tag.browser{background:var(--accent-soft);color:var(--accent)}
+.evidence a{color:var(--accent)}
+.feed{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:6px 0}
+.feed div{padding:8px 16px;border-top:1px solid var(--line);display:flex;gap:12px;font-size:13.5px}
+.feed div:first-child{border-top:0}
+.feed time{font-family:var(--mono);font-size:12px;color:var(--muted);flex:none;width:72px}
+pre.learn{white-space:pre-wrap;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:16px;font:13px/1.6 var(--mono);margin:0}
+.empty{color:var(--muted);padding:20px 0}
+.theme{background:var(--surface);border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:6px 10px;font:inherit;font-size:13px;cursor:pointer}
+.live{font:600 11px/1 var(--mono);color:var(--ok)}
+@media (max-width:640px){
+  .cp summary{grid-template-columns:auto 1fr}
+  .gates{grid-column:1/-1;justify-content:flex-start}
+  .body{padding-left:18px}
+  th:nth-child(3),td:nth-child(3){display:none}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <div class="eyebrow">Ratchet loop · <span id="slug"></span> <span id="live" class="live"></span></div>
+      <h1 id="feature">Loading…</h1>
+      <div class="meta" id="meta"></div>
+    </div>
+    <button class="theme" id="theme" type="button">Theme</button>
+  </header>
+  <div id="callout"></div>
+  <div class="progress" id="progress"></div>
+  <nav class="tabs" role="tablist">
+    <button role="tab" aria-selected="true" data-tab="plan">Checkpoints</button>
+    <button role="tab" aria-selected="false" data-tab="activity">Activity</button>
+    <button role="tab" aria-selected="false" data-tab="learnings">Learnings</button>
+  </nav>
+  <section id="tab-plan"></section>
+  <section id="tab-activity" hidden></section>
+  <section id="tab-learnings" hidden></section>
+</div>
+<script>
+const EMBEDDED = /*__RATCHET_DATA__*/null;
+const GATE_LABEL = {behavior:"1 Behavior", ui:"2 UI", adversarial:"3 Review", human:"4 You"};
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const openState = new Set();
+
+function callout(d){
+  const st = d.state, phase = st.phase;
+  const map = {
+    planning:["","Planning in progress","The planner is splitting the feature into checkpoints."],
+    awaiting_plan_approval:["you","Your turn: review this plan","Read each checkpoint in order. Is anything missing, in the wrong order, or too big? Then reply “approve” in the chat, or describe the changes you want."],
+    building:["","Building "+(st.current||""),d.next?.action||""],
+    awaiting_checkpoint_review:["you","Your turn: review "+(st.review_target||"the last checkpoint"),"Try it in the running app. Approve, or describe what should change."],
+    awaiting_final_review:["you","Your turn: final review","All checkpoints passed their gates. Use the feature like a real user would, then approve or ask for changes — each change becomes a new checkpoint."],
+    planning_feedback:["","Turning your feedback into checkpoints",""],
+    blocked:["blocked","Blocked — needs you",st.blocked_reason||""],
+    paused:["blocked","Paused",st.blocked_reason||""],
+    done:["done","Done","Every checkpoint passed all four gates."]
+  };
+  const [cls,t,p] = map[phase] || ["",phase,""];
+  return `<div class="callout ${cls}"><span class="dot"></span><div><b>${esc(t)}</b><p>${esc(p)}</p></div></div>`;
+}
+
+function chip(name, g, isCur, step){
+  if(!g) return "";
+  const by = g.by ? ` · by ${g.by}` : "";
+  let cls = g.status;
+  if(isCur && step===name && g.status!=="passed") cls += " current";
+  const label = GATE_LABEL[name] + (g.status==="passed"?" ✓":g.status==="failed"?" ✗":g.status==="stale"?" ~":"");
+  return `<span class="chip ${cls}" title="${esc(name)}: ${esc(g.status)}${g.attempts?` · ${g.attempts} attempt(s)`:""}${by}">${esc(label)}</span>`;
+}
+
+function testsTable(tp){
+  if(!tp || !tp.cases?.length) return `<div class="meta">No test plan yet.</div>`;
+  return `<table><thead><tr><th>ID</th><th>What is checked</th><th>How</th></tr></thead><tbody>${
+    tp.cases.map(c=>`<tr><td><code>${esc(c.id)}</code></td><td>${esc(c.title||"")}${
+      c.given||c.when||c.then?`<div class="meta">${c.given?`Given ${esc(c.given)}. `:""}${c.when?`When ${esc(c.when)}. `:""}${c.then?`Then ${esc(c.then)}.`:""}</div>`:""}</td><td>${
+      `<span class="tag ${c.layer==="browser"?"browser":""}">${esc(c.layer||"code")}</span>`}${c.edge?`<span class="tag edge">edge</span>`:""}</td></tr>`).join("")
+  }</tbody></table>`;
+}
+
+function renderPlan(d){
+  const cps = d.plan?.checkpoints || [];
+  if(!cps.length) return `<div class="empty">No checkpoints yet.</div>`;
+  return cps.map((cp,i)=>{
+    const s = d.state.checkpoints?.[cp.id] || {};
+    const isCur = d.state.current===cp.id && d.state.phase==="building";
+    const cls = s.status==="done"?"done":isCur?"active":"";
+    const gates = ["behavior","ui","adversarial","human"].map(n=>{
+      let g = s.gates?.[n];
+      if(!g){ g = {status: n==="human"?"pending":(cp.gates?.[n]?"pending":"skipped")}; }
+      if(n==="human" && d.state.human_review==="none") g = {status:"skipped"};
+      return chip(n,g,isCur,s.step);
+    }).join("");
+    const ev = [];
+    ["behavior","ui","adversarial"].forEach(n=>{
+      const g = s.gates?.[n]; if(!g) return;
+      const p = g.evidence || g.last?.log; if(p) ev.push(`<li>${esc(n)}: <span class="mono">${esc(p)}</span></li>`);
+    });
+    if(s.commit) ev.push(`<li>commit <span class="mono">${esc(s.commit)}</span></li>`);
+    return `<details class="cp ${cls}" data-id="${esc(cp.id)}" ${openState.has(cp.id)||isCur?"open":""}>
+      <summary><span class="num">${esc(cp.id)}</span>
+        <span><div class="title">${esc(cp.title)}${cp.risk&&cp.risk!=="normal"?` <span class="tag ${cp.risk==="high"?"edge":""}">${esc(cp.risk)} risk</span>`:""}</div><div class="sum">${esc(cp.summary)}</div></span>
+        <span class="gates">${gates}</span></summary>
+      <div class="body">
+        <div><h4>Done when</h4><ul>${(cp.done_when||[]).map(x=>`<li>${esc(x)}</li>`).join("")}</ul></div>
+        ${cp.gates?.ui?`<div><h4>What the design reviewer checks</h4><div class="scope">${esc(cp.ui_scope)}</div>${
+          cp.ui_states?.length?`<div class="meta" style="margin-top:6px">States compared: ${cp.ui_states.map(u=>esc(u.name)).join(", ")}</div>`:""}</div>`:
+          `<div><h4>UI review</h4><div class="meta">Not needed — ${esc(cp.ui_skip_reason||"no visible change; behaviour tests cover it")}.</div></div>`}
+        ${cp.gates?.behavior?`<div><h4>Planned tests</h4>${testsTable(d.tests?.[cp.id])}</div>`:
+          `<div><h4>Behavior tests</h4><div class="meta">Skipped — ${esc(cp.behavior_skip_reason||"")}</div></div>`}
+        ${ev.length?`<div class="evidence"><h4>Evidence</h4><ul>${ev.join("")}</ul></div>`:""}
+      </div></details>`;
+  }).join("");
+}
+
+function renderActivity(d){
+  const h = (d.history||[]).slice().reverse();
+  if(!h.length) return `<div class="empty">Nothing yet.</div>`;
+  const label = e => {
+    const {at,event,...rest} = e; const bits = Object.entries(rest).filter(([k,v])=>v!==null&&v!==undefined&&typeof v!=="object").map(([k,v])=>`${k}: ${v}`);
+    return `${event.replaceAll("_"," ")}${bits.length?` — ${bits.join(" · ")}`:""}`;
+  };
+  return `<div class="feed">${h.map(e=>`<div><time>${esc((e.at||"").slice(11,16))}</time><span>${esc(label(e))}</span></div>`).join("")}</div>`;
+}
+
+function render(d){
+  document.getElementById("slug").textContent = d.state.slug;
+  document.getElementById("feature").textContent = d.plan?.feature || d.state.feature;
+  const cps = d.plan?.checkpoints||[];
+  const done = cps.filter(c=>d.state.checkpoints?.[c.id]?.status==="done").length;
+  document.getElementById("meta").textContent = `${done} of ${cps.length} checkpoints done · human review: ${d.state.human_review} · updated ${new Date(d.generated_at).toLocaleString()}`;
+  const ref = (d.plan?.reference?.paths||[]).find(p=>/prototype\.html$/.test(p));
+  const T = new URLSearchParams(location.search).get("t");
+  const protoHref = location.protocol==="file:" ? "reference/prototype.html?switcher=1" : "reference/prototype.html?switcher=1"+(T?"&t="+encodeURIComponent(T):"");
+  document.getElementById("callout").innerHTML = callout(d) + (ref ? `<p class="meta" style="margin:-10px 0 18px">Prototype: <a href="${protoHref}" target="_blank" rel="noopener">open the clickable prototype</a> (use the state switcher to see every screen)</p>` : "");
+  document.getElementById("progress").innerHTML = cps.map(c=>{
+    const s = d.state.checkpoints?.[c.id]; const bad = s && Object.values(s.gates||{}).some(g=>g.status==="failed");
+    return `<i class="${s?.status==="done"?"done":d.state.current===c.id?(bad?"bad":"active"):""}" title="${esc(c.id)}"></i>`;
+  }).join("");
+  document.querySelectorAll("details.cp").forEach(el=>{ if(el.open) openState.add(el.dataset.id); else openState.delete(el.dataset.id); });
+  document.getElementById("tab-plan").innerHTML = renderPlan(d);
+  document.getElementById("tab-activity").innerHTML = renderActivity(d);
+  document.getElementById("tab-learnings").innerHTML = d.learnings?.trim() ? `<pre class="learn">${esc(d.learnings)}</pre>` : `<div class="empty">No learnings yet.</div>`;
+  document.querySelectorAll("details.cp").forEach(el=>el.addEventListener("toggle",()=>{ el.open?openState.add(el.dataset.id):openState.delete(el.dataset.id); }));
+}
+
+document.querySelectorAll(".tabs button").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll(".tabs button").forEach(x=>x.setAttribute("aria-selected", x===b));
+  ["plan","activity","learnings"].forEach(t=>document.getElementById("tab-"+t).hidden = t!==b.dataset.tab);
+}));
+document.getElementById("theme").addEventListener("click",()=>{
+  const r = document.documentElement; const dark = r.dataset.theme ? r.dataset.theme==="dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  r.dataset.theme = dark ? "light" : "dark";
+});
+
+if(EMBEDDED) render(EMBEDDED);
+async function poll(){
+  if(location.protocol==="file:") return;
+  const T = new URLSearchParams(location.search).get("t");
+  try{ const r = await fetch("viewer-data.json?"+(T?"t="+encodeURIComponent(T)+"&":"")+Date.now(),{cache:"no-store"}); if(r.ok){ render(await r.json()); document.getElementById("live").textContent="● live"; } }catch(e){}
+  setTimeout(poll, 3000);
+}
+poll();
+</script>
+</body>
+</html>

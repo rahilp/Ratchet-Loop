@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+external_review.py — run a Ratchet adversarial review with ANOTHER PROVIDER's model (Claude Code,
+OpenAI Codex, Gemini CLI, GitHub Copilot CLI, or any command you configure) and turn its answer into
+the findings JSON that `ratchet.py adv-record` accepts. Whichever model hosts the loop, reviewers
+from a different provider are preferred; this script is how they are called.
+
+    python3 external_review.py --reviewer codex-correctness --cp CP3 --out <path>
+
+Why: reviewers from the same model family share blind spots. A different provider finds different bugs.
+
+The reviewer gets everything inline — the adversary instructions, the checkpoint, the standards,
+the learnings and the full diff (plus untracked files) — so it needs no tools and runs read-only.
+The review is stamped with the code fingerprint taken BEFORE it starts; if the code changes
+meanwhile, adv-record rejects it.
+
+Reviewer specs live in .ratchet/config.json → "reviewers". A "command" reviewer uses a preset
+or its own command:
+
+  "codex-correctness": {"kind":"command","preset":"codex","lens":"correctness","vendor":"openai"}
+  "my-reviewer":       {"kind":"command","lens":"both","vendor":"acme",
+                        "command":["acme-cli","review","--in","{prompt_file}"], "stdin": false}
+
+If the CLI is missing, or it fails (auth, quota, timeout, no parseable answer), this script marks the
+reviewer unavailable for `unavailable_ttl_hours` and exits with code 3; `ratchet.py reviewers CPn`
+then gives that slot to the next alternative, ending with the host's own sub-agent reviewer.
+
+Placeholders in "command": {prompt_file} {prompt} {out_file} {root}. With "stdin": true the prompt
+is piped on stdin. Flags differ between CLI versions — override "command" if a preset doesn't
+match the version you have installed.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PLUGIN_ROOT = HERE.parents[2]
+ENGINE = PLUGIN_ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+AGENT_DIRS = [PLUGIN_ROOT / "agents", Path.home() / ".claude" / "agents"]
+
+PRESETS = {
+    # Anthropic Claude Code: print mode, prompt on stdin, no project settings/instructions loaded.
+    "claude": {"command": ["claude", "-p", "--no-session-persistence", "--setting-sources", ""], "stdin": True},
+    # Google Gemini CLI: non-interactive; the full review prompt arrives on stdin.
+    "gemini": {"command": ["gemini", "-p", "Carry out the code review described on stdin. Reply with only the JSON it asks for."],
+               "stdin": True},
+    # OpenAI Codex CLI: non-interactive, read-only sandbox, prompt on stdin, last message to a file.
+    "codex": {"command": ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
+                          "--output-last-message", "{out_file}", "-"], "stdin": True},
+    # GitHub Copilot CLI: non-interactive prompt mode, no tool permissions granted (read-only by construction).
+    "copilot": {"command": ["copilot", "-p", "{prompt}"], "stdin": False},
+}
+
+MAX_DIFF = 180_000
+MAX_DOC = 40_000
+
+
+def load_engine():
+    spec = importlib.util.spec_from_file_location("ratchet_engine", ENGINE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def git(root, *args):
+    r = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def base_commit(root) -> str:
+    last = git(root, "log", "--grep=^ratchet(", "-1", "--format=%H").strip()
+    if last:
+        return last
+    mb = git(root, "merge-base", "HEAD", "origin/HEAD").strip()
+    return mb or "HEAD"
+
+
+def collect_diff(root: Path) -> str:
+    base = base_commit(root)
+    diff = git(root, "diff", base, "--", ".", ":(exclude).ratchet")
+    untracked = [l for l in git(root, "ls-files", "--others", "--exclude-standard").splitlines()
+                 if l and not l.startswith(".ratchet/")]
+    parts = [f"# Diff since {base[:12]}\n", diff]
+    for f in untracked:
+        p = root / f
+        try:
+            if p.stat().st_size < 60_000:
+                parts.append(f"\n# NEW FILE {f}\n" + p.read_text(errors="ignore"))
+        except OSError:
+            pass
+    text = "".join(parts)
+    if len(text) > MAX_DIFF:
+        text = text[:MAX_DIFF] + f"\n\n[diff truncated at {MAX_DIFF} chars — flag anything you could not see]"
+    return text
+
+
+def read_doc(root: Path, rel: str) -> str:
+    p = root / rel
+    if not p.exists():
+        return ""
+    t = p.read_text(errors="ignore")
+    return f"\n\n## {rel}\n" + (t[:MAX_DOC] + "\n[truncated]" if len(t) > MAX_DOC else t)
+
+
+def adversary_instructions() -> str:
+    for d in AGENT_DIRS:
+        for name in ("ratchet-adversary.md",):
+            p = d / name
+            if p.exists():
+                return re.sub(r"^---\n.*?\n---\n", "", p.read_text(), count=1, flags=re.S).strip()
+    return "You are an adversarial code reviewer. Assume the code is wrong and prove it."
+
+
+def build_prompt(eng, ctx, cfg, cp, rid, spec, fp, fixes_path) -> str:
+    root = ctx.root
+    docs = "".join(read_doc(root, s) for s in cfg.get("standards", []))
+    docs += read_doc(root, ".ratchet/learnings.md")
+    if cp.get("gates", {}).get("ui"):
+        docs += read_doc(root, cfg.get("design_md", "DESIGN.md"))
+    fixes = ""
+    if fixes_path and Path(fixes_path).exists():
+        fixes = "\n\n## Fixer rebuttals from the previous round (fixes.md)\n" + Path(fixes_path).read_text()[:MAX_DOC]
+    return f"""{adversary_instructions()}
+
+---
+# This review (non-interactive — everything you need is below; you have no tools and must not ask questions)
+
+Reviewer id: {rid}
+Lens: {spec.get('lens', 'both')}
+Checkpoint: {cp['id']} — {cp['title']}
+Code fingerprint: {fp}
+
+## Checkpoint entry
+{json.dumps(cp, indent=2)}
+
+## Standards, learnings{' and DESIGN.md' if cp.get('gates', {}).get('ui') else ''}
+{docs or '(no written standards found — review for correctness and consistency with the surrounding code)'}
+{fixes}
+
+## Code under review
+{collect_diff(root)}
+
+---
+Reply with ONLY one JSON object, no markdown fences, exactly this shape:
+{{"reviewer":"{rid}","lens":"{spec.get('lens', 'both')}","checkpoint":"{cp['id']}","fingerprint":"{fp}",
+ "verdict":"APPROVE or CHANGES_REQUESTED",
+ "findings":[{{"id":"X1","severity":"blocker|major|minor","file":"path","line":0,"rule":"cited rule or failure scenario","description":"...","fix":"..."}}]}}
+An empty findings list means you approve. Every finding needs a cited rule or a concrete failure scenario.
+"""
+
+
+def parse_findings(text: str) -> dict | None:
+    """Take the LAST top-level JSON object in the text that has a 'findings' key."""
+    text = re.sub(r"```(?:json)?", "", text)
+    best, depth, start, in_str, esc = None, 0, None, False, False
+    for i, ch in enumerate(text):
+        if in_str:
+            esc = (not esc) if ch == "\\" else False
+            if ch == '"' and not esc:
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    obj = json.loads(text[start:i + 1])
+                    if isinstance(obj, dict) and "findings" in obj:
+                        best = obj
+                except json.JSONDecodeError:
+                    pass
+    return best
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--reviewer", required=True, help="reviewer id from config 'reviewers'")
+    ap.add_argument("--cp", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--fixes", help="fixes.md from the previous round (round 2+)")
+    ap.add_argument("--root")
+    ap.add_argument("--timeout", type=int, default=int(os.environ.get("RATCHET_REVIEW_TIMEOUT", "1200")))
+    ap.add_argument("--dry-run", action="store_true", help="write the prompt, don't call the model")
+    a = ap.parse_args()
+
+    eng = load_engine()
+    ctx = eng.Ctx(eng.find_root(Path(a.root) if a.root else None))
+    cfg = ctx.config()
+    spec = (cfg.get("reviewers") or {}).get(a.reviewer)
+    if not spec:
+        sys.exit(f"unknown reviewer '{a.reviewer}' (define it under config 'reviewers')")
+    if spec.get("kind") != "command":
+        sys.exit(f"'{a.reviewer}' is kind={spec.get('kind')} — spawn it as a ratchet-adversary sub-agent instead")
+    okay, why = eng.reviewer_availability(ctx, cfg, a.reviewer)
+    if not okay and "same provider as the host" in why:
+        sys.exit(f"'{a.reviewer}' is {why}. Run `ratchet.py reviewers {a.cp}` for this round's reviewers.")
+    cp = eng.cp_by_id(ctx.plan(), a.cp)
+    fp = eng.fingerprint(ctx.root)["id"]
+    prompt = build_prompt(eng, ctx, cfg, cp, a.reviewer, spec, fp, a.fixes)
+
+    out = Path(a.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix=f"ratchet-{a.reviewer}-"))
+    prompt_file, out_file = work / "prompt.md", work / "last-message.txt"
+    prompt_file.write_text(prompt)
+    if a.dry_run:
+        print(f"prompt written: {prompt_file} ({len(prompt)} chars)")
+        return
+
+    preset = PRESETS.get(spec.get("preset", ""), {})
+    cmd_t = spec.get("command") or preset.get("command")
+    if not cmd_t:
+        sys.exit(f"reviewer '{a.reviewer}' has neither 'command' nor a known 'preset' ({list(PRESETS)})")
+    use_stdin = spec.get("stdin", preset.get("stdin", False))
+    subs = {"{prompt_file}": str(prompt_file), "{prompt}": prompt, "{out_file}": str(out_file),
+            "{root}": str(ctx.root)}
+    cmd = []
+    for part in cmd_t:
+        for k, v in subs.items():
+            part = part.replace(k, v)
+        cmd.append(part)
+    def unavailable(reason):
+        # A quota/auth/outage failure takes down every reviewer that uses the same CLI.
+        binary = eng.reviewer_binary(cfg, a.reviewer)
+        same = [r for r in (cfg.get("reviewers") or {}) if eng.reviewer_binary(cfg, r) == binary] or [a.reviewer]
+        for r in same:
+            until = eng.mark_unavailable(ctx, r, reason if r == a.reviewer else f"{binary} failed: {reason}")
+        print(f"{a.reviewer} UNAVAILABLE: {reason}\n"
+              f"Marked unavailable until {until[:16]}Z. Run `ratchet.py reviewers {a.cp}` — its slot now "
+              "goes to the next provider, or to the host's own sub-agents.", file=sys.stderr)
+        sys.exit(3)
+
+    shown = " ".join(c if len(c) < 80 else c[:40] + "…" for c in cmd)
+    print(f"running {a.reviewer}: {shown}", file=sys.stderr)
+    try:
+        r = subprocess.run(cmd, cwd=ctx.root, input=prompt if use_stdin else None,
+                           capture_output=True, text=True, timeout=a.timeout)
+    except FileNotFoundError:
+        unavailable(f"'{cmd[0]}' is not installed or not on PATH")
+    except subprocess.TimeoutExpired:
+        unavailable(f"timed out after {a.timeout}s")
+    text = (out_file.read_text() if out_file.exists() else "") + "\n" + (r.stdout or "")
+    review = parse_findings(text)
+    if review is None:
+        (out.parent / f"{a.reviewer}.raw.txt").write_text(text + "\n--- stderr ---\n" + (r.stderr or ""))
+        tail = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()[-1:] or [""]
+        unavailable(f"exit {r.returncode}, no findings JSON ({tail[0][:160]})")
+    # Stamp identity ourselves — never trust the model to echo these correctly.
+    review.update(reviewer=a.reviewer, lens=spec.get("lens"), vendor=spec.get("vendor"),
+                  checkpoint=a.cp, fingerprint=fp)
+    review["findings"] = [f for f in review.get("findings") or [] if isinstance(f, dict)]
+    review["verdict"] = "APPROVE" if not review["findings"] else "CHANGES_REQUESTED"
+    out.write_text(json.dumps(review, indent=2))
+    print(f"{a.reviewer}: {review['verdict']} ({len(review['findings'])} findings) → {out}")
+
+
+if __name__ == "__main__":
+    main()
