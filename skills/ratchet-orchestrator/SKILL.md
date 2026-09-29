@@ -15,6 +15,24 @@ Two ideas make the loop work:
 
 The human is needed exactly **twice**: once to approve the plan, and once to review the finished feature. The exceptions are `human_review: each` mode and a gate that stays stuck past its retry limit.
 
+## Controls (what the user can say at any time)
+
+The user talks in plain words; you turn what they say into engine commands. Any command marked "ask first" needs the two-step flow: run `$RATCHET ask <action>`, put that question to the user, and run the command itself only after their clear yes. A hedge or a bare "ok" is not a yes.
+
+**In a director-enrolled lane this flow does not apply** (see "Running under a director"): a chat "yes" does not count there. Cancel, set-review and approve-changes need a director token (`director-sign cancel`, `director-sign set-review`, `director-sign approve-changes`), and `resume --claim` is not available at all (it has no director-sign action; changing the owner is the director's job). As the lane orchestrator, do not run the ask/confirm flow with the user for these and do not attempt the command without a token. Tell the user in one line that the director must sign it. If the run is mid-build, carry on, or run `$RATCHET pause --reason "director decision needed: <what>"` so your turn can end. In your final message say exactly what you are waiting for (the action and why), so the director, or whoever reads the lane, sees it. Do not claim `waiting_on: director` unless `status --json` shows it: the engine reports it only while the lane awaits plan approval, a checkpoint or final review, or is blocked. The director's agent signs and either runs the command itself or hands you the token, and you then pass it with `--director-token <t>`. Plain `$RATCHET resume` (no `--claim`) needs no approval and still resumes a paused enrolled lane.
+
+- **"Pause" / "hold on".** Run `$RATCHET pause --reason "<why, in the user's words>"`, confirm in one line that the run is paused and where it stopped, then end your turn.
+- **Continue / resume / carry on.** Ask first: `$RATCHET ask claim`. After a clear yes, run `$RATCHET resume --claim`, which claims the run for this session (it may have been started in another chat), then carry on from `$RATCHET next`.
+- **"Cancel" / "abandon this".** Ask first: `$RATCHET ask cancel`. Confirm with the user in plain words that the run will be abandoned, and only after a clear yes run `$RATCHET cancel`.
+- **"What's the status?" / "where are we?"** Run `$RATCHET status` (it prints plain text) and give a short plain summary in your own words: what is done, what is happening now, what is next. Never paste raw JSON.
+- **"Only check in at the end."** Ask first: `$RATCHET ask set-review end`. After a clear yes, run `$RATCHET set-review end`. Other choices use the same flow with a different value (`each` reviews after every checkpoint, `none` is fully autonomous).
+
+**Progress updates.** Keep them plain: say what is done and what is next, one or two lines at a time, for example "Step 2 of 6 done: the sign-in form works and its tests pass. Next is the error states." Never paste raw JSON, and avoid jargon such as gate names or internal state.
+
+**Viewer link.** When the user asks to see the plan or the viewer ("show me the plan"), run `$RATCHET view --serve` and share the link. If they are on another machine, add `--bind 0.0.0.0` (and `--public-host <name>` when the machine has a reachable name). The user never has to start it. This is your job as orchestrator and is never done in a builder session.
+
+**Reviewer check.** When the user asks who can review ("who can review?"), run `$RATCHET reviewer-status` and report the result in your own words: which reviewers are available and which are not. Do not hand over the raw output, and never do this in a builder session.
+
 ## Setup (every run)
 
 ```bash
@@ -51,6 +69,12 @@ Hooks (installed with the plugin, or by `install.sh --host <cli>` / `$RATCHET in
 | `ratchet-adversary` | Assumes the code is wrong and hunts for problems against the standards (lens: `standards` or `correctness`) |
 | `ratchet-fixer` | Fixes every adversarial finding and nothing else |
 
+## Fallback: hosts without sub-agents
+
+Some hosts have no sub-agents at all. Then you do every role yourself, one role at a time: finish one (for example write the tests), write down its result on disk, then start the next (implement, review, fix) as a fresh piece of work, reading only the files that role would get. Read the agent prompt in `agents/<name>.md` before taking each role, and do not carry over your reasoning from the previous one.
+
+Tell the user this plainly, once, at plan time: reviews done this way are less independent, because the same model is checking its own work. Never claim independence you do not have. The loop still proceeds with every gate that the plan turned on, and you never skip a gate, lower the bar or weaken a standard because of it. Record the substitution with `$RATCHET learn` or in the final summary so the user can see which reviews were done by you. Where another CLI is installed, `reviewers` will offer it for the adversarial slots, which restores real independence for that gate.
+
 ## Phase A: Plan (ends at human stop #1)
 
 1. **Before init, check the tree yourself (read-only).** Run `git status --porcelain` and `git branch --show-current`. If the tree has uncommitted changes or you are on the default branch (main/master), say so in one plain sentence and offer to work on a new branch. Never create or switch a branch without asking. If they agree, run `$RATCHET init --branch "<feature in the user's words>"`; if they decline or there is nothing to flag, run `$RATCHET init "<feature in the user's words>"`. `--branch` only works at init: on an active run, init refuses. Add `--human-review each|none` if the user asked for per-checkpoint review or full autonomy.
@@ -63,7 +87,7 @@ Hooks (installed with the plugin, or by `install.sh --host <cli>` / `$RATCHET in
 3. **In parallel**, spawn:
    - `ratchet-app-scout`: make sure the app runs, fill `app-scout.json`, set `.ratchet/config.json` `app.*` / `regression_command` via `$RATCHET config --set`, and draft `.ratchet/standards.md` if no written standard exists.
    - `ratchet-checkpoint-planner` (PLAN mode) with the feature request verbatim, plus any reference the user gave (old screen path, docs, screenshots, Figma export).
-4. If the planner returns `QUESTIONS:`, ask the user in plain words (recall memory first per their preferences), then re-spawn the planner with the answers. Keep this short. It's a clarification, not the review.
+4. If the planner returns `QUESTIONS:`, ask the user directly in chat, in plain words, then re-spawn the planner with the answers. Keep this short. It's a clarification, not the review.
 5. **Reference for the UI gate.** If any checkpoint has `gates.ui: true`:
    - The user gave a reference (existing screen, design, screenshots)? Put its path or URL in `checkpoints.json → reference` and move on.
    - Otherwise, a prototype is needed. If `DESIGN.md` (config `design_md`) is missing, spawn `ratchet-design-system` first. Then spawn `ratchet-prototyper` with the checkpoints list. It writes `<run>/reference/prototype.html` with a `?state=` switcher covering every `ui_states` name.
@@ -104,7 +128,7 @@ make sure the app is running → write `states/CPn.json` (scope limited to what 
 
 Then continue with whatever `$RATCHET next` says. Keep the user informed with one short line per completed checkpoint (e.g. "CP2 ✓ — 3 test rounds, 1 UI round, adversaries approved in round 2"). No step-by-step narration.
 
-**When a gate won't converge.** Each gate has a retry limit (`max_*` in config). When it's hit, `ratchet.py` sets phase `blocked` and the Stop hook lets you stop. Tell the user plainly what's stuck, show the evidence path, and offer 2–3 concrete options. When they decide, `$RATCHET human-approve` resumes (after their message), and you act on their decision. Never lower a standard on your own.
+**When a gate won't converge.** Each gate has a retry limit (`max_*` in config). When it's hit, `ratchet.py` sets phase `blocked` and the Stop hook lets you stop. Present the block as a conversation, not a status dump: quote the finding (the reviewer's or test's own words) in a block quote, then offer two or three lettered options (A, B, C), each one line, with your recommendation, and wait until they answer. Give the evidence path if they want it. When they decide, `$RATCHET human-approve` resumes (after their message), and you act on their decision. Never lower a standard on your own.
 
 **When the same mistake repeats.** If you see the same kind of failure twice (same UI issue, same review rule), record it: `$RATCHET learn "<rule in one line>" --source "gate:<name>"`. Every future agent will read it.
 
@@ -130,15 +154,16 @@ When `next` says `awaiting_final_review` (or `awaiting_checkpoint_review` in `ea
 
 A director is an orchestrator above Ratchet that runs several lanes at once, one Ratchet run per git worktree, and owns merge order, quotas and cross-lane checks. Ratchet stays the engine *inside* each lane. Nothing about the gates changes.
 
-- **Enrollment.** The director (a session started with `RATCHET_ROLE=director`) runs `ratchet.py director-key` once, then `ratchet.py --root <lane> director-enroll` for each lane. In an enrolled lane, chat messages **no longer count as approvals**, because the "user" messages a builder receives come from the director. Plan approval, final review and unblocking need a director token instead.
+- **Setup is a conversation the director session's agent leads.** When the user asks for several lanes (or for a director), ask plain questions in chat (which lanes, which branches, who approves) instead of handing over commands. Never hand the user a command to copy. The agent in the director session then enrolls the lanes and signs approvals on the director's behalf under the rules below, when asked. It never does this in a builder or lane session.
+- **Enrollment.** The director (a session started with `RATCHET_ROLE=director`) runs `ratchet.py director-key` once, then `ratchet.py --root <lane> director-enroll` for each lane. In an enrolled lane, chat messages **no longer count as approvals**, because the "user" messages a builder receives come from the director. Plan approval, final review, unblocking, cancel, set-review, approve-changes and the hooks waiver need a director token instead (`resume --claim` is not available in an enrolled lane).
 - **Approving.** The director runs `ratchet.py --root <lane> director-sign approve-plan` (or `human-approve` / `feedback`) and either runs the approval itself (`ratchet.py --root <lane> approve-plan --director-token <t>`) or sends you the token. The token only works for that lane's current pause. It's logged as `by: director`.
-- **You, the lane orchestrator, never** read the key, sign, enroll, or set `RATCHET_ROLE`. The guard hook blocks it, and trying is a violation, not a workaround. When the lane pauses, end your turn with a short status. The director sees `waiting_on: director` in `ratchet.py status --json` or `ratchet.py lanes --scan <dir>`.
-- **Viewer.** Start this lane's viewer with `ratchet.py view --serve` (add `--bind 0.0.0.0` if the director or the user is on another machine). Each lane gets its own port, and its URL appears as `viewer_url` in `status --json`. The director can also serve one page for every lane with `ratchet.py lanes --serve --scan <dir>`, which links into each lane's viewer through a single port.
+- **You, the lane orchestrator, never** read the key, sign, enroll, or set `RATCHET_ROLE`. The guard hook blocks it, and trying is a violation, not a workaround. When the lane pauses, end your turn with a short status that says exactly what you are waiting for and why. The director sees `waiting_on: director` in `ratchet.py status --json` or `ratchet.py lanes --scan <dir>` only in the phases where the engine sets it (awaiting plan approval, checkpoint or final review, blocked); a paused or building lane shows `waiting_on: null`, so your final message is what tells them.
+- **Viewer.** When the user asks for it, start this lane's viewer with `ratchet.py view --serve` (add `--bind 0.0.0.0` if the director or the user is on another machine). Each lane gets its own port, and its URL appears as `viewer_url` in `status --json`. The director can also serve one page for every lane with `ratchet.py lanes --serve --scan <dir>`, which links into each lane's viewer through a single port.
 - **Quota.** If the run-wide round cap blocks the lane, stop and report. The director decides whether to raise the cap, lower risk, or re-slice.
 
 ## Hard rules
 
-- Never edit `state.json`, evidence, `active.json`, or `human_log.jsonl`. Never run approve commands without a real user message.
+- Never edit `state.json`, evidence, `active.json`, or `human_log.jsonl`. Never run approve commands without a real user message. If the user wants the approved plan changed mid-build, use `$RATCHET ask approve-changes`, put the question to them, and run `$RATCHET approve-changes` only after their clear yes.
 - Never skip a gate the plan turned on, and never mark something passed that `ratchet.py` didn't pass.
 - Never weaken, delete, or `skip` a test to get green. Never tell a reviewer what verdict you want.
 - One checkpoint at a time, in order. Parallelism happens *within* a step, never across checkpoints.

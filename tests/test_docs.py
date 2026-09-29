@@ -435,7 +435,557 @@ def cp4_orchestrator_setup_and_plan_review():
 
 # ---- end CP4 ----
 
-SECTIONS = [("CP4", cp4_orchestrator_setup_and_plan_review)]
+
+# ---- CP5 ----
+# All skills and agents: controls, blocks, fallback, director/viewer/reviewer actions, no user-run commands.
+import ast
+import os
+import subprocess
+import shutil
+import tempfile
+
+ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+BUILDERS = ("ratchet-implementer", "ratchet-fixer", "ratchet-test-writer")
+ENTRY_SPLIT = re.compile(r"(?m)^(?=\s*(?:[-*]\s|\d+[.)]\s|\||\*\*|#{3,6}\s))")
+# user-directed command phrasing; every hit is reported as file:line
+USER_CMD_DENY = [
+    r"\byou\s+(?:can|should|must|need\s+to|will)\s+run\b|\byou\s+run\s+(?:`|\$|ratchet|this\b|it\b|that\b|the\s+command)", r"in\s+your\s+(?:own\s+)?(?:terminal|shell)",
+    r"run\s+this\s+in", r"\btype\s+`", r"tell\s+the\s+user\s+which\s+install\s+command",
+    r"(?:ask|tell|have|get|let)\s+the\s+user\s+(?:to\s+)?(?:run|type|execute)\b",
+    r"the\s+user\s+(?:should|must|needs?\s+to|can|has\s+to)\s+(?:run|type|execute)\b", r"\bplease\s+run\b",
+    r"\byourself\b[^.\n]{0,20}`|run\s+`[^`]+`\s+yourself",
+]
+
+
+def cp5_docs():
+    """[(relative name, text)] for every skill and agent, read-only."""
+    out = []
+    for f in sorted((ROOT / "skills").glob("*/SKILL.md")) + sorted((ROOT / "agents").glob("*.md")):
+        out.append((str(f.relative_to(ROOT)), f.read_text(encoding="utf-8")))
+    return out
+
+
+def hsection(text, kw):
+    """Body of the first markdown heading (any level) whose title matches kw, up to the next heading of the same or higher level."""
+    heads = list(re.finditer(r"(?m)^(#{1,6})\s+(.*)$", text))
+    for i, m in enumerate(heads):
+        if re.search(kw, m.group(2), re.I):
+            end = len(text)
+            for n in heads[i + 1:]:
+                if len(n.group(1)) <= len(m.group(1)):
+                    end = n.start()
+                    break
+            return text[m.end():end]
+    return ""
+
+
+def entries(text):
+    return [e.strip() for e in ENTRY_SPLIT.split(text) if e.strip()]
+
+
+def units(text):
+    """Paragraphs and list items."""
+    out = []
+    for para in re.split(r"\n\s*\n", text):
+        out += [u.strip() for u in ENTRY_SPLIT.split(para) if u.strip()]
+    return out
+
+
+KEYS = {"pause": r"\bpause\b|hold on", "resume": r"\bresume\b|\bcontinue\b|carry on|keep going",
+        "cancel": r"\bcancel\b|abandon", "status": r"\bstatus\b|where things stand",
+        "checkin": r"check[- ]?in|only\s.{0,25}\bend\b|set-review"}
+
+
+def control_entries(controls):
+    """{key: entry text}: each entry is classified by the earliest control keyword in its first 110 characters."""
+    found = {}
+    for e in entries(controls):
+        head = e[:110]
+        pos = {k: m.start() for k, rx in KEYS.items() for m in [re.search(rx, head, re.I)] if m}
+        if pos:
+            k = min(pos, key=pos.get)
+            found.setdefault(k, e)
+    return found
+
+
+def engine_commands():
+    r = subprocess.run([sys.executable, str(ENGINE), "--help"], capture_output=True, text=True, timeout=60, cwd=tempfile.gettempdir())
+    m = re.search(r"\{([a-z][^}]*)\}", r.stdout)
+    return set(m.group(1).split(",")) if m else set()
+
+
+def named_commands(text):
+    return re.findall(r"`[^`\n]*?(?:\$RATCHET|ratchet\.py)\s+(?:--root\s+\S+\s+)?([a-z][a-z-]*)", text)
+
+
+def bt(text, rx):
+    """A backticked snippet matching rx."""
+    return any(re.search(rx, m, re.I) for m in re.findall(r"`([^`\n]+)`", text))
+
+
+NEG = r"(?:never|not|no|don't|do\s+not|without|neither)"
+
+
+def p_controls_five(c):
+    return len(control_entries(c)) == 5
+
+
+def p_pause_resume(c, cmds):
+    e = control_entries(c)
+    a, b = e.get("pause", ""), e.get("resume", "")
+    return (bt(a, r"\bpause\b") and has(a, r"reason") and bt(b, r"\bresume\b") and bt(b, r"ask\s+claim|--claim")
+            and has(b, r"\bclaim") and has(b, r"(this|current|new|your)\s+(session|chat|conversation)")
+            and {"pause", "resume"} <= cmds)
+
+
+def p_cancel_status(c):
+    e = control_entries(c)
+    a, b = e.get("cancel", ""), e.get("status", "")
+    return (bt(a, r"ask\s+cancel") and bt(a, r"\$RATCHET\s+cancel|ratchet\.py\s+cancel|^cancel\b|\bcancel\b(?!\s*$)")
+            and has(a, r"confirm|clear\s+yes|check\s+with\s+the\s+user|ask\s+(the\s+user\s+)?first|are\s+you\s+sure")
+            and bt(b, r"\bstatus\b") and has(b, r"plain") and has(b, r"short|summary|brief")
+            and has(b, NEG + r"[^.\n]{0,50}(raw\s+)?JSON"))
+
+
+def p_checkin(c, help_txt):
+    a = control_entries(c).get("checkin", "")
+    return bt(a, r"set-review\s+end\b") and bt(a, r"ask\s+set-review") and re.search(r"\bend\b", help_txt) is not None
+
+
+def p_cmds_real(c, cmds):
+    named = set(named_commands(c))
+    return len(named) >= 5 and named <= cmds
+
+
+def blocks_text(doc):
+    return [u for u in units(doc) if re.search(r"\bblocked\b|won't\s+converge|stuck", u, re.I)]
+
+
+def p_blocks(doc):
+    return any(has(u, r"\bquot(e|ed|ing)\b", r"\blettered\b|\bA\b[^.]{0,20}\bB\b", r"\boptions?\b",
+                   r"\b(2|two)\b[^.]{0,8}(3|three)|two or three",
+                   r"wait(s|ing)?\s+(for|until)|end\s+your\s+turn|until\s+(they|the\s+user)\s+(answer|repl|choos|decid|pick)")
+               for u in blocks_text(doc))
+
+
+def p_progress(doc):
+    return any(has(u, r"\bprogress\b", r"\bplain\b", r"\b(done|finished|completed)\b", r"\b(next|left to do|still to do)\b",
+                   NEG + r"[^.\n]{0,60}JSON", r"jargon|gate\s+names?|internal\s+(state|terms)")
+               for u in units(doc))
+
+
+def fb_text(doc):
+    return hsection(doc, r"fallback|without\s+sub-?agents?|no\s+sub-?agents?|hosts?\s+without")
+
+
+def p_fallback(f):
+    return has(f, r"(without|no|lack|doesn't\s+(have|support)|cannot|can't|don't\s+(have|support))\s+(any\s+)?sub-?agents?",
+               r"one\s+role\s+at\s+a\s+time",
+               r"(less|not\s+as|reduced|weaker)\s+(\w+\s+){0,3}independen|independen\w*\s+(is\s+)?(less|reduced|weaker|lower)")
+
+
+def p_fallback_bar(f):
+    return has(f, r"still\s+(proceed|run|go|work|build|apply|enforce)|keeps?\s+(going|the\s+bar)|proceeds?",
+               NEG + r"\s+(skip|lower|weaken|drop|relax)[^.\n]{0,50}(gate|bar|check|standard)",
+               r"(record|log|tell|say|note|disclos|mention|state|flag)\w*[^.\n]{0,60}(user|evidence|log|run\s+notes|plain)")
+
+
+def dir_text(doc):
+    return hsection(doc, r"director")
+
+
+def p_director_convo(d):
+    return has(d, r"(when|if)\s+(the\s+)?user\s+(asks?|wants|says|requests?)|on\s+request|when\s+asked",
+               r"director-enroll|director-sign|\benroll",
+               r"plain\s+(questions?|words)|ask\w*\s+(the\s+user|them)",
+               NEG + r"[^.\n]{0,60}(hand|give|paste|tell)\w*[^.\n]{0,40}command",
+               NEG + r"[^.\n]{0,90}(builder|lane)\s+session")
+
+
+def p_lane_forbid(d):
+    for u in re.split(r"(?<=[.!?])\s+", d):
+        if re.search(r"lane\s+orchestrator", u, re.I) and has(u, NEG, r"\bkey\b", r"\bsign", r"enroll", r"RATCHET_ROLE"):
+            return True
+    return False
+
+
+def p_viewer_reviewer(doc):
+    req = r"(when|if|whenever)\s+(the\s+)?(user|they)\s+(asks?|wants|requests?|says)|on\s+request|when\s+asked|if\s+asked"
+    us = units(doc)
+    v = any(has(u, r"\bview\b|viewer", r"link", r"share|give|send|paste|show", req) and has(u, NEG + r"[^.\n]{0,60}(builder|lane|sub-?agent)\s+(session|context)?|builder")
+            for u in us)
+    r = any(has(u, r"reviewer-status", r"plain|own\s+words", req) and has(u, r"builder") for u in us)
+    return v and r
+
+
+def p_hooks_offer(doc):
+    us = [u for u in units(doc) if re.search(r"hooks?", u, re.I) and re.search(r"install", u, re.I)]
+    offers = any(re.search(r"offer\w*[^.\n]{0,80}install|install[^.\n]{0,40}(offer|if\s+they\s+agree|with\s+their\s+ok)", u, re.I) for u in us)
+    bad = re.search(r"tell\s+the\s+user\s+(which|what|the)[^.\n]{0,40}(command|install)|(ask|tell)\s+the\s+user\s+to\s+(run|install|type)", doc, re.I)
+    return offers and not bad
+
+
+def p_questions_chat(doc):
+    return any(has(u, r"QUESTIONS", r"ask\s+the\s+user", r"directly|in\s+chat|right\s+here|in\s+the\s+(conversation|chat)") for u in units(doc))
+
+
+def user_cmd_hits(name, text):
+    hits = []
+    for i, line in enumerate(text.splitlines(), 1):
+        if any(re.search(rx, line, re.I) for rx in USER_CMD_DENY):
+            hits.append(f"{name}:{i}")
+    return hits
+
+
+def neutrality_hits(name, text):
+    out = []
+    for u in units(text):
+        if re.search(r"\bclaude\b(?![-.]\w)", u, re.I) and not re.search(r"codex|gemini|copilot|\bother\b|\banother\b|\bany\b|\bevery\b|whichever|host_provider", u, re.I):
+            out.append(f"{name}: {u[:80]}")
+    return out
+
+
+def fm_parse(text):
+    m = re.match(r"---\n(.*?)\n---\n", text, re.S)
+    if not m:
+        return None
+    d = {}
+    for line in m.group(1).splitlines():
+        k = re.match(r"^([A-Za-z_-]+):\s*(.*)$", line)
+        if k:
+            d[k.group(1)] = k.group(2).strip()
+    return d
+
+
+def cp5_frontmatter_problems(docs):
+    bad = []
+    for name, text in docs:
+        fm = fm_parse(text)
+        f = Path(name)
+        if fm is None:
+            bad.append(f"{name}: no frontmatter")
+        elif name.startswith("skills"):
+            if fm.get("name") != f.parent.name or not fm.get("description"):
+                bad.append(f"{name}: name/description")
+        else:
+            if not re.fullmatch(r"ratchet-[a-z][a-z-]*", fm.get("name", "")) or fm.get("name") != f.stem or not fm.get("description") or not fm.get("tools"):
+                bad.append(f"{name}: name/description/tools")
+            if not re.search(r"\bReturn\b[^\n]{0,20}(≤|<=|up to|at most|under)\s*\d+|(≤|<=)\s*\d+\s+lines|return\s+only\s+an?\s+\d+-line|\bverdict\b", text, re.I):
+                bad.append(f"{name}: no Return bound")
+    return bad
+
+
+def stdlib_only(path):
+    ok = {"re", "sys", "traceback", "pathlib", "ast", "os", "subprocess", "tempfile", "json", "shutil", "textwrap", "hashlib", "time"}
+    bad = []
+    for n in ast.walk(ast.parse(Path(path).read_text(encoding="utf-8"))):
+        mods = [a.name for a in n.names] if isinstance(n, ast.Import) else [n.module or ""] if isinstance(n, ast.ImportFrom) else []
+        bad += [m for m in mods if m.split(".")[0] not in ok]
+    return bad
+
+
+def tree_snapshot(d):
+    """(path, mtime, size) of every file under d. Only ever pointed at a private temp copy, never the live .ratchet/."""
+    d = Path(d)
+    return sorted((str(f.relative_to(d)), f.stat().st_mtime_ns, f.stat().st_size) for f in d.rglob("*") if f.is_file())
+
+
+def private_repo_copy(dest):
+    """Copy of the repo without .git and .ratchet (hooks rewrite the live .ratchet/ concurrently)."""
+    shutil.copytree(ROOT, dest, ignore=shutil.ignore_patterns(".git", ".ratchet", "__pycache__"))
+    return Path(dest)
+
+
+def tree_snapshot_detects_ratchet():
+    with tempfile.TemporaryDirectory() as tmp:
+        c = private_repo_copy(Path(tmp) / "r")
+        b = tree_snapshot(c)
+        (c / ".ratchet").mkdir()
+        (c / ".ratchet" / "x.json").write_text("{}")
+        return tree_snapshot(c) != b and (c / ".ratchet").exists()
+
+
+def snip_pos(text, rx):
+    """Offset of the first backticked snippet that fully matches rx, else -1."""
+    for m in re.finditer(r"`([^`\n]+)`", text):
+        if re.fullmatch(rx, m.group(1).strip()):
+            return m.start()
+    return -1
+
+
+def p_yes_gated(text, ask_rx, act_rx):
+    """ask snippet, then a 'clear yes', then the exact action snippet, in that order."""
+    a, act = snip_pos(text, ask_rx), snip_pos(text, act_rx)
+    y = [m.start() for m in re.finditer(r"clear\s+yes", text, re.I)]
+    return a >= 0 and act > a and any(a < i < act for i in y)
+
+
+def p_gated_cancel(c):
+    return p_yes_gated(control_entries(c).get("cancel", ""), r"\$RATCHET ask cancel", r"\$RATCHET cancel")
+
+
+def p_gated_setreview(c):
+    return p_yes_gated(control_entries(c).get("checkin", ""), r"\$RATCHET ask set-review end", r"\$RATCHET set-review end")
+
+
+def p_gated_resume(c):
+    return p_yes_gated(control_entries(c).get("resume", ""), r"\$RATCHET ask claim", r"\$RATCHET resume --claim")
+
+
+def p_two_step(c):
+    return has(c, r"two-step", r"\$RATCHET ask <action>", r"only after their clear yes", r"hedge[^.\n]*bare[^.\n]*not a yes")
+
+
+def p_approve_changes(text):
+    m = re.search(r"(?m)^.*approve-changes.*$", hsection(text, r"hard rules"))
+    if not m:
+        return False
+    t = m.group(0)
+    a, act = snip_pos(t, r"\$RATCHET ask approve-changes"), snip_pos(t, r"\$RATCHET approve-changes")
+    return 0 <= a < act and re.search(r"only\s+after\s+their\s+clear\s+yes", t[act:], re.I) is not None
+
+
+def p_enrolled(c):
+    return (has(c, r"director-enrolled lane[^.\n]*does not apply", r"chat\s+\"yes\"\s+does\s+not\s+count",
+                r"`director-sign cancel`", r"`director-sign set-review`", r"`director-sign approve-changes`",
+                r"`resume --claim`\s+is\s+not\s+available", r"do\s+not\s+run\s+the\s+ask/confirm\s+flow",
+                r"do\s+not\s+attempt\s+the\s+command\s+without\s+a\s+token", r"--director-token")
+            and bt(c, r"director-sign\s+cancel"))
+
+
+def p_enrolled_wait(c):
+    # controls paragraph: pause escape, exact-wait message, conditional waiting_on claim, plain resume; no unconditional claim
+    para = re.search(r"(?m)^\*\*In a director-enrolled lane.*$", c)
+    t = para.group(0) if para else c
+    return (para is not None and has(t, r"say exactly what you are waiting for \(the action and why\)", r"\$RATCHET pause --reason",
+                    r"Do not claim `waiting_on: director` unless `status --json` shows it",
+                    r"Plain `\$RATCHET resume` \(no `--claim`\) needs no approval and still resumes a paused enrolled lane")
+                and not re.search(r"end your turn[^.]*saying the lane is `waiting_on: director`", t, re.I))
+
+
+def p_director_wait(c):
+    d = hsection(c, r"running under a director")
+    return has(d, r"says exactly what you are waiting for|say exactly what you are waiting for", r"only in the phases where the engine sets it",
+               r"`waiting_on: null`")
+
+
+def p_enrolled_bullet(orch):
+    d = hsection(orch, r"running under a director")
+    return has(d, r"cancel,\s+set-review,\s+approve-changes[^.\n]*need a director token", r"resume --claim`?\s+is not available")
+
+
+def cp5_docs_lint():
+    docs = cp5_docs()
+    by = dict(docs)
+    orch = by.get("skills/ratchet-orchestrator/SKILL.md", "")
+    controls = hsection(orch, r"control")
+    cmds = engine_commands()
+    sub = subprocess.run([sys.executable, str(ENGINE), "set-review", "--help"], capture_output=True, text=True, timeout=60, cwd=tempfile.gettempdir())
+    setrev_help = sub.stdout
+
+    def teeth(tid, label, pred_ok, pred_mut_red):
+        check(f"[CP5-{tid}] teeth: {label}", pred_ok and pred_mut_red)
+
+    # T01
+    ents = control_entries(controls)
+    check("[CP5-T01] orchestrator has a controls section with pause, resume/continue, cancel, status and 'only check in at the end' as five separate entries",
+          bool(controls) and p_controls_five(controls), f"section found={bool(controls)}, entries={sorted(ents)}")
+    check("[CP5-T01] teeth: merging two entries into one leaves fewer than five",
+          p_controls_five(controls) and not p_controls_five(re.sub(r"(?m)^\s*(?:[-*]\s|\d+[.)]\s)\**\s*(resume|continue)", "", controls, count=1, flags=re.I)))
+    # T02
+    check("[CP5-T02] pause names `pause` with a reason; resume names `resume`, `ask claim`, claims the run for this session; both are engine commands",
+          p_pause_resume(controls, cmds), {k: v[:80] for k, v in ents.items() if k in ("pause", "resume")})
+    check("[CP5-T02] teeth: dropping the claim wording or the reason turns it red",
+          p_pause_resume(controls, cmds) and not p_pause_resume(re.sub(r"(?i)claim\w*", "move", controls), cmds)
+          and not p_pause_resume(re.sub(r"(?i)reason", "note", controls), cmds))
+    # T03
+    check("[CP5-T03] cancel: `ask cancel` then cancel, after a clear yes; status: short plain summary, never raw JSON",
+          p_cancel_status(controls), {k: v[:80] for k, v in ents.items() if k in ("cancel", "status")})
+    check("[CP5-T03] teeth: telling the agent to show raw JSON, or cancel without confirming, is red",
+          p_cancel_status(controls) and not p_cancel_status(re.sub(r"(?i)(never|not|don't|do not|no)([^.\n]{0,50})JSON", r"always\2JSON", controls))
+          and not p_cancel_status(re.sub(r"(?i)confirm\w*|clear yes|check with the user|ask (the user )?first|are you sure", "", controls)))
+    # T04
+    check("[CP5-T04] 'only check in at the end' names `ask set-review` + `set-review end`, and the engine accepts `end`",
+          p_checkin(controls, setrev_help), ents.get("checkin", "")[:120])
+    check("[CP5-T04] teeth: `set-review none` (autonomous) instead of `end` is red",
+          p_checkin(controls, setrev_help) and not p_checkin(re.sub(r"set-review\s+end\b", "set-review none", controls), setrev_help))
+    # T05
+    named = set(named_commands(controls))
+    check("[CP5-T05] every `$RATCHET <cmd>` named in the controls section is a real subcommand (and at least five are named)",
+          p_cmds_real(controls, cmds), f"named={sorted(named)} unknown={sorted(named - cmds)}")
+    check("[CP5-T05] teeth: a renamed/nonexistent command in the section is red",
+          p_cmds_real(controls, cmds) and not p_cmds_real(controls + "\n- `$RATCHET frobnicate`", cmds))
+    # T06
+    check("[CP5-T06] blocked run: quote the finding, offer 2-3 lettered options, wait for the answer", p_blocks(orch),
+          [u[:100] for u in blocks_text(orch)][:3])
+    check("[CP5-T06] teeth: unlettered options / no quoting / no waiting turns it red",
+          p_blocks(orch) and all(not p_blocks(re.sub(rx, "", orch, flags=re.I)) for rx in (r"lettered|\bA\b[^.]{0,20}\bB\b", r"\bquot\w*", r"wait\w*\s+(for|until)|end\s+your\s+turn")))
+    # T07
+    check("[CP5-T07] progress updates are plain (done and next), never raw JSON or gate jargon", p_progress(orch))
+    check("[CP5-T07] teeth: 'paste raw JSON' wording is red",
+          p_progress(orch) and not p_progress(re.sub(NEG + r"([^.\n]{0,60})JSON", r"always\1JSON", orch, flags=re.I)))
+    # T08 / T09
+    fb = fb_text(orch)
+    check("[CP5-T08] fallback section for hosts without sub-agents: one role at a time, reviews less independent",
+          bool(fb) and p_fallback(fb), f"fallback section found={bool(fb)}")
+    check("[CP5-T08] teeth: 'all roles at once' / 'fully independent' is red",
+          p_fallback(fb) and not p_fallback(re.sub(r"(?i)one role at a time", "all roles at once", fb))
+          and not p_fallback(re.sub(r"(?i)less|reduced|weaker", "fully", fb)))
+    check("[CP5-T09] fallback keeps the bar (no gate skipped) and records or tells the user about the substitution",
+          bool(fb) and p_fallback_bar(fb))
+    check("[CP5-T09] teeth: allowing a skipped gate, or staying silent, is red",
+          p_fallback_bar(fb) and not p_fallback_bar(re.sub(r"(?i)\b(never|do not|don't|without|no)\b", "may", fb))
+          and not p_fallback_bar(re.sub(r"(?i)record\w*|log\w*|tell\w*|disclos\w*|mention\w*|flag\w*|say\b|note\b|state\b", "ignore", fb)))
+    # T10 / T11
+    d = dir_text(orch)
+    check("[CP5-T10] director setup is a conversation the agent leads: enrolls/signs when asked, asks plain questions, hands over no commands, never in a builder or lane session",
+          bool(d) and p_director_convo(d))
+    check("[CP5-T10] teeth: 'hand the user the command' or removing the builder/lane exclusion is red",
+          p_director_convo(d) and not p_director_convo(re.sub(r"(?i)(builder|lane)\s+session", "any session", d))
+          and not p_director_convo(re.sub(NEG + r"([^.\n]{0,60}(hand|give|paste|tell)\w*[^.\n]{0,40}command)", r"always\1", d, flags=re.I)))
+    check("[CP5-T11] a lane orchestrator still never reads the key, signs, enrolls or sets RATCHET_ROLE", p_lane_forbid(d))
+    check("[CP5-T11] teeth: turning that 'never' into permission is red",
+          p_lane_forbid(d) and not p_lane_forbid(re.sub(r"(?i)(lane\s+orchestrator[^.]*?)\b(never|not)\b", r"\1may", d)))
+    # T12
+    check("[CP5-T12] viewer link and reviewer-status are things the agent does when the user asks (plain-words report), never in a builder session",
+          p_viewer_reviewer(orch))
+    check("[CP5-T12] teeth: 'ask the user to run reviewer-status' / dropping the builder exclusion is red",
+          p_viewer_reviewer(orch) and not p_viewer_reviewer(re.sub(r"(?i)builder", "anyone", orch)))
+    # T13
+    bad13 = []
+    for name in BUILDERS:
+        t = by.get(f"agents/{name}.md", "")
+        if not t:
+            bad13.append(f"{name}: missing")
+        if re.search(r"director-(enroll|sign|key)|reviewer-status|\bview\s+--serve|\bviewer\b|RATCHET_ROLE", t, re.I):
+            bad13.append(name)
+    check("[CP5-T13] implementer, fixer and test-writer carry no director, viewer or reviewer-status actions", not bad13, bad13)
+    check("[CP5-T13] teeth: a builder agent told to run reviewer-status is detected",
+          bool(re.search(r"director-(enroll|sign|key)|reviewer-status", by.get("agents/ratchet-fixer.md", "") + "\nRun `$RATCHET reviewer-status`.", re.I)))
+    # T14
+    banned14 = [n for n, t in docs if re.search(r"AskUserQuestion|recall[\s-]+memory", t, re.I)]
+    check("[CP5-T14] 'AskUserQuestion' and 'recall memory' appear in no skill or agent", not banned14, banned14)
+    check("[CP5-T14] planner QUESTIONS step says to ask the user directly in chat", p_questions_chat(orch))
+    check("[CP5-T14] teeth: reintroducing 'recall memory' is caught",
+          bool(re.search(r"recall[\s-]+memory", "ask (recall memory first)", re.I)) and not p_questions_chat("If the planner returns `QUESTIONS:`, ask the user in plain words (recall memory first)."))
+    # T15 / T16
+    hits = [h for n, t in docs for h in user_cmd_hits(n, t)]
+    check("[CP5-T15] no skill or agent tells the user to run a command", not hits, hits[:6])
+    with tempfile.TemporaryDirectory() as td:
+        tf = Path(td) / "SKILL.md"
+        tf.write_text(orch + "\nRun `ratchet.py status` in your terminal.\n", encoding="utf-8")
+        planted = user_cmd_hits(str(tf), tf.read_text(encoding="utf-8"))
+    variants = ["You run `ratchet.py status`.", "Type `approve` to go on.", "Tell the user which install command to use.",
+                "Ask the user to run doctor.", "Please run `ratchet.py doctor`.", "Run this in your terminal."]
+    check("[CP5-T16] the user-command lint reports a planted 'Run `ratchet.py status` in your terminal' with file:line",
+          len(planted) == 1 and re.search(r"SKILL\.md:\d+$", planted[0]) is not None, planted)
+    check("[CP5-T16] every denylist phrase variant is caught", all(user_cmd_hits("x", v) for v in variants),
+          [v for v in variants if not user_cmd_hits("x", v)])
+    # T17
+    check("[CP5-T17] missing hooks: the agent offers to install; no 'tell the user which install command to run'",
+          p_hooks_offer(orch))
+    check("[CP5-T17] teeth: adding 'tell the user which install command to run' is red",
+          p_hooks_offer(orch) and not p_hooks_offer(orch + "\nTell the user which install command to run.\n"))
+    # T18
+    n18 = [h for n, t in docs for h in neutrality_hits(n, t)]
+    check("[CP5-T18] no paragraph names only Claude / Claude Code as the host or sub-agent mechanism", not n18, n18[:4])
+    check("[CP5-T18] teeth: a Claude-only sentence is flagged, a multi-CLI one is not",
+          bool(neutrality_hits("x", "Spawn sub-agents with the Claude Code Agent tool.")) and not neutrality_hits("x", "In Claude Code use the Agent tool; in other CLIs use theirs."))
+    # T19
+    bad19 = cp5_frontmatter_problems(docs)
+    check("[CP5-T19] frontmatter valid: skills name==folder + description; agents ratchet-<role> + description + tools + Return bound",
+          len(docs) >= 18 and not bad19, bad19 or len(docs))
+    check("[CP5-T19] teeth: a skill whose name differs from its folder, or an agent without tools, is flagged",
+          bool(cp5_frontmatter_problems([("skills/x/SKILL.md", "---\nname: y\ndescription: d\n---\nbody\n"), ("agents/ratchet-a.md", "---\nname: ratchet-a\ndescription: d\n---\nReturn ≤5 lines\n")])))
+    # T21-T27: safety wording of the controls (yes gate, exact commands, enrolled lanes)
+    rx = lambda a, b: (lambda t: re.sub(a, b, t))
+    check("[CP5-T21] cancel: `ask cancel`, then a clear yes, then exactly `$RATCHET cancel`", p_gated_cancel(controls), ents.get("cancel", "")[:120])
+    check("[CP5-T21] teeth: cancel without the clear-yes gate, or cancel before asking, is red",
+          p_gated_cancel(controls) and not p_gated_cancel(controls.replace("only after a clear yes", "right away"))
+          and not p_gated_cancel(controls.replace("`$RATCHET ask cancel`", "`$RATCHET cancel`").replace("Ask first: ", "")))
+    check("[CP5-T22] 'only at the end': `ask set-review end`, then a clear yes, then exactly `$RATCHET set-review end`", p_gated_setreview(controls), ents.get("checkin", "")[:120])
+    check("[CP5-T22] teeth: dropping the yes gate, running `set-review none|each` instead of end, or `ask set-review` with no mode is red",
+          p_gated_setreview(controls)
+          and not p_gated_setreview(controls.replace("After a clear yes, run", "Right away, run"))
+          and not p_gated_setreview(controls.replace("run `$RATCHET set-review end`", "run `$RATCHET set-review none`"))
+          and not p_gated_setreview(controls.replace("run `$RATCHET set-review end`", "run `$RATCHET set-review each`"))
+          and not p_gated_setreview(controls.replace("`$RATCHET ask set-review end`", "`$RATCHET ask set-review`")))
+    check("[CP5-T23] resume: `ask claim`, then a clear yes, then exactly `$RATCHET resume --claim`", p_gated_resume(controls), ents.get("resume", "")[:120])
+    check("[CP5-T23] teeth: `resume --force`, or resume without the yes gate, is red",
+          p_gated_resume(controls) and not p_gated_resume(controls.replace("`$RATCHET resume --claim`", "`$RATCHET resume --force`"))
+          and not p_gated_resume(controls.replace("After a clear yes, run", "Run")))
+    check("[CP5-T24] the two-step flow is defined: ask first, act only after a clear yes, a hedge or bare ok is not a yes", p_two_step(controls))
+    check("[CP5-T24] teeth: removing the hedge sentence or the yes condition is red",
+          p_two_step(controls) and not p_two_step(controls.replace('A hedge or a bare "ok" is not a yes.', ""))
+          and not p_two_step(controls.replace("only after their clear yes", "at once")))
+    check("[CP5-T25] approve-changes rule: `ask approve-changes`, then a clear yes, then `$RATCHET approve-changes`", p_approve_changes(orch))
+    check("[CP5-T25] teeth: deleting the rule, or running it without asking, is red",
+          p_approve_changes(orch) and not p_approve_changes(re.sub(r"(?m)^.*approve-changes.*$", "", orch))
+          and not p_approve_changes(orch.replace("`$RATCHET ask approve-changes`", "`$RATCHET approve-changes`"))
+          and not p_approve_changes(orch.replace("only after their clear yes", "at once")))
+    check("[CP5-T26] controls say that in a director-enrolled lane chat yes does not count, name the director-sign actions, "
+          "say resume --claim is unavailable, forbid the ask flow", p_enrolled(controls))
+    check("[CP5-T26] teeth: deleting the enrolled-lane paragraph, or any of its load-bearing claims, is red",
+          p_enrolled(controls)
+          and not p_enrolled(re.sub(r"(?m)^\*\*In a director-enrolled lane.*$", "", controls))
+          and not p_enrolled(controls.replace("`resume --claim` is not available", "`resume --claim` works"))
+          and not p_enrolled(controls.replace("`director-sign approve-changes`", "`director-sign x`"))
+          and not p_enrolled(controls.replace("do not run the ask/confirm flow", "run the ask/confirm flow"))
+          )
+    check("[CP5-T29] enrolled lane: final message names the action and why; waiting_on: director is not claimed unconditionally; plain resume still works",
+          p_enrolled_wait(controls) and p_director_wait(orch))
+    check("[CP5-T29] teeth: unconditional waiting_on claim, dropped final-message rule, or dropped plain-resume is red",
+          p_enrolled_wait(controls) and p_director_wait(orch)
+          and not p_director_wait(orch.replace("only in the phases where the engine sets it", "in every phase"))
+          and not p_enrolled_wait(controls.replace("Do not claim `waiting_on: director` unless `status --json` shows it", "You are `waiting_on: director`"))
+          and not p_enrolled_wait(controls.replace("say exactly what you are waiting for (the action and why)", "say you are done"))
+          and not p_enrolled_wait(controls.replace("Plain `$RATCHET resume` (no `--claim`) needs no approval and still resumes", "Resume is unavailable for"))
+          and not p_enrolled_wait(controls.replace("`$RATCHET pause --reason", "`$RATCHET stop --reason"))
+          and not p_enrolled_wait(controls.replace("Tell the user in one line", "End your turn saying the lane is `waiting_on: director`. Tell the user in one line")))
+    check("[CP5-T27] the director section lists cancel, set-review, approve-changes and says resume --claim is unavailable", p_enrolled_bullet(orch))
+    check("[CP5-T27] teeth: reverting to the old three-item list is red",
+          p_enrolled_bullet(orch) and not p_enrolled_bullet(orch.replace("cancel, set-review, approve-changes and the hooks waiver", "nothing else")))
+    # T20
+    if os.environ.get("RATCHET_DOCS_NESTED"):
+        check("[CP5-T20] standalone run (nested run: skipped to avoid recursion)", True)
+        return
+    me = Path(__file__).resolve()
+    env = dict(os.environ, RATCHET_DOCS_NESTED="1")
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = private_repo_copy(Path(tmp) / "repo")
+        before = tree_snapshot(copy)
+        with tempfile.TemporaryDirectory() as cwd:
+            r = subprocess.run([sys.executable, str(copy / "tests" / "test_docs.py")], capture_output=True, text=True,
+                               timeout=600, cwd=cwd, env=env)
+        after = tree_snapshot(copy)
+        (copy / "tests" / "zz_probe").write_text("x")
+        probe_seen = tree_snapshot(copy) != after
+        made_ratchet = (copy / ".ratchet").exists()
+    ids_missing = [f"T{n:02d}" for n in range(1, 20) if f"[CP5-T{n:02d}]" not in r.stdout]
+    consistent = (r.returncode == 0) == ("✗" not in r.stdout) and re.search(r"\d+ passed, \d+ failed", r.stdout) is not None
+    check("[CP5-T20] runs from another cwd, prints a line for every CP5 id, exit code matches the failures shown, and it exits 0 on current docs",
+          not ids_missing and consistent and r.returncode == 0, f"rc={r.returncode} missing={ids_missing}")
+    src = me.read_text(encoding="utf-8")
+    forced = {}
+    for label, val in (("fail", "False"), ("pass", "True")):
+        code = src.replace("ROOT = Path(__file__).resolve().parents[1]", f"ROOT = Path({str(ROOT)!r})")
+        code = re.sub(r"(?m)^SECTIONS = \[.*\]$", f"SECTIONS = [('X', lambda: check('forced', {val}))]", code)
+        with tempfile.TemporaryDirectory() as cwd:
+            f = Path(cwd) / "t.py"
+            f.write_text(code, encoding="utf-8")
+            forced[label] = subprocess.run([sys.executable, str(f)], capture_output=True, text=True, timeout=120, cwd=cwd, env=env).returncode
+    check("[CP5-T20] exit code is non-zero when a check fails and zero when all pass", forced == {"fail": 1, "pass": 0}, forced)
+    check("[CP5-T20] imports only the stdlib and writes nothing under the repo's .ratchet/", not stdlib_only(me) and after == before and not made_ratchet,
+          stdlib_only(me))
+    check("[CP5-T28] the write check runs on a private temp copy and never reads the live .ratchet/, so hook writes cannot flip it",
+          "ROOT" not in src.split("def tree_snapshot")[1].split("def private_repo_copy")[0] and ".ratchet" in src.split("def private_repo_copy")[1].split("def tree_snapshot_detects")[0] and probe_seen)
+    check("[CP5-T28] teeth: a write inside the copy, or a .ratchet/ created in it, is detected; a change to the live .ratchet/ is not looked at",
+          probe_seen and tree_snapshot_detects_ratchet())
+
+
+# ---- end CP5 ----
+
+SECTIONS = [("CP4", cp4_orchestrator_setup_and_plan_review), ("CP5", cp5_docs_lint)]
 
 
 def main():
