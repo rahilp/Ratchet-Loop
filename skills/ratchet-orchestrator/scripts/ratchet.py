@@ -524,6 +524,7 @@ def integrity_problems(ctx, st) -> list[str]:
     for f, h in snap.get("files", {}).items():
         if now_["files"].get(f) != h:
             out.append(f"reference file {f}")
+    out += weakened_tests(ctx, st)
     if snap.get("host") and snap["host"] != now_["host"]:
         out.append(f"host provider ({snap['host']} → {now_['host']})")
     if snap.get("human_review") != st.get("human_review"):
@@ -1416,10 +1417,52 @@ def cmd_red(args):
             die(f"{args.cp} is not marked green_first_ok in the approved plan, so its tests must fail before "
                 "implementation. (Pure refactors get green_first_ok from the planner, visible to the user at approval.)")
         cps["red"]["green_first_reason"] = args.reason
+    cps["red_tests"] = _snapshot_tests(ctx, cp)
     cps["step"] = "implement"
     ctx.log(st, "red", cp=args.cp, exit=code)
     ctx.save_state(st)
     ok(f"{args.cp}: red run recorded (exit {code}). Next: implement.")
+
+
+def _test_paths(ctx, cp) -> list[Path]:
+    out = []
+    for f in (cp.get("tests") or {}).get("files") or []:
+        out += sorted(ctx.root.glob(f)) if any(ch in f for ch in "*?[") else [ctx.root / f]
+    return [p for p in out if p.is_file()]
+
+
+def _snapshot_tests(ctx, cp) -> dict:
+    """Keep a copy of the tests exactly as they failed at the red run (in evidence/, which agents can't write)."""
+    snap = {}
+    d = ctx.evidence(cp["id"]) / "red-tests"
+    d.mkdir(parents=True, exist_ok=True)
+    for p in _test_paths(ctx, cp):
+        rel = str(p.relative_to(ctx.root))
+        (d / rel.replace("/", "__")).write_bytes(p.read_bytes())
+        snap[rel] = _file_sha(p)
+    return snap
+
+
+def _additive(old: str, new: str) -> bool:
+    """True if every non-blank line of `old` still appears, in order, in `new` (tests were only added to)."""
+    it = iter([l.rstrip() for l in new.splitlines() if l.strip()])
+    return all(any(line == n for n in it) for line in [l.rstrip() for l in old.splitlines() if l.strip()])
+
+
+def weakened_tests(ctx, st) -> list[str]:
+    cur = st.get("current")
+    cps = (st.get("checkpoints") or {}).get(cur) or {}
+    if not cps.get("red_tests"):
+        return []
+    out = []
+    d = ctx.run_dir() / "evidence" / cur / "red-tests"
+    for rel in cps["red_tests"]:
+        old_p, new_p = d / rel.replace("/", "__"), ctx.root / rel
+        if not old_p.exists():
+            continue
+        if not new_p.exists() or not _additive(old_p.read_text(errors="replace"), new_p.read_text(errors="replace")):
+            out.append(f"test file {rel} (lines changed or removed since the red run)")
+    return out
 
 
 def cmd_implemented(args):
@@ -1612,9 +1655,6 @@ def cmd_adv_record(args):
     approved = not all_findings
     g["rounds"] = g.get("rounds", []) + [{"at": now(), "fingerprint": fp["id"], "verdicts": verdicts,
                                           "findings": len(all_findings), "substitutions": subs}]
-    if subs:
-        ctx.log(st, "reviewer_fallback", cp=args.cp,
-                detail="; ".join(f"{x['used']} instead of {', '.join(x['instead_of'])}" for x in subs))
     if not approved:
         g["status"] = "failed"
         if g["attempts"] >= cfg["max_adversarial_rounds"]:
@@ -1965,8 +2005,7 @@ def cmd_cancel(args):
     if st["phase"] in ("done", "cancelled"):
         ok(f"Run '{st['slug']}' is already {st['phase']}.")
         return
-    if not getattr(args, "director_token", None):
-        _require_pending(st, "cancel")
+    _require_pending(st, "cancel")
     msg = _require_human(ctx, st, "cancel", getattr(args, "director_token", None))
     st.pop("pending", None)
     st["cancelled_from"] = st["phase"]
@@ -1987,8 +2026,7 @@ def cmd_set_review(args):
     """Change how often the user reviews (end | each | none) — the user's call, so it needs their confirmation."""
     ctx = Ctx(find_root())
     st = ctx.state()
-    if not getattr(args, "director_token", None):
-        _require_pending(st, "set-review", args.mode)
+    _require_pending(st, "set-review", args.mode)
     msg = _require_human(ctx, st, "set-review", getattr(args, "director_token", None))
     old = st.get("human_review")
     st["human_review"] = args.mode
@@ -2008,10 +2046,12 @@ def cmd_approve_changes(args):
     if not probs:
         ok("Nothing has changed since approval.")
         return
-    if not getattr(args, "director_token", None):
-        _require_pending(st, "approve-changes")
+    _require_pending(st, "approve-changes")
     msg = _require_human(ctx, st, "approve-changes", getattr(args, "director_token", None))
     st["approved"] = approval_snapshot(ctx, st)
+    cur = st.get("current")
+    if cur and (st["checkpoints"].get(cur) or {}).get("red_tests") is not None:
+        st["checkpoints"][cur]["red_tests"] = _snapshot_tests(ctx, cp_by_id(ctx.plan(), cur))
     _clear_pending(st)
     ctx.log(st, "changes_approved", by=msg["by"], changed="; ".join(probs)[:400])
     ctx.save_state(st)

@@ -22,7 +22,7 @@ Ask at most 4 questions, and only ones whose answers change the plan. For minor 
 - **Vertical, not horizontal.** Prefer "Approve a request (API + button)" over "all API endpoints", then "all UI".
 - **Gates per checkpoint:**
   - `behavior: true` unless there's genuinely no logic (then `behavior_skip_reason`).
-  - `ui: true` only if this checkpoint changes something a user sees. Pure logic, API, or migration checkpoints set `ui:false` + `ui_skip_reason`.
+  - `ui: true` only if this checkpoint changes something a user sees. That includes static pages the project serves or renders (a dashboard, a report page, a generated HTML viewer): if it can be opened in a browser, it can be screenshotted and compared, so it gets the UI gate. Only set `ui:false` when there is truly nothing a person looks at. Pure logic, API, or migration checkpoints set `ui:false` + `ui_skip_reason`.
   - `adversarial: true`, always.
 - **risk** (`low` / `normal` / `high`) sets how many independent adversarial reviewers must approve (`review_depth` in config). `low`: skeletons, copy or style tweaks, renames. `high`: auth and permissions, money, data migrations, deletion, concurrency, security-sensitive input, anything an eval or lock depends on. Everything else is `normal`. Don't inflate it: high-risk review costs the most quota.
 - **ui_scope** names exactly what the reviewer may judge *at this checkpoint*, and what to ignore because it isn't built yet ("Only the header and empty state; ignore the table"). The scope widens as checkpoints add parts.

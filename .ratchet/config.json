@@ -13,7 +13,7 @@
       "codex"
     ]
   },
-  "regression_command": "python3 tests/test_hooks.py && python3 tests/test_viewer.py",
+  "regression_command": "for t in tests/test_*.py; do python3 \"$t\" > /dev/null || exit 1; done",
   "commit_per_checkpoint": true,
   "design_md": "DESIGN.md",
   "standards": [

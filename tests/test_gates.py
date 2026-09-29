@@ -702,6 +702,31 @@ def main():
 
     cp7_gates()
 
+    print("Tests can't be weakened after the red run (dogfood finding)")
+    d = project("weaken")
+    approve_plan(d)
+    write_tests(d)
+    rx(d, "tests-written", "CP1"); rx(d, "red", "CP1")
+    (d / "src/f.js").write_text("export const f = () => 1;\n")
+    rx(d, "implemented", "CP1")
+    tf = d / "tests/cp1.test.js"
+    tf.write_text(tf.read_text() + "t('[CP1-T01] extra edge', () => a.ok(true));\n")
+    check("adding a test after red is fine", rx(d, "behavior", "CP1").returncode == 0)
+    tf.write_text(tf.read_text().replace("a.equal(f(), 1)", "a.ok(true)"))
+    r = rx(d, "behavior", "CP1")
+    check("changing an assertion after red stops the gates", r.returncode != 0 and "since the red run" in r.stderr, r.stderr)
+    q = rx(d, "ask", "approve-changes")
+    check("the question names the weakened test file", "tests/cp1.test.js" in q.stdout, q.stdout)
+    say(d, "yes")
+    check("after the user's yes the new tests become the baseline", rx(d, "approve-changes").returncode == 0
+          and rx(d, "behavior", "CP1").returncode == 0)
+
+    print("Director tokens for mid-build decisions need the question too (dogfood finding)")
+    d = project("dirask")
+    approve_plan(d)
+    r = rx(d, "cancel", "--director-token", "deadbeef")
+    check("cancel with a token but no question is refused", r.returncode != 0 and "ask cancel" in r.stderr, r.stderr)
+
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
 
