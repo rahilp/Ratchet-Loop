@@ -1,0 +1,57 @@
+{
+  "human_review": "end",
+  "host_provider": "auto",
+  "ui_reviewers": {
+    "visual": [
+      "gemini",
+      "claude",
+      "codex"
+    ],
+    "behavior": [
+      "claude",
+      "gemini",
+      "codex"
+    ]
+  },
+  "regression_command": "python3 tests/test_hooks.py && python3 tests/test_viewer.py",
+  "commit_per_checkpoint": true,
+  "design_md": "DESIGN.md",
+  "standards": [
+    ".ratchet/standards.md"
+  ],
+  "app": {
+    "start_command": null,
+    "url": null,
+    "healthcheck": null
+  },
+  "review_depth": {
+    "low": [
+      "host-both"
+    ],
+    "normal": [
+      "host-standards",
+      [
+        "codex-correctness",
+        "gemini-correctness",
+        "claude-correctness",
+        "copilot-correctness"
+      ]
+    ],
+    "high": [
+      "host-standards",
+      "host-correctness",
+      [
+        "codex-correctness",
+        "gemini-correctness",
+        "claude-correctness",
+        "copilot-correctness"
+      ],
+      [
+        "gemini-standards",
+        "claude-standards",
+        "codex-standards",
+        "copilot-standards"
+      ]
+    ]
+  }
+}

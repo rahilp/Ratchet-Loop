@@ -230,6 +230,14 @@ def role_providers(a) -> tuple[str, dict]:
     return host, out
 
 
+def _current_fingerprint():
+    try:
+        eng = _engine()
+        return eng.fingerprint(eng.find_root())["id"]
+    except (Exception, SystemExit):
+        return None
+
+
 def combine(reviews: list[dict], checkpoint: str | None) -> dict:
     diffs, invalid, names = [], [], []
     for r in reviews:
@@ -241,7 +249,7 @@ def combine(reviews: list[dict], checkpoint: str | None) -> dict:
             diffs.append(dict(d, reviewer=name))
     fixable = [d for d in diffs if d.get("fixable_in_code", True)]
     verdict = "INVALID" if invalid else ("FAIL" if fixable else "PASS")
-    return {"checkpoint": checkpoint, "reviewers": names, "verdict": verdict,
+    return {"checkpoint": checkpoint, "fingerprint": _current_fingerprint(), "reviewers": names, "verdict": verdict,
             "invalid_reason": "; ".join(invalid) or None, "differences": diffs,
             "summary": f"{len(fixable)} code-fixable difference(s) across {len(names)} reviewer(s)"}
 

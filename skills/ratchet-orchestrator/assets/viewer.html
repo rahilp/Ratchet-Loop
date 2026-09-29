@@ -198,7 +198,7 @@ function render(d){
   const cps = d.plan?.checkpoints||[];
   const done = cps.filter(c=>d.state.checkpoints?.[c.id]?.status==="done").length;
   document.getElementById("meta").textContent = `${done} of ${cps.length} checkpoints done · human review: ${d.state.human_review} · updated ${new Date(d.generated_at).toLocaleString()}`;
-  const ref = (d.plan?.reference?.paths||[]).find(p=>/prototype\.html$/.test(p));
+  const ref = d.prototype || (d.plan?.reference?.paths||[]).some(p=>/prototype\.html$/.test(p));
   const T = new URLSearchParams(location.search).get("t");
   const protoHref = location.protocol==="file:" ? "reference/prototype.html?switcher=1" : "reference/prototype.html?switcher=1"+(T?"&t="+encodeURIComponent(T):"");
   document.getElementById("callout").innerHTML = callout(d) + (ref ? `<p class="meta" style="margin:-10px 0 18px">Prototype: <a href="${protoHref}" target="_blank" rel="noopener">open the clickable prototype</a> (use the state switcher to see every screen)</p>` : "");

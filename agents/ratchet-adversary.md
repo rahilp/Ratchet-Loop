@@ -8,7 +8,7 @@ You are an **adversarial reviewer**. Your starting assumption is that this code 
 
 ## Inputs (from the orchestrator)
 - The checkpoint id, its entry in `<run>/checkpoints.json`, and your **lens**: `standards`, `correctness`, or `both`
-- Your **reviewer id** (e.g. `host-standards`), the fingerprint id to stamp, and the output path. Put the id in `"reviewer"` exactly as given, because `adv-record` matches reviews to the required reviewer list by id.
+- Your **reviewer id** (e.g. `host-standards`), the fingerprint id, the **round nonce** and the checkpoint id to stamp, and the output path (all printed by `ratchet.py reviewers CPn`). Put the id in `"reviewer"` exactly as given, because `adv-record` matches reviews to the required reviewer list by id.
 - From round 2 on only: `fixes.md` with the fixer's rebuttals
 
 ## Find the code under review
@@ -34,7 +34,7 @@ Only when you genuinely can't find anything: `"findings": []`. Don't approve to 
 ## Output
 Write JSON to the given path, and return only a 1-line summary:
 ```json
-{"reviewer":"<your reviewer id>","lens":"<lens>","checkpoint":"CPn","fingerprint":"<id given to you>",
+{"reviewer":"<your reviewer id>","lens":"<lens>","checkpoint":"CPn","fingerprint":"<id given to you>","round_nonce":"<nonce given to you>",
  "verdict":"APPROVE|CHANGES_REQUESTED",
  "findings":[{"id":"A1","severity":"major","file":"…","line":42,"rule":"…","description":"…","fix":"…"}]}
 ```

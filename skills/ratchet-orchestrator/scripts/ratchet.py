@@ -49,6 +49,7 @@ STEPS = ["tests", "red", "implement", "behavior", "ui", "adversarial", "complete
 
 # Phases in which the Stop hook lets the main agent stop.
 STOPPABLE_PHASES = {
+    "cancelled",
     "awaiting_plan_approval",
     "awaiting_checkpoint_review",
     "awaiting_final_review",
@@ -107,8 +108,14 @@ DEFAULT_CONFIG = {
     "standards": [".ratchet/standards.md"],
     "app": {"start_command": None, "url": None, "healthcheck": None},
     "test_timeout_sec": 900,
-    "max_stop_blocks": 40,          # safety valve for the Stop hook
+    "max_stop_blocks": 40,          # safety valve for the Stop hook (reset whenever a gate makes progress)
+    "fingerprint_include": [],      # gitignored files that still matter to behaviour (e.g. ".env.test"); added to fingerprints
+    "ui_single_reviewer_ok": False, # allow a UI review with only one of visual/behaviour (human-set, locked at approval)
+    "min_review_timeout_sec": 120,  # other-provider reviewers can't be given a timeout short enough to knock them out
 }
+
+PROGRESS_EVENTS = {"tests_written", "red", "implemented", "behavior_passed", "ui_passed", "adversarial_approved",
+                   "checkpoint_complete", "plan_submitted", "plan_approved", "plan_extended", "reviewers_launched"}
 
 FINGERPRINT_EXCLUDES = {
     ".git", RATCHET_DIR, "node_modules", ".next", ".nuxt", "dist", "build", "out",
@@ -152,7 +159,7 @@ def find_root(start: Path | None = None) -> Path:
 
 def read_json(path: Path, default=None):
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return default
     except json.JSONDecodeError as e:
@@ -162,7 +169,7 @@ def read_json(path: Path, default=None):
 def write_json(path: Path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -225,6 +232,8 @@ class Ctx:
 
     def log(self, st, event: str, **data):
         st.setdefault("history", []).append({"at": now(), "event": event, **data})
+        if event in PROGRESS_EVENTS:
+            st["stop_blocks"] = 0  # the safety valve counts stops WITHOUT progress
 
 
 # --------------------------------------------------------------------------- fingerprint
@@ -247,6 +256,9 @@ def fingerprint(root: Path) -> dict:
                                cwd=root, env=env, capture_output=True, text=True)
             if r.returncode != 0:
                 die(f"git add for fingerprint failed: {r.stderr.strip()}")
+            extra = (read_json(root / RATCHET_DIR / "config.json", {}) or {}).get("fingerprint_include") or []
+            if extra:  # gitignored files that tests still depend on
+                subprocess.run(["git", "add", "-f", "--", *extra], cwd=root, env=env, capture_output=True, text=True)
             t = subprocess.run(["git", "write-tree"], cwd=root, env=env,
                                capture_output=True, text=True)
             if t.returncode != 0:
@@ -293,6 +305,113 @@ def touches_ui(files: list[str], globs: list[str]) -> list[str]:
         if any(fnmatch.fnmatch(name, g) or fnmatch.fnmatch(f, g) for g in globs):
             hits.append(f)
     return hits
+
+
+# --------------------------------------------------------------------------- run bookkeeping
+
+def _set_blocked(st, reason):
+    """Block the run and remember where it was, so an unblock returns to the same place."""
+    if st.get("phase") != "blocked":
+        st["blocked_from"] = st.get("phase")
+    st["phase"] = "blocked"
+    st["blocked_reason"] = reason
+    st["awaiting_since"] = now()
+
+
+def ratchet_home() -> Path:
+    """Per-user Ratchet data OUTSIDE any repository (director key, active-run markers)."""
+    return Path(os.environ.get("RATCHET_HOME") or Path.home() / ".config" / "ratchet")
+
+
+def _markers_path() -> Path:
+    return ratchet_home() / "active-runs.json"
+
+
+def register_active(root: Path, slug: str | None):
+    """Remember active runs outside the repo, so deleting .ratchet/ is noticed instead of silently ending the loop."""
+    try:
+        p = _markers_path()
+        data = read_json(p, {}) or {}
+        key = str(root.resolve())
+        if slug:
+            data[key] = {"slug": slug, "since": now()}
+        else:
+            data.pop(key, None)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        write_json(p, data)
+    except Exception:
+        pass
+
+
+APPROVE_RE = re.compile(r"(^|\s|/)(approve[ds]?|approval|lgtm|yes|yep|yeah|yup|sure|go ahead|go for it|proceed|"
+                        r"ship it|build it|looks good|sounds good|do it|confirm(ed)?|ok(ay)?|good to go|let'?s go)\b|👍|✅",
+                        re.I)
+HEDGE_RE = re.compile(r"\?|\b(no|not|don'?t|wait|hold|stop|change|instead|but|however|except|remove|rather|"
+                      r"i guess|maybe|probably|not sure|i think|unsure|hmm)\b", re.I)
+CANCEL_RE = re.compile(r"\b(cancel|abandon|scrap|drop|kill|forget it|throw (it )?away|start over)\b", re.I)
+
+
+def message_intent(text: str) -> str:
+    """approve | cancel | unclear — only an unhedged approval counts as one."""
+    t = (text or "").strip()
+    if re.match(r"^/?approve\b", t, re.I):
+        return "approve"
+    if CANCEL_RE.search(t):
+        return "cancel"
+    if APPROVE_RE.search(t) and not HEDGE_RE.search(t):
+        return "approve"
+    return "unclear"
+
+
+RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversarial_rounds_run", "max_ui_rounds",
+             "max_behavior_attempts", "ui_block_on_nits", "ui_globs", "regression_command", "standards",
+             "fingerprint_include", "approver", "ui_single_reviewer_ok", "min_review_timeout_sec", "test_timeout_sec"]
+
+
+def _sha(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+
+
+def approval_snapshot(ctx, st) -> dict:
+    plan = ctx.plan() or {"checkpoints": []}
+    cfg = ctx.config()
+    return {"plan": _plan_hash(plan),
+            "cps": {c["id"]: _sha(c) for c in plan["checkpoints"]},
+            "tests": {c["id"]: _sha(test_plan(ctx, c["id"])) for c in plan["checkpoints"]},
+            "rules": {k: _sha(cfg.get(k)) for k in RULE_KEYS},
+            "human_review": st.get("human_review")}
+
+
+def integrity_problems(ctx, st) -> list[str]:
+    """What changed since the human approved the plan (plan, test plans, or the loop's rules)."""
+    snap = st.get("approved")
+    if not snap:
+        return []
+    now_ = approval_snapshot(ctx, st)
+    out = []
+    for cid, h in snap.get("cps", {}).items():
+        if now_["cps"].get(cid) != h:
+            out.append(f"checkpoint {cid} in checkpoints.json")
+    for cid, h in snap.get("tests", {}).items():
+        if now_["tests"].get(cid) != h:
+            out.append(f"test plan tests/{cid}.json")
+    extra = set(now_["cps"]) - set(snap.get("cps", {}))
+    if extra:
+        out.append(f"new checkpoints {sorted(extra)} (use feedback + plan-extend)")
+    for k, h in snap.get("rules", {}).items():
+        if now_["rules"].get(k) != h:
+            out.append(f"config rule '{k}'")
+    if snap.get("human_review") != st.get("human_review"):
+        out.append("human_review mode")
+    return out
+
+
+def verify_integrity(ctx, st):
+    probs = integrity_problems(ctx, st)
+    if probs:
+        die("These changed after the user approved the plan: " + "; ".join(probs) + ". "
+            "Either undo the change, or show the user exactly what changed and — only after they confirm — "
+            "run `ratchet.py approve-changes`.")
 
 
 # --------------------------------------------------------------------------- plan validation
@@ -389,14 +508,21 @@ def next_action(ctx: Ctx, st=None) -> dict:
         if missing:
             return {"phase": phase, "action": "Spawn in parallel: " + "; ".join(missing),
                     "stop_ok": False}
-        return {"phase": phase, "action": "Run ratchet.py plan-submit (validates checkpoints, builds viewer). "
-                "Spawn ratchet-test-planner for each checkpoint in parallel.", "stop_ok": False}
+        missing_tp = [c["id"] for c in (ctx.plan() or {}).get("checkpoints", [])
+                      if c.get("gates", {}).get("behavior") and not test_plan(ctx, c["id"])]
+        if missing_tp:
+            return {"phase": phase, "action": "Spawn ratchet-test-planner for " + ", ".join(missing_tp)
+                    + " (in parallel). When every test plan exists, run ratchet.py plan-submit.", "stop_ok": False}
+        return {"phase": phase, "action": "Run ratchet.py plan-submit (validates the plan and test plans, "
+                "prints the viewer link), then show the user the plan.", "stop_ok": False}
     if phase == "awaiting_plan_approval":
         missing = [c["id"] for c in ctx.plan()["checkpoints"]
                    if c["gates"].get("behavior") and not test_plan(ctx, c["id"])]
-        extra = f" (test plans still missing for {', '.join(missing)} — spawn ratchet-test-planner)" if missing else ""
-        return {"phase": phase, "action": "Waiting for the human to approve the checkpoint plan in the viewer"
-                + extra, "stop_ok": not missing}
+        extra = (f" (test plans still missing for {', '.join(missing)} — spawn ratchet-test-planner, then run "
+                 "ratchet.py plan-submit again)") if missing else ""
+        return {"phase": phase, "action": "Waiting for the user to approve the plan. When they reply, only a clear "
+                "approval counts — otherwise answer their question or make their change and ask again." + extra,
+                "stop_ok": not missing}
     if phase in ("awaiting_checkpoint_review", "awaiting_final_review"):
         return {"phase": phase, "action": "Waiting for the human to review. On approval run ratchet.py "
                 "human-approve; on feedback run ratchet.py feedback.", "stop_ok": True}
@@ -404,7 +530,7 @@ def next_action(ctx: Ctx, st=None) -> dict:
         return {"phase": phase, "action": "Spawn ratchet-checkpoint-planner in EXTEND mode with the human's feedback "
                 "(append new checkpoints, never edit completed ones), ratchet-test-planner for each new checkpoint, "
                 "then run ratchet.py plan-extend", "stop_ok": False}
-    if phase in ("blocked", "paused", "done"):
+    if phase in ("blocked", "paused", "done", "cancelled"):
         return {"phase": phase, "action": st.get("blocked_reason") or phase, "stop_ok": True}
 
     # building
@@ -451,30 +577,58 @@ def cmd_init(args):
         learn.write_text("# Ratchet learnings\n\nEvery Ratchet agent reads this file before starting work. "
                          "Entries come from human reviews and repeated gate failures.\n\n")
     gi = ctx.ratchet / ".gitignore"
-    if not gi.exists():
-        gi.write_text("manifests/\nhuman_log.jsonl\nruns/*/evidence/**/*.png\nruns/*/viewer.html\n"
-                      "viewer.json\nviewer.log\nhook-heartbeat.json\nhook-errors.log\nunavailable-reviewers.json\n")
+    if not gi.exists() or gi.read_text(encoding="utf-8").startswith("manifests/"):
+        # runtime state stays out of git: git stash/checkout/reset can't roll it back, and checkpoint commits
+        # don't carry it. Only the files people edit and share are tracked.
+        gi.write_text("*\n!.gitignore\n!config.json\n!standards.md\n!learnings.md\n", encoding="utf-8")
+        if _is_git(root):
+            tracked = subprocess.run(["git", "ls-files", RATCHET_DIR], cwd=root, capture_output=True,
+                                     text=True).stdout.split()
+            runtime = [f for f in tracked if f.split("/", 1)[-1] not in (".gitignore", "config.json", "standards.md",
+                                                                        "learnings.md")]
+            if runtime:
+                subprocess.run(["git", "rm", "--cached", "-q", "--", *runtime], cwd=root, capture_output=True)
     existing = ctx.active_slug()
-    if existing and not args.force:
-        st = read_json(ctx.state_path(existing))
-        if st and st.get("phase") not in ("done",):
-            die(f"Run '{existing}' is still active (phase {st['phase']}). Finish it, "
-                f"or pass --force to start a new one.")
+    if existing:
+        old_st = read_json(ctx.state_path(existing), None)
+        if old_st and old_st.get("phase") not in ("done", "cancelled"):
+            if not (args.force and os.environ.get("RATCHET_HUMAN_OVERRIDE") == "1"):
+                die(f"Run '{existing}' is still active (phase {old_st['phase']}). Ask the user whether to resume it "
+                    f"(ratchet.py resume) or cancel it (ratchet.py cancel, after they confirm). "
+                    "A run is never replaced silently.")
     slug = args.slug or slugify(args.feature)
     rd = ctx.ratchet / "runs" / slug
     if rd.exists() and not args.force:
-        die(f"Run {slug} already exists. Use --slug to pick another name or --force.")
+        die(f"Run {slug} already exists. Use --slug to pick another name.")
+    dirty = []
+    branch = None
+    if _is_git(root):
+        dirty = [l[3:] for l in subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True,
+                                               text=True).stdout.splitlines() if l and not l[3:].startswith(RATCHET_DIR)]
+        if args.branch:
+            branch = f"ratchet/{slug}"
+            r = subprocess.run(["git", "checkout", "-b", branch], cwd=root, capture_output=True, text=True)
+            if r.returncode != 0:
+                die(f"Could not create branch {branch}: {r.stderr.strip()}")
     (rd / "tests").mkdir(parents=True, exist_ok=True)
     (rd / "evidence").mkdir(exist_ok=True)
+    human = [e for e in _human_since(ctx, "0") if e.get("session")]
     st = {
         "slug": slug, "feature": args.feature, "phase": "planning", "created_at": now(),
         "human_review": args.human_review or ctx.config()["human_review"],
         "current": None, "checkpoints": {}, "plan_hash": None, "awaiting_since": None,
-        "stop_blocks": 0, "history": [],
+        "stop_blocks": 0, "history": [], "branch": branch, "dirty_at_start": dirty[:50],
+        "owner_session": human[-1]["session"] if human else None,
+        "base_tree": fingerprint(root)["id"],
     }
     write_json(rd / "state.json", st)
     write_json(ctx.ratchet / "active.json", {"slug": slug})
-    ok(f"Initialised run '{slug}' at {rd.relative_to(root)}")
+    register_active(root, slug)
+    ok(f"Initialised run '{slug}' at {rd.relative_to(root)}" + (f" on new branch {branch}" if branch else ""))
+    if dirty:
+        print(f"WARNING: {len(dirty)} uncommitted change(s) already in the working tree (e.g. {', '.join(dirty[:3])}). "
+              "Checkpoint commits would include them — ask the user whether to commit, stash or keep them first.")
+    print("NEXT: run `ratchet.py doctor` now to confirm this agent CLI's Ratchet hooks are firing.")
     print(json.dumps(next_action(ctx), indent=2))
 
 
@@ -637,6 +791,10 @@ def cmd_plan_submit(args):
         webbrowser.open(link["url"]) if link["live"] else open_viewer(path)
 
 
+def _in_a_minute():
+    return (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=1)).isoformat(timespec="microseconds")
+
+
 def _human_since(ctx: Ctx, since_iso: str | None):
     log = ctx.ratchet / "human_log.jsonl"
     if not log.exists() or not since_iso:
@@ -647,7 +805,8 @@ def _human_since(ctx: Ctx, since_iso: str | None):
             e = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if e.get("at", "") > since_iso:
+        at = e.get("at", "")
+        if since_iso < at <= _in_a_minute():  # a timestamp from the future is forged, not typed
             out.append(e)
     return out
 
@@ -686,8 +845,14 @@ def _sign(key: bytes, payload: str) -> str:
     return hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
 
 
+def _enrolled_outside(ctx) -> str | None:
+    return (read_json(ratchet_home() / "enrolled.json", {}) or {}).get(str(ctx.root.resolve()))
+
+
 def approval_mode(ctx) -> str:
     enr = read_json(ctx.ratchet / "director.json")
+    if not enr and _enrolled_outside(ctx):
+        return "director"  # enrollment file deleted from the repo: still enrolled
     if enr:
         key = _director_key(required=False)
         if key and hmac.compare_digest(enr.get("sig", ""), _sign(key, "enroll|" + str(ctx.root.resolve()))):
@@ -713,18 +878,25 @@ def _require_approval(ctx, st, action, token=None):
         die("This lane is director-enrolled: approvals need a director token "
             f"(director runs: ratchet.py --root {ctx.root} director-sign {action}). "
             "Chat messages do not count as approvals here.")
-    msgs = _human_since(ctx, st.get("awaiting_since"))
-    if msgs:
-        return {"by": "human", "detail": msgs[-1].get("prompt", "")[:200]}
     if os.environ.get("RATCHET_HUMAN_OVERRIDE") == "1":
         return {"by": "human", "detail": "(RATCHET_HUMAN_OVERRIDE)"}
+    msgs = _human_since(ctx, st.get("awaiting_since"))
+    if msgs:
+        last = msgs[-1].get("prompt", "")
+        intent = message_intent(last)
+        wanted = {"feedback": ("approve", "unclear", "cancel"), "cancel": ("cancel", "approve")}.get(action, ("approve",))
+        if intent in wanted:
+            return {"by": "human", "detail": last[:200], "session": msgs[-1].get("session")}
+        die(f"The user's latest message is not a clear {'cancellation' if action == 'cancel' else 'approval'}: "
+            f"\"{last[:120]}\". Answer it or make the change they asked for, then ask them plainly to confirm "
+            "(e.g. \"Shall I go ahead? Reply yes to continue.\"), and try again after they reply.")
     die("No human message recorded since the loop paused. Approval must come from the user — "
         "stop and wait for them. (Requires the UserPromptSubmit hook; see README.)")
 
 
 def _require_human(ctx, st, action="human-approve", token=None):
     a = _require_approval(ctx, st, action, token)
-    return {"prompt": a["detail"], "by": a["by"]}
+    return {"prompt": a["detail"], "by": a["by"], "session": a.get("session")}
 
 
 def cmd_director_key(args):
@@ -746,8 +918,11 @@ def cmd_director_enroll(args):
     ctx = Ctx(find_root())
     ctx.ratchet.mkdir(exist_ok=True)
     key = _director_key()
-    write_json(ctx.ratchet / "director.json", {"enrolled_at": now(),
-                                               "sig": _sign(key, "enroll|" + str(ctx.root.resolve()))})
+    sig = _sign(key, "enroll|" + str(ctx.root.resolve()))
+    write_json(ctx.ratchet / "director.json", {"enrolled_at": now(), "sig": sig})
+    outside = read_json(ratchet_home() / "enrolled.json", {}) or {}
+    outside[str(ctx.root.resolve())] = sig
+    write_json(ratchet_home() / "enrolled.json", outside)
     ok(f"Lane {ctx.root} enrolled: approvals now require a director token.")
 
 
@@ -758,7 +933,12 @@ def cmd_director_sign(args):
     st = ctx.state()
     want = {"approve-plan": ["awaiting_plan_approval"],
             "human-approve": ["awaiting_checkpoint_review", "awaiting_final_review", "blocked"],
-            "feedback": ["awaiting_checkpoint_review", "awaiting_final_review", "done"]}[args.action]
+            "feedback": ["awaiting_checkpoint_review", "awaiting_final_review", "done"],
+            "approve-changes": ["building", "blocked", "awaiting_checkpoint_review", "awaiting_final_review"],
+            "cancel": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
+                       "awaiting_checkpoint_review", "awaiting_final_review", "planning_feedback"],
+            "set-review": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
+                           "awaiting_checkpoint_review", "awaiting_final_review"]}[args.action]
     if st["phase"] not in want:
         die(f"Run {st['slug']} is in phase {st['phase']}; {args.action} applies to {want}.")
     print(_sign(_director_key(), _approval_payload(ctx, st, args.action)))
@@ -776,11 +956,15 @@ def cmd_approve_plan(args):
     if missing:
         die(f"Test plans missing for {', '.join(missing)}. Spawn ratchet-test-planner first.")
     msg = _require_human(ctx, st, "approve-plan", getattr(args, "director_token", None))
+    st["approved"] = approval_snapshot(ctx, st)
+    if msg.get("session"):
+        st["owner_session"] = msg["session"]  # the session where the user said yes owns the build
     st["phase"] = "building"
     st["current"] = plan["checkpoints"][0]["id"]
     first = st["checkpoints"][st["current"]]
     first["status"] = "in_progress"
     first["started_at"] = now()
+    first["base_tree"] = fingerprint(ctx.root)["id"]
     st["awaiting_since"] = None
     ctx.log(st, "plan_approved", by=msg["by"], note=msg.get("prompt", "")[:200])
     ctx.save_state(st)
@@ -794,6 +978,7 @@ def _cur(ctx, st, cp_id):
         die(f"Not building (phase {st['phase']})")
     if cp_id != st["current"]:
         die(f"{cp_id} is not the current checkpoint ({st['current']}). Checkpoints run strictly in order.")
+    verify_integrity(ctx, st)
     return st["checkpoints"][cp_id]
 
 
@@ -815,7 +1000,8 @@ def _coverage(ctx, cp):
         for p in ctx.root.glob(f) if any(ch in f for ch in "*?[") else [ctx.root / f]:
             if p.is_file():
                 blob += p.read_text(errors="ignore")
-    missing = [c["id"] for c in _planned_cases(ctx, cp["id"]) if c["id"] not in blob]
+    missing = [c["id"] for c in _planned_cases(ctx, cp["id"])
+               if not re.search(r"(?<![A-Za-z0-9-])" + re.escape(c["id"]) + r"(?![0-9])", blob)]
     return files, missing, bool(blob)
 
 
@@ -878,6 +1064,10 @@ def cmd_red(args):
     if code == 0:
         if not args.reason:
             die("--allow-green-first needs --reason")
+        if not cp.get("green_first_ok"):
+            ctx.save_state(st)
+            die(f"{args.cp} is not marked green_first_ok in the approved plan, so its tests must fail before "
+                "implementation. (Pure refactors get green_first_ok from the planner, visible to the user at approval.)")
         cps["red"]["green_first_reason"] = args.reason
     cps["step"] = "implement"
     ctx.log(st, "red", cp=args.cp, exit=code)
@@ -920,10 +1110,8 @@ def cmd_behavior(args):
     if code != 0:
         g["status"] = "failed"
         g["last"] = {"exit": code, "log": str(log.relative_to(ctx.root)), "at": now()}
-        if cps["step"] == "behavior" and g["attempts"] >= cfg["max_behavior_attempts"]:
-            st["phase"] = "blocked"
-            st["blocked_reason"] = f"{args.cp}: behavior gate failed {g['attempts']} times — needs a human."
-            st["awaiting_since"] = now()
+        if g["attempts"] >= cfg["max_behavior_attempts"]:
+            _set_blocked(st, f"{args.cp}: behavior gate failed {g['attempts']} times — needs a human decision.")
         ctx.log(st, "behavior_failed", cp=args.cp, attempt=g["attempts"])
         ctx.save_state(st)
         build_viewer(ctx)
@@ -947,7 +1135,7 @@ def _ui_verdict(review: dict, cfg) -> tuple[str, list]:
     for d in review.get("differences", []) or []:
         sev = str(d.get("severity", "")).lower()
         fixable = d.get("fixable_in_code", True)
-        if not fixable:
+        if not fixable and sev not in ("blocker", "major"):  # a reviewer can't wave through its own serious finding
             continue
         if sev == "nit" and not cfg["ui_block_on_nits"]:
             continue
@@ -971,8 +1159,14 @@ def cmd_ui_record(args):
     for key in ("reviewers", "differences"):
         if key not in review:
             die(f"combined review must contain '{key}' (see ratchet-ui-compare skill)")
-    if len(review.get("reviewers", [])) < 2 and not args.single_reviewer_ok:
+    if len(review.get("reviewers", [])) < 2 and not cfg.get("ui_single_reviewer_ok"):
         die("UI gate needs both a visual and a behaviour reviewer in the combined review.")
+    if review.get("checkpoint") not in (None, args.cp):
+        die(f"combined review is for {review.get('checkpoint')}, not {args.cp}.")
+    cur_fp = fingerprint(ctx.root)["id"]
+    if review.get("fingerprint") != cur_fp:
+        die("combined review is not stamped with the current code fingerprint (it was produced for other code, or by "
+            "hand). Capture and review again with ui_review.py — it stamps the fingerprint itself.")
     g = cps["gates"]["ui"]
     g["attempts"] += 1
     verdict, blockers = _ui_verdict(review, cfg)
@@ -990,9 +1184,7 @@ def cmd_ui_record(args):
         g["status"] = "failed"
         g["blockers"] = len(blockers)
         if g["attempts"] >= cfg["max_ui_rounds"]:
-            st["phase"] = "blocked"
-            st["blocked_reason"] = f"{args.cp}: UI gate failed {g['attempts']} rounds — needs a human."
-            st["awaiting_since"] = now()
+            _set_blocked(st, f"{args.cp}: UI gate failed {g['attempts']} rounds — needs a human decision.")
         ctx.log(st, "ui_failed", cp=args.cp, blockers=len(blockers))
         ctx.save_state(st)
         build_viewer(ctx)
@@ -1016,31 +1208,37 @@ def cmd_adv_record(args):
     _expect_step(cps, ["adversarial", "complete"], args.cp)
     cfg = ctx.config()
     cp = cp_by_id(ctx.plan(), args.cp)
-    resolved = resolve_reviewers(ctx, cfg, cp)
-    required = [r["id"] for r in resolved]
-    subs = [{"used": r["id"], "instead_of": r["fallback_for"], "why": r["reasons"]} for r in resolved if r["fallback_for"]]
     g = cps["gates"]["adversarial"]
     fp = fingerprint(ctx.root)
+    rnd = cps.get("adv_round")
+    if not rnd or rnd.get("recorded"):
+        die(f"No open review round for {args.cp}. Start one with `ratchet.py reviewers {args.cp}` — it lists who must "
+            "review and gives each reviewer the round nonce to stamp.")
+    if rnd["fingerprint"] != fp["id"]:
+        die(f"The code changed after review round {rnd['round']} was opened. Run `ratchet.py reviewers {args.cp}` "
+            "again so every reviewer looks at the current code.")
+    required = rnd["reviewers"]
+    subs = rnd.get("substitutions") or []
     reviews = {}
     for rp in args.reviews:
         r = read_json(Path(rp))
         if r is None:
             die(f"Review not found: {rp}")
         rid = r.get("reviewer") or Path(rp).stem
-        if not r.get("fingerprint"):
-            die(f"{rp} has no 'fingerprint'. Every review must be stamped with `ratchet.py fingerprint` "
-                "taken before the reviewer started.")
-        if r["fingerprint"] != fp["id"]:
-            die(f"{rp} ({rid}) reviewed code {r['fingerprint'][:10]} but code is now {fp['id'][:10]}. "
-                "Re-run that reviewer on the current code.")
+        if r.get("fingerprint") != fp["id"]:
+            die(f"{rp} ({rid}) is not stamped with the current fingerprint {fp['id'][:10]}. Re-run that reviewer.")
+        if r.get("round_nonce") != rnd["nonce"]:
+            die(f"{rp} ({rid}) does not carry this round's nonce. Reviews must come from reviewers launched for "
+                f"round {rnd['round']} (see `ratchet.py reviewers {args.cp}`).")
+        if r.get("checkpoint") not in (None, args.cp):
+            die(f"{rp} is a review of {r.get('checkpoint')}, not {args.cp}.")
         reviews[rid] = (rp, r)
     missing = [i for i in required if i not in reviews]
     if missing:
         die(f"{args.cp} (risk={cp.get('risk', 'normal')}) needs reviews from {required}; missing {missing}. "
             f"Run `ratchet.py reviewers {args.cp}` to see how to launch each one.")
-    g["attempts"] += 1
-    st["adv_rounds_total"] = int(st.get("adv_rounds_total", 0)) + 1
-    dest = ctx.evidence(args.cp) / "adversarial" / f"round-{g['attempts']:02d}"
+    rnd["recorded"] = now()
+    dest = ctx.evidence(args.cp) / "adversarial" / f"round-{rnd['round']:02d}"
     dest.mkdir(parents=True, exist_ok=True)
     all_findings, verdicts = [], []
     for rid in required:
@@ -1062,16 +1260,8 @@ def cmd_adv_record(args):
     if not approved:
         g["status"] = "failed"
         if g["attempts"] >= cfg["max_adversarial_rounds"]:
-            st["phase"] = "blocked"
-            st["blocked_reason"] = (f"{args.cp}: adversarial review still has {len(all_findings)} finding(s) after "
-                                    f"{g['attempts']} rounds — needs a human/director decision.")
-            st["awaiting_since"] = now()
-        elif st["adv_rounds_total"] >= cfg["max_adversarial_rounds_run"]:
-            st["phase"] = "blocked"
-            st["blocked_reason"] = (f"Run-wide adversarial round cap reached ({st['adv_rounds_total']}/"
-                                    f"{cfg['max_adversarial_rounds_run']}) — escalating instead of burning more "
-                                    "review quota. Raise the cap or lower checkpoint risk to continue.")
-            st["awaiting_since"] = now()
+            _set_blocked(st, f"{args.cp}: adversarial review still has {len(all_findings)} finding(s) after "
+                             f"{g['attempts']} rounds — needs a human/director decision.")
         ctx.log(st, "adversarial_changes_requested", cp=args.cp, findings=len(all_findings))
         ctx.save_state(st)
         build_viewer(ctx)
@@ -1133,12 +1323,15 @@ def cmd_complete(args):
         if code != 0:
             print(_tail(out))
             die(f"Regression suite failed (exit {code}) — an earlier behaviour broke. Fix before completing.", 2)
+        if fingerprint(ctx.root)["id"] != fp["id"]:
+            die("The regression command changed files in the project. Those changes were never reviewed — find out "
+                "what wrote them (generated files? snapshots?) and either add them to .gitignore or re-run the gates.", 2)
     commit = None
     if cfg.get("commit_per_checkpoint") and _is_git(ctx.root):
         subprocess.run(["git", "add", "-A"], cwd=ctx.root, capture_output=True)
         msg = f"ratchet({st['slug']}): {args.cp} {cp['title']}\n\n{cp['summary']}\n\nGates: " + ", ".join(
             f"{n}={cps['gates'][n]['status']}" for n in ["behavior", "ui", "adversarial"])
-        r = subprocess.run(["git", "commit", "-m", msg, "--no-verify"] if args.no_verify else ["git", "commit", "-m", msg],
+        r = subprocess.run(["git", "commit", "-m", msg],
                            cwd=ctx.root, capture_output=True, text=True)
         if r.returncode == 0:
             commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ctx.root,
@@ -1155,11 +1348,13 @@ def cmd_complete(args):
         st["awaiting_since"] = now()
         st["review_target"] = args.cp
     elif remaining:
-        _advance(st, remaining[0])
+        _advance(st, remaining[0], fingerprint(ctx.root)["id"])
     else:
         st["current"] = None
         st["phase"] = "awaiting_final_review" if mode != "none" else "done"
         st["awaiting_since"] = now()
+        if st["phase"] == "done":
+            register_active(ctx.root, None)
     ctx.save_state(st)
     build_viewer(ctx)
     ok(f"{args.cp} complete{f' (commit {commit})' if commit else ''}.")
@@ -1174,11 +1369,13 @@ def _earliest_open_step(cps):
     return "complete"
 
 
-def _advance(st, cp_id):
+def _advance(st, cp_id, base_tree=None):
     st["current"] = cp_id
     st["phase"] = "building"
     st["checkpoints"][cp_id]["status"] = "in_progress"
     st["checkpoints"][cp_id]["started_at"] = now()
+    if base_tree:
+        st["checkpoints"][cp_id]["base_tree"] = base_tree  # what reviewers diff against
 
 
 def cmd_human_approve(args):
@@ -1189,13 +1386,24 @@ def cmd_human_approve(args):
     msg = _require_human(ctx, st, "human-approve", getattr(args, "director_token", None))
     order = [c["id"] for c in ctx.plan()["checkpoints"]]
     if st["phase"] == "blocked":
-        st["phase"] = "building"
+        back = st.pop("blocked_from", None) or "building"
+        if back == "blocked":
+            back = "building"
+        st["phase"] = back
         st["blocked_reason"] = None
-        # a human unblock resets the attempt counters on the current checkpoint's failing gates
-        for g in st["checkpoints"][st["current"]]["gates"].values():
-            if g["status"] in ("failed", "invalid", "stale"):
-                g["attempts"] = 0
-        ctx.log(st, "unblocked", by=msg["by"], note=msg.get("prompt", "")[:200])
+        cur = st.get("current")
+        if back == "building" and not cur:  # nothing current: pick up the next unfinished checkpoint
+            pending = [c for c in order if st["checkpoints"][c]["status"] != "done"]
+            if pending:
+                _advance(st, pending[0], fingerprint(ctx.root)["id"])
+            else:
+                st["phase"] = "awaiting_final_review"
+        elif cur:
+            # a human unblock resets the attempt counters on the current checkpoint's failing gates
+            for g in st["checkpoints"][cur]["gates"].values():
+                if g["status"] in ("failed", "invalid", "stale"):
+                    g["attempts"] = 0
+        ctx.log(st, "unblocked", by=msg["by"], note=msg.get("prompt", "")[:200], back_to=st["phase"])
     else:
         target = st.get("review_target")
         done_ids = [target] if target else [c for c in order if st["checkpoints"][c]["status"] == "done"]
@@ -1204,12 +1412,15 @@ def cmd_human_approve(args):
         remaining = [c for c in order if st["checkpoints"][c]["status"] != "done"]
         st["review_target"] = None
         if remaining:
-            _advance(st, remaining[0])
+            _advance(st, remaining[0], fingerprint(ctx.root)["id"])
         else:
             st["phase"] = "done"
             st["current"] = None
+            register_active(ctx.root, None)
+            _stop_server(ctx.ratchet / "viewer.json")
         ctx.log(st, "approved", by=msg["by"], note=msg.get("prompt", "")[:200])
-    st["awaiting_since"] = None
+    # "done" still accepts later feedback, so it keeps a pause marker
+    st["awaiting_since"] = now() if st["phase"] in ("done", "awaiting_final_review") else None
     ctx.save_state(st)
     build_viewer(ctx)
     ok(f"Human approval recorded. Phase → {st['phase']}")
@@ -1248,13 +1459,19 @@ def cmd_plan_extend(args):
     for cid in st["checkpoints"]:
         if cid not in [c["id"] for c in plan["checkpoints"]]:
             die(f"Existing checkpoint {cid} was removed from the plan — completed work is append-only.")
+    approved_cps = (st.get("approved") or {}).get("cps", {})
+    edited = [c["id"] for c in plan["checkpoints"] if c["id"] in approved_cps and _sha(c) != approved_cps[c["id"]]]
+    if edited:
+        die(f"Existing checkpoint(s) {edited} were edited. Feedback only APPENDS new checkpoints; restore the originals.")
     missing = [c for c in new_ids if cp_by_id(plan, c)["gates"].get("behavior") and not test_plan(ctx, c)]
     if missing:
         die(f"Test plans missing for new checkpoints {missing}")
     for cid in new_ids:
         st["checkpoints"][cid] = new_cp_state(cp_by_id(plan, cid))
     st["plan_hash"] = _plan_hash(plan)
-    _advance(st, new_ids[0])
+    _advance(st, new_ids[0], fingerprint(ctx.root)["id"])
+    st["approved"] = approval_snapshot(ctx, st)  # the user's feedback is the approval for the appended checkpoints
+    register_active(ctx.root, st["slug"])
     ctx.log(st, "plan_extended", added=new_ids)
     ctx.save_state(st)
     build_viewer(ctx)
@@ -1276,25 +1493,110 @@ def cmd_learn(args):
 def cmd_pause(args):
     ctx = Ctx(find_root())
     st = ctx.state()
+    if st["phase"] in ("paused", "done", "cancelled"):
+        ok(f"Nothing to pause (phase {st['phase']}).")
+        return
     st["paused_from"] = st["phase"]
     st["phase"] = "paused"
     st["blocked_reason"] = args.reason or "paused"
     ctx.log(st, "paused", reason=args.reason)
     ctx.save_state(st)
-    ok("Paused. The Stop hook will let the agent stop. Resume with ratchet.py resume.")
+    ok("Paused. The Stop hook now lets the agent stop. Resume with ratchet.py resume.")
+
+
+CONSUMING_EVENTS = {"plan_approved", "approved", "unblocked", "changes_approved", "review_mode_changed",
+                    "cancelled", "human_feedback", "resumed"}
+
+
+def _decision_window(st) -> str:
+    """For decisions taken mid-build (approve-changes, cancel, set-review): messages after the user's last decision."""
+    times = [e["at"] for e in st.get("history", []) if e.get("event") in CONSUMING_EVENTS]
+    return max(times) if times else st.get("created_at", "0")
+
+
+def _latest_session(ctx):
+    human = [e for e in _human_since(ctx, "0") if e.get("session")]
+    return human[-1]["session"] if human else None
 
 
 def cmd_resume(args):
+    """Resume a paused run, or claim an active run for THIS session (the Stop hook binds to the owner session)."""
     ctx = Ctx(find_root())
     st = ctx.state()
-    if st["phase"] != "paused":
-        die("Not paused")
-    st["phase"] = st.pop("paused_from", "building")
-    st["blocked_reason"] = None
+    if st["phase"] in ("done", "cancelled"):
+        die(f"Run '{st['slug']}' is {st['phase']}; start a new one with init.")
+    if st["phase"] == "paused":
+        st["phase"] = st.pop("paused_from", "building")
+        st["blocked_reason"] = None
     st["stop_blocks"] = 0
+    st["owner_session"] = _latest_session(ctx) or st.get("owner_session")
+    register_active(ctx.root, st["slug"])
+    ctx.log(st, "resumed")
     ctx.save_state(st)
-    ok(f"Resumed in phase {st['phase']}")
+    ok(f"Resumed '{st['slug']}' in phase {st['phase']} (this session now owns the run).")
     print(json.dumps(next_action(ctx, st), indent=2))
+
+
+def cmd_cancel(args):
+    """Abandon the active run — only after the user confirms. Commits already made are kept."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    if st["phase"] in ("done", "cancelled"):
+        ok(f"Run '{st['slug']}' is already {st['phase']}.")
+        return
+    if not st.get("awaiting_since"):
+        st["awaiting_since"] = _decision_window(st)
+    msg = _require_human(ctx, st, "cancel", getattr(args, "director_token", None))
+    st["cancelled_from"] = st["phase"]
+    st["phase"] = "cancelled"
+    st["current"] = None
+    st["blocked_reason"] = args.reason or "cancelled by the user"
+    ctx.log(st, "cancelled", by=msg["by"], note=msg.get("prompt", "")[:200])
+    ctx.save_state(st)
+    register_active(ctx.root, None)
+    stopped = _stop_server(ctx.ratchet / "viewer.json")
+    commits = [c.get("commit") for c in st["checkpoints"].values() if c.get("commit")]
+    ok(f"Run '{st['slug']}' cancelled." + (" Viewer server stopped." if stopped else "")
+       + (f" Checkpoint commits kept: {', '.join(commits)} — ask the user whether to keep or revert them."
+          if commits else ""))
+
+
+def cmd_set_review(args):
+    """Change how often the user reviews (end | each | none) — the user's call, so it needs their confirmation."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    if not st.get("awaiting_since"):
+        st["awaiting_since"] = _decision_window(st)
+    msg = _require_human(ctx, st, "set-review", getattr(args, "director_token", None))
+    old = st.get("human_review")
+    st["human_review"] = args.mode
+    if st.get("approved"):
+        st["approved"]["human_review"] = args.mode
+    if st["phase"] not in ("awaiting_plan_approval", "awaiting_checkpoint_review", "awaiting_final_review", "blocked"):
+        st["awaiting_since"] = None
+    ctx.log(st, "review_mode_changed", by=msg["by"], old=old, new=args.mode)
+    ctx.save_state(st)
+    ok(f"Review mode {old} → {args.mode}.")
+
+
+def cmd_approve_changes(args):
+    """The user confirmed a change to the plan, test plans or rules after approval: accept it as the new baseline."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    probs = integrity_problems(ctx, st)
+    if not probs:
+        ok("Nothing has changed since approval.")
+        return
+    if not st.get("awaiting_since"):
+        st["awaiting_since"] = _decision_window(st)
+    msg = _require_human(ctx, st, "approve-changes", getattr(args, "director_token", None))
+    st["approved"] = approval_snapshot(ctx, st)
+    if st["phase"] == "building":
+        st["awaiting_since"] = None
+    ctx.log(st, "changes_approved", by=msg["by"], changed="; ".join(probs)[:400])
+    ctx.save_state(st)
+    build_viewer(ctx)
+    ok("Accepted as the new baseline: " + "; ".join(probs))
 
 
 def cmd_next(args):
@@ -1328,38 +1630,76 @@ def cmd_status(args):
 
 
 def cmd_reviewers(args):
+    """Open (or show) the adversarial review round for a checkpoint. Opening a round is what counts toward the
+    retry caps, so re-rolling reviewers until one approves still costs rounds."""
     ctx = Ctx(find_root())
     cfg = ctx.config()
     st = ctx.state()
+    cps = _cur(ctx, st, args.cp)
+    _expect_step(cps, ["adversarial", "complete"], args.cp)
     cp = cp_by_id(ctx.plan(), args.cp)
-    cps = st["checkpoints"].get(args.cp, {})
-    rnd = (cps.get("gates", {}).get("adversarial", {}).get("attempts", 0) or 0) + 1
-    out_dir = ctx.run_dir() / "reviews" / args.cp / f"adv-round-{rnd:02d}"
     fp = fingerprint(ctx.root)["id"]
+    g = cps["gates"]["adversarial"]
+    rnd = cps.get("adv_round")
+    if not rnd or rnd.get("recorded") or rnd["fingerprint"] != fp:
+        if g["attempts"] >= cfg["max_adversarial_rounds"]:
+            _set_blocked(st, f"{args.cp}: {g['attempts']} adversarial rounds used without approval — needs a "
+                             "human/director decision.")
+            ctx.save_state(st)
+            die(st["blocked_reason"], 2)
+        if int(st.get("adv_rounds_total", 0)) >= cfg["max_adversarial_rounds_run"]:
+            _set_blocked(st, f"Run-wide adversarial round cap reached ({st.get('adv_rounds_total')}/"
+                             f"{cfg['max_adversarial_rounds_run']}). Raising it is the user's call "
+                             "(config change + approve-changes).")
+            ctx.save_state(st)
+            die(st["blocked_reason"], 2)
+        resolved = resolve_reviewers(ctx, cfg, cp)
+        g["attempts"] += 1
+        st["adv_rounds_total"] = int(st.get("adv_rounds_total", 0)) + 1
+        prev = rnd["round"] if rnd else 0
+        rnd = {"round": prev + 1, "nonce": secrets.token_hex(8), "fingerprint": fp, "opened_at": now(),
+               "reviewers": [r["id"] for r in resolved],
+               "substitutions": [{"used": r["id"], "instead_of": r["fallback_for"], "why": r["reasons"]}
+                                 for r in resolved if r["fallback_for"]],
+               "resolved": resolved}
+        cps["adv_round"] = rnd
+        ctx.log(st, "reviewers_launched", cp=args.cp, round=rnd["round"], reviewers=",".join(rnd["reviewers"]))
+        if rnd["substitutions"]:
+            ctx.log(st, "reviewer_fallback", cp=args.cp, detail="; ".join(
+                f"{x['used']} instead of {', '.join(x['instead_of'])}" for x in rnd["substitutions"]))
+        ctx.save_state(st)
+    out_dir = ctx.run_dir() / "reviews" / args.cp / f"adv-round-{rnd['round']:02d}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fixes = ctx.run_dir() / "reviews" / args.cp / f"adv-round-{rnd['round'] - 1:02d}" / "fixes.md"
+    fixes_arg = f" --fixes {fixes}" if rnd["round"] > 1 else ""
     ext_script = SKILL_DIR.parent / "ratchet-adversarial-loop" / "scripts" / "external_review.py"
     rows = []
-    for res_r in resolve_reviewers(ctx, cfg, cp):
+    for res_r in rnd["resolved"]:
         rid = res_r["id"]
         spec = dict(cfg["reviewers"][rid], id=rid, output=str(out_dir / f"{rid}.json"),
                     slot=res_r["slot"], fallback_for=res_r["fallback_for"], reasons=res_r["reasons"])
         if spec["kind"] == "agent":
-            spec["how"] = (f"Spawn ratchet-adversary sub-agent with lens={spec['lens']}, reviewer id '{rid}', "
-                           f"fingerprint {fp}, output {spec['output']}")
+            spec["how"] = (f"Spawn a ratchet-adversary sub-agent: lens={spec['lens']}, reviewer id '{rid}', "
+                           f"fingerprint {fp}, round_nonce {rnd['nonce']}, checkpoint {args.cp}, output {spec['output']}"
+                           + (f", fixes.md {fixes}" if rnd["round"] > 1 else ""))
         else:
-            spec["how"] = f"python3 {ext_script} --reviewer {rid} --cp {args.cp} --out {spec['output']}"
+            spec["how"] = f"python3 {ext_script} --reviewer {rid} --cp {args.cp} --out {spec['output']}{fixes_arg}"
         rows.append(spec)
-    res = {"checkpoint": args.cp, "risk": cp.get("risk", "normal"), "round": rnd, "fingerprint": fp,
+    res = {"checkpoint": args.cp, "risk": cp.get("risk", "normal"), "round": rnd["round"], "fingerprint": fp,
+           "round_nonce": rnd["nonce"], "output_dir": str(out_dir),
+           "fixes_md": str(fixes) if rnd["round"] > 1 else None,
            "run_rounds_used": st.get("adv_rounds_total", 0), "run_rounds_cap": cfg["max_adversarial_rounds_run"],
            "reviewers": rows}
     if args.json:
         print(json.dumps(res, indent=2))
         return
-    print(f"{args.cp} risk={res['risk']} round={rnd} fingerprint={fp[:12]} "
+    print(f"{args.cp} risk={res['risk']} round={rnd['round']} fingerprint={fp[:12]} nonce={rnd['nonce']} "
           f"(run rounds {res['run_rounds_used']}/{res['run_rounds_cap']})")
     for r in rows:
         print(f"  - {r['id']:<22} [{r['vendor']}/{r['lens']}] {r['how']}")
         for skipped in r["fallback_for"]:
             print(f"      (instead of {skipped}: {r['reasons'][skipped]})")
+    print(f"Then: ratchet.py adv-record {args.cp} --reviews {out_dir}/*.json")
 
 
 def cmd_reviewer_status(args):
@@ -1480,7 +1820,8 @@ def viewer_data(ctx: Ctx):
         if tp:
             tests[cp["id"]] = tp
     learn = ctx.ratchet / "learnings.md"
-    return {"state": {k: v for k, v in st.items() if k != "history"},
+    return {"state": {k: v for k, v in st.items() if k not in ("history", "approved")},
+            "prototype": (ctx.run_dir() / "reference" / "prototype.html").exists(),
             "history": st.get("history", [])[-40:], "plan": plan, "tests": tests,
             "learnings": learn.read_text() if learn.exists() else "",
             "next": next_action(ctx, st), "generated_at": now()}
@@ -1649,8 +1990,12 @@ def _make_handler(routes, token):
             u = urlparse(self.path)
             if token:
                 given = (parse_qs(u.query).get("t") or [""])[0]
-                if not hmac.compare_digest(given, token):
+                if not hmac.compare_digest(given.encode("utf-8", "replace"), token.encode()):
                     return self._send(403, "text/plain", b"Missing or wrong access token (?t=...) for this Ratchet viewer.")
+            elif self.server.server_address[0] in ("127.0.0.1", "::1"):
+                host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+                if host not in ("127.0.0.1", "localhost", "::1"):  # blocks DNS-rebinding reads of the plan
+                    return self._send(403, "text/plain", b"Unexpected Host header.")
             res = routes(u.path)
             if res is None:
                 return self._send(404, "text/plain", b"Not found")
@@ -1902,15 +2247,24 @@ def _heartbeat(root: Path, event: str, host: str):
         pass
 
 
+ENGINE_PATH = str(Path(__file__).resolve())
+
+
 def decide_stop(n: dict) -> tuple[bool, str]:
     root = find_root(Path(n["cwd"]))
     ctx = Ctx(root)
+    marker = (read_json(_markers_path(), {}) or {}).get(str(root.resolve()))
     if not ctx.ratchet.is_dir() or not ctx.active_slug():
+        if marker:  # .ratchet/ vanished under an active run: never let that end the loop silently
+            return _stop_error(root, f"Ratchet run '{marker['slug']}' was active here but its .ratchet/ state is gone. "
+                                     "Tell the user; restore it (e.g. from git history or backup) or ask them to cancel.")
         return False, ""
     _heartbeat(root, "stop", n["host"])
     st = read_json(ctx.state_path(), None)
     if not st:
-        return False, ""
+        return _stop_error(root, "Ratchet's state.json for the active run is missing or unreadable.")
+    if st.get("owner_session") and n.get("session") and n["session"] != st["owner_session"]:
+        return False, ""  # another session in the same repo: not bound by this run (the prompt hook tells it)
     na = next_action(ctx, st)
     if na.get("stop_ok"):
         if st.get("stop_blocks"):
@@ -1920,10 +2274,8 @@ def decide_stop(n: dict) -> tuple[bool, str]:
     cfg = ctx.config()
     st["stop_blocks"] = int(st.get("stop_blocks", 0)) + 1
     if st["stop_blocks"] > cfg["max_stop_blocks"]:
-        st["phase"] = "blocked"
-        st["blocked_reason"] = (f"Stop hook fired {st['stop_blocks']} times without progress — "
-                                "loop halted for human inspection.")
-        st["awaiting_since"] = now()
+        _set_blocked(st, f"The agent tried to stop {st['stop_blocks']} times without any gate progress — "
+                         "loop halted for the user to look at.")
         ctx.save_state(st)
         return False, f"RATCHET: safety valve — {st['blocked_reason']}"
     ctx.save_state(st)
@@ -1931,8 +2283,25 @@ def decide_stop(n: dict) -> tuple[bool, str]:
                   f"Run: {st['slug']}  phase={na['phase']}"
                   + (f"  checkpoint={na.get('checkpoint')}  step={na.get('step')}" if na.get("checkpoint") else "")
                   + f"\nNext required action: {na['action']}\n"
-                  "Gates cannot be skipped or argued past. If you are genuinely stuck, run "
-                  "`ratchet.py pause --reason \"...\"` and explain the blocker to the user.")
+                  f"(Engine: python3 \"{ENGINE_PATH}\" — load the ratchet-orchestrator skill if you haven't.)\n"
+                  "Gates cannot be skipped or argued past. If the user asked you to stop, or you are genuinely "
+                  "stuck, run `ratchet.py pause --reason \"...\"` and tell the user why.")
+
+
+def _stop_error(root: Path, why: str) -> tuple[bool, str]:
+    """Fail CLOSED for stop when state is unreadable — but only a few times, so a broken install can't trap a session."""
+    p = ratchet_home() / "stop-errors.json"
+    data = read_json(p, {}) or {}
+    key = str(root.resolve())
+    data[key] = int(data.get(key, 0)) + 1
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        write_json(p, data)
+    except Exception:
+        pass
+    if data[key] > 5:
+        return False, f"RATCHET: {why} (letting you stop after repeated failures — tell the user.)"
+    return True, f"RATCHET: {why} You may not stop silently: explain this to the user first."
 
 
 def decide_prompt(n: dict) -> tuple[bool, str]:
@@ -1949,59 +2318,147 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
     ctx = Ctx(root)
     if ctx.active_slug():
         st = read_json(ctx.state_path(), None)
-        if st:
+        if st and st.get("phase") not in ("done", "cancelled"):
             st["stop_blocks"] = 0
             ctx.save_state(st)
+            eng = f'python3 "{ENGINE_PATH}"'
+            if st.get("owner_session") and n.get("session") and n["session"] != st["owner_session"]:
+                return False, (f"[ratchet] This repo has an unfinished Ratchet run '{st['slug']}' (phase {st['phase']}) "
+                               "started in another session. If the user wants to continue it here, run "
+                               f"`{eng} resume`; otherwise leave it alone and do what they asked.")
+            if st["phase"] == "building" and re.match(r"^\s*(stop|pause|hold on|wait|halt|cancel)\b", n["prompt"], re.I):
+                return False, (f"[ratchet] The user asked you to stop. Run `{eng} pause --reason \"user asked\"`, "
+                               "confirm in one line, and ask whether they want to resume later or cancel the run.")
             if st["phase"] in ("awaiting_plan_approval", "awaiting_checkpoint_review",
                                "awaiting_final_review", "blocked"):
-                return False, (f"[ratchet] Run '{st['slug']}' is waiting on you (phase {st['phase']}). "
-                               "If this message approves, run ratchet.py approve-plan / human-approve; "
-                               "if it requests changes, handle them per the orchestrator skill.")
+                intent = message_intent(n["prompt"])
+                hint = {"approve": "This reads as an approval — record it with the matching command.",
+                        "cancel": "This reads as a request to cancel — confirm, then run `cancel`.",
+                        "unclear": "This is NOT a clear approval: answer it or make the requested change, "
+                                   "then ask the user to confirm plainly."}[intent]
+                return False, (f"[ratchet] Run '{st['slug']}' is waiting on the user (phase {st['phase']}). {hint} "
+                               f"(Engine: {eng})")
     return False, ""
 
 
-PROTECTED = [re.compile(r"\.ratchet/runs/[^/\s]+/state\.json"), re.compile(r"\.ratchet/runs/[^/\s]+/evidence/"),
-             re.compile(r"\.ratchet/human_log\.jsonl"), re.compile(r"\.ratchet/active\.json"),
-             re.compile(r"\.ratchet/director\.json"), re.compile(r"\.ratchet/unavailable-reviewers\.json"),
-             re.compile(r"\.ratchet/hook-heartbeat\.json")]
-WRITE_VERBS = re.compile(r"(>|\btee\b|\brm\b|\bmv\b|\bcp\b|sed\s+-i|\btruncate\b|open\(|writeFile|json\.dump)")
-NESTED_AGENT_RE = re.compile(r"(^|[;&|\s(])(claude|gemini|copilot)\s+(-p|--print|--prompt)\b|(^|[;&|\s(])codex\s+exec\b")
+# Inside .ratchet/, agents may only write these (everything else is written by ratchet.py itself).
+ALLOWED_RATCHET_WRITES = re.compile(
+    r"^runs/[^/]+/(reviews|states|reference|tests)(/.*)?$|^runs/[^/]+/(checkpoints|app-scout)\.json$"
+    r"|^(standards\.md|learnings\.md|app\.log)$", re.I)
+READ_ONLY_PROGRAMS = {"cat", "less", "more", "head", "tail", "grep", "egrep", "fgrep", "rg", "jq", "ls", "wc",
+                      "stat", "file", "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "cd", "pushd", "popd", "pwd",
+                      "true", "tree", "du"}
+READ_ONLY_GIT = {"diff", "log", "show", "status", "ls-files", "blame", "rev-parse", "cat-file"}
+RATCHET_TOKEN_RE = re.compile(r"""[^\s'"<>|;&()`]*\.ratchet(?:[/\\][^\s'"<>|;&()`]*)?""", re.I)
+REDIRECT_RE = re.compile(r"(?<![0-9&])>>?\s*(?!&)(\S+)")
+ENGINE_CALL_RE = re.compile(r"""^\s*(?:\S*python3?(?:\.\d+)?|py)\s+(?:-\S+\s+)*["']?\S*(ratchet|external_review|ui_review)\.py\b""")
+NESTED_AGENT_RE = re.compile(r"(^|[\s;&|(/])(claude|gemini|copilot)\b[^;&|\n]*\s(-p|--print|--prompt)\b"
+                             r"|(^|[\s;&|(/])codex\b[^;&|\n]*\sexec\b")
+SELF_HOOK_RE = re.compile(r"""ratchet\.py["']?\s+(?:--root\s+\S+\s+)?(hook\b|hook-(stop|prompt|guard)\b)""")
+DIRECTOR_CALL_RE = re.compile(r"""ratchet\.py["']?\s+(?:--root\s+\S+\s+)?director-(sign|key|enroll)\b""")
+ROLE_SET_RE = re.compile(r"(^|[\s;&|(])(export\s+)?RATCHET_ROLE\s*=|env\s+[^;&|]*RATCHET_ROLE=")
+OVERRIDE_SET_RE = re.compile(r"(^|[\s;&|(])(export\s+)?RATCHET_HUMAN_OVERRIDE\s*=|env\s+[^;&|]*RATCHET_HUMAN_OVERRIDE=")
+DANGEROUS_GIT_RE = re.compile(r"\bgit\s+(clean\b[^;&|\n]*\s-[a-zA-Z]*[xX]|stash\b[^;&|\n]*(\s--all\b|\s-a\b))")
+
+
+def _segments(cmd: str) -> list[str]:
+    return [p for p in re.split(r"\|\||&&|;|\||\n", cmd) if p.strip()]
+
+
+def _program(seg: str) -> tuple[str, str]:
+    toks = seg.strip().split()
+    while toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):  # leading VAR=value
+        toks.pop(0)
+    while toks and toks[0] in ("sudo", "env", "command", "exec", "time", "nice", "nohup"):
+        toks.pop(0)
+    if not toks:
+        return "", ""
+    return os.path.basename(toks[0]), (toks[1] if len(toks) > 1 else "")
+
+
+def _ratchet_rel(path: str, cwd: str) -> str | None:
+    """Path relative to the nearest .ratchet/ it lies in (case-insensitive), or None if it isn't inside one."""
+    full = os.path.normpath(os.path.join(cwd, os.path.expanduser(path))).replace("\\", "/")
+    m = re.search(r"(^|[/=:])\.ratchet(/|$)(.*)$", full, re.I)
+    if not m:
+        return None
+    return m.group(3)
+
+
+def _write_allowed(path: str, cwd: str) -> bool:
+    rel = _ratchet_rel(path, cwd)
+    return rel is None or bool(rel and ALLOWED_RATCHET_WRITES.match(rel))
+
+
+def _guard_shell(cmd: str, cwd: str) -> str | None:
+    if NESTED_AGENT_RE.search(cmd):
+        return ("RATCHET GUARD: launching another agent session (claude -p, codex exec, gemini -p, copilot -p) from "
+                "the shell is blocked while Ratchet is active — it could impersonate the user. Use sub-agents, "
+                "external_review.py for adversarial reviews, or ui_review.py for UI reviews.")
+    if SELF_HOOK_RE.search(cmd):
+        return ("RATCHET GUARD: Ratchet's hooks are called by your agent CLI, not by you. Calling `ratchet.py hook` "
+                "yourself would forge a user message or a gate event.")
+    if DANGEROUS_GIT_RE.search(cmd):
+        return "RATCHET GUARD: this git command would delete or stash Ratchet's run state (ignored files)."
+    inside = any(re.match(r"^\s*(cd|pushd)\s+\S*\.ratchet", seg, re.I) for seg in _segments(cmd))
+    for seg in _segments(cmd):
+        prog, sub = _program(seg)
+        mentions = RATCHET_TOKEN_RE.findall(seg)
+        if not mentions and not inside:
+            continue
+        if ENGINE_CALL_RE.match(seg):
+            if not REDIRECT_RE.search(seg):
+                continue  # ratchet.py / reviewer scripts write their own files
+        read_only = prog in READ_ONLY_PROGRAMS or (prog == "git" and sub in READ_ONLY_GIT) or \
+            (prog == "find" and not re.search(r"\s-(delete|exec|execdir|ok|fprint)\b", seg)) or \
+            (prog in ("mkdir",) and all(_write_allowed(t, cwd) for t in mentions))
+        targets = [t for t in REDIRECT_RE.findall(seg) if t not in ("/dev/null", "/dev/stderr", "/dev/stdout")]
+        if read_only and not targets:
+            continue
+        if read_only and targets and all(_write_allowed(t, cwd) and not inside for t in targets):
+            continue
+        if not inside and mentions and all(_write_allowed(t, cwd) for t in mentions) and \
+                all(_write_allowed(t, cwd) for t in targets):
+            continue  # e.g. writing a review JSON or a capture spec
+        return ("RATCHET GUARD: this command could change Ratchet's run state (.ratchet/). Gate state, evidence, "
+                "approvals and config are owned by ratchet.py — use its commands (behavior / ui-record / adv-record "
+                "/ complete / config) instead. Reading those files is fine.")
+    return None
 
 
 def decide_guard(n: dict) -> tuple[bool, str]:
-    blob = json.dumps(n["input"]) + " " + n["command"]
-    cmd = n["command"]
+    cmd, cwd = n["command"], n["cwd"]
     if not _is_director_session():
-        if (re.search(r"director-(sign|key|enroll)\b|director\.key|RATCHET_DIRECTOR_KEY_FILE|RATCHET_ROLE", blob)
-                or str(director_key_path()) in blob):
-            return True, ("RATCHET GUARD: director keys and signing are reserved for the director session. "
-                          "Wait for the director to approve this lane.")
-        if n["kind"] == "shell" and re.search(r"reviewer-status\b.*--mark", cmd):
-            return True, ("RATCHET GUARD: only the director (or you, in your own terminal) can switch a reviewer off. "
-                          "Reviewers that genuinely fail are marked unavailable automatically.")
-        if n["kind"] == "shell" and "RATCHET_HUMAN_OVERRIDE" in cmd:
-            return True, "RATCHET GUARD: RATCHET_HUMAN_OVERRIDE is for a human at their own terminal, not for agents."
-    root = find_root(Path(n["cwd"]))
-    if not (root / RATCHET_DIR).is_dir():
-        return False, ""
-    _heartbeat(root, "guard", n["host"])
-    targets = []
+        key_bits = [str(director_key_path()), str(ratchet_home()), "director.key", ".config/ratchet"]
+        scan = cmd + " " + " ".join(n["paths"]) + " " + json.dumps({k: v for k, v in n["input"].items()
+                                                                     if k in ("path", "pattern", "glob", "file_path",
+                                                                              "absolute_path", "dir_path")})
+        if any(b in scan for b in key_bits):
+            return True, ("RATCHET GUARD: the director's key and Ratchet's per-user files are off-limits to builder "
+                          "sessions. Wait for the director to approve this lane.")
+        if n["kind"] == "shell" and (DIRECTOR_CALL_RE.search(cmd) or ROLE_SET_RE.search(cmd)):
+            return True, "RATCHET GUARD: director commands and RATCHET_ROLE are reserved for the director session."
+        if n["kind"] == "shell" and re.search(r"reviewer-status\b[^;&|\n]*--mark", cmd):
+            return True, ("RATCHET GUARD: only the director (or the user, in their own terminal) can switch a "
+                          "reviewer off. Reviewers that genuinely fail are marked unavailable automatically.")
+        if n["kind"] == "shell" and OVERRIDE_SET_RE.search(cmd):
+            return True, "RATCHET GUARD: RATCHET_HUMAN_OVERRIDE is for a person at their own terminal, not for agents."
+    root = find_root(Path(cwd))
+    if (root / RATCHET_DIR).is_dir():
+        _heartbeat(root, "guard", n["host"])
+    if n["kind"] == "shell" and cmd:
+        why = _guard_shell(cmd, cwd)
+        if why:
+            return True, why
     if n["kind"] == "write":
-        targets += n["paths"] + ([n["patch"]] if n["patch"] else [])
-    elif n["kind"] == "shell":
-        if NESTED_AGENT_RE.search(cmd) and not re.search(r"ui_review\.py|external_review\.py", cmd):
-            return True, ("RATCHET GUARD: launching nested agent sessions (claude -p, codex exec, gemini -p, copilot -p) "
-                          "from the shell is blocked while Ratchet is active — they could impersonate a human approval. "
-                          "Use sub-agents, external_review.py for adversarial reviews, or ui_review.py for UI reviews.")
-        if re.search(r"\bratchet\.py\b", cmd) and not WRITE_VERBS.search(cmd.split("ratchet.py", 1)[0]):
-            return False, ""
-        if WRITE_VERBS.search(cmd):
-            targets.append(cmd)
-    for t in targets:
-        if any(pat.search(t.replace("\\", "/")) for pat in PROTECTED):
-            return True, ("RATCHET GUARD: gate state, evidence and the human-approval log are owned by ratchet.py. "
-                          "Record results with ratchet.py commands (behavior / ui-record / adv-record / complete) "
-                          "instead of editing these files.")
+        bad = [p for p in n["paths"] if not _write_allowed(p, cwd)]
+        if n["patch"] and not bad:
+            bad = [p for p in re.findall(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", n["patch"], re.M)
+                   if not _write_allowed(p, cwd)]
+        if bad:
+            return True, ("RATCHET GUARD: gate state, evidence, approvals and config under .ratchet/ are written by "
+                          "ratchet.py only (you may write reviews/, states/, tests/, reference/, checkpoints.json, "
+                          f"app-scout.json, standards.md, learnings.md). Blocked: {bad[0]}")
     return False, ""
 
 
@@ -2033,7 +2490,8 @@ def run_hook(event: str, host_arg: str | None) -> int:
         n = normalize_hook(data, host)
         block, msg = {"stop": decide_stop, "prompt": decide_prompt, "guard": decide_guard}[event](n)
         return emit_hook(host, event, block, msg)
-    except (Exception, SystemExit) as e:  # fail OPEN — never brick the host session (die() raises SystemExit)
+    except (Exception, SystemExit) as e:  # guard/prompt fail OPEN — never brick the host session
+        root = None
         try:
             root = find_root(Path(data.get("cwd") or os.getcwd()))
             if (root / RATCHET_DIR).is_dir():
@@ -2041,6 +2499,12 @@ def run_hook(event: str, host_arg: str | None) -> int:
                     f.write(f"{now()} {host} {event}: {type(e).__name__}: {e}\n")
         except Exception:
             pass
+        if event == "stop" and root is not None and (root / RATCHET_DIR / "active.json").exists():
+            try:  # stop fails CLOSED (a few times) — a corrupted state file must not end the loop quietly
+                block, msg = _stop_error(root, f"Ratchet could not read its run state ({type(e).__name__}: {e}).")
+                return emit_hook(host, event, block, msg)
+            except Exception:
+                pass
         return 0
 
 
@@ -2167,7 +2631,11 @@ def cmd_doctor(args):
 def hooks_warning(ctx) -> str | None:
     """Used by `next`/status: gates without hooks are just advice."""
     hb = read_json(ctx.ratchet / "hook-heartbeat.json", {}) or {}
-    if not (hb.get("guard") or hb.get("stop") or hb.get("prompt")):
+    day_ago = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=24)).isoformat()
+    host = VENDOR_TO_HOST.get(detect_host(ctx.config()))
+    fresh = [e for e in hb.values() if isinstance(e, dict) and e.get("at", "") > day_ago
+             and (host is None or e.get("host") == host)]
+    if not fresh:
         return ("No Ratchet hook has fired in this project yet — the Stop/guard hooks may not be installed for "
                 "this agent CLI. Run `ratchet.py doctor`.")
     return None
@@ -2182,12 +2650,18 @@ def main(argv=None):
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     except (AttributeError, ValueError):
         pass
+    for stream in (sys.stdout, sys.stderr):  # ✓/✗ must not crash a cp1252 console
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
     p = argparse.ArgumentParser(prog="ratchet.py", description="Ratchet loop state engine")
     p.add_argument("--root", help="operate on the project/lane at this path (default: current folder)")
     sp = p.add_subparsers(dest="cmd", required=True)
 
     a = sp.add_parser("init"); a.add_argument("feature"); a.add_argument("--slug")
     a.add_argument("--human-review", choices=["end", "each", "none"]); a.add_argument("--force", action="store_true")
+    a.add_argument("--branch", action="store_true", help="create and switch to branch ratchet/<slug>")
     a.set_defaults(fn=cmd_init)
     a = sp.add_parser("plan-submit"); a.add_argument("--open", action="store_true"); a.set_defaults(fn=cmd_plan_submit)
     a = sp.add_parser("approve-plan"); a.add_argument("--director-token"); a.set_defaults(fn=cmd_approve_plan)
@@ -2197,10 +2671,10 @@ def main(argv=None):
     a = sp.add_parser("implemented"); a.add_argument("cp"); a.set_defaults(fn=cmd_implemented)
     a = sp.add_parser("behavior"); a.add_argument("cp"); a.set_defaults(fn=cmd_behavior)
     a = sp.add_parser("ui-record"); a.add_argument("cp"); a.add_argument("--review", required=True)
-    a.add_argument("--single-reviewer-ok", action="store_true"); a.set_defaults(fn=cmd_ui_record)
+    a.set_defaults(fn=cmd_ui_record)
     a = sp.add_parser("adv-record"); a.add_argument("cp"); a.add_argument("--reviews", nargs="+", required=True)
     a.set_defaults(fn=cmd_adv_record)
-    a = sp.add_parser("complete"); a.add_argument("cp"); a.add_argument("--no-verify", action="store_true")
+    a = sp.add_parser("complete"); a.add_argument("cp")
     a.set_defaults(fn=cmd_complete)
     a = sp.add_parser("human-approve"); a.add_argument("--director-token"); a.set_defaults(fn=cmd_human_approve)
     a = sp.add_parser("feedback"); a.add_argument("--text"); a.add_argument("--learning", action="append")
@@ -2209,7 +2683,14 @@ def main(argv=None):
     sp.add_parser("plan-extend").set_defaults(fn=cmd_plan_extend)
     a = sp.add_parser("learn"); a.add_argument("text"); a.add_argument("--source"); a.set_defaults(fn=cmd_learn)
     a = sp.add_parser("pause"); a.add_argument("--reason"); a.set_defaults(fn=cmd_pause)
-    sp.add_parser("resume").set_defaults(fn=cmd_resume)
+    sp.add_parser("resume", help="resume a paused run, or claim the active run for this session").set_defaults(fn=cmd_resume)
+    a = sp.add_parser("cancel", help="abandon the active run (needs the user's confirmation)")
+    a.add_argument("--reason"); a.add_argument("--director-token"); a.set_defaults(fn=cmd_cancel)
+    a = sp.add_parser("set-review", help="change how often the user reviews (needs their confirmation)")
+    a.add_argument("mode", choices=["end", "each", "none"]); a.add_argument("--director-token")
+    a.set_defaults(fn=cmd_set_review)
+    a = sp.add_parser("approve-changes", help="accept a user-confirmed change to the approved plan/tests/rules")
+    a.add_argument("--director-token"); a.set_defaults(fn=cmd_approve_changes)
     sp.add_parser("next").set_defaults(fn=cmd_next)
     a = sp.add_parser("status"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_status)
     a = sp.add_parser("reviewers"); a.add_argument("cp"); a.add_argument("--json", action="store_true")
@@ -2225,7 +2706,8 @@ def main(argv=None):
     a.set_defaults(fn=cmd_lanes)
     a = sp.add_parser("director-key"); a.add_argument("--rotate", action="store_true"); a.set_defaults(fn=cmd_director_key)
     sp.add_parser("director-enroll").set_defaults(fn=cmd_director_enroll)
-    a = sp.add_parser("director-sign"); a.add_argument("action", choices=["approve-plan", "human-approve", "feedback"])
+    a = sp.add_parser("director-sign"); a.add_argument("action", choices=["approve-plan", "human-approve", "feedback",
+                                                                          "approve-changes", "cancel", "set-review"])
     a.set_defaults(fn=cmd_director_sign)
     sp.add_parser("fingerprint").set_defaults(fn=cmd_fingerprint)
     a = sp.add_parser("config"); a.add_argument("--set", nargs="*"); a.set_defaults(fn=cmd_config)

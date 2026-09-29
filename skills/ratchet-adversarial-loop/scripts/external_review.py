@@ -75,27 +75,26 @@ def git(root, *args):
     return r.stdout if r.returncode == 0 else ""
 
 
-def base_commit(root) -> str:
-    last = git(root, "log", "--grep=^ratchet(", "-1", "--format=%H").strip()
-    if last:
-        return last
-    mb = git(root, "merge-base", "HEAD", "origin/HEAD").strip()
-    return mb or "HEAD"
+def collect_diff(root: Path, base_tree: str | None, current_tree: str | None) -> str:
+    """Everything that changed since the checkpoint started — committed, uncommitted and untracked alike.
 
-
-def collect_diff(root: Path) -> str:
-    base = base_commit(root)
-    diff = git(root, "diff", base, "--", ".", ":(exclude).ratchet")
-    untracked = [l for l in git(root, "ls-files", "--others", "--exclude-standard").splitlines()
-                 if l and not l.startswith(".ratchet/")]
-    parts = [f"# Diff since {base[:12]}\n", diff]
-    for f in untracked:
-        p = root / f
-        try:
-            if p.stat().st_size < 60_000:
-                parts.append(f"\n# NEW FILE {f}\n" + p.read_text(errors="ignore"))
-        except OSError:
-            pass
+    Both sides are tree ids from ratchet.py's fingerprint (a snapshot of the whole working tree), so a
+    checkpoint can't hide code from reviewers by committing it or by naming a commit 'ratchet(...)'.
+    """
+    parts = []
+    if base_tree and current_tree:
+        parts = [f"# Changes in this checkpoint ({base_tree[:10]} → {current_tree[:10]})\n",
+                 git(root, "diff-tree", "-r", "-p", "--no-color", base_tree, current_tree)]
+    else:  # non-git project or an old run: fall back to the working-tree diff against HEAD
+        parts = ["# Diff against HEAD\n", git(root, "diff", "HEAD", "--", ".", ":(exclude).ratchet")]
+        for f in [l for l in git(root, "ls-files", "--others", "--exclude-standard").splitlines()
+                  if l and not l.startswith(".ratchet/")]:
+            p = root / f
+            try:
+                if p.stat().st_size < 60_000:
+                    parts.append(f"\n# NEW FILE {f}\n" + p.read_text(errors="ignore"))
+            except OSError:
+                pass
     text = "".join(parts)
     if len(text) > MAX_DIFF:
         text = text[:MAX_DIFF] + f"\n\n[diff truncated at {MAX_DIFF} chars — flag anything you could not see]"
@@ -119,7 +118,7 @@ def adversary_instructions() -> str:
     return "You are an adversarial code reviewer. Assume the code is wrong and prove it."
 
 
-def build_prompt(eng, ctx, cfg, cp, rid, spec, fp, fixes_path) -> str:
+def build_prompt(eng, ctx, cfg, cp, rid, spec, fp, fixes_path, base_tree=None, nonce=None) -> str:
     root = ctx.root
     docs = "".join(read_doc(root, s) for s in cfg.get("standards", []))
     docs += read_doc(root, ".ratchet/learnings.md")
@@ -146,7 +145,7 @@ Code fingerprint: {fp}
 {fixes}
 
 ## Code under review
-{collect_diff(root)}
+{collect_diff(root, base_tree, fp)}
 
 ---
 Reply with ONLY one JSON object, no markdown fences, exactly this shape:
@@ -206,10 +205,20 @@ def main():
         sys.exit(f"'{a.reviewer}' is kind={spec.get('kind')} — spawn it as a ratchet-adversary sub-agent instead")
     okay, why = eng.reviewer_availability(ctx, cfg, a.reviewer)
     if not okay and "same provider as the host" in why:
-        sys.exit(f"'{a.reviewer}' is {why}. Run `ratchet.py reviewers {a.cp}` for this round's reviewers.")
+        print(f"'{a.reviewer}' is {why}. Run `ratchet.py reviewers {a.cp}` for this round's reviewers.", file=sys.stderr)
+        sys.exit(3)
+    min_t = int(cfg.get("min_review_timeout_sec", 120))
+    if a.timeout < min_t:
+        sys.exit(f"--timeout must be at least {min_t}s (a shorter one would just knock the reviewer out).")
     cp = eng.cp_by_id(ctx.plan(), a.cp)
     fp = eng.fingerprint(ctx.root)["id"]
-    prompt = build_prompt(eng, ctx, cfg, cp, a.reviewer, spec, fp, a.fixes)
+    st = ctx.state()
+    cps = st["checkpoints"].get(a.cp) or {}
+    rnd = cps.get("adv_round") or {}
+    if not rnd or rnd.get("recorded") or rnd.get("fingerprint") != fp or a.reviewer not in rnd.get("reviewers", []):
+        sys.exit(f"No open review round for {a.cp} that includes '{a.reviewer}' at the current code. "
+                 f"Run `ratchet.py reviewers {a.cp}` first and launch exactly the reviewers it lists.")
+    prompt = build_prompt(eng, ctx, cfg, cp, a.reviewer, spec, fp, a.fixes, cps.get("base_tree"), rnd["nonce"])
 
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -246,8 +255,10 @@ def main():
     shown = " ".join(c if len(c) < 80 else c[:40] + "…" for c in cmd)
     print(f"running {a.reviewer}: {shown}", file=sys.stderr)
     try:
-        r = subprocess.run(cmd, cwd=ctx.root, input=prompt if use_stdin else None,
-                           capture_output=True, text=True, timeout=a.timeout)
+        # run from an empty folder, flagged as nested: the reviewer needs nothing but the prompt, can't touch the
+        # project, and its CLI's own hooks must not log this prompt as if the user had typed it
+        r = subprocess.run(cmd, cwd=work, input=prompt if use_stdin else None, capture_output=True, text=True,
+                           timeout=a.timeout, env=dict(os.environ, RATCHET_NESTED_REVIEW="1"))
     except FileNotFoundError:
         unavailable(f"'{cmd[0]}' is not installed or not on PATH")
     except subprocess.TimeoutExpired:
@@ -259,7 +270,7 @@ def main():
         tail = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()[-1:] or [""]
         unavailable(f"exit {r.returncode}, no findings JSON ({tail[0][:160]})")
     # Stamp identity ourselves — never trust the model to echo these correctly.
-    review.update(reviewer=a.reviewer, lens=spec.get("lens"), vendor=spec.get("vendor"),
+    review.update(reviewer=a.reviewer, lens=spec.get("lens"), vendor=spec.get("vendor"), round_nonce=rnd["nonce"],
                   checkpoint=a.cp, fingerprint=fp)
     review["findings"] = [f for f in review.get("findings") or [] if isinstance(f, dict)]
     review["verdict"] = "APPROVE" if not review["findings"] else "CHANGES_REQUESTED"
