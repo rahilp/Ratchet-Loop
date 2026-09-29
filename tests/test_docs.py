@@ -985,7 +985,264 @@ def cp5_docs_lint():
 
 # ---- end CP5 ----
 
-SECTIONS = [("CP4", cp4_orchestrator_setup_and_plan_review), ("CP5", cp5_docs_lint)]
+# ---- CP6 ----
+# README as things you say to your agent, commands in a marked reference section, manifests in sync.
+# Independent of CP7 (which fixes README drift claims); every phrase check uses tolerant regex alternatives.
+
+import json
+
+CMD_RX = r"\./install\.sh|python3\s+\S|claude --plugin-dir|ratchet\.py"
+CLAUDE_ONLY_RX = r"/plugin\b|claude --plugin-dir|AskUserQuestion"
+REF_HEAD_RX = re.compile(r"(?im)^(#{2,3})\s+[^\n]*\breference\b[^\n]*$")
+
+
+def cp6_split_readme(text):
+    """(primary, reference): the reference section runs from its heading to the next heading of the same or higher level."""
+    m = REF_HEAD_RX.search(text)
+    if not m:
+        return text, ""
+    level = len(m.group(1))
+    rest = text[m.end():]
+    nxt = re.search(r"(?m)^#{1,%d}\s" % level, rest)
+    end = m.end() + (nxt.start() if nxt else len(rest))
+    return text[:m.start()] + text[end:], text[m.start():end]
+
+
+def cp6_sentences(text):
+    """Things said to an agent: blockquote lines, quoted strings, and fenced blocks that are not shell commands. -> [(pos, str)]"""
+    out = []
+    for m in re.finditer(r"(?m)^[ \t]*>[ \t]?(.+)$", text):
+        out.append((m.start(), m.group(1).strip()))
+    for m in re.finditer(r"[\"“]([^\"”\n]{15,})[\"”]", text):
+        out.append((m.start(), m.group(1).strip()))
+    for m in re.finditer(r"(?s)```[^\n]*\n(.*?)```", text):
+        body = m.group(1).strip()
+        if body and not re.match(r"(\$ |\./|python3|claude|codex|gemini|copilot|npm|npx|git|ratchet|cd )", body) and "├" not in body and "└" not in body:
+            out.append((m.start(), " ".join(body.split())))
+    return sorted(out)
+
+
+def cp6_opening_sentence(text):
+    primary, _ = cp6_split_readme(text)
+    for pos, s in cp6_sentences(primary):
+        if re.search(r"install", s, re.I) and re.search(r"ratchet", s, re.I) and re.search(r"start|begin|set (it )?up|use|build", s, re.I):
+            return pos, s
+    return None, ""
+
+
+def cp6_first_command_pos(text):
+    m = re.search(CMD_RX, cp6_split_readme(text)[0])
+    return m.start() if m else len(text)
+
+
+def cp6_install_area(text):
+    """From the top of the README to the end of its Install section (or the first 40 lines when there is none)."""
+    primary = cp6_split_readme(text)[0]
+    m = re.search(r"(?im)^##\s+[^\n]*\binstall", primary)
+    if not m:
+        return "\n".join(primary.splitlines()[:40])
+    nxt = re.search(r"(?m)^##\s", primary[m.end():])
+    return primary[: m.end() + (nxt.start() if nxt else len(primary))]
+
+
+def cp6_opens_with_sentence(text):
+    pos, s = cp6_opening_sentence(text)
+    return pos is not None and pos < cp6_first_command_pos(text) and text[:pos].count("\n") < 40
+
+
+def cp6_install_primary_is_sentence(text):
+    area = cp6_install_area(text)
+    table_cmds = re.search(r"(?m)^\s*\|[^\n]*(install\.sh|--plugin-dir)", area)
+    you_run = re.search(r"you run|run this in your terminal|run the following in (a|your) terminal", area, re.I)
+    return len(providers_named(area)) == 4 and not table_cmds and not you_run and cp6_opens_with_sentence(text)
+
+
+TOPICS = {
+    "hooks": r"\bhooks?\b",
+    "viewer": r"\bviewer\b|\blink\b",
+    "reviewer": r"\breviewers?\b",
+    "pause": r"\bpause\b.*\bresume\b|\bresume\b.*\bpause\b|\bpause and resume\b",
+    "director": r"\bdirectors?\b",
+}
+
+
+def cp6_task_sentences(text):
+    primary = cp6_split_readme(text)[0]
+    res = {}
+    for topic, rx in TOPICS.items():
+        res[topic] = [s for _, s in cp6_sentences(primary)
+                      if re.search(rx, s, re.I) and not re.search(CMD_RX, s) and re.search(r"\b(please|can you|could you|show|check|install|give|tell|pause|resume|who|what|set|use|run|start|open|is|are|enroll)\b", s, re.I)]
+    return res
+
+
+def cp6_task_sentences_ok(text):
+    res = cp6_task_sentences(text)
+    chosen = [res[t][0] for t in TOPICS if res[t]]
+    return all(res[t] for t in TOPICS) and len(set(chosen)) == len(TOPICS)
+
+
+def cp6_reference_ok(text):
+    primary, ref = cp6_split_readme(text)
+    if not ref:
+        return False
+    says = re.search(r"agent runs|the agent (runs|uses)|people typing|you (can )?type|by hand|for humans|for people|terminal", ref[:1500], re.I)
+    need = [r"view --serve", r"install-hooks --host", r"\bdoctor\b", r"lanes --scan"]
+    banned_primary = [r"view --serve", r"install-hooks --host", r"ratchet\.py[^\n]*\bdoctor\b|\bdoctor --json", r"lanes --scan"]
+    return bool(says) and all(re.search(n, ref) for n in need) and not any(re.search(b, primary) for b in banned_primary)
+
+
+def cp6_tests_on_disk():
+    return sorted(p.name for p in (ROOT / "tests").glob("test_*.py"))
+
+
+def cp6_tests_documented(text, files):
+    ref = cp6_split_readme(text)[1]
+    return bool(ref) and all(f in text and re.search(r"python3?\s+tests/" + re.escape(f), ref) for f in files)
+
+
+def cp6_headings(text):
+    return {re.sub(r"\s+", " ", h.strip().lower()) for h in re.findall(r"(?m)^#{1,6}\s+(.+?)\s*#*$", text)}
+
+
+def cp6_slug(h):
+    return re.sub(r"\s+", "-", re.sub(r"[^\w\s-]", "", h.lower()).strip())
+
+
+def cp6_broken_refs(text):
+    heads = cp6_headings(text)
+    slugs = {cp6_slug(h) for h in heads}
+    bad = []
+    for name in re.findall(r"(?i)(?:README|section|see)\s+['\"‘“]([^'\"’”]+)['\"’”]", text):
+        if re.sub(r"\s+", " ", name.strip().lower()) not in heads:
+            bad.append(name)
+    for a in re.findall(r"\]\(#([^)]+)\)", text):
+        if a.lower() not in slugs:
+            bad.append("#" + a)
+    return bad
+
+
+def cp6_nonclaude_ok(text):
+    return (bool(re.search(r"~/\.ratchet-loop/skills|RATCHET_HOME/skills", text))
+            and bool(re.search(r"symlink|link(ed)? (it |that |the |those )?(folder |them )?(in)?to|linked into", text, re.I))
+            and not re.search(r"point (the |your )?(CLI|agent) at", text, re.I)
+            and (len(providers_named(text) - {"claude"}) == 3 and bool(re.search(r"non-claude|other (agent )?CLIs?|codex.{0,60}gemini.{0,60}copilot", text, re.I))))
+
+
+def cp6_neutral_ok(text):
+    pos, s = cp6_opening_sentence(text)
+    primary = cp6_split_readme(text)[0]
+    sents = [x for _, x in cp6_sentences(primary)]
+    return pos is not None and not any(re.search(CLAUDE_ONLY_RX, x) for x in sents + [s]) and not re.search(CLAUDE_ONLY_RX, primary)
+
+
+def cp6_manifest_problems(text):
+    probs = []
+    ms = {}
+    for rel in (".claude-plugin/plugin.json", ".codex-plugin/plugin.json"):
+        try:
+            ms[rel] = json.loads((ROOT / rel).read_text(encoding="utf-8"))
+        except Exception as e:
+            probs.append(f"{rel}: {e}")
+    if len(ms) == 2:
+        a, b = ms.values()
+        if a.get("name") != b.get("name") or a.get("version") != b.get("version"):
+            probs.append("name/version differ")
+        for rel, m in ms.items():
+            if not has(m.get("description", ""), r"checkpoint", r"gate"):
+                probs.append(f"{rel}: description misses checkpoints/gates")
+    if not has(text.split("\n## ")[0], r"checkpoint", r"gate"):
+        probs.append("README intro misses checkpoints/gates")
+    blocks = re.findall(r"(?s)```[^\n]*\n(.*?)```", text)
+    for rel in (".claude-plugin", ".codex-plugin"):
+        if (ROOT / rel / "plugin.json").exists() and not any(rel + "/plugin.json" in b for b in blocks):
+            probs.append(f"README does not list {rel}/plugin.json in its file tree")
+    pos, s = cp6_opening_sentence(text)
+    for f in re.findall(r"[\w./-]*plugin\.json", s):
+        if not (ROOT / f).exists():
+            probs.append(f"install sentence names missing {f}")
+    return probs
+
+
+def cp6_docs_lint():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    good = ('# R\n\n> Please install Ratchet Loop for me in Claude Code, Codex, Gemini CLI or GitHub Copilot CLI, and start it.\n\n'
+            '## Install\nSay the sentence above.\n\n## Common tasks\n'
+            '> Check that the hooks are installed.\n> Give me the viewer link.\n> Who is reviewing this, and can other reviewers be used?\n'
+            '> Pause and resume the build.\n> Enroll this lane under a director.\n\n'
+            '## Command reference\nCommands the agent runs, for people typing by hand:\n`ratchet.py view --serve`, `ratchet.py install-hooks --host codex`, '
+            '`ratchet.py doctor`, `ratchet.py lanes --scan d`, `python3 tests/test_hooks.py`\n')
+    bad_cmd_first = good.replace("> Please install", "`./install.sh --host claude`\n\n> Please install", 1)
+    bad_you_run = good.replace("Say the sentence above.", "| Claude | `./install.sh` |\nYou run this in your terminal.")
+    ref_leak = good.replace("Say the sentence above.", "Run `ratchet.py view --serve`.")
+    tests = cp6_tests_on_disk()
+
+    # T01
+    check("[CP6-T01] README opens with a quoted sentence to the agent that asks to install Ratchet and start, before any shell command",
+          cp6_opens_with_sentence(readme), cp6_opening_sentence(readme))
+    check("[CP6-T01] teeth: the sentence is found in a good sample, and a shell command before it or a missing sentence is rejected",
+          cp6_opens_with_sentence(good) and not cp6_opens_with_sentence(bad_cmd_first) and not cp6_opens_with_sentence("# R\n\nInstall by reading docs.\n"))
+    check("[CP6-T22] the opening sentence names where Ratchet Loop comes from (an address, link, clone or folder path)",
+          re.search(r"from\s+<[^>]*(address|link|url|clone|folder|path)[^>]*>|from\s+(https?://|[~/.])", cp6_opening_sentence(readme)[1], re.I) is not None, cp6_opening_sentence(readme)[1])
+    # T02
+    check("[CP6-T02] the install path names all four CLIs, leads with the sentence, and has no per-CLI command table or 'you run'",
+          cp6_install_primary_is_sentence(readme), sorted(providers_named(cp6_install_area(readme))))
+    check("[CP6-T02] teeth: a command table or 'you run this in your terminal' in the install area is rejected; a good sample passes",
+          cp6_install_primary_is_sentence(good) and not cp6_install_primary_is_sentence(bad_you_run))
+    # T03
+    res = cp6_task_sentences(readme)
+    check("[CP6-T03] each of hooks, viewer link, reviewers, pause and resume, directors has its own example sentence to the agent",
+          cp6_task_sentences_ok(readme), {k: len(v) for k, v in res.items()})
+    check("[CP6-T03] teeth: a sample missing the director sentence, or one that reuses a single sentence for every topic, is rejected",
+          cp6_task_sentences_ok(good) and not cp6_task_sentences_ok(good.replace("> Enroll this lane under a director.\n", ""))
+          and not cp6_task_sentences_ok("> Please check the hooks, viewer link, reviewers, pause and resume, and the director.\n"))
+    # T04
+    heads = [h for h in re.findall(r"(?m)^#{2,3}\s+(.+)$", readme) if re.search(r"reference", h, re.I)]
+    check("[CP6-T04] a Reference section says who the commands are for and holds view --serve, install-hooks --host, doctor, lanes --scan; none appear above it",
+          cp6_reference_ok(readme), heads)
+    check("[CP6-T04] teeth: a command leaking into the primary text, or a missing Reference heading, is rejected",
+          cp6_reference_ok(good) and not cp6_reference_ok(ref_leak) and not cp6_reference_ok(good.replace("## Command reference", "## Commands")))
+    # T05
+    check("[CP6-T05] the reference section gives a runnable python3 tests/<file> command for every tests/test_*.py, and each is named",
+          cp6_tests_documented(readme, tests), [f for f in tests if f not in readme])
+    check("[CP6-T05] teeth: a missing file or a test command outside the reference section is rejected",
+          cp6_tests_documented(good, ["test_hooks.py"]) and not cp6_tests_documented(good, ["test_hooks.py", "test_zzz.py"])
+          and not cp6_tests_documented(good.replace("## Command reference", "## Commands"), ["test_hooks.py"]))
+    # T06
+    files = [ROOT / "README.md", ROOT / "install.sh"] + sorted((ROOT / "skills").glob("*/SKILL.md")) + sorted((ROOT / "agents").glob("*.md"))
+    hits = [p.name for p in files if re.search(r"other agent clis?", p.read_text(encoding="utf-8"), re.I)]
+    check("[CP6-T06] no README, install.sh, SKILL.md or agent file mentions 'Other agent CLIs'", not hits, hits)
+    check("[CP6-T06] README has no #other-agent-clis anchor, and every heading it refers to by quoted name or anchor exists",
+          not cp6_broken_refs(readme) and "#other-agent-clis" not in readme, cp6_broken_refs(readme))
+    inst = (ROOT / "install.sh").read_text(encoding="utf-8")
+    check("[CP6-T06] install.sh does not refer to a README section that does not exist", not cp6_broken_refs(inst + "\n" + readme) and not [n for n in re.findall(r"README\s+'([^']+)'", inst) if n.lower() not in cp6_headings(readme)])
+    check("[CP6-T06] teeth: a reference to a missing quoted heading or anchor is detected; an existing one is not",
+          cp6_broken_refs("# A\n\nsee README 'Other agent CLIs'\n") == ["Other agent CLIs"]
+          and cp6_broken_refs("# A\n\n[x](#nope)\n") == ["#nope"]
+          and cp6_broken_refs("# Install\n\nsee README 'Install' and [x](#install)\n") == [])
+    # T07
+    check("[CP6-T07] README says non-Claude CLIs find skills in ~/.ratchet-loop/skills and must be pointed at or linked to it (Codex, Gemini, Copilot)",
+          cp6_nonclaude_ok(readme))
+    check("[CP6-T07] teeth: missing folder, missing link instruction, or missing hosts are rejected",
+          cp6_nonclaude_ok("Non-Claude hosts (Codex, Gemini, Copilot) get skills in ~/.ratchet-loop/skills; symlink that folder into the CLI's skills folder.")
+          and not cp6_nonclaude_ok("Codex, Gemini and Copilot are supported.")
+          and not cp6_nonclaude_ok("Non-Claude hosts (Codex, Gemini, Copilot) get skills in ~/.ratchet-loop/skills.")
+          and not cp6_nonclaude_ok("Codex, Gemini, Copilot: symlink the skills folder."))
+    # T08
+    check("[CP6-T08] the opening and common-task sentences and the primary text carry no /plugin, claude --plugin-dir or AskUserQuestion",
+          cp6_neutral_ok(readme))
+    check("[CP6-T08] teeth: a Claude-only phrase in a sentence or the primary text is rejected, but allowed inside the reference section",
+          cp6_neutral_ok(good) and not cp6_neutral_ok(good.replace("and start it.", "and start it with /plugin install."))
+          and cp6_neutral_ok(good + "\nUse `claude --plugin-dir x` here.\n"))
+    # T17
+    probs = cp6_manifest_problems(readme)
+    check("[CP6-T17] both manifests parse with the same name and version, mention checkpoints and gates, the README lists both, and its install sentence names no missing file",
+          not probs, probs)
+    check("[CP6-T17] teeth: a README that does not list the Codex manifest is reported", any("does not list" in p for p in cp6_manifest_problems("# R\n\ncheckpoint gate\n")))
+
+
+# ---- end CP6 ----
+
+SECTIONS = [("CP4", cp4_orchestrator_setup_and_plan_review), ("CP5", cp5_docs_lint), ("CP6", cp6_docs_lint)]
 
 
 def main():

@@ -49,7 +49,7 @@ Hooks (installed with the plugin, or by `install.sh --host <cli>` / `$RATCHET in
 
 ## Sub-agent rules
 
-- Spawn every agent below as a sub-agent. In Claude Code that's the Agent tool with `subagent_type` = the agent name. In other agent CLIs, use their sub-agent mechanism and give it the prompt from `agents/<name>.md` in this plugin. When installed as a plugin the name is prefixed (`ratchet-loop:ratchet-implementer`), so use whichever form your agent list shows. Each one gets a fresh context window, which is the whole point.
+- Spawn every agent below as a sub-agent. In Claude Code that's the Agent tool with `subagent_type` = the agent name. On other hosts, use their sub-agent mechanism and give it the prompt from `agents/<name>.md` in this plugin. When installed as a plugin the name is prefixed (`ratchet-loop:ratchet-implementer`), so use whichever form your agent list shows. Each one gets a fresh context window, which is the whole point.
 - Every spawn prompt includes the `RATCHET=…` line, the run folder path, the checkpoint id, the exact files to read (checkpoint entry, test plan, open findings), and "Read .ratchet/learnings.md first."
 - Ask each agent for a **short** return value (≤15 lines: what changed, files touched, anything blocking). Never ask for full logs or diffs. Those stay on disk.
 - Run independent agents **in parallel**: send them in one message. Examples: app-scout + checkpoint-planner; the test planners for every checkpoint; the two UI reviewers; all of a round's adversarial reviewers.
