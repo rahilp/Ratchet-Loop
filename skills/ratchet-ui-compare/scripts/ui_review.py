@@ -238,7 +238,15 @@ def _current_fingerprint():
         return None
 
 
-def combine(reviews: list[dict], checkpoint: str | None) -> dict:
+def combine(reviews: list[dict], checkpoint: str | None, manifest_fp: str | None = None) -> dict:
+    """Merge reviewer files. Every input must be a review of the CURRENT code: its own fingerprint (stamped by
+    `review` before the reviewers ran) or the capture manifest's fingerprint must equal the working tree's now."""
+    now_fp = _current_fingerprint()
+    for r in reviews:
+        fp = r.get("fingerprint") or manifest_fp
+        if not fp or (now_fp and fp != now_fp):
+            raise SystemExit(f"Refusing to combine: the {r.get('reviewer', '?')} review is not of the current code "
+                             f"(review {str(fp)[:10]} vs now {str(now_fp)[:10]}). Capture and review again.")
     diffs, invalid, names = [], [], []
     for r in reviews:
         name = r.get("reviewer", "?")
@@ -249,7 +257,7 @@ def combine(reviews: list[dict], checkpoint: str | None) -> dict:
             diffs.append(dict(d, reviewer=name))
     fixable = [d for d in diffs if d.get("fixable_in_code", True)]
     verdict = "INVALID" if invalid else ("FAIL" if fixable else "PASS")
-    return {"checkpoint": checkpoint, "fingerprint": _current_fingerprint(), "reviewers": names, "verdict": verdict,
+    return {"checkpoint": checkpoint, "fingerprint": now_fp, "reviewers": names, "verdict": verdict,
             "invalid_reason": "; ".join(invalid) or None, "differences": diffs,
             "summary": f"{len(fixable)} code-fixable difference(s) across {len(names)} reviewer(s)"}
 
@@ -261,6 +269,9 @@ def cmd_review(a):
     design = Path(a.design) if a.design else None
     cases = Path(a.cases) if a.cases else None
     host, providers = role_providers(a)
+    fp_at_start = _current_fingerprint()
+    manifest["fingerprint"] = fp_at_start           # host sub-agents' files inherit this via `combine --manifest`
+    Path(a.manifest).write_text(json.dumps(manifest, indent=2))
     staged = {role: stage(manifest, design, a.scope, cases if role == "behavior" else None, role)
               for role in ("visual", "behavior")}
 
@@ -269,7 +280,7 @@ def cmd_review(a):
         for prov in providers[role]:
             try:
                 r = RUNNERS[prov](staged[role], role, a.model if prov == "claude" else None, a.timeout)
-                r.update(reviewer=role, provider=prov, checkpoint=manifest.get("checkpoint"))
+                r.update(reviewer=role, provider=prov, checkpoint=manifest.get("checkpoint"), fingerprint=fp_at_start)
                 if tried:
                     r["fallback_for"] = tried
                 return role, r, tried
@@ -294,13 +305,14 @@ def cmd_review(a):
         print(f"\nNo other provider available for: {', '.join(for_host)}. Spawn the host's own reviewer sub-agent(s) "
               "(ratchet-visual-reviewer / ratchet-behavior-reviewer), each told to work ONLY from its folder's INPUT.md "
               f"and to write {out}/<role>.json. Then run:\n  python3 {Path(__file__)} combine --inputs "
-              f"{out}/visual.json {out}/behavior.json --out {out}/combined.json --checkpoint {manifest.get('checkpoint')}",
+              f"{out}/visual.json {out}/behavior.json --out {out}/combined.json --checkpoint {manifest.get('checkpoint')} "
+              f"--manifest {a.manifest}",
               file=sys.stderr)
         sys.exit(4)
     if not a.keep:
         for t in staged.values():
             shutil.rmtree(t, ignore_errors=True)
-    comb = combine(results, manifest.get("checkpoint"))
+    comb = combine(results, manifest.get("checkpoint"), fp_at_start)
     (out / "combined.json").write_text(json.dumps(comb, indent=2))
     print(f"combined: {out / 'combined.json'} → {comb['verdict']} ({comb['summary']})")
 
@@ -316,7 +328,8 @@ def cmd_stage(a):
 
 def cmd_combine(a):
     reviews = [json.loads(Path(p).read_text()) for p in a.inputs]
-    comb = combine(reviews, a.checkpoint)
+    mfp = json.loads(Path(a.manifest).read_text()).get("fingerprint") if a.manifest else None
+    comb = combine(reviews, a.checkpoint, mfp)
     Path(a.out).write_text(json.dumps(comb, indent=2))
     print(f"combined → {comb['verdict']} ({comb['summary']})")
 
@@ -337,7 +350,8 @@ def main():
     s.add_argument("--design"); s.add_argument("--cases"); s.set_defaults(fn=cmd_stage)
     c = sp.add_parser("combine")
     c.add_argument("--inputs", nargs="+", required=True); c.add_argument("--out", required=True)
-    c.add_argument("--checkpoint"); c.set_defaults(fn=cmd_combine)
+    c.add_argument("--checkpoint"); c.add_argument("--manifest", help="capture manifest (carries the fingerprint)")
+    c.set_defaults(fn=cmd_combine)
     a = p.parse_args()
     a.fn(a)
 

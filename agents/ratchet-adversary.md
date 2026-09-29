@@ -34,7 +34,7 @@ Only when you genuinely can't find anything: `"findings": []`. Don't approve to 
 ## Output
 Write JSON to the given path, and return only a 1-line summary:
 ```json
-{"reviewer":"<your reviewer id>","lens":"<lens>","checkpoint":"CPn","fingerprint":"<id given to you>","round_nonce":"<nonce given to you>",
+{"reviewer":"<your reviewer id>","lens":"<lens>","checkpoint":"CPn","fingerprint":"<id given to you>","round_nonce":"<nonce given to you>","files_reviewed":["every changed file you read in full"],
  "verdict":"APPROVE|CHANGES_REQUESTED",
  "findings":[{"id":"A1","severity":"major","file":"…","line":42,"rule":"…","description":"…","fix":"…"}]}
 ```

@@ -213,6 +213,7 @@ def main():
     cp = eng.cp_by_id(ctx.plan(), a.cp)
     fp = eng.fingerprint(ctx.root)["id"]
     st = ctx.state()
+    eng.verify_integrity(ctx, st)  # the reviewer command itself is part of the approved rules
     cps = st["checkpoints"].get(a.cp) or {}
     rnd = cps.get("adv_round") or {}
     if not rnd or rnd.get("recorded") or rnd.get("fingerprint") != fp or a.reviewer not in rnd.get("reviewers", []):
@@ -270,6 +271,9 @@ def main():
         tail = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()[-1:] or [""]
         unavailable(f"exit {r.returncode}, no findings JSON ({tail[0][:160]})")
     # Stamp identity ourselves — never trust the model to echo these correctly.
+    base = cps.get("base_tree")
+    review["files_reviewed"] = (eng.changed_files(ctx.root, {"kind": "git-tree", "id": base}, {"kind": "git-tree", "id": fp})
+                                if base else review.get("files_reviewed") or ["(whole diff)"])
     review.update(reviewer=a.reviewer, lens=spec.get("lens"), vendor=spec.get("vendor"), round_nonce=rnd["nonce"],
                   checkpoint=a.cp, fingerprint=fp)
     review["findings"] = [f for f in review.get("findings") or [] if isinstance(f, dict)]

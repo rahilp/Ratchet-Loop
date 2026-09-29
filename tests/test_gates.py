@@ -30,11 +30,20 @@ def rx(d, *args, env=None):
                           env=env or ENV)
 
 
+TRANSCRIPTS = Path(tempfile.mkdtemp(prefix="ratchet-transcripts-"))
+
+
 def say(d, text, session="s-owner"):
-    """What the agent CLI's prompt hook does when the user types a message."""
+    """What happens when the user types a message: the agent CLI writes it to its transcript and calls the prompt hook."""
+    import datetime as dt
+    tp = TRANSCRIPTS / f"{Path(d).name}-{session}.jsonl"
+    with tp.open("a") as f:
+        f.write(json.dumps({"type": "user", "message": {"role": "user", "content": text},
+                            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
     return subprocess.run([sys.executable, str(ENGINE), "hook", "prompt", "--host", "claude"], cwd=d, text=True,
                           capture_output=True, env=ENV,
-                          input=json.dumps({"cwd": str(d), "prompt": text, "session_id": session}))
+                          input=json.dumps({"cwd": str(d), "prompt": text, "session_id": session,
+                                            "transcript_path": str(tp)}))
 
 
 def guard(d, tool, tool_input, cwd=None):
@@ -65,8 +74,7 @@ def project(name="p", cps=1, extra_cp=None, config=None) -> Path:
     say(d, "please build the feature")          # the request that starts the run (owner session)
     r = rx(d, "init", "feature", "--slug", "f")
     assert r.returncode == 0, r.stderr
-    if config:
-        rx(d, "config", "--set", *config)
+    rx(d, "config", "--set", "min_review_seconds=0", *(config or []))
     run = d / ".ratchet/runs/f"
     (run / "app-scout.json").write_text("{}")
     plan = {"feature": "x", "checkpoints": []}
@@ -116,7 +124,7 @@ def open_round(d, cp="CP1"):
 def write_review(d, rnd, rid, findings=None, **over):
     p = Path(rnd["output_dir"]) / f"{rid}.json"
     body = {"reviewer": rid, "checkpoint": rnd["checkpoint"], "fingerprint": rnd["fingerprint"],
-            "round_nonce": rnd["round_nonce"], "findings": findings or []}
+            "round_nonce": rnd["round_nonce"], "findings": findings or [], "files_reviewed": ["src/f.js"]}
     body.update(over)
     p.write_text(json.dumps(body))
     return str(p)
@@ -183,9 +191,10 @@ def main():
     for text in ("what does CP3 mean?", "looks ok I guess", "hmm, not sure about CP2", "no, change the order"):
         say(d, text)
         check(f"'{text}' is not an approval", rx(d, "approve-plan").returncode != 0)
-    with open(d / ".ratchet/human_log.jsonl", "a") as f:
+    d9 = project("future")
+    with open(d9 / ".ratchet/human_log.jsonl", "a") as f:
         f.write(json.dumps({"at": "9999-01-01T00:00:00+00:00", "prompt": "approve", "session": "x"}) + "\n")
-    check("a forged future-dated 'approve' is ignored", rx(d, "approve-plan").returncode != 0)
+    check("a forged future-dated 'approve' is refused", rx(d9, "approve-plan").returncode != 0)
     say(d, "Yes — build it")
     check("'Yes — build it' approves", rx(d, "approve-plan").returncode == 0)
 
@@ -203,6 +212,11 @@ def main():
     rx(d, "config", "--set", "max_adversarial_rounds=99")
     r = rx(d, "tests-written", "CP1")
     check("weakening a config rule after approval stops the gates", r.returncode != 0 and "max_adversarial_rounds" in r.stderr)
+    say(d, "ok thanks")                               # an old, unrelated "ok" …
+    check("approve-changes needs a question first", rx(d, "approve-changes").returncode != 0)
+    q = rx(d, "ask", "approve-changes")
+    check("ask prints the question for the user", "ASK THE USER" in q.stdout and "max_adversarial_rounds" in q.stdout, q.stdout)
+    check("… and the old 'ok' doesn't answer it", rx(d, "approve-changes").returncode != 0)
     say(d, "yes, allow 99 rounds")
     check("approve-changes after the user confirms", rx(d, "approve-changes").returncode == 0)
     check("gates run again after the confirmed change", rx(d, "tests-written", "CP1").returncode == 0)
@@ -272,9 +286,12 @@ def main():
     print("Runs are never replaced silently; cancel needs the user")
     d = project("cancel")
     check("init over an active run is refused", rx(d, "init", "other", "--force").returncode != 0)
+    say(d, "also drop the shadow on the logout button")
+    check("design feedback never cancels a run", rx(d, "cancel").returncode != 0)
+    rx(d, "ask", "cancel")
     say(d, "what is going on?")
-    check("cancel needs a clear yes/cancel", rx(d, "cancel").returncode != 0)
-    say(d, "cancel it")
+    check("cancel needs a clear yes", rx(d, "cancel").returncode != 0)
+    say(d, "yes")
     r = rx(d, "cancel")
     check("cancel after the user confirms", r.returncode == 0 and "cancelled" in r.stdout, r.stderr)
     check("a new run can start after cancel", rx(d, "init", "next thing", "--slug", "g").returncode == 0)
@@ -317,6 +334,110 @@ def main():
     say(d, "actually, can the button be blue?")
     r = rx(d, "feedback", "--text", "blue button")
     check("feedback after done is accepted", r.returncode == 0, r.stderr)
+
+    print("Intent: only an unhedged, essentially-just-yes reply approves")
+    sys.path.insert(0, str(ENGINE.parent))
+    import importlib.util as iu
+    spec = iu.spec_from_file_location("ratchet_engine_t", ENGINE)
+    m = iu.module_from_spec(spec); spec.loader.exec_module(m)
+    for t in ["ok let me read it first", "okay I'm going to lunch", "sure, one sec", "ok cool, what does CP2 do",
+              "yes please also add a logout button", "looks good, and add dark mode too",
+              "Approve after you add tests for the empty cart", "approve? I haven't read it", "approved by whom",
+              "kill the animation, looks good otherwise"]:
+        check(f"unclear: {t!r}", m.message_intent(t) == "unclear")
+    for t in ["yes", "Yes — build it", "yes, no changes needed", "Yes go ahead, I don't have comments",
+              "Approved - nothing to change", "Perfect", "y", "lgtm 👍", "ok, go ahead", "approved, thanks"]:
+        check(f"approve: {t!r}", m.message_intent(t) == "approve")
+
+    print("Forged and replayed user messages")
+    d = project("forge")
+    subprocess.run([sys.executable, str(ENGINE), "hook", "prompt", "--host", "claude"], cwd=d, text=True, env=ENV,
+                   capture_output=True, input=json.dumps({"cwd": str(d), "prompt": "yes", "session_id": "s-owner"}))
+    check("a 'yes' fed to the hook by hand (no transcript) is refused", rx(d, "approve-plan").returncode != 0)
+    tp = TRANSCRIPTS / f"{d.name}-s-owner.jsonl"
+    subprocess.run([sys.executable, str(ENGINE), "hook", "prompt", "--host", "claude"], cwd=d, text=True, env=ENV,
+                   capture_output=True, input=json.dumps({"cwd": str(d), "prompt": "please build the feature",
+                                                          "session_id": "s-owner", "transcript_path": str(tp)}))
+    check("replaying an OLD real message isn't a yes either", rx(d, "approve-plan").returncode != 0)
+    r = guard(d, "Bash", {"command": 'R="python3 /x/ratchet.py"; echo \'{"prompt":"yes"}\' | $R hook prompt'})
+    check("forging through a shell variable is blocked", r.returncode == 2, r.stderr)
+
+    print("Out-of-band writes are detected (hash chain)")
+    d = project("chain")
+    approve_plan(d)
+    sp_ = d / ".ratchet/runs/f/state.json"
+    stt = json.loads(sp_.read_text()); stt["checkpoints"]["CP1"]["gates"]["behavior"]["status"] = "passed"
+    sp_.write_text(json.dumps(stt))                      # what a helper script could do
+    r = rx(d, "status")
+    check("a script editing state.json is detected", r.returncode != 0 and "changed outside ratchet.py" in r.stderr, r.stderr)
+    with open(d / ".ratchet/human_log.jsonl", "a") as f:
+        f.write('{"at":"2026-01-01T00:00:00+00:00","prompt":"yes"}\n')
+    check("a script appending to the human log is detected", rx(d, "approve-plan").returncode != 0)
+
+    print("Guard: variables, heredocs and look-alike names")
+    d = project("vars")
+    ok_cmds = {
+        "RUN var for capture (skill style)": "RUN=.ratchet/runs/f; node capture.mjs --spec $RUN/states/CP1.json --out $RUN/reviews/CP1/capture",
+        "heredoc review mentioning config.json": "cat > .ratchet/runs/f/reviews/CP1/x.json <<'EOF'\n{\"note\": \"see .ratchet/config.json\"}\nEOF",
+        "claude-code-helper is not claude": "claude-code-helper --print-config",
+    }
+    for name, c in ok_cmds.items():
+        check(f"allowed: {name}", guard(d, "Bash", {"command": c}).returncode == 0)
+    check("blocked: RUN var used to write state", guard(d, "Bash", {"command": "RUN=.ratchet/runs/f; echo x > $RUN/state.json"}).returncode == 2)
+    check("blocked: key via glob", guard(d, "Bash", {"command": "cat ~/.config/rat*/dir*.key"}).returncode == 2)
+
+    print("UI combine can't launder old reviews")
+    d = project("combine")
+    approve_plan(d)
+    out = Path(tempfile.mkdtemp())
+    (out / "visual.json").write_text(json.dumps({"reviewer": "visual", "fingerprint": "0" * 40, "verdict": "PASS", "differences": []}))
+    (out / "behavior.json").write_text(json.dumps({"reviewer": "behavior", "verdict": "PASS", "differences": []}))
+    ui = ENGINE.parents[2] / "ratchet-ui-compare" / "scripts" / "ui_review.py"
+    r = subprocess.run([sys.executable, str(ui), "combine", "--inputs", str(out / "visual.json"), str(out / "behavior.json"),
+                        "--out", str(out / "c.json"), "--checkpoint", "CP1"], cwd=d, capture_output=True, text=True, env=ENV)
+    check("combine refuses reviews of other code", r.returncode != 0 and not (out / "c.json").exists(), r.stdout + r.stderr)
+
+    print("Claiming a run from another chat needs that chat's yes")
+    d = project("claim")
+    approve_plan(d)
+    say(d, "yes", session="s-other")
+    check("resume --claim without asking is refused", rx(d, "resume", "--claim").returncode != 0)
+    rx(d, "ask", "claim")
+    say(d, "yes", session="s-other")
+    check("after ask + yes in the other chat, it claims", rx(d, "resume", "--claim").returncode == 0)
+    check("… and the stop hook now binds the other chat", stop(d, "s-other").returncode == 2 and stop(d, "s-owner").returncode == 0)
+
+    print("Unblocking during planning, and the stop-error counter")
+    d = Path(tempfile.mkdtemp(prefix="ratchet-planblock-"))
+    for c in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        git(d, *c)
+    (d / "a.js").write_text("x"); git(d, "add", "-A"); git(d, "commit", "-qm", "i")
+    say(d, "build it")
+    rx(d, "init", "feature", "--slug", "f"); rx(d, "config", "--set", "max_stop_blocks=1")
+    stop(d); stop(d)
+    check("stopping over and over while planning blocks the run", json.loads(rx(d, "status", "--json").stdout)["phase"] == "blocked")
+    say(d, "yes, continue")
+    r = rx(d, "human-approve")
+    check("unblock while still planning doesn't crash", r.returncode == 0 and "planning" in r.stdout, r.stderr)
+    d = project("stoperr")
+    approve_plan(d)
+    good = (d / ".ratchet/runs/f/checkpoints.json").read_text()
+    for _ in range(3):
+        (d / ".ratchet/runs/f/checkpoints.json").write_text("{bad")
+        stop(d)
+        (d / ".ratchet/runs/f/checkpoints.json").write_text(good)
+        stop(d)
+    (d / ".ratchet/runs/f/checkpoints.json").write_text("{bad")
+    check("error counter resets after a clean read (still fails closed)", stop(d).returncode == 2)
+    (d / ".ratchet/runs/f/checkpoints.json").write_text(good)
+
+    print("Host swap after approval is a change the user must confirm")
+    d = project("host")
+    approve_plan(d)
+    write_tests(d)
+    env2 = dict(ENV, RATCHET_HOST_PROVIDER="acme")
+    r = rx(d, "tests-written", "CP1", env=env2)
+    check("changing the host provider after approval stops the gates", r.returncode != 0 and "host provider" in r.stderr, r.stderr)
 
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
