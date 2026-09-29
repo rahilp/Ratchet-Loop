@@ -50,7 +50,7 @@ Ratchet runs under any of these agent CLIs. The hooks that enforce the gates are
 
 Add `--project` to install for the current repo only (`.claude/`, `.codex/`, `.gemini/`, `.github/hooks/`), or use `--host all`. If the skills are already on disk, `ratchet.py install-hooks --host <cli> [--scope project|user] [--dry-run] [--uninstall]` just (re)writes the hooks. It's safe to run twice, and it leaves your own hooks and settings alone.
 
-**Check it's live:** `python3 <skills>/ratchet-orchestrator/scripts/ratchet.py doctor` shows which CLIs have Ratchet hooks and when each hook last fired in this project. Until one fires, `ratchet.py next` warns that the gates are only advice.
+**Check it's live:** `python3 <skills>/ratchet-orchestrator/scripts/ratchet.py doctor` shows which CLIs have Ratchet hooks and when each hook last fired in this project (`doctor --json` prints just the `hooks` object: `host`, `installed`, `heartbeat_seen`, `fresh`, `missing`). If no hook has fired in the last 24 hours, `ratchet.py next` adds a warning telling the agent to offer to install the hooks (nothing installed) or to ask you to restart the CLI (installed but silent).
 
 **Requirements:** Python 3.8+, git (for fingerprints and per-checkpoint commits), and Node 18+ plus Playwright for the UI gate (`npm i -D playwright && npx playwright install chromium`). Optional, for reviewers from other providers: any of the `claude`, `codex`, `gemini` or `copilot` CLIs, and/or `GEMINI_API_KEY` for Gemini as a UI reviewer. With none installed, the host's own sub-agents do every review.
 

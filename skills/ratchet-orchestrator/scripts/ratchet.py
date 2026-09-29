@@ -1814,9 +1814,11 @@ def cmd_approve_changes(args):
 def cmd_next(args):
     ctx = Ctx(find_root())
     na = next_action(ctx)
-    hw = hooks_warning(ctx)
+    hs = hooks_status(ctx.root, ctx.config())
+    hw = hooks_warning(ctx, hs)
     if hw and na.get("phase") not in ("planning",):
         na["warning"] = hw
+    na["hooks"] = hs
     print(json.dumps(na, indent=2))
 
 
@@ -1955,7 +1957,8 @@ def status_json(ctx: Ctx) -> dict:
                     "gates": {n: {k: g.get(k) for k in ("status", "attempts", "by") if g.get(k) is not None}
                               for n, g in (s.get("gates") or {}).items()}})
     na = next_action(ctx, st)
-    hw = hooks_warning(ctx)
+    hs = hooks_status(ctx.root, ctx.config())
+    hw = hooks_warning(ctx, hs)
     waiting_on = None
     if st["phase"] in ("awaiting_plan_approval", "awaiting_checkpoint_review", "awaiting_final_review", "blocked"):
         waiting_on = "director" if approval_mode(ctx) == "director" else "human"
@@ -1965,7 +1968,8 @@ def status_json(ctx: Ctx) -> dict:
             "awaiting_since": st.get("awaiting_since"), "approval_mode": approval_mode(ctx),
             "adv_rounds_used": st.get("adv_rounds_total", 0),
             "unavailable_reviewers": unavailable_reviewers(ctx), "host_provider": detect_host(ctx.config()),
-            "hooks_warning": hw, "hook_heartbeat": read_json(ctx.ratchet / "hook-heartbeat.json", {}),
+            "hooks_warning": hw, "hook_heartbeat": read_heartbeat(ctx.root),
+            "hooks": hs,
             "viewer_url": viewer_link(ctx)["url"], "viewer_live": viewer_link(ctx)["live"],
             "done": sum(1 for c in cps if c["status"] == "done"), "total": len(cps),
             "checkpoints": cps, "updated_at": st.get("updated_at")}
@@ -2858,22 +2862,35 @@ def cmd_install_hooks(args):
 
 def cmd_doctor(args):
     root = find_root()
-    host = VENDOR_TO_HOST.get(detect_host({}), "unknown")
-    print(f"Host running this command: {host} (provider {detect_host({})})")
+    if getattr(args, "json", False):
+        print(json.dumps({"hooks": hooks_status(root, _safe_config(root))}, indent=2))
+        return
+    cfg = _safe_config(root)
+    hs = hooks_status(root, cfg)
+    print(f"Host running this command: {hs['host']} (provider {detect_host(cfg)})")
     for h in HOOK_HOSTS:
-        found = []
-        for scope in ("project", "user"):
-            p = hook_config_path(h, scope, root)
-            if p.exists() and "ratchet.py" in p.read_text(errors="ignore"):
-                found.append(f"{scope}: {p}")
+        found = [f"{scope}: {p}" for scope, p in installed_hook_files(h, root)]
         if h in ("claude", "codex"):
             found.append("(or installed as a plugin — hooks/hooks.json)")
         print(f"  {h:<8} " + ("; ".join(found) if found else "not installed — ratchet.py install-hooks --host " + h))
-    hb = read_json(root / RATCHET_DIR / "hook-heartbeat.json", {}) or {}
-    if hb:
+    hb = read_heartbeat(root)
+    hb_file = root / RATCHET_DIR / "hook-heartbeat.json"
+    try:
+        hb_raw = hb_file.read_text(errors="ignore").strip() if hb_file.exists() else ""
+    except OSError:
+        hb_raw = "?"  # directory / permission problem: report as unreadable below
+    if not hb and hb_raw not in ("", "{}"):
+        print("  hook-heartbeat.json unreadable (corrupt or not a JSON object) - delete it; the next hook run rewrites it.")
+    elif hb:
+        now = _dt.datetime.now(_dt.timezone.utc)
         for ev in ("guard", "prompt", "stop"):
-            if ev in hb:
-                print(f"  last {ev:<6} hook: {hb[ev]['at'][:19]}Z via {hb[ev]['host']}")
+            e = hb.get(ev)
+            if isinstance(e, dict) and isinstance(e.get("at"), str) and isinstance(e.get("host"), str):
+                t = _parse_iso(e["at"])
+                fut = "  (future-dated: clock skew or bad entry; not counted as fresh)" if t and t > now + _dt.timedelta(minutes=5) else ""
+                print(f"  last {ev:<6} hook: {e['at'][:19]}Z via {e['host']}{fut}")
+            elif ev in hb:
+                print(f"  last {ev:<6} hook: unreadable entry in hook-heartbeat.json")
             else:
                 print(f"  last {ev:<6} hook: never fired in this project")
     else:
@@ -2885,17 +2902,83 @@ def cmd_doctor(args):
         print("  recent hook errors (hooks failed open):\n    " + "\n    ".join(tail))
 
 
-def hooks_warning(ctx) -> str | None:
-    """Used by `next`/status: gates without hooks are just advice."""
-    hb = read_json(ctx.ratchet / "hook-heartbeat.json", {}) or {}
-    day_ago = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=24)).isoformat()
-    host = VENDOR_TO_HOST.get(detect_host(ctx.config()))
-    fresh = [e for e in hb.values() if isinstance(e, dict) and e.get("at", "") > day_ago
-             and (host is None or e.get("host") == host)]
-    if not fresh:
-        return ("No Ratchet hook has fired in this project yet — the Stop/guard hooks may not be installed for "
-                "this agent CLI. Run `ratchet.py doctor`.")
-    return None
+def _safe_config(root: Path) -> dict:
+    """Config for read-only diagnostics: a corrupt config.json (read_json dies) counts as empty."""
+    try:
+        json.loads((root / RATCHET_DIR / "config.json").read_text())  # quiet pre-check: read_json die()s noisily
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        return {}
+    try:
+        return Ctx(root).config()
+    except (Exception, SystemExit):
+        return {}
+
+
+def installed_hook_files(host: str, root: Path) -> list:
+    """[(scope, path)] of config files that already contain Ratchet hooks for `host`. Single definition of 'installed'."""
+    out = []
+    if host not in HOOK_HOSTS:
+        return out
+    for scope in ("project", "user"):
+        try:
+            p = hook_config_path(host, scope, root)
+            if p.exists() and "ratchet.py" in p.read_text(errors="ignore"):
+                out.append((scope, p))
+        except OSError:
+            pass
+    return out
+
+
+def read_heartbeat(root: Path) -> dict:
+    """Tolerant read: a corrupt or odd heartbeat file counts as empty."""
+    try:
+        hb = json.loads((root / RATCHET_DIR / "hook-heartbeat.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return hb if isinstance(hb, dict) else {}
+
+
+def _parse_iso(v):
+    try:
+        t = _dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        return t if t.tzinfo else t.replace(tzinfo=_dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def hooks_status(root: Path, cfg=None) -> dict:
+    """Read-only: {host, installed, heartbeat_seen, fresh, missing} for the CLI running this command."""
+    # Unknown host (e.g. unrecognised host_provider): we cannot tell which CLI this is, so a heartbeat from ANY
+    # host counts as evidence that hooks run in this project. Documented; doctor prints the host as "unknown".
+    host = VENDOR_TO_HOST.get(detect_host(cfg or {}), "unknown")
+    installed = bool(installed_hook_files(host, root))
+    hb = read_heartbeat(root)
+    entries = [e for e in hb.values()
+               if isinstance(e, dict) and (host == "unknown" or e.get("host") == host)]
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cutoff, latest = now - _dt.timedelta(hours=24), now + _dt.timedelta(minutes=5)  # future-dated is not fresh
+    fresh = False
+    for e in entries:
+        t = _parse_iso(e.get("at"))
+        if t and cutoff < t <= latest:
+            fresh = True
+    return {"host": host, "installed": installed, "heartbeat_seen": bool(entries), "fresh": fresh,
+            "missing": not installed and not fresh}
+
+
+def hooks_warning(ctx, hs=None) -> str | None:
+    """Used by `next`/status: gates without hooks are just advice. Phrased for the agent, not the user."""
+    hs = hs or hooks_status(ctx.root, ctx.config())
+    if hs["fresh"]:
+        return None
+    if hs["installed"]:
+        return ("Ratchet hooks are installed for this agent CLI but none has fired recently. Tell the user the "
+                "agent CLI probably needs a restart (and, for Codex, hooks enabled) so the gates are enforced.")
+    return ("No Ratchet hook has fired in this project yet, so the gates are only advice. Offer to install the "
+            "hooks for this agent CLI (`ratchet.py install-hooks`), ask the user first, and tell them a restart "
+            "is needed afterwards. `ratchet.py doctor` still shows details.")
 
 
 
@@ -2993,7 +3076,8 @@ def main(argv=None):
     a.add_argument("--scope", default="project", choices=["project", "user"])
     a.add_argument("--dry-run", action="store_true"); a.add_argument("--uninstall", action="store_true")
     a.set_defaults(fn=cmd_install_hooks)
-    sp.add_parser("doctor", help="which hosts have Ratchet hooks, and are they firing?").set_defaults(fn=cmd_doctor)
+    a = sp.add_parser("doctor", help="which hosts have Ratchet hooks, and are they firing?")
+    a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_doctor)
 
     args = p.parse_args(argv)
     if args.root:

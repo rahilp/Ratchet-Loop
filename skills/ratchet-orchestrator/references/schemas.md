@@ -287,5 +287,17 @@ Each `review_depth` entry is a list of **slots**: a reviewer id, or an ordered l
 | gemini | `.gemini/settings.json` / `~/.gemini/settings.json` | AfterAgent | BeforeAgent | BeforeTool |
 | copilot | `.github/hooks/ratchet.json` / `~/.copilot/hooks/ratchet.json` | agentStop | userPromptSubmitted | preToolUse |
 
-Runtime files: `.ratchet/hook-heartbeat.json` (last time each hook fired and via which host; read by `doctor`, `next`, and `status --json` as `hooks_warning`) and `.ratchet/hook-errors.log` (internal errors; hooks fail open).
+Runtime files: `.ratchet/hook-heartbeat.json` (last time each hook fired and via which host; read by `doctor`, `next`, and `status --json` as `hooks_warning` and `hooks`) and `.ratchet/hook-errors.log` (internal errors; hooks fail open).
+
+**`hooks` object** (in `status --json`, in `next`, and as the only key of `doctor --json`; read-only, computed for the agent CLI running the command):
+
+| key | type | meaning |
+|---|---|---|
+| `host` | string | `claude`, `codex`, `gemini`, `copilot` or `unknown` (from `host_provider` / environment) |
+| `installed` | bool | a project or user hook config for `host` contains Ratchet hooks |
+| `heartbeat_seen` | bool | the heartbeat has an entry from `host` (any host if `host` is `unknown`) |
+| `fresh` | bool | such an entry has an `at` timestamp within the last 24 hours and not more than 5 minutes in the future |
+| `missing` | bool | `not installed and not fresh` |
+
+`hooks_warning` (string or null) is null when `fresh`. Otherwise it tells the agent either that the hooks are installed but silent (restart the CLI) or that none fired yet (offer to run `install-hooks`, ask the user first). A corrupt or odd `hook-heartbeat.json` or `config.json` counts as empty here; `doctor` never raises for it.
 
