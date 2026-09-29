@@ -178,7 +178,7 @@ Step verbs: `goto`, `click`, `fill`+`value`, `press`, `hover`, `select`+`value`,
 
 ## 6. UI review JSON
 
-Each reviewer writes one file; `ui_review.py combine` (or the orchestrator) merges them into `combined.json`.
+Each reviewer writes one file (only that reviewer may write it); `ui_review.py` merges them into `combined.json` (only the script may write it).
 
 ```json
 {
@@ -202,7 +202,7 @@ Each reviewer writes one file; `ui_review.py combine` (or the orchestrator) merg
 - `severity`: `blocker` | `major` | `minor` | `nit`
 - ratchet.py ignores the self-reported PASS/FAIL and recomputes: any difference with `fixable_in_code: true` blocks (nits too, unless `ui_block_on_nits:false`).
 
-`combined.json` = `{ "checkpoint", "reviewers": ["visual","behavior"], "verdict", "invalid_reason", "differences": [...all, each with "reviewer"] }`.
+`combined.json` = `{ "checkpoint", "fingerprint", "compared": {"spec_sha256", "scope"}, "reviewers": ["visual","behavior"], "verdict", "invalid_reason", "differences": [...all, each with "reviewer"] }`. `compared` records what the round compared: the hash of `states/CPn.json` (stamped into the capture manifest by `capture.mjs`) and the scope given to the reviewers. After a FAIL round both are frozen: `ui-record` refuses a later round that compared something else until the gate passes, unless the user agreed to a change (`ask ui-respec CPn`, then `ui-respec CPn`).
 
 ## 7. Adversarial review JSON
 

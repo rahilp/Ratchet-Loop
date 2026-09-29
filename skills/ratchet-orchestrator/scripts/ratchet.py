@@ -309,6 +309,14 @@ def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str):
     paths = changed_files(root, {"kind": "git-tree", "id": base_tree}, fp)
     if not paths:
         return None
+    shared = []  # the .ratchet files people edit and share ride along with the checkpoint (never run state)
+    for name in (".gitignore", "config.json", "standards.md", "learnings.md"):
+        f = root / RATCHET_DIR / name
+        if f.is_file():
+            oid = subprocess.run(["git", "hash-object", "-w", "--", str(f)], cwd=root, capture_output=True,
+                                 text=True).stdout.strip()
+            if oid:
+                shared.append((f"{RATCHET_DIR}/{name}", oid))
     def git(*a, env=None, inp=None):
         r = subprocess.run(["git", *a], cwd=root, capture_output=True, input=inp, env=env)
         if r.returncode != 0:
@@ -333,14 +341,17 @@ def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str):
                 info.append(f"{mode} {oid}\t{p}")
             else:
                 info.append(f"0 {'0' * 40}\t{p}")  # mode 0 removes the path
+        info += [f"100644 {oid}\t{rel}" for rel, oid in shared]
         git("update-index", "-z", "--index-info", env=env,
             inp="\0".join(info).encode("utf-8", "surrogateescape") + b"\0")
         tree = git("write-tree", env=env).strip()
+        if head and tree == git("rev-parse", f"{head}^{{tree}}").strip():
+            return None
         new = git("commit-tree", tree, *(["-p", head] if head else []), "-m", msg).strip()
     git("update-ref", "HEAD", new, *([head] if head else []))
     # the real index now lags behind HEAD for these paths: bring just those entries up to date
     subprocess.run(["git", "reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], cwd=root,
-                   capture_output=True, input="\0".join(paths).encode("utf-8", "surrogateescape"),
+                   capture_output=True, input="\0".join(paths + [r for r, _ in shared]).encode("utf-8", "surrogateescape"),
                    env=dict(os.environ, GIT_LITERAL_PATHSPECS="1"))
     return new[:7]
 
@@ -1431,6 +1442,7 @@ def cmd_director_sign(args):
             "human-approve": ["awaiting_checkpoint_review", "awaiting_final_review", "blocked"],
             "feedback": ["awaiting_checkpoint_review", "awaiting_final_review", "done"],
             "approve-changes": ["building", "blocked", "awaiting_checkpoint_review", "awaiting_final_review"],
+            "ui-respec": ["building", "blocked"],
             "cancel": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
                        "awaiting_checkpoint_review", "awaiting_final_review", "planning_feedback"],
             "set-review": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
@@ -1708,6 +1720,20 @@ def cmd_ui_record(args):
         die("combined review is not stamped with the current code fingerprint (it was produced for other code, or by "
             "hand). Capture and review again with ui_review.py — it stamps the fingerprint itself.")
     g = cps["gates"]["ui"]
+    compared = review.get("compared") or {}
+    if not compared.get("spec_sha256") or compared.get("scope") is None:
+        die("The combined review doesn't say what was compared (capture spec and scope). Produce it with "
+            "ui_review.py from a capture.mjs manifest: `review`, or `combine --manifest <manifest.json>`.")
+    spec_file = ctx.run_dir() / "states" / f"{args.cp}.json"
+    if spec_file.exists() and hashlib.sha256(spec_file.read_bytes()).hexdigest() != compared["spec_sha256"]:
+        die(f"states/{args.cp}.json changed after this capture. Capture and review again.")
+    frozen = g.get("frozen")
+    if frozen and frozen != compared:
+        die(f"The UI check found differences in {args.cp}, and since then the capture spec (states/{args.cp}.json) "
+            "or the review scope has changed. Differences are fixed in the app's code, not by changing what is "
+            "compared. Put the spec and scope back as they were and re-run the capture. If the spec itself was "
+            f"wrong, run `ratchet.py ask ui-respec {args.cp}`, explain to the user what you want to change and "
+            f"why, and after their clear yes run `ratchet.py ui-respec {args.cp}`.")
     g["attempts"] += 1
     verdict, blockers = _ui_verdict(review, cfg)
     dest = ctx.evidence(args.cp) / "ui" / f"round-{g['attempts']:02d}"
@@ -1723,6 +1749,7 @@ def cmd_ui_record(args):
     if verdict == "FAIL":
         g["status"] = "failed"
         g["blockers"] = len(blockers)
+        g["frozen"] = compared  # from now on only the app's code may change until the gate passes
         if g["attempts"] >= cfg["max_ui_rounds"]:
             _set_blocked(st, f"{args.cp}: UI gate failed {g['attempts']} rounds — needs a human decision.")
         ctx.log(st, "ui_failed", cp=args.cp, blockers=len(blockers))
@@ -1734,11 +1761,30 @@ def cmd_ui_record(args):
             "Send them to ratchet-implementer, then re-run behavior + UI.", 2)
     g.update(status="passed", fingerprint=fingerprint(ctx.root), passed_at=now(),
              evidence=str(dest.relative_to(ctx.root)), blockers=0)
+    g.pop("frozen", None)
     cps["step"] = _earliest_open_step(cps)
     ctx.log(st, "ui_passed", cp=args.cp, round=g["attempts"])
     ctx.save_state(st)
     build_viewer(ctx)
     ok(f"Gate 2 (UI) PASSED for {args.cp}. Next step: {cps['step']}")
+
+
+def cmd_ui_respec(args):
+    """The user agreed that the UI check itself (capture spec or scope) was wrong: allow one change to it."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    cps = _cur(ctx, st, args.cp)
+    g = cps["gates"]["ui"]
+    if not g.get("frozen"):
+        ok(f"{args.cp}'s UI check isn't frozen; the spec can change freely until it finds a difference.")
+        return
+    _require_pending(st, "ui-respec", args.cp)
+    msg = _require_human(ctx, st, "ui-respec", getattr(args, "director_token", None))
+    g.pop("frozen", None)
+    _clear_pending(st)
+    ctx.log(st, "ui_respec_approved", cp=args.cp, by=msg["by"], note=msg.get("prompt", "")[:200])
+    ctx.save_state(st)
+    ok(f"{args.cp}: the capture spec and scope may be changed once; the next recorded round becomes the new baseline.")
 
 
 def cmd_adv_record(args):
@@ -2089,10 +2135,11 @@ ASKABLE = {"approve-changes": "accept the changes listed above as the new baseli
            "cancel": "cancel this Ratchet run (commits already made are kept)",
            "set-review": "change how often you review",
            "claim": "continue this Ratchet run in THIS chat",
-           "hooks-waive": "build without the Ratchet hooks (the checks then only advise; nothing enforces them)"}
+           "hooks-waive": "build without the Ratchet hooks (the checks then only advise; nothing enforces them)",
+           "ui-respec": "change what the UI check compares for this step (its capture steps or scope), as explained above"}
 # the command that carries out a "yes" to each question
 PENDING_COMMAND = {"approve-changes": "approve-changes", "cancel": "cancel", "set-review": "set-review",
-                   "claim": "resume --claim", "hooks-waive": "hooks-waive"}
+                   "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec"}
 REVIEW_MODE_WORDS = {"end": "only at the end", "each": "after every step", "none": "never (fully autonomous)"}
 
 
@@ -2110,8 +2157,12 @@ def cmd_ask(args):
         ctx.save_state(st)
         ok(f"Withdrew the waiting question ({p.get('action')}). Nothing was changed.")
         return
-    if args.action == "set-review" and not args.mode:
+    if args.action == "set-review" and args.mode not in ("end", "each", "none"):
         die("ask set-review needs the mode: end | each | none")
+    if args.action == "ui-respec" and not (args.mode and args.mode in (st.get("checkpoints") or {})):
+        die("ask ui-respec needs the checkpoint id, e.g. `ratchet.py ask ui-respec CP2`")
+    if args.action not in ("set-review", "ui-respec") and args.mode:
+        die(f"ask {args.action} takes no extra value")
     detail = ""
     if args.action == "approve-changes":
         probs = integrity_problems(ctx, st)
@@ -2935,6 +2986,7 @@ def normalize_hook(data: dict, host: str) -> dict:
     return {"host": host, "tool": tool, "kind": kind, "input": ti, "command": str(cmd), "paths": paths,
             "patch": patch, "cwd": data.get("cwd") or os.getcwd(),
             "prompt": data.get("prompt") or "", "session": data.get("session_id") or data.get("sessionId"),
+            "agent_type": data.get("agent_type") or "", "agent_id": data.get("agent_id") or "",
             "transcript_path": data.get("transcript_path") or data.get("transcriptPath")}
 
 
@@ -3077,7 +3129,8 @@ READ_ONLY_PROGRAMS = {"cat", "less", "more", "head", "tail", "grep", "egrep", "f
 READ_ONLY_GIT = {"diff", "log", "show", "status", "ls-files", "blame", "rev-parse", "cat-file"}
 RATCHET_TOKEN_RE = re.compile(r"""[^\s'"<>|;&()`]*\.ratchet(?:[/\\][^\s'"<>|;&()`]*)?""", re.I)
 REDIRECT_RE = re.compile(r"(?<![0-9&])>>?\s*(?!&)(\S+)")
-ENGINE_CALL_RE = re.compile(r"""^\s*(?:\S*python3?(?:\.\d+)?|py)\s+(?:-\S+\s+)*["']?\S*(ratchet|external_review|ui_review)\.py\b""")
+ENGINE_CALL_RE = re.compile(r"""^\s*(?:(?:\S*python3?(?:\.\d+)?|py)\s+(?:-\S+\s+)*["']?\S*(ratchet|external_review|ui_review)\.py\b"""
+                            r"""|\S*node\s+(?:-\S+\s+)*["']?\S*capture\.mjs\b)""")
 NESTED_AGENT_RE = re.compile(r"(^|[\s;&|(/])(claude|gemini|copilot)(?![\w.-])[^;&|\n]*\s(-p|--print|--prompt)\b"
                              r"|(^|[\s;&|(/])codex(?![\w.-])[^;&|\n]*\sexec\b")
 SELF_HOOK_RE = re.compile(r"\bhook\s+(stop|prompt|guard)\b|\bhook-(stop|prompt|guard)\b")
@@ -3123,12 +3176,100 @@ def _ratchet_rel(path: str, cwd: str) -> str | None:
     return m.group(3)
 
 
+# Review files that only their reviewer may write (checked where the host says which sub-agent is acting: Claude
+# Code puts agent_type on every tool call a sub-agent makes). An empty owner set means "only the script writes it".
+REVIEW_OWNERS = [
+    (re.compile(r"^runs/[^/]+/reviews/[^/]+/adv-round-\d+/[^/]+\.json$", re.I), {"ratchet-adversary"}),
+    (re.compile(r"^runs/[^/]+/reviews/[^/]+/round-\d+/visual\.json$", re.I), {"ratchet-visual-reviewer"}),
+    (re.compile(r"^runs/[^/]+/reviews/[^/]+/round-\d+/behavior\.json$", re.I), {"ratchet-behavior-reviewer"}),
+    (re.compile(r"^runs/[^/]+/reviews/[^/]+/round-\d+/combined\.json$", re.I), set()),
+    (re.compile(r"^runs/[^/]+/reviews/[^/]+/capture[^/]*/manifest\.json$", re.I), set()),
+]
+INTERPRETER_RE = re.compile(r"(^|[\s;&|(/])(python[\d.]*|py|node|deno|bun|bash|sh|zsh|dash|ksh|perl|ruby|php|osascript)(?=\s|$)")
+
+
+def _owner_problem(path: str, cwd: str, who: dict | None) -> str | None:
+    """Why this acting agent may not write this review file, or None."""
+    rel = _ratchet_rel(path, cwd)
+    if not rel or not who or not who.get("enforce"):
+        return None
+    for rx, owners in REVIEW_OWNERS:
+        if rx.match(rel):
+            actor = (who.get("agent_type") or "").split(":")[-1]
+            if actor and actor in owners:
+                return None
+            if not owners:
+                return (f"RATCHET GUARD: {rel} is written by ui_review.py only. Run the script (combine) instead of "
+                        "writing the file yourself.")
+            return (f"RATCHET GUARD: {rel} is a reviewer's own output. Only a {' or '.join(sorted(owners))} sub-agent "
+                    "may write it: launch that reviewer and let it write its file. Never write or edit a review "
+                    "yourself, not even to copy what the reviewer said.")
+    return None
+
+
+WRITE_CODE_RE = re.compile(r"""open\([^)]*,\s*['"][wax]|write_text\(|write_bytes\(|writeFileSync|appendFileSync|\.write\(""")
+ORCH_EDIT_MSG = ("RATCHET GUARD: during the build, project files are changed by Ratchet's sub-agents (implementer, fixer, "
+                 "test writer, design system), not by the orchestrator, so that every change goes through the gates by "
+                 "the role that owns it. Spawn ratchet-implementer (code or UI fixes), ratchet-fixer (review findings) "
+                 "or ratchet-design-system (DESIGN.md) with the change you want. Files under .ratchet/ that you own "
+                 "(checkpoints, capture specs, reference) are fine. If the user asked for something unrelated to the build, "
+                 "pause the run first (ratchet.py pause), make the change, then resume.")
+
+
+def _in_project_outside_ratchet(path: str, cwd: str, root: Path) -> bool:
+    full = Path(os.path.normpath(os.path.join(cwd, os.path.expanduser(path))))
+    try:
+        full.relative_to(root.resolve())
+    except ValueError:
+        return False  # /tmp, /dev/null, another folder: not the project
+    return _ratchet_rel(str(full), cwd) is None
+
+
+def _orchestrator_edit(n: dict, root: Path) -> bool:
+    """Is the main session (not a sub-agent) about to change a project file outside .ratchet/?"""
+    cwd = n["cwd"]
+    if n["kind"] == "write":
+        return any(_in_project_outside_ratchet(p, cwd, root) for p in n["paths"])
+    if n["kind"] != "shell" or not n["command"]:
+        return False
+    raw = n["command"]
+    if INTERPRETER_RE.search(raw):
+        for m in HEREDOC_RE.finditer(raw):
+            body = m.group(0)
+            if WRITE_CODE_RE.search(body) and not RATCHET_TOKEN_RE.search(body):
+                return True
+    cmd = _expand(raw)
+    for seg in _segments(cmd):
+        if ENGINE_CALL_RE.match(seg):
+            continue
+        targets = [t for t in REDIRECT_RE.findall(seg) if not t.startswith("&")]
+        prog, _ = _program(seg)
+        if prog == "sed" and re.search(r"\s-[a-zA-Z]*i", seg):
+            targets += [t for t in seg.split()[1:] if not t.startswith("-") and ("/" in t or "." in t)][-1:]
+        if prog == "tee":
+            targets += [t for t in seg.split()[1:] if not t.startswith("-")]
+        if any(_in_project_outside_ratchet(t.strip("'\""), cwd, root) for t in targets):
+            return True
+    return False
+
+
 def _write_allowed(path: str, cwd: str) -> bool:
     rel = _ratchet_rel(path, cwd)
     return rel is None or bool(rel and ALLOWED_RATCHET_WRITES.match(rel))
 
 
-def _guard_shell(cmd: str, cwd: str) -> str | None:
+def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
+    raw = cmd
+    if INTERPRETER_RE.search(raw):  # heredoc bodies fed to an interpreter are code, not data: check what they touch
+        for m in HEREDOC_RE.finditer(raw):
+            for t in RATCHET_TOKEN_RE.findall(m.group(0)):
+                if not _write_allowed(t, cwd):
+                    return ("RATCHET GUARD: this script touches Ratchet's run state (.ratchet/). Gate state, evidence, "
+                            "approvals and config are owned by ratchet.py — use its commands instead. To read those "
+                            "files, use cat or jq.")
+                why = _owner_problem(t, cwd, who)
+                if why:
+                    return why
     cmd = _expand(cmd)
     if NESTED_AGENT_RE.search(cmd):
         return ("RATCHET GUARD: launching another agent session (claude -p, codex exec, gemini -p, copilot -p) from "
@@ -3150,6 +3291,12 @@ def _guard_shell(cmd: str, cwd: str) -> str | None:
         if ENGINE_CALL_RE.match(seg):
             if not REDIRECT_RE.search(seg):
                 continue  # ratchet.py / reviewer scripts write their own files
+        for t in mentions + REDIRECT_RE.findall(seg):
+            if prog in READ_ONLY_PROGRAMS and t not in REDIRECT_RE.findall(seg):
+                continue  # reading a review is fine
+            why = _owner_problem(t, cwd, who)
+            if why:
+                return why
         read_only = prog in READ_ONLY_PROGRAMS or (prog == "git" and sub in READ_ONLY_GIT) or \
             (prog == "find" and not re.search(r"\s-(delete|exec|execdir|ok|fprint)\b", seg)) or \
             (prog in ("mkdir",) and all(_write_allowed(t, cwd) for t in mentions))
@@ -3165,6 +3312,16 @@ def _guard_shell(cmd: str, cwd: str) -> str | None:
                 "approvals and config are owned by ratchet.py — use its commands (behavior / ui-record / adv-record "
                 "/ complete / config) instead. Reading those files is fine.")
     return None
+
+
+def _run_phase(root: Path) -> str | None:
+    try:
+        ctx = Ctx(root)
+        if not (ctx.ratchet / "active.json").exists():
+            return None
+        return (read_json(ctx.state_path(), {}) or {}).get("phase")
+    except (Exception, SystemExit):
+        return None
 
 
 def decide_guard(n: dict) -> tuple[bool, str]:
@@ -3186,13 +3343,24 @@ def decide_guard(n: dict) -> tuple[bool, str]:
         if n["kind"] == "shell" and OVERRIDE_SET_RE.search(cmd):
             return True, "RATCHET GUARD: RATCHET_HUMAN_OVERRIDE is for a person at their own terminal, not for agents."
     root = find_root(Path(cwd))
+    marks = False
     if (root / RATCHET_DIR).is_dir():
         _heartbeat(root, "guard", n["host"])
+        if n.get("agent_type") and n["host"] == "claude":
+            _heartbeat(root, "agent_marks", n["host"])  # this CLI names the sub-agent on its tool calls
+        marks = isinstance(read_heartbeat(root).get("agent_marks"), dict)
+    who = {"enforce": marks and n["host"] == "claude", "agent_type": n.get("agent_type")}
     if n["kind"] == "shell" and cmd:
-        why = _guard_shell(cmd, cwd)
+        why = _guard_shell(cmd, cwd, who)
         if why:
             return True, why
+    if who["enforce"] and not n.get("agent_type") and _run_phase(root) == "building" and _orchestrator_edit(n, root):
+        return True, ORCH_EDIT_MSG
     if n["kind"] == "write":
+        for p in n["paths"]:
+            why = _owner_problem(p, cwd, who)
+            if why:
+                return True, why
         bad = [p for p in n["paths"] if not _write_allowed(p, cwd)]
         if n["patch"] and not bad:
             bad = [p for p in re.findall(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", n["patch"], re.M)
@@ -3525,8 +3693,9 @@ def main(argv=None):
     a = sp.add_parser("resume", help="resume a paused run; --claim moves the run to this chat (after `ask claim`)")
     a.add_argument("--claim", action="store_true"); a.set_defaults(fn=cmd_resume)
     a = sp.add_parser("ask", help="record the question you're about to ask the user (needed before cancel, "
-                                  "set-review, approve-changes, hooks-waive, resume --claim)")
-    a.add_argument("action", choices=list(ASKABLE) + ["withdraw"]); a.add_argument("mode", nargs="?", choices=["end", "each", "none"])
+                                  "set-review, approve-changes, hooks-waive, resume --claim, ui-respec)")
+    a.add_argument("action", choices=list(ASKABLE) + ["withdraw"])
+    a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec: the checkpoint id")
     a.set_defaults(fn=cmd_ask)
     sp.add_parser("accept-state", help=argparse.SUPPRESS).set_defaults(fn=cmd_accept_state)
     a = sp.add_parser("hooks-waive", help="record the user's choice to build without hooks (after `ask hooks-waive`)")
@@ -3537,6 +3706,8 @@ def main(argv=None):
     a = sp.add_parser("set-review", help="change how often the user reviews (needs their confirmation)")
     a.add_argument("mode", choices=["end", "each", "none"]); a.add_argument("--director-token")
     a.set_defaults(fn=cmd_set_review)
+    a = sp.add_parser("ui-respec", help="after `ask ui-respec CPn` and the user's yes: allow one change to a frozen UI check")
+    a.add_argument("cp"); a.add_argument("--director-token"); a.set_defaults(fn=cmd_ui_respec)
     a = sp.add_parser("approve-changes", help="accept a user-confirmed change to the approved plan/tests/rules")
     a.add_argument("--director-token"); a.set_defaults(fn=cmd_approve_changes)
     sp.add_parser("next").set_defaults(fn=cmd_next)

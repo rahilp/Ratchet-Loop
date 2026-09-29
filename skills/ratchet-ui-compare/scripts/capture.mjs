@@ -174,13 +174,15 @@ async function main() {
     console.error("usage: capture.mjs --spec states/CPn.json --out <dir>   |   capture.mjs --smoke prototype.html");
     process.exit(2);
   }
-  const spec = JSON.parse(fs.readFileSync(String(args.spec), "utf8"));
+  const specText = fs.readFileSync(String(args.spec), "utf8");
+  const spec = JSON.parse(specText);
+  const specSha = (await import("node:crypto")).createHash("sha256").update(specText).digest("hex");
   for (const k of ["reference", "app"]) if (!spec.targets?.[k]) { console.error(`spec.targets.${k} missing`); process.exit(2); }
   const pw = await loadPlaywright();
   const browser = await launch(pw);
   const outRoot = path.resolve(String(args.out));
   fs.mkdirSync(outRoot, { recursive: true });
-  const manifest = { checkpoint: spec.checkpoint, viewport: spec.viewport || { width: 1280, height: 800 },
+  const manifest = { checkpoint: spec.checkpoint, spec_sha256: specSha, viewport: spec.viewport || { width: 1280, height: 800 },
                      captured_at: new Date().toISOString(), states: [] };
   for (const state of spec.states || []) {
     const dir = path.join(outRoot, state.name.replace(/[^a-z0-9_-]+/gi, "-"));

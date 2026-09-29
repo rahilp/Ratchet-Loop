@@ -92,6 +92,7 @@ Tell the user this plainly, once, at plan time: reviews done this way are less i
 5. **Reference for the UI gate.** If any checkpoint has `gates.ui: true`:
    - The user gave a reference (existing screen, design, screenshots)? Put its path or URL in `checkpoints.json → reference` and move on.
    - Otherwise, a prototype is needed. If `DESIGN.md` (config `design_md`) is missing, spawn `ratchet-design-system` first. Then spawn `ratchet-prototyper` with the checkpoints list. It writes `<run>/reference/prototype.html` with a `?state=` switcher covering every `ui_states` name.
+   - **Close DESIGN.md gaps now, before the plan is shown.** If the prototyper lists design decisions `DESIGN.md` doesn't cover (new tokens, a button style, an error colour, a focus ring), spawn `ratchet-design-system` to add them to `DESIGN.md` now, and name the additions in the plan message. `DESIGN.md` is locked when the user approves the plan, so an addition made during the build stops the run and asks the user again. Never plan to "add it during the build".
 6. **In parallel**: one `ratchet-test-planner` per checkpoint that has `gates.behavior: true`.
 7. **Start the live viewer, then submit the plan.**
    - `$RATCHET view --serve`. It starts in the background on a free port (or reuses the one already running) and prints `Ratchet viewer started: <URL>`. The page refreshes itself as gates pass, for the whole run.
@@ -112,7 +113,7 @@ Spawn `ratchet-test-writer` for `CPn` with `tests/CPn.json` and the checkpoint e
 - If red fails because the tests already pass, re-spawn the test-writer: "tests pass without the feature; make them actually exercise it." Use `--allow-green-first --reason` only for pure refactors that preserve behavior.
 
 **Step 2: Implement.**
-Spawn `ratchet-implementer` for exactly this checkpoint: checkpoint entry, test plan, `DESIGN.md` and the reference if it has UI, `.ratchet/standards.md`, learnings. Then `$RATCHET implemented CPn`.
+You never change project files yourself during the build: code, tests, styles and `DESIGN.md` are changed by the sub-agent that owns them (implementer, test writer, fixer, design system), even for a one-line fix, so every change goes through the gates. Where the host names the acting sub-agent (Claude Code does), the guard enforces this. Your own files under `.ratchet/` (checkpoints, capture specs, the reference after the user agrees) are fine. Spawn `ratchet-implementer` for exactly this checkpoint: checkpoint entry, test plan, `DESIGN.md` and the reference if it has UI, `.ratchet/standards.md`, learnings. Then `$RATCHET implemented CPn`.
 
 **Step 3: Gate 1, Behavior.**
 Spawn `ratchet-test-runner` (it runs `$RATCHET behavior CPn`), or run it yourself if you expect it to pass cleanly. On failure, spawn `ratchet-implementer` with the log path and the runner's diagnosis, then re-run. Tests may not be edited to make them pass. `ratchet.py` detects deleted case ids.

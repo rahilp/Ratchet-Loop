@@ -55,5 +55,6 @@ $RATCHET ui-record CPn --review $RUN/reviews/CPn/round-NN/combined.json
 - **PASS**: continue to the adversarial gate.
 
 ## What never happens here
-- The orchestrator never "interprets away" a difference, or edits a review file, or tells a reviewer the fix is done. The reviewers re-look every round.
+- The orchestrator never "interprets away" a difference, or edits a review file, or tells a reviewer the fix is done. The reviewers re-look every round. The guard enforces this where the host names the acting sub-agent (Claude Code): only the visual or behaviour reviewer writes its own file, and only `ui_review.py` writes `combined.json` and the capture manifest.
+- **What is compared is frozen after a FAIL.** Once a round finds differences, `ui-record` refuses a later round whose capture spec (`states/CPn.json`) or `--scope` differs, until the gate passes. Adding a step that only the app side runs, or a scope line saying a difference is "expected", is exactly what this stops. If the spec genuinely was wrong (for example the two sides were not in the same state), run `$RATCHET ask ui-respec CPn`, tell the user plainly what you want to change and why, and only after their clear yes run `$RATCHET ui-respec CPn`. An INVALID round (states didn't match) before any FAIL needs no question: fix the spec and capture again.
 - The prototype is never changed to match the app. If the human decides the app is better, that's a human decision: record it with `ratchet.py learn`, and update the prototype and DESIGN.md explicitly.

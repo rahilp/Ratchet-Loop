@@ -56,3 +56,4 @@ The loop ends only when **all** required reviewers approve the **same, current**
 - Findings are never waived by the orchestrator. The human or director decides at a block, and that decision usually becomes a line in `standards.md` or `learnings.md`.
 - If the same rule is violated in 2+ rounds or checkpoints, run `$RATCHET learn "<rule>" --source gate:adversarial` so implementers stop doing it.
 - Adversaries don't fix, and fixers don't review. Keeping the roles separate is what makes the loop adversarial.
+- Each reviewer writes its own review file. Never write, copy or edit one yourself, even to transcribe what a reviewer said. Where the host names the acting sub-agent on each tool call (Claude Code does; Codex, Gemini CLI and Copilot CLI currently don't, so there it is on you), the guard blocks anyone but a `ratchet-adversary` sub-agent from writing `adv-round-NN/*.json`. If a reviewer didn't write its file, launch it again.

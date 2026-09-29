@@ -47,10 +47,12 @@ def say(d, text, session="s-owner"):
                                             "transcript_path": str(tp)}))
 
 
-def guard(d, tool, tool_input, cwd=None):
+def guard(d, tool, tool_input, cwd=None, agent=None):
+    payload = {"cwd": str(cwd or d), "tool_name": tool, "tool_input": tool_input}
+    if agent:
+        payload.update(agent_type=agent, agent_id="a-" + agent)
     return subprocess.run([sys.executable, str(ENGINE), "hook", "guard", "--host", "claude"], cwd=d, text=True,
-                          capture_output=True, env=ENV,
-                          input=json.dumps({"cwd": str(cwd or d), "tool_name": tool, "tool_input": tool_input}))
+                          capture_output=True, env=ENV, input=json.dumps(payload))
 
 
 def stop(d, session="s-owner"):
@@ -522,6 +524,8 @@ def main():
     check("a clean round-2 review approves", rx(d, "adv-record", "CP1", "--reviews", p).returncode == 0)
     check("complete commits", rx(d, "complete", "CP1").returncode == 0)
     tracked = git(d, "ls-files", ".ratchet").stdout.split()
+    check("the shared .ratchet files (config, learnings) are committed with the checkpoint",
+          ".ratchet/config.json" in tracked and ".ratchet/learnings.md" in tracked, tracked)
     check("run state is not committed (only config/standards/learnings)",
           all(t.split("/", 1)[1] in (".gitignore", "config.json", "standards.md", "learnings.md") for t in tracked), tracked)
 
@@ -599,11 +603,110 @@ def main():
     c.write_text(json.dumps({"reviewers": ["visual", "behavior"], "differences": []}))
     check("a combined review without a fingerprint is refused", rx(d, "ui-record", "CP1", "--review", str(c)).returncode != 0)
     c.write_text(json.dumps({"checkpoint": "CP1", "fingerprint": fp, "reviewers": ["visual", "behavior"],
+                             "compared": {"spec_sha256": "s1", "scope": "all"},
                              "differences": [{"severity": "blocker", "location": "x", "description": "broken",
                                               "fixable_in_code": False}]}))
     check("a blocker can't exempt itself with fixable_in_code:false", rx(d, "ui-record", "CP1", "--review", str(c)).returncode == 2)
     c.write_text(json.dumps({"checkpoint": "CP1", "fingerprint": fp, "reviewers": ["visual"], "differences": []}))
     check("one reviewer is not enough", rx(d, "ui-record", "CP1", "--review", str(c)).returncode != 0)
+
+    print("What the UI check compares is frozen after a FAIL (smoke-run finding)")
+    def ui_round(d, compared, diffs):
+        c = Path(tempfile.mkdtemp()) / "combined.json"
+        c.write_text(json.dumps({"checkpoint": "CP1", "fingerprint": json.loads(rx(d, "fingerprint").stdout)["id"],
+                                 "reviewers": ["visual", "behavior"], "compared": compared, "differences": diffs}))
+        return rx(d, "ui-record", "CP1", "--review", str(c))
+    spin = [{"severity": "minor", "location": "bill input", "description": "spinner arrows show", "fixable_in_code": True}]
+    d = project("uifreeze", extra_cp={"gates": {"behavior": True, "ui": True, "adversarial": True},
+                                      "ui_scope": "all", "ui_states": [{"name": "empty"}]})
+    approve_plan(d)
+    write_tests(d)
+    rx(d, "tests-written", "CP1"); rx(d, "red", "CP1")
+    (d / "src/f.js").write_text("export const f = () => 1;\n")
+    rx(d, "implemented", "CP1"); rx(d, "behavior", "CP1")
+    base = {"spec_sha256": "s1", "scope": "the tip card"}
+    r = ui_round(d, {"reviewers": 1}, [])
+    check("a combined review that doesn't say what it compared is refused", r.returncode != 0 and "compared" in r.stderr, r.stderr)
+    check("round 1 finds a difference", ui_round(d, base, spin).returncode == 2)
+    r = ui_round(d, {"spec_sha256": "s1", "scope": "the tip card. Spinner arrows are expected."}, [])
+    check("a later round with a softened scope is refused", r.returncode != 0 and "ask ui-respec CP1" in r.stderr, r.stderr)
+    r = ui_round(d, {"spec_sha256": "s2", "scope": "the tip card"}, [])
+    check("a later round with a changed capture spec is refused", r.returncode != 0 and "states/CP1.json" in r.stderr, r.stderr)
+    check("the same spec and scope may run again", ui_round(d, base, spin).returncode == 2)
+    r = rx(d, "ui-respec", "CP1")
+    check("ui-respec needs the question first", r.returncode != 0 and "ask ui-respec" in r.stderr, r.stderr)
+    q = rx(d, "ask", "ui-respec", "CP1")
+    check("the ui-respec question is printed", "ASK THE USER" in q.stdout, q.stdout + q.stderr)
+    say(d, "yes")
+    r = rx(d, "ui-respec", "CP1")
+    check("after the user's yes, ui-respec unfreezes the check", r.returncode == 0, r.stderr)
+    new = {"spec_sha256": "s3", "scope": "the tip card, blurred"}
+    check("… and the next round with the new spec is recorded (and passes)", ui_round(d, new, []).returncode == 0)
+    run = d / ".ratchet/runs/f"
+    (run / "states").mkdir(exist_ok=True)
+    (run / "states/CP1.json").write_text('{"states": []}')
+    r = ui_round(d, new, [])
+    check("a review whose spec hash doesn't match states/CP1.json on disk is refused",
+          r.returncode != 0 and "changed after this capture" in r.stderr, r.stderr)
+
+    print("Review files belong to their reviewers (smoke-run finding)")
+    d = project("owners")
+    guard(d, "Bash", {"command": "ls"}, agent="ratchet-loop:ratchet-implementer")  # the CLI names sub-agents here
+    adv = ".ratchet/runs/f/reviews/CP1/adv-round-01/host-correctness.json"
+    r = guard(d, "Write", {"file_path": adv, "content": "{}"})
+    check("the orchestrator can't write an adversarial review", r.returncode == 2 and "reviewer's own output" in r.stderr, r.stderr)
+    r = guard(d, "Bash", {"command": f"cat > {adv} <<'E'\n{{}}\nE"})
+    check("… nor through a shell heredoc", r.returncode == 2, r.stderr)
+    r = guard(d, "Write", {"file_path": adv, "content": "{}"}, agent="ratchet-loop:ratchet-fixer")
+    check("… nor can the fixer", r.returncode == 2, r.stderr)
+    r = guard(d, "Write", {"file_path": adv, "content": "{}"}, agent="ratchet-loop:ratchet-adversary")
+    check("the adversary writes its own review", r.returncode == 0, r.stderr)
+    r = guard(d, "Write", {"file_path": adv, "content": "{}"}, agent="ratchet-adversary")
+    check("… also when installed without the plugin prefix", r.returncode == 0, r.stderr)
+    vis = ".ratchet/runs/f/reviews/CP1/round-02/visual.json"
+    check("the visual reviewer writes visual.json", guard(d, "Write", {"file_path": vis, "content": "{}"},
+                                                          agent="ratchet-visual-reviewer").returncode == 0)
+    check("the behaviour reviewer can't write visual.json", guard(d, "Write", {"file_path": vis, "content": "{}"},
+                                                                  agent="ratchet-behavior-reviewer").returncode == 2)
+    comb = ".ratchet/runs/f/reviews/CP1/round-02/combined.json"
+    check("nobody hand-writes combined.json", guard(d, "Write", {"file_path": comb, "content": "{}"}).returncode == 2)
+    check("ui_review.py combine may write it", guard(d, "Bash", {"command": f"python3 /x/ui_review.py combine --inputs a b --out {comb}"}).returncode == 0)
+    man = ".ratchet/runs/f/reviews/CP1/capture2/manifest.json"
+    check("nobody hand-edits a capture manifest", guard(d, "Edit", {"file_path": man, "old_string": "a", "new_string": "b"}).returncode == 2)
+    check("capture.mjs may write it", guard(d, "Bash", {"command": f"node /x/capture.mjs --spec s.json --out .ratchet/runs/f/reviews/CP1/capture2"}).returncode == 0)
+    check("reading a review is fine", guard(d, "Bash", {"command": f"cat {adv} | jq ."}).returncode == 0)
+    check("the fixer may write fixes.md", guard(d, "Write", {"file_path": ".ratchet/runs/f/reviews/CP1/adv-round-01/fixes.md", "content": "x"},
+                                                agent="ratchet-fixer").returncode == 0)
+    r = guard(d, "Bash", {"command": "python3 - <<'E'\nopen('.ratchet/runs/f/state.json','w').write('{}')\nE"})
+    check("a Python heredoc that writes the run state is blocked", r.returncode == 2 and "run state" in r.stderr, r.stderr)
+    r = guard(d, "Bash", {"command": "python3 - <<'E'\nimport json\np='.ratchet/runs/f/states/CP1.json'\nopen(p,'w').write('{}')\nE"})
+    check("a Python heredoc that edits a capture spec is allowed", r.returncode == 0, r.stderr)
+    check("a heredoc of plain data that mentions state.json is allowed",
+          guard(d, "Bash", {"command": "cat > notes.md <<'E'\nsee .ratchet/runs/f/state.json\nE"}).returncode == 0)
+    print("During the build the orchestrator doesn't edit project files itself (smoke-run finding)")
+    approve_plan(d)
+    for label, tool, ti in [
+            ("Write tool on source", "Write", {"file_path": "src/f.js", "content": "x"}),
+            ("Edit tool on DESIGN.md", "Edit", {"file_path": "DESIGN.md", "old_string": "a", "new_string": "b"}),
+            ("python heredoc rewriting CSS", "Bash", {"command": "python3 - <<'E'\np='src/styles.css';s=open(p).read()\nopen(p,'w').write(s)\nE"}),
+            ("shell redirect into source", "Bash", {"command": "echo 'x' > src/f.js"}),
+            ("sed -i on source", "Bash", {"command": "sed -i 's/a/b/' src/f.js"})]:
+        r = guard(d, tool, ti)
+        check(f"orchestrator blocked: {label}", r.returncode == 2 and "sub-agents" in r.stderr, r.stderr)
+        r = guard(d, tool, ti, agent="ratchet-loop:ratchet-implementer")
+        check(f"implementer allowed: {label}", r.returncode == 0, r.stderr)
+    for label, tool, ti in [
+            ("capture spec via python heredoc", "Bash", {"command": "python3 - <<'E'\np='.ratchet/runs/f/states/CP1.json'\nopen(p,'w').write('{}')\nE"}),
+            ("output to /tmp", "Bash", {"command": "node --test tests/ > /tmp/out.log 2>&1"}),
+            ("checkpoints.json", "Write", {"file_path": ".ratchet/runs/f/checkpoints.json", "content": "{}"}),
+            ("reading source", "Bash", {"command": "cat src/f.js | head"})]:
+        check(f"orchestrator allowed: {label}", guard(d, tool, ti).returncode == 0)
+    rx(d, "pause", "--reason", "user asked for an unrelated fix")
+    check("a paused run lets the orchestrator edit files for the user",
+          guard(d, "Write", {"file_path": "README.md", "content": "x"}).returncode == 0)
+    d2 = project("owners-unmarked")
+    check("where the CLI never names sub-agents, review writes are not blocked (nothing to go on)",
+          guard(d2, "Write", {"file_path": adv, "content": "{}"}).returncode == 0)
 
     print("Runs are never replaced silently; cancel needs the user")
     d = project("cancel")
