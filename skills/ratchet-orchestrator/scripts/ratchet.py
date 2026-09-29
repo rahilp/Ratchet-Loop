@@ -254,6 +254,10 @@ def _is_git(root: Path) -> bool:
     return r.returncode == 0 and r.stdout.strip() == "true"
 
 
+# Interpreter caches and OS litter: never part of the reviewed code, never committed by Ratchet.
+JUNK_PATHSPECS = [":(exclude,glob)**/__pycache__/**", ":(exclude,glob)**/*.pyc", ":(exclude,glob)**/.DS_Store"]
+
+
 def fingerprint(root: Path) -> dict:
     """Hash of the working tree (tracked + untracked, respecting .gitignore, minus .ratchet)."""
     if _is_git(root):
@@ -262,7 +266,7 @@ def fingerprint(root: Path) -> dict:
             # seed from HEAD if it exists so the add is fast
             subprocess.run(["git", "read-tree", "HEAD"], cwd=root, env=env,
                            capture_output=True)
-            r = subprocess.run(["git", "add", "-A", "--", ".", f":(exclude){RATCHET_DIR}"],
+            r = subprocess.run(["git", "add", "-A", "--", ".", f":(exclude){RATCHET_DIR}", *JUNK_PATHSPECS],
                                cwd=root, env=env, capture_output=True, text=True)
             if r.returncode != 0:
                 die(f"git add for fingerprint failed: {r.stderr.strip()}")
@@ -294,14 +298,61 @@ def fingerprint(root: Path) -> dict:
     return {"kind": "manifest", "id": fid}
 
 
+def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str):
+    """Commit exactly what this checkpoint changed, byte for byte as reviewed: HEAD plus the difference between the
+    checkpoint's starting tree and the reviewed tree. Unrelated work already in the tree, and anything the user has
+    staged, stays out. Built with a private index, so renames, deletions, odd file names and fingerprint_include
+    files all work. Returns the short commit id, or None when the checkpoint changed nothing."""
+    if not base_tree:
+        die("This checkpoint has no recorded starting tree, so Ratchet can't tell which changes are its own. "
+            "Commit it by hand, or set commit_per_checkpoint to false.")
+    paths = changed_files(root, {"kind": "git-tree", "id": base_tree}, fp)
+    if not paths:
+        return None
+    def git(*a, env=None, inp=None):
+        r = subprocess.run(["git", *a], cwd=root, capture_output=True, input=inp, env=env)
+        if r.returncode != 0:
+            die(f"git {a[0]} failed while committing the checkpoint: "
+                f"{r.stderr.decode('utf-8', 'replace').strip()[:400]}")
+        return r.stdout.decode("utf-8", "surrogateescape")
+    head = subprocess.run(["git", "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=root,
+                          capture_output=True, text=True).stdout.strip()
+    with tempfile.TemporaryDirectory() as td:
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(td) / "index"), GIT_LITERAL_PATHSPECS="1")
+        git("read-tree", *([head] if head else ["--empty"]), env=env)
+        listing = git("ls-tree", "-r", "-z", "--full-tree", fp["id"], env=env)
+        entries = {}
+        for rec in listing.split("\0"):
+            if rec:
+                meta, _, path = rec.partition("\t")
+                entries[path] = meta.split()  # mode, type, object id
+        info = []
+        for p in paths:
+            if p in entries:
+                mode, _, oid = entries[p]
+                info.append(f"{mode} {oid}\t{p}")
+            else:
+                info.append(f"0 {'0' * 40}\t{p}")  # mode 0 removes the path
+        git("update-index", "-z", "--index-info", env=env,
+            inp="\0".join(info).encode("utf-8", "surrogateescape") + b"\0")
+        tree = git("write-tree", env=env).strip()
+        new = git("commit-tree", tree, *(["-p", head] if head else []), "-m", msg).strip()
+    git("update-ref", "HEAD", new, *([head] if head else []))
+    # the real index now lags behind HEAD for these paths: bring just those entries up to date
+    subprocess.run(["git", "reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], cwd=root,
+                   capture_output=True, input="\0".join(paths).encode("utf-8", "surrogateescape"),
+                   env=dict(os.environ, GIT_LITERAL_PATHSPECS="1"))
+    return new[:7]
+
+
 def changed_files(root: Path, fp_a: dict, fp_b: dict) -> list[str]:
     if fp_a["id"] == fp_b["id"]:
         return []
     if fp_a["kind"] == fp_b["kind"] == "git-tree":
-        r = subprocess.run(["git", "diff-tree", "-r", "--name-only", fp_a["id"], fp_b["id"]],
-                           cwd=root, capture_output=True, text=True)
+        r = subprocess.run(["git", "diff-tree", "-r", "-z", "--no-renames", "--name-only", fp_a["id"], fp_b["id"]],
+                           cwd=root, capture_output=True)
         if r.returncode == 0:
-            return [l for l in r.stdout.splitlines() if l.strip()]
+            return [x for x in r.stdout.decode("utf-8", "surrogateescape").split("\0") if x]
     mdir = root / RATCHET_DIR / "manifests"
     a = read_json(mdir / f"{fp_a['id']}.json", {}) or {}
     b = read_json(mdir / f"{fp_b['id']}.json", {}) or {}
@@ -394,32 +445,50 @@ def register_active(root: Path, slug: str | None):
         pass
 
 
+# A bare "ok", "sure", "great" or thumbs-up is NOT a yes (it is often just an acknowledgement); those words are
+# allowed only as fillers around a real approval ("ok, go ahead").
 APPROVAL_PHRASES = [
     "approved", "approve", "approval granted", "lgtm", "looks good to me", "looks good", "looks great", "sounds good",
     "go ahead", "go for it", "good to go", "ship it", "build it", "do it", "let's go", "lets go", "proceed", "continue",
-    "carry on", "confirmed", "confirm", "yes", "yep", "yeah", "yup", "yes please", "ok", "okay", "sure", "perfect",
-    "great", "y", "go", "👍", "✅"]
+    "carry on", "confirmed", "confirm", "yes", "yep", "yeah", "yup", "yes please", "works for me", "that works",
+    "that's fine", "thats fine", "fine by me", "happy with it", "happy with that", "moveon"]
 BENIGN_PHRASES = [
     "no changes needed", "no changes", "no further changes", "no comments", "nothing to change", "nothing else",
     "i don't have any comments", "i don't have comments", "i dont have comments", "no notes", "all good",
-    "thanks", "thank you", "thx", "please", "pls", "awesome", "nice", "cool", "for now", "from me", "as is"]
+    "thanks", "thank you", "thx", "please", "pls", "awesome", "nice", "cool", "for now", "from me", "as is",
+    "without changes", "without any changes"]
 HEDGE_WORDS = {"no", "not", "don't", "dont", "wait", "hold", "stop", "but", "however", "except", "instead", "rather",
                "maybe", "probably", "guess", "think", "hmm", "unsure", "also", "add", "change", "remove", "drop",
                "after", "before", "first", "later", "read", "sec", "second", "minute", "moment", "lunch", "brb",
                "what", "why", "how", "who", "whom", "when", "which", "where", "if", "unless", "until",
                "otherwise", "kill", "fix", "tweak", "make", "move", "rename", "replace", "update", "adjust", "swap",
-               "remove", "delete", "less", "more", "bigger", "smaller"}
+               "delete", "less", "more", "bigger", "smaller", "cancel", "abandon", "abort", "scrap", "pause",
+               "restart", "redo", "revert", "undo", "reset", "over", "start", "nah", "nope", "never", "disagree",
+               "wrong", "bad", "hate", "dislike", "reject", "rejected", "decline", "declined"}
+# Words that may surround an approval without changing its meaning. Anything else left over makes the reply unclear.
+APPROVAL_FILLERS = {"it", "the", "plan", "this", "that", "all", "then", "go", "on", "ahead", "and", "a", "i", "me", "we",
+                    "you", "can", "now", "ok", "okay", "sure", "great", "perfect", "right", "alright", "fine", "is",
+                    "please", "so", "just", "yes", "to", "with", "let's", "lets", "that's",
+                    "thats", "👍", "✅", "good", "fully", "totally", "definitely", "absolutely"}
 
 
 def message_intent(text: str) -> str:
-    """approve | unclear. A reply only counts as an approval if it is essentially nothing BUT an approval:
-    no question, no hedge, no extra request (\"yes, and also add X\" is a change request, not a yes)."""
+    """approve | unclear. A reply only counts as an approval if it is nothing BUT an approval: it must contain a real
+    approval phrase ("yes", "go ahead", "approved"...), and every other word must be a filler. No question, no hedge,
+    no extra request ("yes, and also add X" or "ok cancel it" is not a yes). A bare "ok" / "sure" / thumbs-up is not
+    a yes either."""
     t = " " + (text or "").strip().lower().replace("’", "'") + " "
     if not t.strip() or "?" in t:
         return "unclear"
     for ph in sorted(BENIGN_PHRASES, key=len, reverse=True):
         t = t.replace(" " + ph + " ", " ").replace(" " + ph + ",", " ").replace(" " + ph + ".", " ").replace(" " + ph + "!", " ")
-    words = re.findall(r"[a-z0-9']+|👍|✅", t)
+    t = re.sub(r"\b(let's |lets )?move on\b", " moveon ", t)  # "move" alone asks for a change; "move on" is a go-ahead
+    # Only plain letters, digits and ordinary punctuation are understood. Anything else (another script, another
+    # emoji, full-width letters, a full-width question mark) could carry a "no" we can't read, so it is unclear.
+    residue = re.sub("[a-z0-9'\\s.,!;:()\"\\-\u2014\u2013\u2026\ufe0f\U0001F3FB-\U0001F3FF\U0001F44D\u2705]", "", t)
+    if residue:
+        return "unclear"
+    words = re.findall("[a-z0-9']+|\U0001F44D|\u2705", t)
     if any(w in HEDGE_WORDS for w in words):
         return "unclear"
     rest = " " + " ".join(words) + " "
@@ -428,9 +497,8 @@ def message_intent(text: str) -> str:
         if " " + ph + " " in rest:
             found = True
             rest = rest.replace(" " + ph + " ", " ")
-    leftover = [w for w in rest.split() if w not in ("it", "the", "plan", "this", "that", "all", "then", "go", "on",
-                                                    "ahead", "and", "a", "i", "me", "we", "you", "can", "now")]
-    return "approve" if found and len(leftover) <= 3 else "unclear"
+    leftover = [w for w in rest.split() if w not in APPROVAL_FILLERS]
+    return "approve" if found and not leftover else "unclear"
 
 
 # The ONLY replies that waive hooks (compared after normalising: lowercase, punctuation and extra spaces dropped,
@@ -464,7 +532,7 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "max_behavior_attempts", "ui_block_on_nits", "ui_globs", "regression_command", "standards",
              "fingerprint_include", "approver", "ui_single_reviewer_ok", "min_review_timeout_sec", "test_timeout_sec",
              "host_provider", "ui_reviewers", "design_md", "max_stop_blocks", "unavailable_ttl_hours",
-             "verify_transcripts"]
+             "verify_transcripts", "min_review_seconds", "commit_per_checkpoint"]
 
 
 def _file_sha(p: Path) -> str | None:
@@ -810,6 +878,25 @@ def cmd_status_text(ctx: Ctx):
         print(f"Live view: {url}")
 
 
+PLAIN_PROVIDER = {"host": "this agent", "claude": "Claude", "codex": "Codex", "gemini": "Gemini", "copilot": "Copilot"}
+PLAIN_LENS = {"both": "code standards and bugs", "standards": "code standards", "correctness": "bugs and security"}
+
+
+def _plain_reviewer(rid) -> str:
+    prov, _, lens = str(rid).partition("-")
+    return f"{PLAIN_PROVIDER.get(prov, prov)} ({PLAIN_LENS.get(lens, lens or 'review')})"
+
+
+def _plain_slot(slot) -> str:
+    """A review slot in plain words: 'Codex (bugs and security), or the next available provider'."""
+    if isinstance(slot, list):
+        if not slot:
+            return ""
+        more = ", or the next available provider" if len(slot) > 1 else ""
+        return _plain_reviewer(slot[0]) + more + " (this agent if none is available)"
+    return _plain_reviewer(slot)
+
+
 def cmd_plan_summary(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -821,7 +908,7 @@ def cmd_plan_summary(args):
     for i, cp in enumerate(plan["checkpoints"], 1):
         risk = cp.get("risk", "normal")
         slots = cp.get("reviewers") or depth.get(risk) or depth.get("normal") or []
-        who = ", ".join(str(s[0] if isinstance(s, list) else s) for s in slots if s)
+        who = "; ".join(_plain_slot(s) for s in slots if s)
         print(f"\n{i}. {cp['title']}")
         print(f"   Done when: {(cp.get('done_when') or [''])[0]}")
         print(f"   UI review: {'yes' if (cp.get('gates') or {}).get('ui') else 'no'}")
@@ -1145,8 +1232,56 @@ def approval_mode(ctx) -> str:
     return ctx.config().get("approver", "human")
 
 
+def _content_text(c) -> str:
+    """Text of a message's content: a string, or a list of text parts (Claude, Codex, Gemini shapes)."""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):  # only text parts: tool results, images and the like are not something the user typed
+        return "\n".join(_content_text(x) for x in c
+                         if isinstance(x, str) or (isinstance(x, dict) and x.get("type", "text") in ("text", "input_text")))
+    if isinstance(c, dict):
+        for k in ("text", "input_text", "content", "message"):
+            if isinstance(c.get(k), (str, list)):
+                return _content_text(c[k])
+    return ""
+
+
+def _user_turns(obj):
+    """Yield (text, timestamp) for every user turn in one parsed transcript record. Only records that clearly say
+    they are the user's count; anything without a user role is ignored."""
+    if isinstance(obj, list):
+        for x in obj:
+            yield from _user_turns(x)
+        return
+    if not isinstance(obj, dict):
+        return
+    for key in ("messages", "history", "items"):  # whole-file transcripts (e.g. Gemini's JSON session file)
+        if isinstance(obj.get(key), list):
+            yield from _user_turns(obj[key])
+    msg = obj.get("message")
+    ts = obj.get("timestamp") or obj.get("time") or (msg.get("timestamp") if isinstance(msg, dict) else None)
+    if isinstance(msg, dict) and msg.get("role") == "user" and obj.get("type") in (None, "user"):  # Claude Code
+        yield _content_text(msg.get("content")), ts
+        return
+    payload = obj.get("payload")
+    if isinstance(payload, dict):  # Codex rollout
+        if payload.get("type") == "user_message":
+            yield _content_text(payload.get("message")), ts
+        elif payload.get("type") == "message" and payload.get("role") == "user":
+            yield _content_text(payload.get("content")), ts
+        return
+    if obj.get("role") in ("user", "human") or obj.get("type") in ("user", "human"):
+        if "content" in obj or "text" in obj or isinstance(msg, str):
+            yield _content_text(obj.get("content", obj.get("text", msg))), ts
+
+
+def _norm_text(t: str) -> str:
+    return " ".join((t or "").split())
+
+
 def _transcript_ok(entry: dict, since: str | None) -> tuple[bool, str]:
-    """Is this logged message a real user turn in the agent CLI's own transcript, typed after `since`?"""
+    """Is this logged message a real user turn in the agent CLI's own transcript, typed after `since`?
+    The transcript record must parse, say it is the user's, and hold the WHOLE message (whitespace aside)."""
     tp = entry.get("transcript_path")
     if entry.get("host") == "copilot" and not tp:
         return True, "copilot hooks carry no transcript"
@@ -1155,29 +1290,34 @@ def _transcript_ok(entry: dict, since: str | None) -> tuple[bool, str]:
     try:
         with open(tp, "rb") as f:
             f.seek(0, 2)
-            f.seek(max(0, f.tell() - 8_000_000))
+            size = f.tell()
+            f.seek(max(0, size - 8_000_000))
             text = f.read().decode("utf-8", "replace")
     except OSError as e:
         return False, f"transcript unreadable ({e})"
-    needle = (entry.get("prompt") or "").strip()[:160]
-    if not needle:
+    want = _norm_text(entry.get("prompt") or "")
+    if not want:
         return False, "empty message"
-    esc = json.dumps(needle)[1:-1]
-    for line in text.splitlines():
-        if needle not in line and esc not in line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
+    records = []
+    try:
+        records.append(json.loads(text))  # a whole-file JSON transcript
+    except json.JSONDecodeError:
+        for line in text.splitlines():
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue  # a line that is not a record proves nothing
+    seen = False
+    for rec in records:
+        for said, ts in _user_turns(rec):
+            if _norm_text(said) != want:
+                continue
+            seen = True
+            if ts and since and _iso(ts) < _iso(since) - 90:
+                continue  # an old message replayed as a new one
             return True, "found in transcript"
-        role = obj.get("type") or obj.get("role") or (obj.get("message") or {}).get("role")
-        if role not in (None, "user", "human"):
-            continue
-        ts = obj.get("timestamp") or (obj.get("message") or {}).get("timestamp")
-        if ts and since and _iso(ts) < _iso(since) - 90:
-            continue  # an old message replayed as a new one
-        return True, "found in transcript"
-    return False, "not found as a recent user turn in the transcript"
+    return False, ("only an older copy is in the transcript" if seen
+                   else "not found as a user turn in the transcript")
 
 
 def _iso(ts) -> float:
@@ -1206,12 +1346,20 @@ def _require_approval(ctx, st, action, token=None):
             "Chat messages do not count as approvals here.")
     if os.environ.get("RATCHET_HUMAN_OVERRIDE") == "1":
         return {"by": "human", "detail": "(RATCHET_HUMAN_OVERRIDE)"}
-    msgs = _human_since(ctx, st.get("awaiting_since"))
     p = st.get("pending") or {}
+    if action in ("approve-plan", "human-approve") and p.get("action") not in (None, "hooks-waive"):
+        die(f"A different question is waiting for the user's answer: shall I {ASKABLE.get(p.get('action'), p.get('action'))}"
+            f"{' -> ' + p['mode'] if p.get('mode') else ''}? Their reply answers THAT question, not this approval. "
+            f"If they said yes to it, run `ratchet.py {PENDING_COMMAND.get(p.get('action'), p.get('action'))}"
+            f"{' ' + p['mode'] if p.get('mode') else ''}`. If they said no or moved on, run `ratchet.py ask withdraw`, "
+            "then ask them plainly about this approval and wait for their reply.")
+    msgs = _human_since(ctx, st.get("awaiting_since"))
     if p.get("action") == "hooks-waive" and action != "hooks-waive":
         # the first reply after the hooks question answers THAT question; it is not an approval of anything else
+        # the first reply after the hooks question is its answer, whatever it says ("Any other reply means no"),
+        # so it can never double as an approval of the plan or a checkpoint
         after = [m for m in msgs if m.get("at", "") > p.get("asked_at", "")]
-        if after and hooks_waive_intent(after[0].get("prompt", "")) == "approve":  # only a real waiver phrase is eaten
+        if after:
             msgs = [m for m in msgs if m is not after[0]]
     if action == "hooks-waive":
         msgs = msgs[:1]  # only the FIRST reply after the hooks question answers it
@@ -1236,8 +1384,10 @@ def _require_approval(ctx, st, action, token=None):
                 die(f"Couldn't confirm that reply came from the user ({why}). Ask the user to reply again in this "
                     "chat; if it keeps failing, `ratchet.py doctor` shows whether the prompt hook is installed.")
         return {"by": "human", "detail": last[:200], "session": entry.get("session")}
-    die("No human message recorded since the loop paused. Approval must come from the user — "
-        "stop and wait for them. (Requires the UserPromptSubmit hook; see README.)")
+    die("No human message recorded since Ratchet started waiting for the user. Ask them, end your turn and wait "
+        "for their reply; approval must come from them. If they have already replied, Ratchet's prompt hook is not "
+        "running in this agent CLI, so their reply could not be recorded: run `ratchet.py doctor --json` and follow "
+        "the hooks steps in the orchestrator skill.")
 
 
 def _require_human(ctx, st, action="human-approve", token=None):
@@ -1726,16 +1876,9 @@ def cmd_complete(args):
                 "what wrote them (generated files? snapshots?) and either add them to .gitignore or re-run the gates.", 2)
     commit = None
     if cfg.get("commit_per_checkpoint") and _is_git(ctx.root):
-        subprocess.run(["git", "add", "-A"], cwd=ctx.root, capture_output=True)
         msg = f"ratchet({st['slug']}): {args.cp} {cp['title']}\n\n{cp['summary']}\n\nGates: " + ", ".join(
             f"{n}={cps['gates'][n]['status']}" for n in ["behavior", "ui", "adversarial"])
-        r = subprocess.run(["git", "commit", "-m", msg],
-                           cwd=ctx.root, capture_output=True, text=True)
-        if r.returncode == 0:
-            commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ctx.root,
-                                    capture_output=True, text=True).stdout.strip()
-        elif "nothing to commit" not in (r.stdout + r.stderr):
-            die(f"git commit failed: {(r.stderr or r.stdout).strip()[:400]}")
+        commit = _commit_reviewed(ctx.root, cps.get("base_tree"), fp, msg)
     cps.update(status="done", completed_at=now(), commit=commit)
     ctx.log(st, "checkpoint_complete", cp=args.cp, commit=commit)
     order = [c["id"] for c in ctx.plan()["checkpoints"]]
@@ -1947,12 +2090,26 @@ ASKABLE = {"approve-changes": "accept the changes listed above as the new baseli
            "set-review": "change how often you review",
            "claim": "continue this Ratchet run in THIS chat",
            "hooks-waive": "build without the Ratchet hooks (the checks then only advise; nothing enforces them)"}
+# the command that carries out a "yes" to each question
+PENDING_COMMAND = {"approve-changes": "approve-changes", "cancel": "cancel", "set-review": "set-review",
+                   "claim": "resume --claim", "hooks-waive": "hooks-waive"}
+REVIEW_MODE_WORDS = {"end": "only at the end", "each": "after every step", "none": "never (fully autonomous)"}
 
 
 def cmd_ask(args):
     """Record the question the agent is about to ask the user. Only a clear yes typed AFTER this counts."""
     ctx = Ctx(find_root())
     st = ctx.state()
+    if args.action == "withdraw":
+        p = st.get("pending")
+        if not p:
+            ok("No question is waiting.")
+            return
+        _clear_pending(st)
+        ctx.log(st, "question_withdrawn", action=p.get("action"))
+        ctx.save_state(st)
+        ok(f"Withdrew the waiting question ({p.get('action')}). Nothing was changed.")
+        return
     if args.action == "set-review" and not args.mode:
         die("ask set-review needs the mode: end | each | none")
     detail = ""
@@ -1979,7 +2136,10 @@ def cmd_ask(args):
         print(f"ASK THE USER: Shall I build without the Ratchet hooks? The checks would then only advise; nothing "
               f"enforces them. To agree, reply exactly \"{HOOKS_WAIVE_REPLY}\". Any other reply means no.")
         return
-    q = f"{detail} Shall I {ASKABLE[args.action]}{' → ' + args.mode if args.mode else ''}? Reply yes to confirm."
+    what = ASKABLE[args.action]
+    if args.action == "set-review":
+        what = f"change how often you review to: {REVIEW_MODE_WORDS[args.mode]}"
+    q = f"{detail} Shall I {what}? Reply yes to confirm."
     print(f"ASK THE USER: {q.strip()}")
 
 
@@ -2337,6 +2497,14 @@ def cmd_config(args):
                 cur = cur.setdefault(p, {})
             cur[parts[-1]] = val
         write_json(ctx.config_path, user)
+        cfg = ctx.config()
+        for kv in args.set:
+            k = kv.partition("=")[0]
+            cur = cfg
+            for part in k.split("."):
+                cur = cur.get(part) if isinstance(cur, dict) else None
+            ok(f"Set {k} = {json.dumps(cur)}")
+        return
     print(json.dumps(ctx.config(), indent=2))
 
 
@@ -2871,6 +3039,16 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                "started in another chat. If the user wants to continue it here, run "
                                f"`{eng} ask claim`, ask them, and after a clear yes run `{eng} resume --claim`; "
                                "otherwise leave it alone and do what they asked.")
+            p = st.get("pending") or {}
+            if p.get("action") and p["action"] != "hooks-waive":
+                cmd = PENDING_COMMAND.get(p["action"], p["action"]) + (" " + p["mode"] if p.get("mode") else "")
+                what = (f"change how often they review to: {REVIEW_MODE_WORDS.get(p.get('mode'), p.get('mode'))}"
+                        if p["action"] == "set-review" else ASKABLE.get(p["action"], p["action"]))
+                verdict = ("It reads as a clear yes" if message_intent(n["prompt"]) == "approve"
+                           else "It is NOT a clear yes")
+                return False, (f"[ratchet] This reply answers your waiting question: shall I {what}? {verdict}. "
+                               f"Only after a clear yes run `{eng} {cmd}`; otherwise run `{eng} ask withdraw` and do "
+                               "what they asked. This reply does NOT approve the plan, a checkpoint or anything else.")
             if st["phase"] == "building" and re.match(r"^\s*(stop|pause|hold on|wait|halt|cancel)\b", n["prompt"], re.I):
                 return False, (f"[ratchet] The user asked you to stop. Run `{eng} pause --reason \"user asked\"`, "
                                "confirm in one line, and ask whether they want to resume later or cancel the run.")
@@ -3270,8 +3448,19 @@ def hooks_status(root: Path, cfg=None) -> dict:
         t = _parse_iso(e.get("at"))
         if t and cutoff < t <= latest:
             fresh = True
+
+    def _fresh(ev):
+        e = hb.get(ev)
+        if not (isinstance(e, dict) and (host == "unknown" or e.get("host") == host)):
+            return False
+        t = _parse_iso(e.get("at"))
+        return bool(t and cutoff < t <= latest)
+    # enforcing: the guard or stop hook fired recently (these are what enforce the gates);
+    # prompt_hook: the prompt hook fired recently (it only records the user's replies, it enforces nothing)
+    enforcing = _fresh("guard") or _fresh("stop")
     return {"host": host, "installed": installed, "heartbeat_seen": bool(entries), "fresh": fresh,
-            "missing": not installed and not fresh}
+            "enforcing": enforcing, "prompt_hook": _fresh("prompt"),
+            "missing": not installed and not enforcing}
 
 
 def hooks_warning(ctx, hs=None) -> str | None:
@@ -3279,10 +3468,7 @@ def hooks_warning(ctx, hs=None) -> str | None:
     hs = hs or hooks_status(ctx.root, ctx.config())
     if hs.get("waived"):
         return None  # the user already chose to build without hooks; do not re-offer
-    if hs["installed"]:
-        if hs["fresh"]:
-            return None
-    elif _enforcement_active(ctx.root, ctx.config()):
+    if hs.get("enforcing"):
         return None  # only guard/stop heartbeats count: the prompt hook alone enforces nothing
     if hs["installed"]:
         return ("Ratchet hooks are installed for this agent CLI but none has fired recently. Tell the user the "
@@ -3340,7 +3526,7 @@ def main(argv=None):
     a.add_argument("--claim", action="store_true"); a.set_defaults(fn=cmd_resume)
     a = sp.add_parser("ask", help="record the question you're about to ask the user (needed before cancel, "
                                   "set-review, approve-changes, hooks-waive, resume --claim)")
-    a.add_argument("action", choices=list(ASKABLE)); a.add_argument("mode", nargs="?", choices=["end", "each", "none"])
+    a.add_argument("action", choices=list(ASKABLE) + ["withdraw"]); a.add_argument("mode", nargs="?", choices=["end", "each", "none"])
     a.set_defaults(fn=cmd_ask)
     sp.add_parser("accept-state", help=argparse.SUPPRESS).set_defaults(fn=cmd_accept_state)
     a = sp.add_parser("hooks-waive", help="record the user's choice to build without hooks (after `ask hooks-waive`)")

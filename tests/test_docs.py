@@ -916,7 +916,7 @@ def cp5_docs_lint():
           and not p_gated_resume(controls.replace("After a clear yes, run", "Run")))
     check("[CP5-T24] the two-step flow is defined: ask first, act only after a clear yes, a hedge or bare ok is not a yes", p_two_step(controls))
     check("[CP5-T24] teeth: removing the hedge sentence or the yes condition is red",
-          p_two_step(controls) and not p_two_step(controls.replace('A hedge or a bare "ok" is not a yes.', ""))
+          p_two_step(controls) and not p_two_step(controls.replace('A hedge, a bare "ok" or thumbs-up, or a yes with anything else attached ("ok cancel it", "yes, but…") is not a yes.', ""))
           and not p_two_step(controls.replace("only after their clear yes", "at once")))
     check("[CP5-T25] approve-changes rule: `ask approve-changes`, then a clear yes, then `$RATCHET approve-changes`", p_approve_changes(orch))
     check("[CP5-T25] teeth: deleting the rule, or running it without asking, is red",

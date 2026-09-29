@@ -15,7 +15,7 @@ from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
 PASS = FAIL = 0
-KEYS = {"host", "installed", "heartbeat_seen", "fresh", "missing"}
+KEYS = {"host", "installed", "heartbeat_seen", "fresh", "enforcing", "prompt_hook", "missing"}
 VENDOR = {"claude": "anthropic", "codex": "openai", "gemini": "google", "copilot": "github"}
 SCRUB = ("RATCHET_ROLE", "RATCHET_HUMAN_OVERRIDE", "RATCHET_ROOT", "RATCHET_HOST_PROVIDER", "CLAUDECODE",
          "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED",
@@ -73,8 +73,20 @@ def prompt_payload(host, d):
     }[host]
 
 
-def fire(d, env, host):
-    return rx(d, env, "hook", "prompt", "--host", host, stdin=json.dumps(prompt_payload(host, d)))
+def stop_payload(host, d):
+    p = dict(prompt_payload(host, d))
+    p.pop("prompt", None)
+    if "hook_event_name" in p:
+        p["hook_event_name"] = {"claude": "Stop", "codex": "Stop", "gemini": "AfterAgent"}[host]
+    return p
+
+
+def fire(d, env, host, prompt_only=False):
+    """A normal turn: the prompt hook fires, then (unless prompt_only) the stop hook, which enforces."""
+    r = rx(d, env, "hook", "prompt", "--host", host, stdin=json.dumps(prompt_payload(host, d)))
+    if not prompt_only:
+        r = rx(d, env, "hook", "stop", "--host", host, stdin=json.dumps(stop_payload(host, d)))
+    return r
 
 
 def hb_path(d):
@@ -153,7 +165,8 @@ def main():
     st = js(rx(d, env, "status", "--json"))
     h = st.get("hooks") if isinstance(st, dict) else None
     check("[CP1-T01] no hooks: status --json hooks == missing object",
-          h == {"host": "claude", "installed": False, "heartbeat_seen": False, "fresh": False, "missing": True}
+          h == {"host": "claude", "installed": False, "heartbeat_seen": False, "fresh": False, "enforcing": False,
+                "prompt_hook": False, "missing": True}
           and all(type(h[k]) is bool for k in KEYS - {"host"}), h)
 
     nx = js(rx(d, env, "next"))
@@ -167,20 +180,23 @@ def main():
     j = js(r)
     check("[CP1-T03] doctor --json is pure JSON for codex, missing",
           isinstance(j, dict) and j.get("hooks") == {"host": "codex", "installed": False, "heartbeat_seen": False,
-                                                     "fresh": False, "missing": True}, r.stdout[:200] + r.stderr[:100])
+                                                     "fresh": False, "enforcing": False, "prompt_hook": False,
+                                                     "missing": True}, r.stdout[:200] + r.stderr[:100])
 
     env = make_env("claude")
     d = project(env)
     install(d, env, "claude")
     hd, hs = hooks_of(rx(d, env, "doctor", "--json")), hooks_of(rx(d, env, "status", "--json"))
-    want = {"host": "claude", "installed": True, "heartbeat_seen": False, "fresh": False, "missing": False}
+    want = {"host": "claude", "installed": True, "heartbeat_seen": False, "fresh": False, "enforcing": False,
+            "prompt_hook": False, "missing": False}
     check("[CP1-T04] installed, never fired: not fresh, not missing (doctor and status)", hd == want and hs == want,
           (hd, hs))
 
     fire(d, env, "claude")
     hs = hooks_of(rx(d, env, "status", "--json"))
     check("[CP1-T05] installed and fired just now: fresh",
-          hs == {"host": "claude", "installed": True, "heartbeat_seen": True, "fresh": True, "missing": False}, hs)
+          hs == {"host": "claude", "installed": True, "heartbeat_seen": True, "fresh": True, "enforcing": True,
+                 "prompt_hook": True, "missing": False}, hs)
 
     hb = json.loads(hb_path(d).read_text())
     for e in hb.values():
@@ -188,7 +204,8 @@ def main():
         e["host"] = "claude"
     hb_path(d).write_text(json.dumps(hb))
     hd, hs = hooks_of(rx(d, env, "doctor", "--json")), hooks_of(rx(d, env, "status", "--json"))
-    want = {"host": "claude", "installed": True, "heartbeat_seen": True, "fresh": False, "missing": False}
+    want = {"host": "claude", "installed": True, "heartbeat_seen": True, "fresh": False, "enforcing": False,
+            "prompt_hook": False, "missing": False}
     check("[CP1-T06] fired 48h ago: seen, not fresh, not missing", hd == want and hs == want, (hd, hs))
 
     print("Other hosts, plugins, dialects")
@@ -209,7 +226,17 @@ def main():
     fire(d, env, "claude")  # plugin-delivered hooks: firing, but no install-hooks config anywhere
     h = hooks_of(rx(d, env, "status", "--json"))
     check("[CP1-T08] plugin-delivered hooks that fire are not missing",
-          h == {"host": "claude", "installed": False, "heartbeat_seen": True, "fresh": True, "missing": False}, h)
+          h == {"host": "claude", "installed": False, "heartbeat_seen": True, "fresh": True, "enforcing": True,
+                "prompt_hook": True, "missing": False}, h)
+
+    env = make_env("claude")
+    d = project(env)
+    fire(d, env, "claude", prompt_only=True)  # only the prompt hook runs: replies are recorded, nothing is enforced
+    h = hooks_of(rx(d, env, "status", "--json")) or {}
+    nx = js(rx(d, env, "next")) or {}
+    check("[CP1-T08b] only the prompt hook fires: not enforcing, still missing, and next warns (doctor and next agree)",
+          h.get("enforcing") is False and h.get("prompt_hook") is True and h.get("missing") is True
+          and "warning" in nx and (nx.get("hooks") or {}).get("missing") is True, (h, nx.get("warning")))
 
     ok = True
     detail = []
@@ -233,7 +260,7 @@ def main():
     outs = [rx(d, env, "status", "--json"), rx(d, env, "next"), rx(d, env, "doctor", "--json")]
     js_ = [js(r) for r in outs]
     hs = [(j.get("hooks") if isinstance(j, dict) else None) for j in js_]
-    check("[CP1-T10] unknown host: exit 0, valid JSON, five keys, string host, boolean missing",
+    check("[CP1-T10] unknown host: exit 0, valid JSON, all keys, string host, boolean missing",
           all(r.returncode == 0 for r in outs) and all(isinstance(h, dict) and set(h) == KEYS
                                                        and isinstance(h["host"], str)
                                                        and isinstance(h["missing"], bool) for h in hs),

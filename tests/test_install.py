@@ -38,10 +38,13 @@ class Env:
         for d in (self.home, self.rh, self.cwd):
             d.mkdir()
 
-    def run(self, *args):
+    def run(self, *args, extra_env=None):
         env = dict(os.environ, HOME=str(self.home), RATCHET_HOME=str(self.rh))
-        for k in ("XDG_CONFIG_HOME", "CODEX_HOME"):
-            env.pop(k, None)
+        for k in ("XDG_CONFIG_HOME", "CODEX_HOME", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX",
+                  "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED", "GEMINI_CLI", "COPILOT_CLI",
+                  "GITHUB_COPILOT_CLI"):
+            env.pop(k, None)  # the host is auto-detected from these; tests set them explicitly
+        env.update(extra_env or {})
         return subprocess.run(["bash", str(INSTALL), *args], capture_output=True, text=True, timeout=120, cwd=self.cwd, env=env)
 
     def files(self, root):
@@ -132,6 +135,29 @@ def main():
         check("[CP6-T16] neither message mentions 'Other agent CLIs'", not re.search(r"other agent clis?", rc2.stdout + ra.stdout, re.I))
         check("[CP6-T16] a --host claude run does not print the non-Claude link line",
               not re.search(r"link|point your|symlink", claude_out, re.I) and str(e.rh) not in claude_out, claude_out[-250:])
+
+    # T25: auto-detected host, and skills linked into the CLI's own skills folder
+    with tempfile.TemporaryDirectory() as tmp:
+        e = Env(tmp)
+        r = e.run(extra_env={"CODEX_THREAD_ID": "t1"})
+        link = e.home / ".codex/skills/ratchet-orchestrator"
+        check("[CP6-T25] no --host inside Codex installs for Codex (shared copy + Codex hooks, no Claude copy)",
+              r.returncode == 0 and "Installing for: codex" in r.stdout and (e.home / ".codex/hooks.json").exists()
+              and not (e.home / ".claude").exists(), r.stdout[-300:] + r.stderr[-200:])
+        check("[CP6-T25] the skills are linked into ~/.codex/skills and point at the shared copy",
+              link.is_symlink() and link.resolve() == (e.rh / "skills/ratchet-orchestrator").resolve()
+              and (link / "SKILL.md").exists(), link)
+        r2 = e.run(extra_env={"CODEX_THREAD_ID": "t1"})
+        check("[CP6-T25] re-running keeps a single working link per skill",
+              r2.returncode == 0 and link.is_symlink() and (link / "SKILL.md").exists(), r2.stderr[-200:])
+    with tempfile.TemporaryDirectory() as tmp:
+        e = Env(tmp)
+        r = e.run()
+        check("[CP6-T25] no --host and no CLI detected falls back to Claude Code and says so",
+              r.returncode == 0 and "Could not tell" in r.stdout and (e.home / ".claude/skills/ratchet-orchestrator").exists(),
+              r.stdout[-300:])
+        check("[CP6-T25] the closing line matches the README's sentence",
+              "Set up Ratchet and continue" in r.stdout, r.stdout[-200:])
 
     # T13
     with tempfile.TemporaryDirectory() as tmp:

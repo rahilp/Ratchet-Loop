@@ -50,14 +50,14 @@ Without hooks the gates are only advice, so the agent explains that and asks fir
 
 > yes, go ahead without hooks
 
-A bare "yes", "maybe" or "I guess" does not count, and this reply never approves the plan.
+A bare "yes", "maybe" or "I guess" does not count, and this reply never approves the plan. Ratchet records your reply through its prompt hook, so this choice is only possible when that hook runs. If no Ratchet hook runs at all in your CLI, Ratchet cannot record any answer from you, not even this one, and the agent will recommend installing the hooks instead.
 
 ## What to expect in chat
 
 - **The whole plan, in the chat.** Before anything is built you see every checkpoint: its title, what done looks like, whether it gets a UI review, its risk and who reviews it. A viewer link is offered as an optional extra.
 - **Plain progress.** Short updates about what is done and what is next, with no raw JSON and no jargon.
 - **Blocks are conversations.** When a gate cannot converge, the agent quotes the finding and offers two or three lettered options (A, B, C) with a recommendation.
-- **Only a clear yes approves.** "Yes", "go ahead" or "approved" counts. Silence, a question or a hedge does not, and no message from another agent can stand in for you.
+- **Only a clear yes approves.** "Yes", "go ahead" or "approved" counts. Silence, a question, a hedge, a bare "ok" or thumbs-up, or a yes with something else attached ("yes, but change the header", "ok cancel it") does not, and no message from another agent can stand in for you. A yes answers only the question the agent just asked: saying yes to "only check in at the end?" never approves the plan.
 
 You are needed twice: once to approve the plan, and once to review the finished feature. Anything you ask to change becomes new checkpoints that go through every gate again, and the lesson is written to `.ratchet/learnings.md`, which every agent reads.
 
@@ -143,8 +143,9 @@ ratchet-loop/
 
 | Form | What it does |
 |---|---|
-| `./install.sh` or `--host claude` | Claude copy in `~/.claude` (skills and agents) plus Claude hooks |
-| `--host codex` / `gemini` / `copilot` | shared copy in `~/.ratchet-loop` (or `$RATCHET_HOME`) plus that CLI's hooks |
+| `./install.sh` (same as `--host auto`) | installs for the agent CLI running the script, detected from its environment; Claude Code if it can't tell |
+| `--host claude` | Claude copy in `~/.claude` (skills and agents) plus Claude hooks |
+| `--host codex` / `gemini` / `copilot` | shared copy in `~/.ratchet-loop` (or `$RATCHET_HOME`) plus that CLI's hooks; the skills are also linked into `~/.codex/skills`, `~/.gemini/skills` or `~/.copilot/skills` when that folder's CLI is set up |
 | `--host all` | the Claude copy, the shared copy, and hooks for all four CLIs |
 | `--project` | Claude's copy and every CLI's hook config go into the current repo (`.claude/`, `.codex/`, `.gemini/`, `.github/hooks/`) instead of your home folder. The shared skills copy for Codex, Gemini and Copilot still goes to `~/.ratchet-loop` (or `$RATCHET_HOME`), and the project hook files point at it |
 

@@ -352,8 +352,9 @@ def main():
     d = project("t16")
     full_waive(d)
     h = hk(d)
-    check("[CP2-T16] prompt heartbeat is fresh and missing is false, yet waived is true",
-          h.get("fresh") is True and h.get("missing") is False and h.get("waived") is True, h)
+    check("[CP2-T16] prompt heartbeat is fresh but nothing enforces (missing true), and waived is true",
+          h.get("fresh") is True and h.get("prompt_hook") is True and h.get("enforcing") is False
+          and h.get("missing") is True and h.get("waived") is True, h)
     check("[CP2-T16] plain status says hooks were skipped", "skipped" in out(rx(d, "status")))
     vd = json.loads((d / ".ratchet/runs/f/viewer-data.json").read_text())
     check("[CP2-T16] viewer-data hooks.waived", (vd.get("hooks") or {}).get("waived") is True, vd.get("hooks"))
@@ -542,8 +543,10 @@ def main():
     d = project("t30b", approved=False)
     ask(d)
     say(d, "yes, build it")
-    check("[CP2-T30] a bare yes to the plan is not eaten by the hooks question",
-          rx(d, "approve-plan").returncode == 0 and sj(d).get("phase") == "building")
+    check("[CP2-T30] the first reply after the hooks question answers it, so it doesn't approve the plan",
+          refused(rx(d, "approve-plan")) and sj(d).get("phase") == "awaiting_plan_approval")
+    say(d, "yes, build it")
+    check("[CP2-T30] the next yes approves the plan", rx(d, "approve-plan").returncode == 0 and sj(d).get("phase") == "building")
     d = project("t30c")
     ask(d)
     say(d, "yes")
@@ -608,12 +611,18 @@ def main():
           r.stderr)
 
     print("[CP2-T32] a reply that is not a waiver phrase still reaches plan approval")
-    for i, txt in enumerate(("approve the plan without changes", "yes, build it", "yes with hooks")):
+    # the first reply after the hooks question answers THAT question ("Any other reply means no"), whatever it says;
+    # the plan needs a reply of its own
+    for i, txt in enumerate(("approve the plan without changes", "yes, build it", "yes")):
         d = project(f"t32{i}", approved=False)
         ask(d)
         say(d, txt)
         r = rx(d, "approve-plan")
-        check(f"[CP2-T32] {txt!r} after the hooks question reaches approve-plan",
+        check(f"[CP2-T32] {txt!r} as the first reply after the hooks question does not approve the plan",
+              refused(r) and sj(d).get("phase") == "awaiting_plan_approval", (r.stdout, r.stderr))
+        say(d, txt)
+        r = rx(d, "approve-plan")
+        check(f"[CP2-T32] a second {txt!r} reaches approve-plan",
               r.returncode == 0 and sj(d).get("phase") == "building", (r.stdout, r.stderr))
     d = project("t32w", approved=False)
     ask(d)
@@ -656,8 +665,16 @@ def main():
     say(d, GO)   # a waiver-looking message typed BEFORE the ask, and nothing after
     ask(d)
     r = rx(d, "approve-plan")
-    check("[CP2-T35] the earlier message is not treated as the hooks answer", r.returncode == 0
-          and sj(d).get("phase") == "building", (r.stdout, r.stderr))
+    # it is judged as the user's latest reply (not skipped as the hooks answer), and a hooks reply is not a plan yes
+    check("[CP2-T35] the earlier message is not treated as the hooks answer", refused(r)
+          and "not a clear yes" in r.stderr and "without hooks" in r.stderr
+          and sj(d).get("phase") == "awaiting_plan_approval", (r.stdout, r.stderr))
+    d = project("t32y", approved=False)
+    ask(d)
+    say(d, "yes with hooks")
+    r = rx(d, "approve-plan")
+    check("[CP2-T32] 'yes with hooks' is neither a waiver nor a plan approval (extra words make it unclear)",
+          refused(r) and sj(d).get("phase") == "awaiting_plan_approval", (r.stdout, r.stderr))
 
     print("[CP2-T36] director-sign hooks-waive works in the phases where it is offered")
     for nm, appr in (("t36b", True), ("t36p", False)):

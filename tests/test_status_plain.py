@@ -312,21 +312,18 @@ def main():
     print("[CP3-T07] plan summary reflects per-step differences")
     depth = json.loads((pre / ".ratchet/config.json").read_text())["review_depth"]
 
-    def ids(risk):
-        out = []
-        for s in depth[risk]:
-            out += s if isinstance(s, list) else [s]
-        return out
-
-    def seen(block, risk):
-        return {i for i in ids(risk) if i in block}
-    low, high = seen(blks[0], "low"), seen(blks[3], "high")
-    check("[CP3-T07] low-risk step names its reviewer (host-both) and not the high-risk ones",
-          "host-both" in blks[0] and "host-correctness" not in blks[0], blks[0])
-    check("[CP3-T07] high-risk step lists more reviewers than the low-risk one, incl. host-correctness",
-          len(high) > len(low) and "host-correctness" in blks[3], (low, high))
-    check("[CP3-T07] normal-risk step differs from both", blks[1].split("\n", 1)[-1] != blks[3].split("\n", 1)[-1]
-          and seen(blks[1], "normal") != high, blks[1])
+    def reviewed_by(block):
+        m = re.search(r"Reviewed by: (.*)", block)
+        return [x.strip() for x in m.group(1).split(";")] if m else []
+    low, normal, high = reviewed_by(blks[0]), reviewed_by(blks[1]), reviewed_by(blks[3])
+    check("[CP3-T07] low-risk step names its one reviewer in plain words",
+          low == ["this agent (code standards and bugs)"], low)
+    check("[CP3-T07] high-risk step lists more reviewers than the low-risk one, incl. this agent on bugs",
+          len(high) == len(depth["high"]) > len(low) and "this agent (bugs and security)" in high, high)
+    check("[CP3-T07] normal-risk step differs from both", normal not in (low, high) and len(normal) == len(depth["normal"]),
+          normal)
+    check("[CP3-T07] no reviewer ids (host-both, codex-correctness) or arrows in the summary",
+          not re.search(r"host-|-correctness|-standards|→", "\n".join(blks)), blks[3])
     check("[CP3-T07] UI review says yes for exactly the two UI steps",
           [bool(m and m.group(1).lower() == "yes") for m in ui_marks] == UI, UI)
 

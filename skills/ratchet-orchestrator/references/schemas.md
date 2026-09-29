@@ -213,6 +213,8 @@ Each reviewer writes one file; `ui_review.py combine` (or the orchestrator) merg
   "vendor": "openai",
   "checkpoint": "CP2",
   "fingerprint": "<output of ratchet.py fingerprint → id>",
+  "round_nonce": "<the nonce printed by ratchet.py reviewers CPn for this round>",
+  "files_reviewed": ["src/server/leave/approve.ts", "src/server/leave/types.ts"],
   "verdict": "CHANGES_REQUESTED",
   "findings": [
     { "id": "A1", "severity": "major", "file": "src/server/leave/approve.ts", "line": 42,
@@ -223,7 +225,7 @@ Each reviewer writes one file; `ui_review.py combine` (or the orchestrator) merg
 }
 ```
 
-`reviewer` must be the reviewer id from the config roster, because adv-record matches reviews to the required list by id. `fingerprint` is **required**: reviews of other code are rejected. Second-vendor reviews are written by `external_review.py`, which stamps `reviewer`, `vendor` and `fingerprint` itself.
+`reviewer` must be the reviewer id from the config roster, because adv-record matches reviews to the required list by id. `fingerprint` is **required**: reviews of other code are rejected. `round_nonce` is **required** and must match the round opened by `ratchet.py reviewers CPn`, so a review from an earlier round, or one written without launching a reviewer, is rejected. `files_reviewed` lists the files the reviewer actually read; a review with no findings must list at least one of the files this checkpoint changed, or it is rejected. A review file written less than `min_review_seconds` (config, default 20) after its round opened is rejected as too fast to be real. Other-provider reviews are written by `external_review.py`, which stamps `reviewer`, `vendor`, `fingerprint`, `round_nonce` and `files_reviewed` itself.
 
 A reviewer approves by returning `"findings": []`. Every finding must be fixed — there is no "minor, ignore" path. If a finding is wrong, the fixer writes a rebuttal in `fixes.md` and the NEXT adversary round decides whether to withdraw it.
 
