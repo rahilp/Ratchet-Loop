@@ -6,7 +6,7 @@ config `ui_reviewers` that is DIFFERENT from the model hosting the loop (Gemini,
 if none is available, the role falls back to the host's own sub-agents.
 
 Every reviewer works inside a temp folder that holds ONLY the screenshots, the accessibility
-snapshots, DESIGN.md and the scope — never the project's code, instructions or chat history.
+snapshots, the design file and the scope — never the project's code, instructions or chat history.
 
   review   Run both roles. Exit 0 = combined.json written. Exit 4 = one or both roles must be done by
            the host's sub-agents: the staged folders and the follow-up `combine` command are printed.
@@ -73,6 +73,60 @@ def agent_prompt(name: str) -> str:
     return f"You are the Ratchet {name}. Compare the app against the reference and output the review JSON."
 
 
+def _project_root() -> Path:
+    try:
+        return Path(_engine().find_root())
+    except (Exception, SystemExit):
+        return Path.cwd()
+
+
+def _inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def resolve_design(explicit: str | None) -> Path | None:
+    """--design wins (a deliberate CLI choice, only noted when it is outside the project); otherwise the
+    config's design_md (default DESIGN.md), which must resolve INSIDE the project root (no absolute paths
+    elsewhere, no `..` escapes, no symlinks leading out) or no design is staged."""
+    root = _project_root()
+    if explicit:
+        p = Path(explicit)
+        if p.exists() and not _inside(p, root):
+            print(f"note: --design {explicit} is outside the project; staging it because you asked for it.", file=sys.stderr)
+        return p
+    name = "DESIGN.md"
+    try:
+        val = json.loads((root / ".ratchet" / "config.json").read_text()).get("design_md")
+        if isinstance(val, str) and val.strip():
+            name = val.strip()
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        p = root / name
+        if not _inside(p, root):
+            print(f"warning: design_md '{name}' is outside the project, so no design file is staged.", file=sys.stderr)
+            return None
+        return p if p.is_file() else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+DESIGN_RESERVED = {"input.md", "browser-cases.json"}  # compared lower-case: macOS/Windows are case-insensitive
+
+
+def _design_name(td: Path, name: str) -> str:
+    """The name the design is staged under: its own, unless that would collide with a generated file or folder."""
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name) or "design.md"  # safe characters only: no spaces to trip runners
+    existing = {c.name.lower() for c in td.iterdir()}
+    while name.lower() in DESIGN_RESERVED or name.lower() in existing:
+        name = "design-" + name
+    return name
+
+
 def stage(manifest: dict, design: Path | None, scope: str, cases: Path | None, kind: str) -> Path:
     """Copy only what the reviewer is allowed to see into a fresh temp dir."""
     td = Path(tempfile.mkdtemp(prefix=f"ratchet-{kind}-"))
@@ -106,9 +160,10 @@ def stage(manifest: dict, design: Path | None, scope: str, cases: Path | None, k
                                      f"{'ok' if j.get('ok') else 'FAILED: ' + str(j.get('error'))} "
                                      f"url={j.get('url')} screenshot: {sd.name}/{fn}")
         lines.append("")
-    if design and design.exists():
-        shutil.copy2(design, td / "DESIGN.md")
-        lines.append("Design system: DESIGN.md (tokens are exact; use them to name expected values)")
+    if design and design.is_file():
+        staged_name = _design_name(td, design.name)
+        shutil.copy2(design, td / staged_name)
+        lines.append(f"Design system: {staged_name} (tokens are exact; use them to name expected values)")
     if kind == "behavior" and cases and cases.exists():
         tp = json.loads(cases.read_text())
         bc = [c for c in tp.get("cases", []) if c.get("layer") == "browser"]
@@ -187,8 +242,9 @@ def run_gemini(td: Path, kind: str, model: str | None, timeout: int) -> dict:
     model = model or os.environ.get("RATCHET_GEMINI_MODEL", "gemini-2.5-pro")
     parts = [{"text": agent_prompt(f"ratchet-{kind}-reviewer") + "\n\n" + (td / "INPUT.md").read_text()
               + "\n\nReturn ONLY JSON matching this schema:\n" + json.dumps(REVIEW_SCHEMA)}]
-    if (td / "DESIGN.md").exists():
-        parts.append({"text": "DESIGN.md:\n" + (td / "DESIGN.md").read_text()[:30000]})
+    m = re.search(r"^Design system: (.+?) \(tokens", (td / "INPUT.md").read_text(), re.M)
+    if m and (td / m.group(1)).is_file():
+        parts.append({"text": f"{m.group(1)}:\n" + (td / m.group(1)).read_text(errors="replace")[:30000]})
     for png in sorted(td.rglob("*.png")):
         parts.append({"text": f"Image: {png.relative_to(td)}"})
         parts.append({"inline_data": {"mime_type": "image/png", "data": base64.b64encode(png.read_bytes()).decode()}})
@@ -266,7 +322,7 @@ def cmd_review(a):
     manifest = json.loads(Path(a.manifest).read_text())
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    design = Path(a.design) if a.design else None
+    design = resolve_design(a.design)
     cases = Path(a.cases) if a.cases else None
     host, providers = role_providers(a)
     fp_at_start = _current_fingerprint()
@@ -320,7 +376,7 @@ def cmd_review(a):
 def cmd_stage(a):
     """Stage isolated inputs for the host's own sub-agent reviewers."""
     manifest = json.loads(Path(a.manifest).read_text())
-    design = Path(a.design) if a.design else None
+    design = resolve_design(a.design)
     tv = stage(manifest, design, a.scope, None, "visual")
     tb = stage(manifest, design, a.scope, Path(a.cases) if a.cases else None, "behavior")
     print(json.dumps({"visual": str(tv), "behavior": str(tb)}))

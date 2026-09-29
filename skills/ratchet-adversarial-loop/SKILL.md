@@ -20,7 +20,7 @@ Each checkpoint has a `risk` (`low` / `normal` / `high`, set by the planner). Co
 
 **The host** is whichever model is running this loop (auto-detected, or set with `host_provider` in config). `host-*` reviewers are the host's own `ratchet-adversary` sub-agents. Every other reviewer is a different provider's CLI (`claude-*`, `codex-*`, `gemini-*`, `copilot-*`, or any command you add), called through `external_review.py`.
 
-A slot is either one reviewer id or an ordered list of alternatives. The first alternative that is **available right now** fills the slot, preferring a provider not already reviewing this round. Other providers are listed first, so a different model family reviews whenever one is installed and working. When none is, the host's own sub-agents fill the slot: every slot of only other-provider reviewers automatically falls back to a `host-*` reviewer with the same lens (then another lens, so the number of reviewers holds). **A missing or failing provider never stalls the loop.**
+A slot is either one reviewer id or an ordered list of alternatives. The first alternative that is **available right now** fills the slot, preferring a provider not already reviewing this round. Other providers are listed first, so a different model family reviews whenever one is installed and working. When none is, the host's own sub-agents fill the slot: every slot of only other-provider reviewers automatically falls back to a `host-*` reviewer with the same lens (then another lens; for high-risk checkpoints with no other provider installed the count of distinct reviewers can be smaller, and every substitution is logged). **A missing or failing provider never stalls the loop.**
 
 Defaults:
 - `low` → `host-both`
@@ -41,10 +41,10 @@ A reviewer counts as **unavailable** when it's the **same provider as the host**
 3. **Record.** `$RATCHET adv-record CPn --reviews <all output files>`
    - It refuses if any required reviewer is missing, or if any review is of a different fingerprint.
    - Every required reviewer has zero findings → **approved**, and `next` says `complete`.
-   - Otherwise ratchet.py writes `evidence/CPn/adversarial/round-k/open-findings.json`, with each finding tagged by reviewer.
-4. **Fix.** Spawn `ratchet-fixer` with that file. It fixes **every** finding, from every vendor, or writes an evidence-backed rebuttal in `$RUN/reviews/CPn/adv-round-k/fixes.md`, touching nothing unrelated.
+   - Otherwise ratchet.py writes `evidence/CPn/adversarial/round-NN/open-findings.json`, with each finding tagged by reviewer. (NN = the current round, zero-padded: 01, 02, ...)
+4. **Fix.** Spawn `ratchet-fixer` with that file. It fixes **every** finding, from every vendor, or writes an evidence-backed rebuttal in `$RUN/reviews/CPn/adv-round-NN/fixes.md`, touching nothing unrelated.
 5. **Re-prove.** `$RATCHET behavior CPn`. If it fails, send the log to `ratchet-fixer`, since the fix broke it. If the fixer touched UI files, re-run the `ratchet-ui-compare` gate.
-6. Go to step 1 with k+1. **All** reviewers review again, including the ones that approved last round, because the code changed.
+6. Go to step 1 with the next round (NN+1). **All** reviewers review again, including the ones that approved last round, because the code changed.
 
 The loop ends only when **all** required reviewers approve the **same, current** code. `ratchet.py complete` re-checks this.
 

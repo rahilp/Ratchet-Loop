@@ -11,7 +11,8 @@ Contents
 6. UI review JSON — written by the visual / behaviour reviewers
 7. Adversarial review JSON — written by ratchet-adversary
 8. `.ratchet/config.json`
-9. `ratchet.py status --json` / `lanes --json` — for a director
+9. `ratchet.py status --json` / `lanes --json` — director interfaces
+10. Hooks
 
 ---
 
@@ -24,6 +25,9 @@ Contents
   standards.md         # the written standard the adversaries enforce
   human_log.jsonl      # written by the UserPromptSubmit hook only (protected)
   active.json          # which run is active (protected)
+  hook-heartbeat.json  # last time each hook fired and via which host (written by the hooks; see section 10)
+  hook-errors.log      # internal hook errors (hooks fail open)
+  unavailable-reviewers.json  # providers that just failed (quota, auth, timeout) and until when; skipped for the TTL
   viewer.json          # live viewer server: url, port, bind, pid, token (written by `view --serve`)
   runs/<slug>/
     state.json         # gate state — written ONLY by ratchet.py (protected). Optional field `hooks_waived`:
@@ -270,16 +274,21 @@ Each `review_depth` entry is a list of **slots**: a reviewer id, or an ordered l
 `ratchet.py --root <lane> status --json` (or `ratchet.py lanes --scan <dir> --json` for every lane under a folder):
 
 ```json
-{"root": "/work/lanes/track2-labels", "slug": "validity-labels", "phase": "building",
- "current": "CP3", "step": "adversarial", "next": "CP3: run the ratchet-adversarial-loop skill …",
- "stop_ok": false, "waiting_on": null, "blocked_reason": null, "blocked_reason_plain": null, "approval_mode": "director",
+{"root": "/work/lanes/track2-labels", "slug": "validity-labels", "feature": "Validity labels",
+ "phase": "building", "current": "CP3", "step": "adversarial", "next": "CP3: run the ratchet-adversarial-loop skill …",
+ "stop_ok": false, "waiting_on": null, "blocked_reason": null, "blocked_reason_plain": null,
+ "awaiting_since": null, "approval_mode": "director", "adv_rounds_used": 7,
+ "unavailable_reviewers": {"codex": {"reason": "quota", "since": "2026-09-29T17:00:00+00:00", "until": "2026-09-29T18:00:00+00:00"}}, "host_provider": "anthropic",
+ "hooks_warning": null, "hook_heartbeat": {"prompt": {"at": "…", "host": "claude"}},
+ "hooks": {"host": "claude", "installed": true, "heartbeat_seen": true, "fresh": true, "missing": false},
  "viewer_url": "http://10.0.0.12:4481/?t=…", "viewer_live": true,
- "adv_rounds_used": 7, "done": 2, "total": 6, "updated_at": "…",
+ "done": 2, "total": 6, "updated_at": "…",
  "checkpoints": [{"id": "CP1", "title": "…", "risk": "low", "status": "done", "step": "complete",
-                  "commit": "a1b2c3d", "gates": {"behavior": {"status": "passed", "attempts": 1}, "…": {}}}]}
+                  "commit": "a1b2c3d", "gates": {"behavior": {"status": "passed", "attempts": 1},
+                  "human": {"status": "passed", "attempts": 1, "by": "human"}, "…": {}}}]}
 ```
 
-`waiting_on` is `human`, `director` or `null`. Director-only commands (they refuse unless the session has `RATCHET_ROLE=director`, and the guard hook blocks them in every other session): `director-key [--rotate]` (the key lives at `~/.config/ratchet/director.key`, or `RATCHET_DIRECTOR_KEY_FILE`), `director-enroll`, and `director-sign approve-plan|human-approve|feedback`, which prints a token for the lane's current pause. Tokens go to `approve-plan` / `human-approve` / `feedback` via `--director-token`.
+`awaiting_since` is the time the loop began waiting on a human or director (null otherwise). `by` on a gate entry (`human` or `director`) is set when a person's approval passed it. `unavailable_reviewers` maps a skipped reviewer id to `{reason, since, until}` (why it was skipped, when, and when it may be tried again). `waiting_on` is `human`, `director` or `null`. Director-only commands (they refuse unless the session has `RATCHET_ROLE=director`, and the guard hook blocks them in every other session): `director-key [--rotate]` (the key lives at `~/.config/ratchet/director.key`, or `RATCHET_DIRECTOR_KEY_FILE`), `director-enroll`, and `director-sign approve-plan|human-approve|feedback`, which prints a token for the lane's current pause. Tokens go to `approve-plan` / `human-approve` / `feedback` via `--director-token`.
 
 ## 10. Hooks
 

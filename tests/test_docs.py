@@ -1242,7 +1242,205 @@ def cp6_docs_lint():
 
 # ---- end CP6 ----
 
-SECTIONS = [("CP4", cp4_orchestrator_setup_and_plan_review), ("CP5", cp5_docs_lint), ("CP6", cp6_docs_lint)]
+# ---- CP7 ----
+# Doc/engine drift: reviewer-count claim, UI reviewer provider, round folder names, schemas.md vs real output,
+# and the UI gate's design file. Every drift check compares the docs with what the engine really emits.
+
+import json
+import subprocess
+
+
+def cp7_read(rel):
+    return (ROOT / rel).read_text(encoding="utf-8")
+
+
+def cp7_bullet(text, start):
+    m = re.search(r"(?m)^- \*\*" + start + r"[^\n]*(?:\n(?![-#\n])[^\n]*)*", text)
+    return m.group(0) if m else ""
+
+
+def cp7_doc_files():
+    return ([ROOT / "README.md", ROOT / "skills/ratchet-orchestrator/references/schemas.md"]
+            + sorted((ROOT / "skills").glob("*/SKILL.md")) + sorted((ROOT / "agents").glob("*.md")))
+
+
+def cp7_round_tokens(text):
+    """Every folder-like `round-...` token (with or without an adv- prefix) in the text."""
+    return re.findall(r"round-([^\s/`'\")\]]*)", text)
+
+
+def cp7_bad_round_tokens(text):
+    """Round tokens that are neither a zero-padded number, the NN placeholder nor a glob. The unpadded `k` is rejected."""
+    return [t for t in cp7_round_tokens(text) if not re.fullmatch(r"\d{2}|NN|\*", t)]
+
+
+def cp7_real_round():
+    """Real `reviewers --json` output of a round-1 adversarial checkpoint (built in a child process)."""
+    code = ("import sys, json; sys.path.insert(0, %r); import test_gates as g\n"
+            "d, env = g.cp7_host_project('cp7docsr'); g.cp7_to_adversarial(d, env)\n"
+            "print(json.dumps(g.cp7_reviewers(d, env)))\n") % str(ROOT / "tests")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300,
+                       env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {}
+
+
+def cp7_contents_vs_headings(text):
+    toc_part = text.split("\n---", 1)[0]
+    toc = re.findall(r"(?m)^(\d+)\.\s+(.+?)\s*$", toc_part)
+    heads = re.findall(r"(?m)^## (\d+)\.\s+(.+?)\s*$", text)
+    return [(n, t.strip()) for n, t in toc], [(n, t.strip()) for n, t in heads]
+
+
+def cp7_json_block(text, heading_prefix):
+    sec = section(text, heading_prefix)
+    m = re.search(r"```json\n(.*?)```", sec, re.S)
+    return json.loads(m.group(1)) if m else None
+
+
+def cp7_key_diff(real, doc):
+    """(keys the engine emits but the doc lacks, keys the doc lists that the engine does not emit)."""
+    return sorted(set(real) - set(doc)), sorted(set(doc) - set(real))
+
+
+def cp7_real_project():
+    """Real engine output from a throwaway project (built by tests/test_gates.py helpers in a child process)."""
+    code = ("import sys, json; sys.path.insert(0, %r); import test_gates as g\n"
+            "d = g.project('cp7docs'); g.approve_plan(d)\n"
+            "print(json.dumps({'status': json.loads(g.rx(d, 'status', '--json').stdout),"
+            " 'files': sorted(x.name for x in (d / '.ratchet').iterdir() if x.is_file())}))\n") % str(ROOT / "tests")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300,
+                       env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def cp7_layout_block(text):
+    m = re.search(r"## 1\. Project layout\s*```\n(.*?)```", text, re.S)
+    return m.group(1) if m else ""
+
+
+def cp7_docs_lint():
+    print("CP7: doc drift")
+    readme = cp7_read("README.md")
+    schemas = cp7_read("skills/ratchet-orchestrator/references/schemas.md")
+    ui_skill = cp7_read("skills/ratchet-ui-compare/SKILL.md")
+    loop_skill = cp7_read("skills/ratchet-adversarial-loop/SKILL.md")
+
+    # T01
+    para = next((p for p in readme.split("\n\n") if re.search(r"host'?s own sub-agents fill", p, re.I)), "")
+    check("[CP7-T01] README has the reviewer-fallback paragraph", bool(para))
+    check("[CP7-T01] it no longer claims the reviewer count holds / stays the same",
+          bool(para) and not re.search(r"count\s+(still\s+)?(holds|stays|is kept|is unchanged)|same (number|count)|keeps? (its|the) (full )?count|never (drops|shrinks)", para, re.I), para)
+    check("[CP7-T01] it says the number of distinct reviewers can be smaller when only the host is available",
+          has(para, r"distinct reviewers", r"(smaller|fewer|drop|lower)", r"high-risk|high risk"), para)
+    check("[CP7-T01] teeth: the old 'count holds' wording would be rejected",
+          re.search(r"count\s+(still\s+)?(holds|stays)", "the reviewer count holds", re.I) is not None)
+    check("[CP7-T01] the README still says substitutions are logged (matches the engine's reviewer_fallback log)",
+          has(para, r"substitutions? (is|are) logged"))
+    claim = r"(number|count) of reviewers (still )?(holds|stays|is kept)"
+    check("[CP7-T01] no SKILL file claims the number of reviewers holds (the count can shrink for high risk with only the host)",
+          not [f.name for f in (ROOT / "skills").glob("*/SKILL.md") if re.search(claim, f.read_text(encoding="utf-8"), re.I)]
+          and has(loop_skill, r"high-risk", r"count of distinct reviewers can be smaller"))
+    check("[CP7-T01] teeth: the old SKILL wording would be rejected",
+          re.search(claim, "then another lens, so the number of reviewers holds", re.I) is not None)
+
+    # T04 / T05
+    bl = cp7_bullet(readme, r"Isolated UI reviewers")
+    check("[CP7-T04] README has the isolated UI reviewers bullet", bool(bl))
+    check("[CP7-T04] it does not say UI reviewers run as claude sessions only",
+          bool(bl) and not re.search(r"new\s+`?claude\s+-p`?\s+sessions?|always\s+`?claude", bl, re.I), bl)
+    check("[CP7-T04] it says the provider comes from ui_reviewers (any supported CLI other than the host, host sub-agents as fallback)",
+          has(bl, r"ui_reviewers", r"(other than|not|besides|except|skipping)[^.]*host", r"sub-?agents?"), bl)
+    check("[CP7-T04] it says the temp folder holds only screenshots, accessibility trees and the design file",
+          has(bl, r"temp", r"screenshots", r"accessibility trees", r"design"), bl)
+    check("[CP7-T05] it still says reviewers never see the code, project instructions or the chat",
+          has(bl, r"never see", r"(agent|project) instructions|CLAUDE\.md", r"\bcode\b", r"\bchat\b"), bl)
+    check("[CP7-T04] teeth: the old 'new claude sessions' wording would be rejected",
+          re.search(r"new\s+`?claude\s+-p`?\s+sessions?", "run as new `claude -p` sessions", re.I) is not None)
+
+    # T06 / T07
+    bad = {f.name: cp7_bad_round_tokens(f.read_text(encoding="utf-8")) for f in cp7_doc_files()}
+    bad = {k: v for k, v in bad.items() if v}
+    check("[CP7-T06] no doc names a round folder as round-k / round-<k> / adv-round-k (only zero-padded numbers or the NN placeholder)", not bad, bad)
+    check("[CP7-T06] the fixer and loop steps use the NN placeholder, not a hard-coded round",
+          all(re.search(r"round-NN", cp7_read(f)) and not re.search(r"round-01", cp7_read(f))
+              for f in ("agents/ratchet-fixer.md", "skills/ratchet-adversarial-loop/SKILL.md")))
+    check("[CP7-T06] teeth: round-<k> and adv-round-k are flagged; round-01, round-02 and round-NN are not",
+          cp7_bad_round_tokens("x/round-<k>/y adv-round-k") == ["<k>", "k"]
+          and cp7_bad_round_tokens("adv-round-01/fixes.md round-02 round-NN") == [])
+    real_round = cp7_real_round()
+    real_names = [Path(str(real_round.get(k) or "")).parent.name if k == "fixes_md" else Path(str(real_round.get(k) or "")).name
+                  for k in ("output_dir",)]
+    check("[CP7-T07] the engine's real round folder is adv-round-<two digits>, so the docs' NN means the zero-padded round",
+          bool(real_names) and all(re.fullmatch(r"adv-round-\d{2}", n) for n in real_names), real_round.get("output_dir") or real_round)
+    doc_ev = [t for f in cp7_doc_files() for t in cp7_round_tokens(f.read_text(encoding="utf-8"))]
+    check("[CP7-T07] every round folder the docs mention is a two-digit number or NN", doc_ev and all(re.fullmatch(r"\d{2}|NN|\*", t) for t in doc_ev), doc_ev)
+
+    # T08
+    toc, heads = cp7_contents_vs_headings(schemas)
+    words = lambda t: {w for w in re.findall(r"[a-z0-9_.-]{3,}", t.lower())}
+    same = [n for n, _ in toc] == [n for n, _ in heads] and all(words(a[1]) & words(b[1]) for a, b in zip(toc, heads))
+    check("[CP7-T08] schemas.md Contents lists exactly the numbered ## headings (same numbers, each title shares its heading's words)",
+          same and len(heads) >= 10, {"toc": [n for n, _ in toc], "headings": [n for n, _ in heads]})
+    check("[CP7-T08] section 10 Hooks is in both", any(n == "10" and re.search(r"hooks", t, re.I) for n, t in toc) and any(n == "10" for n, _ in heads))
+    good = "Contents\n1. A\n2. B\n\n---\n\n## 1. A\n\n## 2. B\n"
+    a, b = cp7_contents_vs_headings(good)
+    a2, b2 = cp7_contents_vs_headings(good.replace("2. B\n\n---", "\n---"))
+    check("[CP7-T08] teeth: a heading missing from Contents is detected", a == b and [n for n, _ in a2] != [n for n, _ in b2])
+
+    # T09: layout vs files the engine really has under .ratchet/
+    lay = cp7_layout_block(schemas)
+    check("[CP7-T09] schemas.md section 1 has a layout block", bool(lay))
+    names = ["hook-heartbeat.json", "hook-errors.log", "unavailable-reviewers.json"]
+    check("[CP7-T09] the layout lists hook-heartbeat.json, hook-errors.log and unavailable-reviewers.json",
+          all(n in lay for n in names), [n for n in names if n not in lay])
+    proj = cp7_real_project()
+    real_top = [n for n in proj["files"] if n != ".gitignore"]
+    check("[CP7-T09] every file really present in .ratchet/ after init and a prompt hook appears in the layout",
+          bool(real_top) and all(n in lay for n in real_top), [n for n in real_top if n not in lay])
+
+    # T10 / T11 / T12
+    real = proj["status"]
+    doc = cp7_json_block(schemas, "9.")
+    check("[CP7-T10] schemas.md section 9 has a parseable status --json example", isinstance(doc, dict))
+    doc = doc if isinstance(doc, dict) else {}
+    miss, extra = cp7_key_diff(real, doc)
+    check("[CP7-T10] every real top-level status --json key is documented", not miss, miss)
+    check("[CP7-T10] the doc example has no top-level key the engine does not emit", not extra, extra)
+    dcp = (doc.get("checkpoints") or [{}])[0]
+    rcp = real["checkpoints"][0]
+    m2, e2 = cp7_key_diff(rcp, dcp)
+    check("[CP7-T11] per-checkpoint keys (id, title, risk, status, step, commit, gates) all documented, none invented", not m2 and not e2, (m2, e2))
+    gate_keys = {k for gg in (dcp.get("gates") or {}).values() for k in gg}
+    check("[CP7-T11] a documented gate entry shows status, attempts and by (real gates emit status/attempts, and by when set)",
+          {"status", "attempts", "by"} <= gate_keys and set(next(iter(rcp["gates"].values()))) <= gate_keys, gate_keys)
+    ur = (doc or {}).get("unavailable_reviewers") or {}
+    check("[CP7-T10] the unavailable_reviewers example maps a provider to {reason, since, until}",
+          bool(ur) and all(isinstance(v, dict) and {"reason", "since", "until"} <= set(v) for v in ur.values()), ur)
+    key = "hook_heartbeat"
+    trimmed = {k: v for k, v in doc.items() if k != key}
+    tm, _ = cp7_key_diff(real, trimmed)
+    check("[CP7-T12] teeth: with one real key removed from the example, the comparison reports it missing", tm == [key] or key in tm, tm)
+    check("[CP7-T12] teeth: an invented key is reported as extra", cp7_key_diff(real, dict(doc, bogus_key=1))[1] == ["bogus_key"])
+
+    # T18
+    cmd = re.search(r"ui_review\.py review.*?(?=\n```)", ui_skill, re.S)
+    cmd = cmd.group(0) if cmd else ""
+    check("[CP7-T18] the UI skill has the ui_review.py review command", bool(cmd))
+    check("[CP7-T18] the command does not pass a literal --design DESIGN.md", "--design DESIGN.md" not in cmd and "--design DESIGN.md" not in ui_skill, cmd)
+    check("[CP7-T18] the skill says the design file comes from config design_md",
+          has(ui_skill, r"design_md"), "design_md not mentioned")
+    check("[CP7-T18] teeth: the old hard-coded command would be rejected", "--design DESIGN.md" in '--scope "x" --design DESIGN.md --cases y')
+
+    # T19: earlier sections still registered
+    check("[CP7-T19] the CP4, CP5 and CP6 sections are still registered", [n for n, _ in SECTIONS][:3] == ["CP4", "CP5", "CP6"])
+
+
+# ---- end CP7 ----
+
+SECTIONS = [("CP4", cp4_orchestrator_setup_and_plan_review), ("CP5", cp5_docs_lint), ("CP6", cp6_docs_lint), ("CP7", cp7_docs_lint)]
 
 
 def main():

@@ -7,6 +7,7 @@ Runs in throwaway git repos with RATCHET_HOME pointed at a temp folder, so nothi
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -129,6 +130,266 @@ def write_review(d, rnd, rid, findings=None, **over):
     p.write_text(json.dumps(body))
     return str(p)
 
+
+# ---- CP7 ----
+UI_REVIEW = ENGINE.parents[2] / "ratchet-ui-compare" / "scripts" / "ui_review.py"
+PNG = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000001e221bc330000000049454e44ae426082")
+
+
+def cp7_host_project(name, **kw):
+    """A project whose host is forced to claude and whose PATH has no other agent CLI (codex/gemini/copilot/claude)."""
+    import shutil
+    b = Path(tempfile.mkdtemp(prefix="ratchet-bin-"))
+    for n in ("python3", "git", "node", "sh", "env"):
+        p = shutil.which(n)
+        if p:
+            (b / n).symlink_to(p)
+    saved = dict(ENV)
+    ENV["RATCHET_HOST_PROVIDER"] = "claude"
+    ENV["PATH"] = str(b)
+    try:
+        d = project(name, **kw)
+        approve_plan(d)
+    finally:
+        ENV.clear()
+        ENV.update(saved)
+    return d, dict(ENV, RATCHET_HOST_PROVIDER="claude", PATH=str(b))
+
+
+def cp7_to_adversarial(d, env, cp="CP1"):
+    write_tests(d, cp)
+    for step in ("tests-written", "red"):
+        assert rx(d, step, cp, env=env).returncode == 0, step
+    (d / "src/f.js").write_text("export const f = () => 1;\n")
+    assert rx(d, "implemented", cp, env=env).returncode == 0
+    r = rx(d, "behavior", cp, env=env)
+    assert r.returncode == 0, r.stderr + r.stdout
+
+
+def cp7_reviewers(d, env, cp="CP1"):
+    r = rx(d, "reviewers", cp, "--json", env=env)
+    return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else {"_err": r.stderr}
+
+
+def cp7_ui_project(design_cfg=None, design_files=None, extra_files=None):
+    d = Path(tempfile.mkdtemp(prefix="ratchet-ui7-"))
+    for c in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        git(d, *c)
+    (d / "src").mkdir()
+    (d / "src/secret_source.js").write_text("export const SECRET_SOURCE_MARKER = 1;\n")
+    (d / "CLAUDE.md").write_text("PRIVATE_PROJECT_INSTRUCTIONS_MARKER\n")
+    for rel, txt in (design_files or {}).items():
+        (d / rel).parent.mkdir(parents=True, exist_ok=True)
+        (d / rel).write_text(txt)
+    for rel, txt in (extra_files or {}).items():
+        (d / rel).write_text(txt)
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", "init")
+    if design_cfg is not None:
+        say(d, "please build the feature")
+        assert rx(d, "init", "feature", "--slug", "f").returncode == 0
+        assert rx(d, "config", "--set", f"design_md={design_cfg}").returncode == 0
+    return d
+
+
+def cp7_manifest(d):
+    cap = d.parent / (d.name + "-cap")
+    cap.mkdir(exist_ok=True)
+    (cap / "ref.png").write_bytes(PNG)
+    (cap / "app.png").write_bytes(PNG)
+    m = {"checkpoint": "CP1", "viewport": "800x600", "states": [{
+        "name": "home", "scope": "home",
+        "reference": {"screenshot": str(cap / "ref.png")}, "app": {"screenshot": str(cap / "app.png")}}]}
+    (cap / "manifest.json").write_text(json.dumps(m))
+    return cap / "manifest.json"
+
+
+def cp7_stage(d, *extra):
+    r = subprocess.run([sys.executable, str(UI_REVIEW), "stage", "--manifest", str(cp7_manifest(d)), "--scope", "home", *extra],
+                       cwd=d, capture_output=True, text=True, env=ENV)
+    folders = {}
+    try:
+        folders = json.loads(r.stdout)
+    except Exception:
+        pass
+    return r, folders
+
+
+def cp7_staged_text(folders):
+    out = {}
+    for kind, f in folders.items():
+        for p in Path(f).rglob("*"):
+            if p.is_file() and p.suffix != ".png":
+                out[f"{kind}/{p.relative_to(f)}"] = p.read_text(errors="replace")
+    return out
+
+
+def cp7_gates():
+    print("CP7: reviewer fallback, round folders, ui_review design default")
+    # T02 / T03 / T07: real engine behaviour, high risk, host claude, no other provider
+    d, env = cp7_host_project("hi", extra_cp={"risk": "high"})
+    cp7_to_adversarial(d, env)
+    slots = len(json.loads(rx(d, "config", env=env).stdout)["review_depth"]["high"])
+    rnd = cp7_reviewers(d, env)
+    ids = [r["id"] for r in rnd.get("reviewers", [])]
+    check("[CP7-T02] high risk with no other provider: reviewers resolve", bool(ids), rnd)
+    check("[CP7-T02] high risk with no other provider: only host reviewers, all distinct",
+          bool(ids) and len(set(ids)) == len(ids) and all(i.startswith("host-") for i in ids), ids)
+    check("[CP7-T02] high risk with no other provider: fewer reviewers than the configured slots",
+          bool(ids) and len(ids) < slots and slots == 4, (ids, slots))
+    d2, env2 = cp7_host_project("norm", extra_cp={"risk": "normal"})
+    cp7_to_adversarial(d2, env2)
+    ids2 = [r["id"] for r in cp7_reviewers(d2, env2).get("reviewers", [])]
+    check("[CP7-T02] normal risk in the same setup still gets 2 reviewers", len(ids2) == 2, ids2)
+
+    subs = [r for r in rnd.get("reviewers", []) if r.get("fallback_for")]
+    named = {x for r in subs for x in r["fallback_for"]}
+    check("[CP7-T03] the round records fallback_for naming the skipped provider reviewers",
+          bool(subs) and any(x.split("-")[0] in ("codex", "gemini", "claude", "copilot") for x in named), rnd.get("reviewers"))
+    st = json.loads((d / ".ratchet/runs/f/state.json").read_text())
+    adv = st["checkpoints"]["CP1"].get("adv_round") or {}
+    check("[CP7-T03] state keeps substitutions entries (used / instead_of) for the round",
+          bool(adv.get("substitutions")) and all(s.get("used") and s.get("instead_of") for s in adv["substitutions"]),
+          adv.get("substitutions"))
+    check("[CP7-T03] the substitution is written to the run log",
+          "reviewer_fallback" in json.dumps(st.get("log", st)), list(st))
+
+    check("[CP7-T07] round 1 output folder ends in adv-round-01",
+          Path(rnd.get("output_dir", "x")).name == "adv-round-01", rnd.get("output_dir"))
+    (d / "src/f.js").write_text("export const f = () => 1; // changed\n")
+    rx(d, "implemented", "CP1", env=env)
+    r2 = cp7_reviewers(d, env)
+    check("[CP7-T07] after the code changes, round 2 output folder ends in adv-round-02",
+          Path(r2.get("output_dir", "x")).name == "adv-round-02" and r2.get("round") == 2, r2.get("output_dir") or r2)
+    check("[CP7-T07] round 2 fixes.md lives in the adv-round-01 folder",
+          str(r2.get("fixes_md") or "").endswith("adv-round-01/fixes.md"), r2.get("fixes_md"))
+
+    # T13..T17: ui_review.py stage picks the design file from config
+    marker = "CP7_CONFIG_DESIGN_MARKER_A1"
+    d = cp7_ui_project("docs/ui-design.md", {"docs/ui-design.md": f"# tokens\n{marker}\n"})
+    check("[CP7-T13] fixture has no DESIGN.md at the root", not (d / "DESIGN.md").exists())
+    r, f = cp7_stage(d)
+    txt = cp7_staged_text(f)
+    design_hits = [k for k, v in txt.items() if marker in v and not k.endswith("INPUT.md")]
+    check("[CP7-T13] stage without --design exits 0", r.returncode == 0 and set(f) == {"visual", "behavior"}, r.stderr)
+    check("[CP7-T13] the staged folders contain the config design file's content",
+          {k.split("/")[0] for k in design_hits} == {"visual", "behavior"}, list(txt))
+    inp = txt.get("visual/INPUT.md", "")
+    check("[CP7-T13] INPUT.md points at the staged design file",
+          bool(design_hits) and any(Path(k).name in inp for k in design_hits if k.startswith("visual/")), inp[-300:])
+
+    other = d / "other-design.md"
+    other.write_text("EXPLICIT_DESIGN_MARKER_B2\n")
+    r, f = cp7_stage(d, "--design", str(other))
+    txt = cp7_staged_text(f)
+    body = "\n".join(v for k, v in txt.items() if not k.endswith("INPUT.md"))
+    check("[CP7-T14] explicit --design is staged", r.returncode == 0 and "EXPLICIT_DESIGN_MARKER_B2" in body, r.stderr)
+    check("[CP7-T14] the config design file is NOT staged when --design is given", marker not in body, list(txt))
+
+    d = cp7_ui_project("DESIGN.md", {"DESIGN.md": "DEFAULT_DESIGN_MARKER_C3\n"})
+    r, f = cp7_stage(d)
+    body = "\n".join(cp7_staged_text(f).values())
+    check("[CP7-T15] default config: root DESIGN.md is staged without --design", r.returncode == 0 and "DEFAULT_DESIGN_MARKER_C3" in body, r.stderr)
+
+    d = cp7_ui_project("docs/missing.md", {})
+    r, f = cp7_stage(d)
+    txt = cp7_staged_text(f)
+    check("[CP7-T16] config points at a missing design file: exit 0, no traceback, screenshots-only staging",
+          r.returncode == 0 and "Traceback" not in r.stderr and set(f) == {"visual", "behavior"}
+          and not [k for k in txt if not k.endswith(("INPUT.md", "browser-cases.json"))], r.stderr)
+    d = cp7_ui_project(None, {})            # not a Ratchet project at all
+    r, f = cp7_stage(d)
+    check("[CP7-T16] outside a Ratchet project: exit 0, no traceback, staged folders exist",
+          r.returncode == 0 and "Traceback" not in r.stderr and set(f) == {"visual", "behavior"}
+          and all(Path(x).is_dir() for x in f.values()), r.stderr)
+
+    d = cp7_ui_project("docs/ui-design.md", {"docs/ui-design.md": f"{marker}\n"})
+    r, f = cp7_stage(d)
+    allfiles = [p for x in f.values() for p in Path(x).rglob("*") if p.is_file()]
+    blob = "\n".join(p.read_text(errors="replace") for p in allfiles if p.suffix != ".png")
+    check("[CP7-T17] staged folders contain none of CLAUDE.md, source files, state.json or .ratchet contents",
+          bool(f) and not [p for p in allfiles if p.name in ("CLAUDE.md", "state.json", "secret_source.js", "config.json")]
+          and "PRIVATE_PROJECT_INSTRUCTIONS_MARKER" not in blob and "SECRET_SOURCE_MARKER" not in blob
+          and ".ratchet/runs" not in blob, [p.name for p in allfiles])
+    check("[CP7-T17] while the allowed design file is still staged (isolation check is not vacuous)", marker in blob, r.stderr)
+
+    # C1..C3 (adversarial round 1): design staging is confined and collision-safe
+    outside = Path(tempfile.mkdtemp(prefix="ratchet-outside-"))
+    (outside / "secret.md").write_text("CP7_OUTSIDE_SECRET_MARKER\n")
+    d = cp7_ui_project("docs/ui-design.md", {"docs/ui-design.md": "x\n"})
+    for label, val in (("absolute path outside the project", str(outside / "secret.md")), ("`..` escape", "../" + outside.name + "/secret.md")):
+        rx(d, "config", "--set", f"design_md={val}")
+        r, f = cp7_stage(d)
+        blob = "\n".join(cp7_staged_text(f).values())
+        check(f"[CP7-T20] design_md as {label}: exit 0, nothing staged, plain warning, no traceback",
+              r.returncode == 0 and "CP7_OUTSIDE_SECRET_MARKER" not in blob and "Traceback" not in r.stderr
+              and "outside the project" in r.stderr and not [k for k in cp7_staged_text(f) if not k.endswith(("INPUT.md", "browser-cases.json"))],
+              (r.stderr, list(cp7_staged_text(f))))
+    d = cp7_ui_project("link.md", {})
+    (d / "link.md").symlink_to(outside / "secret.md")
+    r, f = cp7_stage(d)
+    blob = "\n".join(cp7_staged_text(f).values())
+    check("[CP7-T20] design_md as a symlink whose real path leaves the project: nothing staged",
+          r.returncode == 0 and "CP7_OUTSIDE_SECRET_MARKER" not in blob and "outside the project" in r.stderr, r.stderr)
+    r, f = cp7_stage(d, "--design", str(outside / "secret.md"))
+    blob = "\n".join(cp7_staged_text(f).values())
+    check("[CP7-T21] explicit --design outside the project still works, with a note",
+          r.returncode == 0 and "CP7_OUTSIDE_SECRET_MARKER" in blob and "outside the project" in r.stderr, r.stderr)
+    d = cp7_ui_project("docs/inside.md", {"docs/inside.md": "CP7_INSIDE_MARKER\n"})
+    r, f = cp7_stage(d)
+    check("[CP7-T21] a design file inside the project is staged with no warning",
+          "CP7_INSIDE_MARKER" in "\n".join(cp7_staged_text(f).values()) and "outside" not in r.stderr, r.stderr)
+
+    for cfgval in ('["a"]', "5", '{"x": 1}', "true"):
+        d = cp7_ui_project("docs/x.md", {"DESIGN.md": "CP7_DEFAULT_FALLBACK_MARKER\n"})
+        rx(d, "config", "--set", f"design_md={cfgval}")
+        r, f = cp7_stage(d)
+        check(f"[CP7-T22] design_md={cfgval} (not a string): no traceback, falls back to the default DESIGN.md",
+              r.returncode == 0 and "Traceback" not in r.stderr and "CP7_DEFAULT_FALLBACK_MARKER" in "\n".join(cp7_staged_text(f).values()), r.stderr)
+
+    for name in ("INPUT.md", "browser-cases.json"):
+        d = cp7_ui_project(name, {name: "CP7_COLLIDING_DESIGN_MARKER\n"})
+        cases = d / "cases.json"
+        cases.write_text(json.dumps({"cases": [{"layer": "browser", "id": "b1"}]}))
+        r, f = cp7_stage(d, "--cases", str(cases))
+        txt = cp7_staged_text(f)
+        beh = {k.split("/", 1)[1]: v for k, v in txt.items() if k.startswith("behavior/")}
+        holder = [k for k, v in beh.items() if "CP7_COLLIDING_DESIGN_MARKER" in v]
+        line = re.search(r"Design system: (\S+) ", beh.get("INPUT.md", ""))
+        check(f"[CP7-T23] design named {name} is staged under a safe name and INPUT.md points at it",
+              r.returncode == 0 and holder and holder[0] not in ("INPUT.md", "browser-cases.json") and line and line.group(1) == holder[0]
+              and "Design system" in beh.get("INPUT.md", ""), (r.stderr, list(beh)))
+        check(f"[CP7-T23] the generated {name} keeps its own content next to the staged design",
+              ("Checkpoint:" in beh.get("INPUT.md", "")) and (name != "browser-cases.json" or '"b1"' in beh.get("browser-cases.json", "")), list(beh))
+
+    d = cp7_ui_project("my design.md", {"my design.md": "CP7_SPACED_MARKER\n"})
+    r, f = cp7_stage(d)
+    beh = {k.split("/", 1)[1]: v for k, v in cp7_staged_text(f).items() if k.startswith("behavior/")}
+    holder = [k for k, v in beh.items() if "CP7_SPACED_MARKER" in v]
+    line = re.search(r"^Design system: (.+?) \(tokens", beh.get("INPUT.md", ""), re.M)
+    check("[CP7-T24] a design name with spaces is staged under a space-free name that INPUT.md names exactly",
+          r.returncode == 0 and holder and " " not in holder[0] and line and line.group(1) == holder[0], (r.stderr, list(beh)))
+
+    d = cp7_ui_project("DESIGN.md", {"DESIGN.md": "x\n"})
+    (d / "adir").mkdir()
+    r, f = cp7_stage(d, "--design", str(d / "adir"))
+    check("[CP7-T25] --design pointing at a directory: no traceback, treated as no design",
+          r.returncode == 0 and "Traceback" not in r.stderr and not [k for k in cp7_staged_text(f) if not k.endswith(("INPUT.md", "browser-cases.json"))]
+          and "Design system" not in "\n".join(cp7_staged_text(f).values()), r.stderr)
+
+    for name in ("input.md", "Browser-Cases.json"):
+        d = cp7_ui_project(name, {name: "CP7_CASE_MARKER\n"})
+        cases = d / "cases.json"
+        cases.write_text(json.dumps({"cases": [{"layer": "browser", "id": "b1"}]}))
+        r, f = cp7_stage(d, "--cases", str(cases))
+        beh = {k.split("/", 1)[1]: v for k, v in cp7_staged_text(f).items() if k.startswith("behavior/")}
+        holder = [k for k, v in beh.items() if "CP7_CASE_MARKER" in v]
+        check(f"[CP7-T26] design named {name} does not collide case-insensitively with generated files",
+              r.returncode == 0 and holder and holder[0].lower() not in ("input.md", "browser-cases.json")
+              and "Checkpoint:" in beh.get("INPUT.md", ""), (r.stderr, list(beh)))
+
+
+# ---- end CP7 ----
 
 def main():
     print("Guard: audit exploits are blocked")
@@ -438,6 +699,8 @@ def main():
     env2 = dict(ENV, RATCHET_HOST_PROVIDER="acme")
     r = rx(d, "tests-written", "CP1", env=env2)
     check("changing the host provider after approval stops the gates", r.returncode != 0 and "host provider" in r.stderr, r.stderr)
+
+    cp7_gates()
 
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

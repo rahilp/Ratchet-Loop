@@ -88,7 +88,7 @@ Modes: by default you check in twice (plan and final review). You can ask to rev
 
 A provider is skipped when it is **the same as the host** (the host's own sub-agents already cover that model family), is not installed, or just failed on quota, auth or a timeout; failed providers are skipped for 6 hours. When no other provider is left, the host's own sub-agents fill in so the loop never stalls, but for high-risk checkpoints the number of distinct reviewers can then be smaller than the table shows. Substitutions are logged, so you can see when a checkpoint was reviewed by the host's model only. Ask your agent who is reviewing and it will tell you.
 
-The UI gate works the same way: the configured UI reviewers are chosen per role from the providers that are available, skipping the host, with the host's own reviewer sub-agents as the fallback.
+The UI gate works the same way: the `ui_reviewers` in config are chosen per role from the providers that are available, skipping the host, with the host's own reviewer sub-agents as the fallback.
 
 **Hooks on every host.** All four CLIs call the same entry point, which works out the host from the payload's shape and answers in that host's dialect. On internal errors the hooks **fail open** and log to `.ratchet/hook-errors.log`, because Copilot denies every tool call when a hook crashes. Sub-agent prompts in `agents/` are in Claude Code's format; on other hosts the orchestrator reads the same prompts and hands them to that CLI's sub-agents.
 
@@ -103,7 +103,7 @@ The UI gate works the same way: the configured UI reviewers are chosen per role 
 - **No deleting tests.** Every planned case ID must still be in the test files at each behavior run.
 - **Code fingerprints.** Every gate pass is stamped with a hash of the working tree. Change the code afterwards and the pass goes stale: behavior always re-runs, UI re-runs if UI files changed, and the adversaries re-review.
 - **INVALID comparisons.** Reviewers reject screenshot pairs that aren't in the same state, so the capture is fixed rather than the app "fixed" to match a different state.
-- **Isolated UI reviewers.** UI reviewers get a temp folder with only screenshots, accessibility trees and DESIGN.md. They never see the project's agent instructions, the code or the chat.
+- **Isolated UI reviewers.** UI reviewers run in the provider chosen from config `ui_reviewers` (any supported CLI other than the host, or the host's own sub-agents as the fallback), in a temp folder with only screenshots, accessibility trees and the design file (config `design_md`). They never see the project's agent instructions, the code or the chat.
 - **Protected state.** A guard hook blocks hand-edits to the run state, evidence, the human log and a lane's director enrollment. It also blocks nested agent sessions and anything that could impersonate a human, and any access to the director key from a non-director session.
 - **Stop hook.** It feeds the next required action back to the agent and allows stopping only at the two review points, when blocked, or when paused.
 - **Retry limits go to you.** When a gate won't converge, the loop blocks and asks you instead of lowering the bar.
