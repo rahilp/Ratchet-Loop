@@ -3,8 +3,10 @@
 Viewer delivery tests: background server, link reporting, access token, what is (not) served,
 multiple lanes, and the director dashboard.   python3 tests/test_viewer.py
 """
+import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,10 @@ import urllib.request
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+TEMPLATE = ENGINE.parent.parent / "assets" / "viewer.html"
+PHASES = ["planning", "awaiting_plan_approval", "building", "awaiting_checkpoint_review", "awaiting_final_review",
+          "planning_feedback", "blocked", "paused", "done", "cancelled"]
+JARGON = re.compile(r"\b(fingerprint|lens|slot)\b", re.I)
 PASS = FAIL = 0
 
 
@@ -54,6 +60,99 @@ def lane(base: Path, slug: str) -> Path:
         "tests": {"files": ["t.js"], "command": "true"}}]}))
     (run / "tests" / "CP1.json").write_text('{"cases": []}')
     return d
+
+
+def say(d, text, transcripts):
+    """The user types a message: the agent CLI writes its transcript and calls the prompt hook."""
+    tp = Path(transcripts) / f"{d.name}.jsonl"
+    with tp.open("a") as f:
+        f.write(json.dumps({"type": "user", "message": {"role": "user", "content": text},
+                            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
+    return subprocess.run([sys.executable, str(ENGINE), "hook", "prompt", "--host", "claude"], cwd=d, text=True,
+                          capture_output=True, input=json.dumps({"cwd": str(d), "prompt": text, "session_id": "s-owner",
+                                                                 "transcript_path": str(tp)}))
+
+
+def building_lane(base: Path, slug: str, transcripts: Path, waive: bool) -> Path:
+    d = lane(base, slug)
+    sh("config", "--set", "min_review_seconds=0", cwd=d)
+    assert sh("plan-submit", cwd=d).returncode == 0
+    say(d, "yes, build it", transcripts)
+    r = sh("approve-plan", cwd=d)
+    assert r.returncode == 0, r.stderr + r.stdout
+    if waive:
+        sh("ask", "hooks-waive", cwd=d)
+        say(d, "yes, go ahead without hooks", transcripts)
+        r = sh("hooks-waive", cwd=d)
+        assert r.returncode == 0, r.stderr + r.stdout
+    sh("view", cwd=d)  # builds viewer.html + viewer-data.json
+    return d
+
+
+def plain_viewer_checks(base: Path):
+    src = TEMPLATE.read_text(encoding="utf-8")
+    tr = base / "transcripts"
+    tr.mkdir()
+    env_home = tempfile.mkdtemp(prefix="ratchet-viewer-home-")
+    os.environ["RATCHET_HOME"] = env_home
+    os.environ["RATCHET_HOST_PROVIDER"] = "anthropic"
+    plain = building_lane(base, "plain", tr, waive=False)
+    waived = building_lane(base, "waivedlane", tr, waive=True)
+
+    print("[CP3-T17] viewer data carries plain step labels")
+    run = plain / ".ratchet/runs/plain"
+    try:
+        data = json.loads((run / "viewer-data.json").read_text())
+    except ValueError:
+        data = {}
+    nxt = data.get("next") or {}
+    check("[CP3-T17] viewer-data.json is valid and the run is building",
+          data.get("state", {}).get("phase") == "building", data.get("state", {}).get("phase"))
+    label = nxt.get("label")
+    check("[CP3-T17] next carries a plain 'label' for the current step (not the agent instruction)",
+          isinstance(label, str) and label.strip() != "" and label != nxt.get("action"), nxt)
+    check("[CP3-T17] the label has no jargon, raw phase id, command name or step code",
+          isinstance(label, str) and not JARGON.search(label) and not re.search(r"_|ratchet\.py|\bCP\d", label or "_"), label)
+    check("[CP3-T17] hooks object present in the data", isinstance(data.get("hooks"), dict), data.get("hooks"))
+    wdata = json.loads((waived / ".ratchet/runs/waivedlane/viewer-data.json").read_text())
+    check("[CP3-T17] waived project: hooks.waived is true in the data", (wdata.get("hooks") or {}).get("waived") is True,
+          wdata.get("hooks"))
+    check("[CP3-T17] not-waived project: hooks.waived is not true", (data.get("hooks") or {}).get("waived") is not True,
+          data.get("hooks"))
+
+    print("[CP3-T18] viewer page maps phases and gates to plain labels")
+    m = re.search(r"GATE_LABEL\s*=\s*\{[^}]*\}", src)
+    gl = m.group(0) if m else ""
+    check("[CP3-T18] gate labels are plain words",
+          all(w in gl for w in ("Tests", "Look and feel", "Second opinion", "Your OK")), gl)
+    check("[CP3-T18] no numbered jargon labels like '1 Behavior' / '3 Review'",
+          not re.search(r"[\"']\d\s+(Behavior|UI|Review|You)\b", src), gl)
+    missing = [p for p in PHASES if not re.search(rf"\b{p}\s*:\s*\[", src)]
+    check("[CP3-T18] every engine phase has a plain label entry", not missing, missing)
+    body = re.sub(r"<style.*?</style>", "", src, flags=re.S)
+    literals = re.findall(r'"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'|`(?:[^`\\]|\\.)*`', body)
+    text_nodes = re.findall(r">([^<>]+)<", body)
+    bad = [x for x in literals + text_nodes if JARGON.search(re.sub(r"\$\{[^}]*\}", "", x))]
+    check("[CP3-T18] no user-visible string says fingerprint, lens or slot", not bad, bad[:3])
+
+    print("[CP3-T19] hooks-skipped banner only when waived")
+    whtml = (waived / ".ratchet/runs/waivedlane/viewer.html").read_text()
+    phtml = (plain / ".ratchet/runs/plain/viewer.html").read_text()
+    check("[CP3-T19] waived page embeds hooks.waived=true", '"waived": true' in whtml)
+    check("[CP3-T19] not-waived page does not embed waived=true", '"waived": true' not in phtml)
+    bm = re.search(r"hooks[^\n]{0,60}skipped|skipped[^\n]{0,60}hooks", src, re.I)
+    check("[CP3-T19] template contains banner text saying hooks were skipped", bm is not None)
+    if bm:
+        before = src[max(0, bm.start() - 400):bm.start()]
+        check("[CP3-T19] banner is conditional on the waived flag (not always shown)", "waived" in before, before[-200:])
+    check("[CP3-T19] hooks access is guarded, so a missing hooks object cannot crash the page",
+          re.search(r"hooks\s*\?\.\s*waived|hooks\s*&&[^;\n]{0,40}waived|\(\s*[\w.]*hooks\s*\|\|\s*\{\s*\}\s*\)\.waived", src) is not None)
+
+    print("[CP3-T20] viewer stays self-contained")
+    check("[CP3-T20] no src/href/import/url() to an external host",
+          not re.search(r"""(src|href)\s*=\s*["']?https?://|@import|url\(\s*["']?https?://""", src, re.I))
+    for d in (plain, waived):
+        sh("view", "--stop", cwd=d)
 
 
 def main():
@@ -102,6 +201,7 @@ def main():
         check("proxies a lane's viewer", get(dash + "lane/0/")[0] == 200)
         check("proxies a lane's live data", json.loads(get(dash + "lane/1/viewer-data.json")[1])["state"]["slug"] in ("alpha", "beta"))
         check("proxies a lane's prototype", get(dash + "lane/0/reference/prototype.html")[1] == b"<p>PROTO</p>")
+        plain_viewer_checks(base)
     finally:
         sh("lanes", "--stop", "--scan", str(base), cwd=base)
         for d in (a, b):

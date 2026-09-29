@@ -80,7 +80,7 @@ The orchestrator puts the viewer link in its message at both stops: plan approva
 
 The server only serves the viewer, its live data and the prototype, never the rest of `.ratchet/` (state, evidence, logs). The URL is saved in `.ratchet/viewer.json` and reported as `viewer_url` by `ratchet.py status --json` and `lanes --json`.
 
-Status any time: `ratchet.py status`.
+Status any time: `ratchet.py status` (plain text, `--json` for tools); `ratchet.py plan-summary` shows the plan step by step.
 
 ### Modes
 - `--human-review end` (default): 2 stops.

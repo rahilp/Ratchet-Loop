@@ -140,4 +140,4 @@ A director is an orchestrator above Ratchet that runs several lanes at once, one
 
 ## Recovering / resuming
 
-Any time you're unsure where things stand, run `$RATCHET status` then `$RATCHET next`. A new session picks up from `state.json`, because nothing lives only in your context.
+Any time you're unsure where things stand, run `$RATCHET status` then `$RATCHET next`. Relay `status` to the user in your own plain words and show `$RATCHET plan-summary` at the plan approval stop; when the run is blocked, put the quoted reason and the lettered options (`options` in `next`) to the user as a question. Never show the user raw JSON or ask them to type a command. A new session picks up from `state.json`, because nothing lives only in your context.

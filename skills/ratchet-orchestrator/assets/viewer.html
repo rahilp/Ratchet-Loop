@@ -108,7 +108,7 @@ pre.learn{white-space:pre-wrap;background:var(--surface);border:1px solid var(--
 </div>
 <script>
 const EMBEDDED = /*__RATCHET_DATA__*/null;
-const GATE_LABEL = {behavior:"1 Behavior", ui:"2 UI", adversarial:"3 Review", human:"4 You"};
+const GATE_LABEL = {behavior:"Tests", ui:"Look and feel", adversarial:"Second opinion", human:"Your OK"};
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const openState = new Set();
 
@@ -117,16 +117,19 @@ function callout(d){
   const map = {
     planning:["","Planning in progress","The planner is splitting the feature into checkpoints."],
     awaiting_plan_approval:["you","Your turn: review this plan","Read each checkpoint in order. Is anything missing, in the wrong order, or too big? Then reply “approve” in the chat, or describe the changes you want."],
-    building:["","Building "+(st.current||""),d.next?.action||""],
+    building:["","Building",d.next?.label||""],
     awaiting_checkpoint_review:["you","Your turn: review "+(st.review_target||"the last checkpoint"),"Try it in the running app. Approve, or describe what should change."],
     awaiting_final_review:["you","Your turn: final review","All checkpoints passed their gates. Use the feature like a real user would, then approve or ask for changes — each change becomes a new checkpoint."],
     planning_feedback:["","Turning your feedback into checkpoints",""],
-    blocked:["blocked","Blocked — needs you",st.blocked_reason||""],
+    blocked:["blocked","Stuck: needs your decision",(st.blocked_reason?"“"+(st.blocked_reason_plain||st.blocked_reason)+"” ":"")+(d.next?.options||[]).map(o=>o.letter+") "+o.text).join("  ")],
     paused:["blocked","Paused",st.blocked_reason||""],
-    done:["done","Done","Every checkpoint passed all four gates."]
+    done:["done","Done","Every step passed its tests, review and your OK."],
+    cancelled:["blocked","Cancelled",st.blocked_reason||"This run was cancelled."]
   };
   const [cls,t,p] = map[phase] || ["",phase,""];
-  return `<div class="callout ${cls}"><span class="dot"></span><div><b>${esc(t)}</b><p>${esc(p)}</p></div></div>`;
+  const isWaived = d.hooks?.waived === true;
+  const banner = isWaived ? `<div class="callout you" data-testid="hooks-skipped-banner"><span class="dot"></span><div><b>Hooks were skipped at your request</b><p>The checks are only advice until hooks are set up.</p></div></div>` : "";
+  return banner + `<div class="callout ${cls}"><span class="dot"></span><div><b>${esc(t)}</b><p>${esc(p)}</p></div></div>`;
 }
 
 function chip(name, g, isCur, step){

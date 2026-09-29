@@ -656,7 +656,11 @@ def next_action(ctx: Ctx, st=None) -> dict:
                 "(append new checkpoints, never edit completed ones), ratchet-test-planner for each new checkpoint, "
                 "then run ratchet.py plan-extend", "stop_ok": False}
     if phase in ("blocked", "paused", "done", "cancelled"):
-        return {"phase": phase, "action": st.get("blocked_reason") or phase, "stop_ok": True}
+        na = {"phase": phase, "action": st.get("blocked_reason") or phase, "stop_ok": True}
+        if phase == "blocked":
+            na["options"] = blocked_options(st.get("blocked_reason"))
+            na["reason_plain"] = plain_reason(st.get("blocked_reason"))
+        return na
 
     # building
     cur = st.get("current")
@@ -679,6 +683,151 @@ def next_action(ctx: Ctx, st=None) -> dict:
         "complete": f"{cur}: run ratchet.py complete {cur}",
     }
     return {"phase": phase, "checkpoint": cur, "step": step, "action": msgs.get(step, step), "stop_ok": False}
+
+
+# --------------------------------------------------------------------------- plain language
+
+STEP_PLAIN = {"tests": "writing the tests", "red": "checking the new tests fail before any code exists",
+              "implement": "building it", "behavior": "running the tests", "ui": "checking how it looks",
+              "adversarial": "getting a second opinion", "complete": "wrapping up"}
+
+
+PHASE_PLAIN = {"planning": "planning", "awaiting_plan_approval": "waiting for your approval of the plan",
+               "building": "building", "awaiting_checkpoint_review": "waiting for your review",
+               "awaiting_final_review": "waiting for your final review", "planning_feedback": "updating the plan",
+               "blocked": "stuck, needs your decision", "paused": "paused", "done": "done", "cancelled": "cancelled"}
+
+
+def plain_reason(reason):
+    """The block reason in plain words for the user. Unknown reasons pass through unchanged; the raw text stays
+    in `status --json` (blocked_reason)."""
+    if not reason:
+        return reason
+    m = re.match(r"(CP\d+): behavior gate failed (\d+) times", reason)
+    if m:
+        return f"The tests for {m.group(1)} still fail after {m.group(2)} tries."
+    m = re.match(r"(CP\d+): UI gate failed (\d+) rounds", reason)
+    if m:
+        return f"The look-and-feel check for {m.group(1)} still is not passing after {m.group(2)} rounds."
+    m = re.match(r"(CP\d+): adversarial review still has (\d+) finding\(s\) after (\d+) rounds", reason)
+    if m:
+        return (f"The reviewers still have {m.group(2)} open concern(s) about {m.group(1)} after "
+                f"{m.group(3)} rounds of fixes, which is the limit.")
+    m = re.match(r"(CP\d+): (\d+) adversarial rounds used without approval", reason)
+    if m:
+        return f"The reviewers have not signed off on {m.group(1)} after {m.group(2)} rounds, which is the limit."
+    m = re.match(r"Run-wide adversarial round cap reached \((\d+)/(\d+)\)", reason)
+    if m:
+        return f"The reviewers have used all the review rounds allowed for this run ({m.group(1)} of {m.group(2)})."
+    if reason.startswith("The agent tried to stop"):
+        return "The work kept stopping without making progress, so it was halted for you to look at."
+    return reason
+
+
+def blocked_options(reason) -> list:
+    """2-3 lettered choices for the user, fitted to why the run is blocked. Offered by the agent, not typed.
+    Only offers things that can work: raising a review limit is a user-confirmed config change."""
+    r = (reason or "").lower()
+    if "round cap" in r or "run-wide" in r:
+        texts = ["Raise the review limit so the reviewers can keep going.",
+                 "Stop here and keep what is already finished."]
+    elif "rounds used" in r or ("adversarial" in r and re.search(r"after \d+ rounds", r)):
+        texts = ["Raise the review limit so the reviewers can keep going.",
+                 "Change the step so the review notes no longer apply.",
+                 "Stop here and keep what is already finished."]
+    elif "behavior gate failed" in r:
+        texts = ["Try again with a different approach.", "Change or revise this step (its tests or its scope).",
+                 "Stop here and keep what is already finished."]
+    elif "adversarial" in r or "review" in r:
+        texts = ["Change the step so the review notes no longer apply.",
+                 "Stop here and keep what is already finished."]
+    else:
+        texts = ["Try again.", "Change the plan for this step.", "Stop here and keep what is already finished."]
+    return [{"letter": "ABC"[i], "text": t} for i, t in enumerate(texts)]
+
+
+def plain_now(ctx: Ctx, st, plan=None) -> str:
+    """One plain sentence about what is happening now (no phase ids, no commands)."""
+    phase = st.get("phase")
+    plan = plan if plan is not None else (ctx.plan() or {})
+    titles = {c["id"]: c.get("title", c["id"]) for c in plan.get("checkpoints", [])}
+    fixed = {
+        "planning": "Planning: splitting the feature into steps.",
+        "awaiting_plan_approval": "The plan is ready and waiting for your approval. Say yes to start building, "
+                                  "or tell me what to change.",
+        "awaiting_final_review": "Everything is built. Please look it over, then approve or tell me what should change.",
+        "planning_feedback": "Turning your feedback into new steps.",
+        "paused": "The work is paused until you say to continue.",
+        "cancelled": "This run was cancelled.",
+        "done": "Finished.",
+        "blocked": "The work is stuck and needs your decision.",
+    }
+    if phase in fixed:
+        return fixed[phase]
+    if phase == "awaiting_checkpoint_review":
+        t = titles.get(st.get("review_target"), "the last step")
+        return f"\"{t}\" is ready for you to review. Try it, then approve or tell me what should change."
+    cur = st.get("current")
+    cps = st.get("checkpoints") or {}
+    if not cur or cur not in cps:
+        return "Getting the next step ready."
+    n = list(cps).index(cur) + 1
+    return (f"Working on step {n} of {len(cps)}, \"{titles.get(cur, cur)}\": "
+            + STEP_PLAIN.get(cps[cur].get("step"), "in progress") + ".")
+
+
+def cmd_status_text(ctx: Ctx):
+    st = ctx.state()
+    plan = ctx.plan() or {"checkpoints": []}
+    cps = plan.get("checkpoints", [])
+    total = len(cps)
+    done = [c for c in cps if (st["checkpoints"].get(c["id"]) or {}).get("status") == "done"]
+    if not total:
+        print("No plan yet.")
+    elif len(done) == total:
+        print(f"All {total} steps are done.")
+    elif done:
+        print(f"Step {len(done)} of {total} done: {done[-1].get('title', done[-1]['id'])}")
+    else:
+        print(f"Step 0 of {total} done. Not started yet.")
+    print(f"Run: {st['slug']}  -  {st['feature']}")
+    print(f"Phase: {PHASE_PLAIN.get(st.get('phase'), st.get('phase'))}")
+    print(plain_now(ctx, st, plan))
+    cur = (st.get("checkpoints") or {}).get(st.get("current")) or {}
+    if st.get("phase") == "building" and any(g.get("status") in ("stale", "invalid")
+                                             for g in (cur.get("gates") or {}).values()):
+        print("The code changed since the checks last passed, so they must be re-run.")
+    if st.get("phase") == "blocked":
+        print(f"Why: \"{plain_reason(st.get('blocked_reason')) or 'no reason was recorded'}\"")
+        print("What would you like to do?")
+        for o in blocked_options(st.get("blocked_reason")):
+            print(f"  {o['letter']}) {o['text']}")
+    if hooks_view(ctx, st).get("waived"):
+        print("Hooks were skipped at your request, so the checks are only advice.")
+    url = viewer_link(ctx)["url"]
+    if url:
+        print(f"Live view: {url}")
+
+
+def cmd_plan_summary(args):
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    plan = ctx.plan()
+    if not plan or not plan.get("checkpoints"):
+        die("There is no plan yet. Finish planning first, then ask again.")
+    depth = ctx.config().get("review_depth") or {}
+    print(f"Plan: {plan.get('feature') or st.get('feature')} ({len(plan['checkpoints'])} steps)")
+    for i, cp in enumerate(plan["checkpoints"], 1):
+        risk = cp.get("risk", "normal")
+        slots = cp.get("reviewers") or depth.get(risk) or depth.get("normal") or []
+        who = ", ".join(str(s[0] if isinstance(s, list) else s) for s in slots if s)
+        print(f"\n{i}. {cp['title']}")
+        print(f"   Done when: {(cp.get('done_when') or [''])[0]}")
+        print(f"   UI review: {'yes' if (cp.get('gates') or {}).get('ui') else 'no'}")
+        print(f"   Risk: {risk}")
+        print(f"   Reviewed by: {who}")
+    if hooks_view(ctx, st).get("waived"):
+        print("\nNote: hooks were skipped at your request, so the checks are only advice.")
 
 
 # --------------------------------------------------------------------------- commands
@@ -1952,22 +2101,7 @@ def cmd_status(args):
     if getattr(args, "json", False):
         print(json.dumps(status_json(ctx), indent=2))
         return
-    st = ctx.state()
-    plan = ctx.plan() or {"checkpoints": []}
-    print(f"Run: {st['slug']}  —  {st['feature']}")
-    print(f"Phase: {st['phase']}   Current: {st.get('current') or '-'}   Human review: {st.get('human_review')}")
-    sym = {"passed": "✓", "failed": "✗", "pending": "·", "skipped": "–", "stale": "~", "invalid": "?"}
-    for cp in plan["checkpoints"]:
-        s = st["checkpoints"].get(cp["id"])
-        if not s:
-            print(f"  {cp['id']:<5} (not submitted) {cp['title']}")
-            continue
-        gates = " ".join(f"{n[0].upper()}{sym.get(s['gates'][n]['status'], '?')}" for n in GATES)
-        print(f"  {cp['id']:<5} {s['status']:<11} [{gates}] step={s['step']:<11} {cp['title']}")
-    if hooks_view(ctx, st).get("waived"):
-        print("\nHooks: skipped at your request, so the gates are only advice.")
-    na = next_action(ctx, st)
-    print(f"\nNext: {na['action']}")
+    cmd_status_text(ctx)
 
 
 def cmd_reviewers(args):
@@ -2092,6 +2226,7 @@ def status_json(ctx: Ctx) -> dict:
     return {"root": str(ctx.root), "slug": st["slug"], "feature": st["feature"], "phase": st["phase"],
             "current": st.get("current"), "step": na.get("step"), "next": na["action"], "stop_ok": na["stop_ok"],
             "waiting_on": waiting_on, "blocked_reason": st.get("blocked_reason"),
+            "blocked_reason_plain": plain_reason(st.get("blocked_reason")),
             "awaiting_since": st.get("awaiting_since"), "approval_mode": approval_mode(ctx),
             "adv_rounds_used": st.get("adv_rounds_total", 0),
             "unavailable_reviewers": unavailable_reviewers(ctx), "host_provider": detect_host(ctx.config()),
@@ -2176,11 +2311,12 @@ def viewer_data(ctx: Ctx):
         if tp:
             tests[cp["id"]] = tp
     learn = ctx.ratchet / "learnings.md"
-    return {"state": {k: v for k, v in st.items() if k not in ("history", "approved")},
+    return {"state": dict({k: v for k, v in st.items() if k not in ("history", "approved")},
+                         blocked_reason_plain=plain_reason(st.get("blocked_reason"))),
             "prototype": (ctx.run_dir() / "reference" / "prototype.html").exists(),
             "history": st.get("history", [])[-40:], "plan": plan, "tests": tests,
             "learnings": learn.read_text() if learn.exists() else "",
-            "next": next_action(ctx, st), "hooks": hooks_view(ctx, st), "generated_at": now()}
+            "next": dict(next_action(ctx, st), label=plain_now(ctx, st, plan)), "hooks": hooks_view(ctx, st), "generated_at": now()}
 
 
 def build_viewer(ctx: Ctx) -> Path:
@@ -2455,7 +2591,7 @@ const cls=l.waiting_on?"wait":l.phase==="building"?"building":l.phase==="done"?"
 const pct=l.total?Math.round(100*l.done/l.total):0;
 return `<tr><td><b>${esc(l.slug)}</b><div class="mono">${esc(l.root)}</div></td><td><span class="pill ${cls}">${esc(l.phase)}</span></td>
 <td class="prog"><span class="bar"><i style="width:${pct}%"></i></span>${l.done}/${l.total}</td><td class="mono">${esc(l.current||"–")} ${esc(l.step||"")}</td>
-<td>${l.waiting_on?`<span class="flag">⚑ ${esc(l.waiting_on)}</span>`:""}${l.blocked_reason?`<div class="mono">${esc(l.blocked_reason)}</div>`:""}${l.hooks_warning?`<div class="mono">hooks not firing</div>`:""}</td>
+<td>${l.waiting_on?`<span class="flag">⚑ ${esc(l.waiting_on)}</span>`:""}${l.blocked_reason?`<div class="mono">${esc(l.blocked_reason_plain||l.blocked_reason)}</div>`:""}${l.hooks_warning?`<div class="mono">hooks not firing</div>`:""}</td>
 <td><a href="lane/${i}/${q}">Open →</a></td></tr>`}).join("")}catch(e){document.getElementById("meta").textContent="Could not load lanes: "+e}
 setTimeout(load,5000)}load();
 </script></body></html>"""
@@ -2999,7 +3135,7 @@ def cmd_doctor(args):
         found = [f"{scope}: {p}" for scope, p in installed_hook_files(h, root)]
         if h in ("claude", "codex"):
             found.append("(or installed as a plugin — hooks/hooks.json)")
-        print(f"  {h:<8} " + ("; ".join(found) if found else "not installed — ratchet.py install-hooks --host " + h))
+        print(f"  {h:<8} " + ("; ".join(found) if found else "not installed"))
     hb = read_heartbeat(root)
     hb_file = root / RATCHET_DIR / "hook-heartbeat.json"
     try:
@@ -3022,7 +3158,10 @@ def cmd_doctor(args):
                 print(f"  last {ev:<6} hook: never fired in this project")
     else:
         print("  No Ratchet hook has fired in this project yet. Until one does, the gates are only advice:"
-              " install the hooks for your agent CLI and restart it.")
+              " offer to set up the hooks for the user's agent CLI (ask first; a restart is needed afterwards).")
+    if not _enforcement_active(root, cfg):
+        print("  For the agent: offer to set up the hooks for the user's agent CLI (ask first; a restart is needed "
+              "afterwards). Do not ask the user to run commands.")
     errs = root / RATCHET_DIR / "hook-errors.log"
     if errs.exists():
         tail = errs.read_text().strip().splitlines()[-3:]
@@ -3108,11 +3247,11 @@ def hooks_warning(ctx, hs=None) -> str | None:
     if hs["installed"]:
         return ("Ratchet hooks are installed for this agent CLI but none has fired recently. Tell the user the "
                 "agent CLI probably needs a restart (and, for Codex, hooks enabled) so the gates are enforced.")
-    return ("No Ratchet hook has fired in this project yet, so the gates are only advice. Offer to install the "
-            "hooks for this agent CLI (`ratchet.py install-hooks`), ask the user first, and tell them a restart "
-            "is needed afterwards. If they would rather not, run `ratchet.py ask hooks-waive`, tell them in one plain "
-            "sentence that the gates would then only be advice, and after their yes run `ratchet.py hooks-waive`. "
-            "`ratchet.py doctor` still shows details.")
+    return ("No Ratchet hook has fired in this project yet, so the gates are only advice. Offer to set up the "
+            "hooks for this agent CLI (the install-hooks command), ask the user first, and tell them a restart "
+            "is needed afterwards. If they would rather not, ask the hooks-waive question, tell them in one plain "
+            "sentence that the gates would then only be advice, and after their clear yes record it with the "
+            "hooks-waive command. The doctor command shows the details.")
 
 
 
@@ -3176,6 +3315,8 @@ def main(argv=None):
     a.add_argument("--director-token"); a.set_defaults(fn=cmd_approve_changes)
     sp.add_parser("next").set_defaults(fn=cmd_next)
     a = sp.add_parser("status"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_status)
+    sp.add_parser("plan-summary", help="plain per-step summary of the plan, to show the user before they approve"
+                  ).set_defaults(fn=cmd_plan_summary)
     a = sp.add_parser("reviewers"); a.add_argument("cp"); a.add_argument("--json", action="store_true")
     a.set_defaults(fn=cmd_reviewers)
     a = sp.add_parser("reviewer-status"); a.add_argument("--reset", metavar="ID")

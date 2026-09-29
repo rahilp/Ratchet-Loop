@@ -272,7 +272,7 @@ Each `review_depth` entry is a list of **slots**: a reviewer id, or an ordered l
 ```json
 {"root": "/work/lanes/track2-labels", "slug": "validity-labels", "phase": "building",
  "current": "CP3", "step": "adversarial", "next": "CP3: run the ratchet-adversarial-loop skill …",
- "stop_ok": false, "waiting_on": null, "blocked_reason": null, "approval_mode": "director",
+ "stop_ok": false, "waiting_on": null, "blocked_reason": null, "blocked_reason_plain": null, "approval_mode": "director",
  "viewer_url": "http://10.0.0.12:4481/?t=…", "viewer_live": true,
  "adv_rounds_used": 7, "done": 2, "total": 6, "updated_at": "…",
  "checkpoints": [{"id": "CP1", "title": "…", "risk": "low", "status": "done", "step": "complete",
@@ -291,6 +291,8 @@ Each `review_depth` entry is a list of **slots**: a reviewer id, or an ordered l
 | codex | `.codex/hooks.json` / `~/.codex/hooks.json` | Stop | UserPromptSubmit | PreToolUse |
 | gemini | `.gemini/settings.json` / `~/.gemini/settings.json` | AfterAgent | BeforeAgent | BeforeTool |
 | copilot | `.github/hooks/ratchet.json` / `~/.copilot/hooks/ratchet.json` | agentStop | userPromptSubmitted | preToolUse |
+
+**Plain-language output (user-facing; never paste JSON at the user).** `ratchet.py status` (no flag) prints plain text: first line `Step N of M done: <title>` (or `All M steps are done.` / `No plan yet.`), the phase in words, what is happening now, a re-run note when a passed check went out of date, and, when blocked, the reason in quotes plus 2-3 lines `A) ...`, `B) ...`, `C) ...`. `ratchet.py plan-summary` prints, per step: title, first done-when line, `UI review: yes|no`, `Risk:` and `Reviewed by:`, plus a hooks-skipped note when waived; paste it at the plan approval stop. `next` gains `options: [{letter, text}]` (blocked phase only, same choices as the text status) and the warning/doctor text is addressed to the agent. viewer-data.json `next` gains `label` (plain sentence for the current step); `hooks.waived` drives the viewer's hooks-skipped banner. `status --json` and `lanes --json` gain `blocked_reason_plain` (the block reason as a plain sentence; unknown reasons pass through unchanged, null when not blocked; `blocked_reason` stays the raw text), viewer-data.json `state` gains the same `blocked_reason_plain`, and `next` in the blocked phase gains `reason_plain` next to the raw reason in `action`.
 
 Runtime files: `.ratchet/hook-heartbeat.json` (last time each hook fired and via which host; read by `doctor`, `next`, and `status --json` as `hooks_warning` and `hooks`) and `.ratchet/hook-errors.log` (internal errors; hooks fail open).
 
