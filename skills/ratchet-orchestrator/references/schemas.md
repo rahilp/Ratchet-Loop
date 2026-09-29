@@ -26,7 +26,11 @@ Contents
   active.json          # which run is active (protected)
   viewer.json          # live viewer server: url, port, bind, pid, token (written by `view --serve`)
   runs/<slug>/
-    state.json         # gate state — written ONLY by ratchet.py (protected)
+    state.json         # gate state — written ONLY by ratchet.py (protected). Optional field `hooks_waived`:
+                       #   {at, by, prompt} = the user chose to build without hooks (see section 10)
+                       #   Optional `hooks_waive_n` (int): incremented whenever a hooks-waive director token is used
+                       #   and whenever `hooks_waived` is auto-cleared; folded into the hooks-waive director-token
+                       #   payload, so that token is single use and a spent one is dead
     app-scout.json
     checkpoints.json
     tests/CP1.json …
@@ -35,6 +39,7 @@ Contents
     reviews/           # scratch area where reviewers write JSON
     evidence/CP1/…     # logs, screenshots, reviews archived by ratchet.py (protected)
     viewer.html
+    viewer-data.json   # what the viewer shows; its `hooks` key is the hooks object of section 10 (incl. `waived`)
 DESIGN.md              # design system (path configurable)
 ```
 
@@ -298,6 +303,7 @@ Runtime files: `.ratchet/hook-heartbeat.json` (last time each hook fired and via
 | `heartbeat_seen` | bool | the heartbeat has an entry from `host` (any host if `host` is `unknown`) |
 | `fresh` | bool | such an entry has an `at` timestamp within the last 24 hours and not more than 5 minutes in the future |
 | `missing` | bool | `not installed and not fresh` |
+| `waived` | bool | (`status --json`, `next`, viewer-data `hooks`, plain `status`; not `doctor`) the user chose to build without hooks (`ask hooks-waive`, then `hooks-waive` after their reply, which must be one of a fixed allow-list of full phrases, `HOOKS_WAIVE_PHRASES` in ratchet.py, after lowercasing and dropping punctuation and a trailing \"please\": \"yes go ahead without hooks\", \"yes skip the hooks\", \"yes build without hooks\", \"go ahead without hooks\", \"skip the hooks\", \"proceed without hooks\"; anything else is refused and clears the question; stored in state.json as `hooks_waived {at, by, prompt}`, with a `hooks_waived` history event). True only while no enforcement hook is installed or seen firing: the guard and stop hooks decide, not the prompt hook (which is how the yes is recorded) and not `missing`. Once they are installed or fire, the next state save removes `hooks_waived` (history event `hooks_waive_cleared`), so it cannot resurface later without new consent. `hooks-waive` refuses to record anything while they are active. Never blocks anything |
 
 `hooks_warning` (string or null) is null when `fresh`. Otherwise it tells the agent either that the hooks are installed but silent (restart the CLI) or that none fired yet (offer to run `install-hooks`, ask the user first). A corrupt or odd `hook-heartbeat.json` or `config.json` counts as empty here; `doctor` never raises for it.
 

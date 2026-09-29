@@ -32,6 +32,7 @@ import secrets
 import json
 import os
 import re
+import unicodedata
 import shutil
 import subprocess
 import sys
@@ -224,6 +225,10 @@ class Ctx:
 
     def save_state(self, st):
         st["updated_at"] = now()
+        if st.get("hooks_waived") and not _waiver_applies(self.root, self.config(), st):
+            st.pop("hooks_waived", None)
+            st["hooks_waive_n"] = int(st.get("hooks_waive_n", 0)) + 1  # hooks are installed or fired: the old consent must not resurface later
+            self.log(st, "hooks_waive_cleared", note="enforcement hooks are active")
         write_json(self.state_path(st["slug"]), st)
         record_chain(self.state_path(st["slug"]))
 
@@ -426,6 +431,29 @@ def message_intent(text: str) -> str:
     leftover = [w for w in rest.split() if w not in ("it", "the", "plan", "this", "that", "all", "then", "go", "on",
                                                     "ahead", "and", "a", "i", "me", "we", "you", "can", "now")]
     return "approve" if found and len(leftover) <= 3 else "unclear"
+
+
+# The ONLY replies that waive hooks (compared after normalising: lowercase, punctuation and extra spaces dropped,
+# a trailing "please" dropped). Each one says what is being waived. Anything else is not consent, however it is worded.
+HOOKS_WAIVE_PHRASES = frozenset({
+    "yes go ahead without hooks", "yes skip the hooks", "yes build without hooks",
+    "go ahead without hooks", "skip the hooks", "proceed without hooks",
+})
+HOOKS_WAIVE_REPLY = "yes, go ahead without hooks"
+
+
+def _norm_reply(text: str) -> str:
+    """NFKC + casefold, then drop only ASCII punctuation (except '?') and extra spaces and a trailing "please".
+    Anything else (non-ASCII letters, emoji, CJK, '?') is kept, so it can never equal an allow-listed phrase."""
+    t = unicodedata.normalize("NFKC", text or "").casefold().replace("\u2019", "'").replace("'", "")
+    t = re.sub(r"[!-/:->@-`{-~\[-\]]+", " ", t)   # ASCII punctuation; '?' (0x3f) is deliberately not in this set
+    t = " ".join(t.split())
+    return re.sub(r"( please)+$", "", t).strip()
+
+
+def hooks_waive_intent(text: str) -> str:
+    """Strict allow-list for the hooks question: approve only when the whole reply is a listed waiver phrase."""
+    return "approve" if _norm_reply(text) in HOOKS_WAIVE_PHRASES else "unclear"
 
 
 CANCEL_HINT_RE = re.compile(r"\b(cancel|abandon|scrap|kill)\b[^.?!]*\b(run|build|feature|ratchet|loop|work|whole thing|everything)\b"
@@ -938,8 +966,11 @@ def _is_director_session() -> bool:
 
 
 def _approval_payload(ctx, st, action) -> str:
-    return "|".join([str(ctx.root.resolve()), st["slug"], st["phase"], str(st.get("awaiting_since")),
-                     str(st.get("plan_hash")), action])
+    parts = [str(ctx.root.resolve()), st["slug"], st["phase"], str(st.get("awaiting_since")),
+             str(st.get("plan_hash")), action]
+    if action == "hooks-waive":  # single use: the counter moves on every waive/clear, so a spent token is dead
+        parts.append(str(st.get("hooks_waive_n", 0)))
+    return "|".join(parts)
 
 
 def _sign(key: bytes, payload: str) -> str:
@@ -1026,10 +1057,26 @@ def _require_approval(ctx, st, action, token=None):
     if os.environ.get("RATCHET_HUMAN_OVERRIDE") == "1":
         return {"by": "human", "detail": "(RATCHET_HUMAN_OVERRIDE)"}
     msgs = _human_since(ctx, st.get("awaiting_since"))
+    p = st.get("pending") or {}
+    if p.get("action") == "hooks-waive" and action != "hooks-waive":
+        # the first reply after the hooks question answers THAT question; it is not an approval of anything else
+        after = [m for m in msgs if m.get("at", "") > p.get("asked_at", "")]
+        if after and hooks_waive_intent(after[0].get("prompt", "")) == "approve":  # only a real waiver phrase is eaten
+            msgs = [m for m in msgs if m is not after[0]]
+    if action == "hooks-waive":
+        msgs = msgs[:1]  # only the FIRST reply after the hooks question answers it
     if msgs:
         entry = msgs[-1]
         last = entry.get("prompt", "")
-        if action != "feedback" and message_intent(last) != "approve":
+        intent = hooks_waive_intent if action == "hooks-waive" else message_intent
+        if action != "feedback" and intent(last) != "approve":
+            if action == "hooks-waive":
+                st.pop("pending", None)  # spent: a later yes must not turn this no into consent
+                ctx.save_state(st)
+                die(f"The user's reply to the hooks question was not a clear yes: \"{last[:120]}\". Nothing was "
+                    "recorded. Only the exact reply \"" + HOOKS_WAIVE_REPLY + "\" (or a listed equivalent) counts. If they "
+                    "still want to skip hooks, run `ratchet.py ask hooks-waive` again and show them the question it "
+                    "prints word for word.")
             die(f"The user's latest reply is not a clear yes: \"{last[:120]}\". Answer it or make the change they asked "
                 "for, then ask them plainly (e.g. \"Shall I go ahead? Reply yes to continue.\") and try again after "
                 "they reply.")
@@ -1087,7 +1134,9 @@ def cmd_director_sign(args):
             "cancel": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
                        "awaiting_checkpoint_review", "awaiting_final_review", "planning_feedback"],
             "set-review": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
-                           "awaiting_checkpoint_review", "awaiting_final_review"]}[args.action]
+                           "awaiting_checkpoint_review", "awaiting_final_review"],
+            "hooks-waive": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
+                            "awaiting_checkpoint_review", "awaiting_final_review"]}[args.action]
     if st["phase"] not in want:
         die(f"Run {st['slug']} is in phase {st['phase']}; {args.action} applies to {want}.")
     print(_sign(_director_key(), _approval_payload(ctx, st, args.action)))
@@ -1707,7 +1756,8 @@ def cmd_resume(args):
 ASKABLE = {"approve-changes": "accept the changes listed above as the new baseline",
            "cancel": "cancel this Ratchet run (commits already made are kept)",
            "set-review": "change how often you review",
-           "claim": "continue this Ratchet run in THIS chat"}
+           "claim": "continue this Ratchet run in THIS chat",
+           "hooks-waive": "build without the Ratchet hooks (the checks then only advise; nothing enforces them)"}
 
 
 def cmd_ask(args):
@@ -1726,11 +1776,20 @@ def cmd_ask(args):
     if args.action == "set-review":
         detail = {"end": "I'll only check in with you at the end.", "each": "I'll check in after every step.",
                   "none": "I'll build every step without checking in; the checks still run."}[args.mode]
+    old = st.get("pending") or {}
+    if args.action == "hooks-waive" and old.get("action") not in (None, "hooks-waive"):
+        die(f"A different question ({old.get('action')}) is still waiting for the user's answer. Get that answered "
+            "first; a hooks question must not take over their reply.")
     asked = now()
     st["pending"] = {"action": args.action, "mode": args.mode, "asked_at": asked, "prev_awaiting": st.get("awaiting_since")}
-    st["awaiting_since"] = asked
+    if args.action != "hooks-waive":  # a hooks question must not open (or reset) any approval window
+        st["awaiting_since"] = asked
     ctx.log(st, "question_asked", action=args.action, mode=args.mode)
     ctx.save_state(st)
+    if args.action == "hooks-waive":
+        print(f"ASK THE USER: Shall I build without the Ratchet hooks? The checks would then only advise; nothing "
+              f"enforces them. To agree, reply exactly \"{HOOKS_WAIVE_REPLY}\". Any other reply means no.")
+        return
     q = f"{detail} Shall I {ASKABLE[args.action]}{' → ' + args.mode if args.mode else ''}? Reply yes to confirm."
     print(f"ASK THE USER: {q.strip()}")
 
@@ -1811,10 +1870,76 @@ def cmd_approve_changes(args):
     ok("Accepted as the new baseline: " + "; ".join(probs))
 
 
+def hooks_view(ctx, st=None) -> dict:
+    """hooks_status plus `waived`: the user chose to build without hooks and nothing enforces the gates yet."""
+    hs = hooks_status(ctx.root, ctx.config())
+    st = st or ctx.state()
+    if _waiver_applies(ctx.root, ctx.config(), st):
+        hs["waived"] = True
+    return hs
+
+
+def _enforcement_beats(root: Path, cfg) -> list:
+    """Timestamps of guard/stop heartbeats from this host. The prompt hook is only the consent channel."""
+    host = VENDOR_TO_HOST.get(detect_host(cfg or {}), "unknown")
+    hb = read_heartbeat(root)
+    out = []
+    for ev in ("guard", "stop"):
+        e = hb.get(ev)
+        if isinstance(e, dict) and (host == "unknown" or e.get("host") == host):
+            t = _parse_iso(e.get("at"))
+            if t and t <= _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=5):
+                out.append(t)
+    return out
+
+
+def _enforcement_active(root: Path, cfg) -> bool:
+    cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=24)
+    return bool(hooks_status(root, cfg)["installed"]) or any(t > cutoff for t in _enforcement_beats(root, cfg))
+
+
+def _waiver_applies(root: Path, cfg, st) -> bool:
+    """A recorded waiver counts only while the enforcement hooks (guard/stop) are neither installed nor seen firing
+    since it was given, so it cannot resurface after an uninstall without new consent."""
+    w = st.get("hooks_waived")
+    if not w or _enforcement_active(root, cfg):
+        return False
+    since = _parse_iso(w.get("at")) if isinstance(w, dict) else None
+    return not (since and any(t > since for t in _enforcement_beats(root, cfg)))
+
+
+def cmd_hooks_waive(args):
+    """Record that the USER chose to build without hooks (after `ask hooks-waive` and their clear yes)."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    token = getattr(args, "director_token", None)
+    if not token:
+        _require_pending(st, "hooks-waive")
+    if _enforcement_active(ctx.root, ctx.config()):
+        st.pop("pending", None)
+        ctx.save_state(st)
+        ok("Ratchet hooks are already active here, so there is nothing to waive; nothing was recorded.")
+        return
+    # only a reply typed after the hooks question counts, and it is spent on this question alone
+    view = dict(st, awaiting_since=st["pending"]["asked_at"]) if not token else st
+    msg = _require_human(ctx, view, "hooks-waive", token)
+    already = bool(st.get("hooks_waived"))
+    if token:
+        st["hooks_waive_n"] = int(st.get("hooks_waive_n", 0)) + 1  # spend the token
+    if not already:
+        st["hooks_waived"] = {"at": now(), "by": msg["by"], "prompt": msg.get("prompt", "")[:200]}
+        ctx.log(st, "hooks_waived", by=msg["by"], note=msg.get("prompt", "")[:200])
+    _clear_pending(st)
+    ctx.save_state(st)
+    build_viewer(ctx)
+    ok("Already recorded: the user chose to build without hooks." if already else
+       "Recorded: the user chose to build without hooks. The checks are advice only; missing hooks never block work.")
+
+
 def cmd_next(args):
     ctx = Ctx(find_root())
     na = next_action(ctx)
-    hs = hooks_status(ctx.root, ctx.config())
+    hs = hooks_view(ctx)
     hw = hooks_warning(ctx, hs)
     if hw and na.get("phase") not in ("planning",):
         na["warning"] = hw
@@ -1839,6 +1964,8 @@ def cmd_status(args):
             continue
         gates = " ".join(f"{n[0].upper()}{sym.get(s['gates'][n]['status'], '?')}" for n in GATES)
         print(f"  {cp['id']:<5} {s['status']:<11} [{gates}] step={s['step']:<11} {cp['title']}")
+    if hooks_view(ctx, st).get("waived"):
+        print("\nHooks: skipped at your request, so the gates are only advice.")
     na = next_action(ctx, st)
     print(f"\nNext: {na['action']}")
 
@@ -1957,7 +2084,7 @@ def status_json(ctx: Ctx) -> dict:
                     "gates": {n: {k: g.get(k) for k in ("status", "attempts", "by") if g.get(k) is not None}
                               for n, g in (s.get("gates") or {}).items()}})
     na = next_action(ctx, st)
-    hs = hooks_status(ctx.root, ctx.config())
+    hs = hooks_view(ctx, st)
     hw = hooks_warning(ctx, hs)
     waiting_on = None
     if st["phase"] in ("awaiting_plan_approval", "awaiting_checkpoint_review", "awaiting_final_review", "blocked"):
@@ -2053,7 +2180,7 @@ def viewer_data(ctx: Ctx):
             "prototype": (ctx.run_dir() / "reference" / "prototype.html").exists(),
             "history": st.get("history", [])[-40:], "plan": plan, "tests": tests,
             "learnings": learn.read_text() if learn.exists() else "",
-            "next": next_action(ctx, st), "generated_at": now()}
+            "next": next_action(ctx, st), "hooks": hooks_view(ctx, st), "generated_at": now()}
 
 
 def build_viewer(ctx: Ctx) -> Path:
@@ -2971,14 +3098,21 @@ def hooks_status(root: Path, cfg=None) -> dict:
 def hooks_warning(ctx, hs=None) -> str | None:
     """Used by `next`/status: gates without hooks are just advice. Phrased for the agent, not the user."""
     hs = hs or hooks_status(ctx.root, ctx.config())
-    if hs["fresh"]:
-        return None
+    if hs.get("waived"):
+        return None  # the user already chose to build without hooks; do not re-offer
+    if hs["installed"]:
+        if hs["fresh"]:
+            return None
+    elif _enforcement_active(ctx.root, ctx.config()):
+        return None  # only guard/stop heartbeats count: the prompt hook alone enforces nothing
     if hs["installed"]:
         return ("Ratchet hooks are installed for this agent CLI but none has fired recently. Tell the user the "
                 "agent CLI probably needs a restart (and, for Codex, hooks enabled) so the gates are enforced.")
     return ("No Ratchet hook has fired in this project yet, so the gates are only advice. Offer to install the "
             "hooks for this agent CLI (`ratchet.py install-hooks`), ask the user first, and tell them a restart "
-            "is needed afterwards. `ratchet.py doctor` still shows details.")
+            "is needed afterwards. If they would rather not, run `ratchet.py ask hooks-waive`, tell them in one plain "
+            "sentence that the gates would then only be advice, and after their yes run `ratchet.py hooks-waive`. "
+            "`ratchet.py doctor` still shows details.")
 
 
 
@@ -3026,10 +3160,13 @@ def main(argv=None):
     a = sp.add_parser("resume", help="resume a paused run; --claim moves the run to this chat (after `ask claim`)")
     a.add_argument("--claim", action="store_true"); a.set_defaults(fn=cmd_resume)
     a = sp.add_parser("ask", help="record the question you're about to ask the user (needed before cancel, "
-                                  "set-review, approve-changes, resume --claim)")
+                                  "set-review, approve-changes, hooks-waive, resume --claim)")
     a.add_argument("action", choices=list(ASKABLE)); a.add_argument("mode", nargs="?", choices=["end", "each", "none"])
     a.set_defaults(fn=cmd_ask)
     sp.add_parser("accept-state", help=argparse.SUPPRESS).set_defaults(fn=cmd_accept_state)
+    a = sp.add_parser("hooks-waive", help="record the user's choice to build without hooks (after `ask hooks-waive`)")
+    a.add_argument("--director-token")
+    a.set_defaults(fn=cmd_hooks_waive)
     a = sp.add_parser("cancel", help="abandon the active run (needs the user's confirmation)")
     a.add_argument("--reason"); a.add_argument("--director-token"); a.set_defaults(fn=cmd_cancel)
     a = sp.add_parser("set-review", help="change how often the user reviews (needs their confirmation)")
@@ -3053,7 +3190,8 @@ def main(argv=None):
     a = sp.add_parser("director-key"); a.add_argument("--rotate", action="store_true"); a.set_defaults(fn=cmd_director_key)
     sp.add_parser("director-enroll").set_defaults(fn=cmd_director_enroll)
     a = sp.add_parser("director-sign"); a.add_argument("action", choices=["approve-plan", "human-approve", "feedback",
-                                                                          "approve-changes", "cancel", "set-review"])
+                                                                          "approve-changes", "cancel", "set-review",
+                                                                          "hooks-waive"])
     a.set_defaults(fn=cmd_director_sign)
     sp.add_parser("fingerprint").set_defaults(fn=cmd_fingerprint)
     a = sp.add_parser("config"); a.add_argument("--set", nargs="*"); a.set_defaults(fn=cmd_config)
