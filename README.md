@@ -56,7 +56,7 @@ A bare "yes", "maybe" or "I guess" does not count, and this reply never approves
 
 - **The whole plan, in the chat.** Before anything is built you see every checkpoint: its title, what done looks like, whether it gets a UI review, its risk and who reviews it. A viewer link is offered as an optional extra.
 - **Plain progress.** Short updates about what is done and what is next, with no raw JSON and no jargon.
-- **Blocks are conversations.** When a gate cannot converge, the agent quotes the finding and offers two or three lettered options (A, B, C) with a recommendation.
+- **Blocks are conversations.** When a gate cannot converge, the agent quotes the finding and offers two or three lettered options (A, B, C) with a recommendation. Reply with just the letter. If an option changes something you approved (the prototype, say), it says so, and picking it is your approval: you won't be asked a second time.
 - **Only a clear yes approves.** "Yes", "go ahead" or "approved" counts. Silence, a question, a hedge, a bare "ok" or thumbs-up, or a yes with something else attached ("yes, but change the header", "ok cancel it") does not, and no message from another agent can stand in for you. A yes answers only the question the agent just asked: saying yes to "only check in at the end?" never approves the plan.
 
 You are needed twice: once to approve the plan, and once to review the finished feature. Anything you ask to change becomes new checkpoints that go through every gate again, and the lesson is written to `.ratchet/learnings.md`, which every agent reads.

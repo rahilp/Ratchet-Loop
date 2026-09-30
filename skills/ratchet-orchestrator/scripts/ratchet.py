@@ -483,6 +483,23 @@ APPROVAL_FILLERS = {"it", "the", "plan", "this", "that", "all", "then", "go", "o
                     "thats", "👍", "✅", "good", "fully", "totally", "definitely", "absolutely"}
 
 
+CHOICE_RE = re.compile(r"^(?:(?:option|choice|go with|let'?s go with|let'?s do|i choose|i pick|i'?ll take|choose|pick|take)\s+)?"
+                       r"(?:option\s+)?\(?([a-z])\)?(?:\s+(?:please|thanks|thank you))?$")
+
+
+def choice_letter(text: str, options) -> str | None:
+    """The option a reply picks, if the reply is nothing but a pick ("A", "b.", "option C", "go with A please").
+    Anything more ("A, but keep the old colour", "A or B?") is not a clear choice."""
+    t = unicodedata.normalize("NFKC", text or "").strip().lower().replace("\u2019", "'")
+    t = re.sub(r"[.!\s]+$", "", t)
+    t = re.sub(r"\s+", " ", t.replace(",", " "))
+    m = CHOICE_RE.match(t)
+    if not m:
+        return None
+    letter = m.group(1).upper()
+    return letter if letter in options else None
+
+
 def message_intent(text: str) -> str:
     """approve | unclear. A reply only counts as an approval if it is nothing BUT an approval: it must contain a real
     approval phrase ("yes", "go ahead", "approved"...), and every other word must be a filler. No question, no hedge,
@@ -1970,7 +1987,14 @@ def cmd_human_approve(args):
     st = ctx.state()
     if st["phase"] not in ("awaiting_checkpoint_review", "awaiting_final_review", "blocked"):
         die(f"Nothing awaiting human approval (phase {st['phase']})")
-    msg = _require_human(ctx, st, "human-approve", getattr(args, "director_token", None))
+    allow = st.get("choice_allow") or {}
+    if st["phase"] == "blocked" and allow.get("unblock") and not getattr(args, "director_token", None):
+        msg = {"by": "human", "prompt": f"picked option {allow['letter']}: {allow.get('reply', '')}"}
+        allow["unblock"] = False
+        if not allow.get("files"):
+            st.pop("choice_allow", None)
+    else:
+        msg = _require_human(ctx, st, "human-approve", getattr(args, "director_token", None))
     order = [c["id"] for c in (ctx.plan() or {"checkpoints": []})["checkpoints"]]
     if st["phase"] == "blocked":
         back = st.pop("blocked_from", None) or "building"
@@ -2136,10 +2160,11 @@ ASKABLE = {"approve-changes": "accept the changes listed above as the new baseli
            "set-review": "change how often you review",
            "claim": "continue this Ratchet run in THIS chat",
            "hooks-waive": "build without the Ratchet hooks (the checks then only advise; nothing enforces them)",
-           "ui-respec": "change what the UI check compares for this step (its capture steps or scope), as explained above"}
+           "ui-respec": "change what the UI check compares for this step (its capture steps or scope), as explained above",
+           "choice": "go with one of the lettered options you listed"}
 # the command that carries out a "yes" to each question
 PENDING_COMMAND = {"approve-changes": "approve-changes", "cancel": "cancel", "set-review": "set-review",
-                   "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec"}
+                   "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec", "choice": "choice"}
 REVIEW_MODE_WORDS = {"end": "only at the end", "each": "after every step", "none": "never (fully autonomous)"}
 
 
@@ -2163,6 +2188,8 @@ def cmd_ask(args):
         die("ask ui-respec needs the checkpoint id, e.g. `ratchet.py ask ui-respec CP2`")
     if args.action not in ("set-review", "ui-respec") and args.mode:
         die(f"ask {args.action} takes no extra value")
+    if args.action == "choice":
+        return _ask_choice(ctx, st, args)
     detail = ""
     if args.action == "approve-changes":
         probs = integrity_problems(ctx, st)
@@ -2192,6 +2219,90 @@ def cmd_ask(args):
         what = f"change how often you review to: {REVIEW_MODE_WORDS[args.mode]}"
     q = f"{detail} Shall I {what}? Reply yes to confirm."
     print(f"ASK THE USER: {q.strip()}")
+
+
+def _ask_choice(ctx, st, args):
+    """A lettered-options question. An option may approve a change to locked files: then picking it is the approval."""
+    if approval_mode(ctx) == "director":
+        die("This lane is director-enrolled: a chat reply can't approve anything here. Put the options to the director.")
+    opts = [o.strip().upper() for o in (args.options or "").split(",") if o.strip()]
+    if len(opts) < 2 or len(set(opts)) != len(opts) or not all(re.fullmatch(r"[A-Z]", o) for o in opts):
+        die("ask choice needs --options with two or more single letters, e.g. --options A,B,C")
+    lockable = set(_reference_files(ctx))
+    cur = st.get("current")
+    lockable |= set(((st.get("checkpoints") or {}).get(cur) or {}).get("red_tests") or [])
+    locked = {}
+    for spec in args.locked or []:
+        letter, _, files = spec.partition("=")
+        letter = letter.strip().upper()
+        if letter not in opts:
+            die(f"--locked {spec}: {letter} is not one of the options {','.join(opts)}")
+        paths = [f.strip() for f in files.split(",") if f.strip()]
+        bad = [f for f in paths if f not in lockable]
+        if not paths or bad:
+            die(f"--locked {spec}: name the locked files exactly as Ratchet lists them. Locked now: "
+                f"{', '.join(sorted(lockable)) or '(none)'}")
+        locked[letter] = paths
+    asked = now()
+    st["pending"] = {"action": "choice", "mode": None, "options": opts, "locked": locked, "asked_at": asked,
+                     "prev_awaiting": st.get("awaiting_since")}
+    st["awaiting_since"] = asked
+    ctx.log(st, "question_asked", action="choice", options=opts, locked=locked)
+    ctx.save_state(st)
+    lines = [f"ASK THE USER: give them options {', '.join(opts)} in your own words, with your recommendation, and ask "
+             f"them to reply with just the letter."]
+    for letter, paths in locked.items():
+        lines.append(f"  In option {letter}, say plainly that choosing it approves changing {', '.join(paths)} "
+                     f"(locked since they approved the plan), and what the change is. Their pick of {letter} is then "
+                     "the approval: no second yes is needed.")
+    lines.append(f"After they reply, run `ratchet.py choice`. It records which option they picked.")
+    print("\n".join(lines))
+
+
+def cmd_choice(args):
+    """Record which lettered option the user picked, from their first reply after `ask choice`."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    _require_pending(st, "choice")
+    p = st["pending"]
+    msgs = _human_since(ctx, p.get("asked_at"))
+    if not msgs:
+        die("No reply from the user yet. End your turn and wait for them to pick an option.")
+    entry = msgs[0]  # the first reply answers the question
+    letter = choice_letter(entry.get("prompt", ""), p.get("options") or [])
+    if ctx.config().get("verify_transcripts", True) and os.environ.get("RATCHET_HUMAN_OVERRIDE") != "1":
+        good, why = _transcript_ok(entry, p.get("asked_at"))
+        if not good:
+            die(f"Couldn't confirm that reply came from the user ({why}). Ask them to reply again in this chat.")
+    if not letter:
+        _clear_pending(st)
+        ctx.log(st, "choice_unclear", reply=entry.get("prompt", "")[:200])
+        ctx.save_state(st)
+        die(f"The user's reply isn't a clear pick of one option: \"{entry.get('prompt', '')[:120]}\". Nothing was "
+            "recorded. Answer what they said; if you still need a decision, ask again (`ratchet.py ask choice ...`).")
+    files = (p.get("locked") or {}).get(letter) or []
+    unblock = st["phase"] == "blocked"
+    if files or unblock:
+        st["choice_allow"] = {"letter": letter, "files": files, "cp": st.get("current"), "at": now(),
+                              "reply": entry.get("prompt", "")[:200], "unblock": unblock}
+    _clear_pending(st)
+    ctx.log(st, "choice_made", letter=letter, approves=files)
+    ctx.save_state(st)
+    msg = f"The user picked option {letter}."
+    if files:
+        msg += (f" That approves changing {', '.join(files)}: make that change (through the sub-agent that owns it), "
+                "then run `ratchet.py approve-changes`. No further question is needed.")
+    if unblock:
+        msg += " The run is blocked: run `ratchet.py human-approve` to resume it, then act on their choice."
+    ok(msg)
+
+
+def _choice_covers(allow: dict, probs: list[str]) -> bool:
+    files = allow.get("files") or []
+    if not files:
+        return False
+    return bool(probs) and all(any(pr == f"reference file {f}" or pr.startswith(f"test file {f} ") for f in files)
+                               for pr in probs)
 
 
 def _require_pending(st, action, mode=None):
@@ -2257,8 +2368,22 @@ def cmd_approve_changes(args):
     if not probs:
         ok("Nothing has changed since approval.")
         return
-    _require_pending(st, "approve-changes")
-    msg = _require_human(ctx, st, "approve-changes", getattr(args, "director_token", None))
+    allow = st.get("choice_allow") or {}
+    if allow and allow.get("cp") == st.get("current") and not getattr(args, "director_token", None) \
+            and _choice_covers(allow, probs):
+        msg = {"by": "human", "prompt": f"picked option {allow['letter']}: {allow.get('reply', '')}"}
+        allow["files"] = []
+        if not allow.get("unblock"):
+            st.pop("choice_allow", None)
+    else:
+        if allow.get("files") and allow.get("cp") == st.get("current") \
+                and (st.get("pending") or {}).get("action") != "approve-changes":
+            extra = [pr for pr in probs if not _choice_covers(allow, [pr])]
+            die(f"The user's pick of option {allow['letter']} approved changing {', '.join(allow['files'])}, but these "
+                f"changed too: {'; '.join(extra)}. Undo them, or show the user exactly what changed and ask "
+                "(`ratchet.py ask approve-changes`).")
+        _require_pending(st, "approve-changes")
+        msg = _require_human(ctx, st, "approve-changes", getattr(args, "director_token", None))
     st["approved"] = approval_snapshot(ctx, st)
     cur = st.get("current")
     if cur and (st["checkpoints"].get(cur) or {}).get("red_tests") is not None:
@@ -3096,6 +3221,12 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                 cmd = PENDING_COMMAND.get(p["action"], p["action"]) + (" " + p["mode"] if p.get("mode") else "")
                 what = (f"change how often they review to: {REVIEW_MODE_WORDS.get(p.get('mode'), p.get('mode'))}"
                         if p["action"] == "set-review" else ASKABLE.get(p["action"], p["action"]))
+                if p["action"] == "choice":
+                    letter = choice_letter(n["prompt"], p.get("options") or [])
+                    return False, (f"[ratchet] This reply answers your lettered question ({', '.join(p.get('options') or [])}). "
+                                   + (f"It reads as option {letter}. " if letter else "It is NOT a clear pick of one option. ")
+                                   + f"Run `{eng} choice` to record it, then continue. It does NOT approve the plan or a "
+                                   "checkpoint.")
                 verdict = ("It reads as a clear yes" if message_intent(n["prompt"]) == "approve"
                            else "It is NOT a clear yes")
                 return False, (f"[ratchet] This reply answers your waiting question: shall I {what}? {verdict}. "
@@ -3696,6 +3827,9 @@ def main(argv=None):
                                   "set-review, approve-changes, hooks-waive, resume --claim, ui-respec)")
     a.add_argument("action", choices=list(ASKABLE) + ["withdraw"])
     a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec: the checkpoint id")
+    a.add_argument("--options", help="choice: the option letters, e.g. A,B,C")
+    a.add_argument("--locked", action="append", metavar="LETTER=FILE[,FILE]",
+                   help="choice: picking LETTER approves changing these locked files (repeatable)")
     a.set_defaults(fn=cmd_ask)
     sp.add_parser("accept-state", help=argparse.SUPPRESS).set_defaults(fn=cmd_accept_state)
     a = sp.add_parser("hooks-waive", help="record the user's choice to build without hooks (after `ask hooks-waive`)")
@@ -3706,6 +3840,8 @@ def main(argv=None):
     a = sp.add_parser("set-review", help="change how often the user reviews (needs their confirmation)")
     a.add_argument("mode", choices=["end", "each", "none"]); a.add_argument("--director-token")
     a.set_defaults(fn=cmd_set_review)
+    a = sp.add_parser("choice", help="after `ask choice`: record which option the user picked")
+    a.set_defaults(fn=cmd_choice)
     a = sp.add_parser("ui-respec", help="after `ask ui-respec CPn` and the user's yes: allow one change to a frozen UI check")
     a.add_argument("cp"); a.add_argument("--director-token"); a.set_defaults(fn=cmd_ui_respec)
     a = sp.add_parser("approve-changes", help="accept a user-confirmed change to the approved plan/tests/rules")

@@ -708,6 +708,77 @@ def main():
     check("where the CLI never names sub-agents, review writes are not blocked (nothing to go on)",
           guard(d2, "Write", {"file_path": adv, "content": "{}"}).returncode == 0)
 
+    print("A lettered pick can carry an approval, so the user isn't asked twice (smoke-run finding)")
+    d = project("choice")
+    approve_plan(d)
+    proto = d / ".ratchet/runs/f/reference/prototype.html"
+    proto.parent.mkdir(parents=True, exist_ok=True)
+    r = rx(d, "ask", "choice", "--options", "A,B,C", "--locked", "A=reference/nope.html")
+    check("a locked file Ratchet doesn't know is refused", r.returncode != 0 and "Locked now" in r.stderr, r.stderr)
+    q = rx(d, "ask", "choice", "--options", "A,B,C", "--locked", "A=reference/prototype.html")
+    check("ask choice tells the agent to put the approval inside option A",
+          q.returncode == 0 and "choosing it approves changing reference/prototype.html" in q.stdout, q.stdout + q.stderr)
+    check("approve-plan style commands can't use the pick", rx(d, "human-approve").returncode != 0)
+    h = say(d, "A")
+    check("the prompt hook reads the reply as option A", "reads as option A" in h.stdout, h.stdout)
+    r = rx(d, "choice")
+    check("choice records option A and says no second yes is needed",
+          r.returncode == 0 and "picked option A" in r.stdout and "No further question" in r.stdout, r.stdout + r.stderr)
+    proto.write_text("<p aria-live='polite'>changed</p>")
+    r = rx(d, "tests-written", "CP1")
+    check("the prototype change is still caught by the lock", r.returncode != 0 and "prototype" in r.stderr, r.stderr)
+    r = rx(d, "approve-changes")
+    check("approve-changes accepts it on the strength of the pick", r.returncode == 0 and "prototype" in r.stdout, r.stdout + r.stderr)
+    proto.write_text("<p>changed again</p>")
+    r = rx(d, "approve-changes")
+    check("the pick approves one change only, not later ones", r.returncode != 0, r.stdout + r.stderr)
+    proto.write_text("<p aria-live='polite'>changed</p>")
+
+    d = project("choiceb")
+    approve_plan(d)
+    proto = d / ".ratchet/runs/f/reference/prototype.html"
+    proto.parent.mkdir(parents=True, exist_ok=True)
+    rx(d, "ask", "choice", "--options", "A,B", "--locked", "A=reference/prototype.html")
+    say(d, "b")
+    rx(d, "choice")
+    proto.write_text("<p>x</p>")
+    check("picking B (which approved nothing) doesn't let the prototype change",
+          rx(d, "approve-changes").returncode != 0)
+
+    d = project("choicex")
+    approve_plan(d)
+    proto = d / ".ratchet/runs/f/reference/prototype.html"
+    proto.parent.mkdir(parents=True, exist_ok=True)
+    rx(d, "ask", "choice", "--options", "A,B", "--locked", "A=reference/prototype.html")
+    say(d, "go with A please")
+    rx(d, "choice")
+    proto.write_text("<p>x</p>")
+    (d / "DESIGN.md").write_text("# changed too\n")
+    r = rx(d, "approve-changes")
+    check("a pick of A doesn't cover a change it didn't name (DESIGN.md)",
+          r.returncode != 0 and "changed too" in r.stderr and "DESIGN.md" in r.stderr, r.stderr)
+
+    d = project("choiceu")
+    approve_plan(d)
+    rx(d, "ask", "choice", "--options", "A,B", "--locked", "A=reference/prototype.html")
+    say(d, "A, but keep the red colour")
+    r = rx(d, "choice")
+    st = json.loads((d / ".ratchet/runs/f/state.json").read_text())
+    check("'A, but ...' is not a clear pick: nothing recorded, question closed",
+          r.returncode != 0 and "isn't a clear pick" in r.stderr and not st.get("pending") and not st.get("choice_allow"),
+          r.stderr)
+
+    d = project("choiceblk", config=["max_stop_blocks=1"])
+    approve_plan(d)
+    stop(d); stop(d)
+    rx(d, "ask", "choice", "--options", "A,B,C")
+    say(d, "B")
+    r = rx(d, "choice")
+    check("at a block, the pick says human-approve resumes the run", "human-approve" in r.stdout, r.stdout)
+    r = rx(d, "human-approve")
+    check("… and human-approve resumes on the pick, without a separate yes",
+          r.returncode == 0 and json.loads(rx(d, "status", "--json").stdout)["phase"] == "building", r.stderr)
+
     print("Runs are never replaced silently; cancel needs the user")
     d = project("cancel")
     check("init over an active run is refused", rx(d, "init", "other", "--force").returncode != 0)
