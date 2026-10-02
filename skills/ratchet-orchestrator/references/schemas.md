@@ -227,7 +227,7 @@ Each reviewer writes one file (only that reviewer may write it); `ui_review.py` 
 
 `reviewer` must be the reviewer id from the config roster, because adv-record matches reviews to the required list by id. `fingerprint` is **required**: reviews of other code are rejected. `round_nonce` is **required** and must match the round opened by `ratchet.py reviewers CPn`, so a review from an earlier round, or one written without launching a reviewer, is rejected. `files_reviewed` lists the files the reviewer actually read; a review with no findings must list at least one of the files this checkpoint changed, or it is rejected. A review file written less than `min_review_seconds` (config, default 20) after its round opened is rejected as too fast to be real. Other-provider reviews are written by `external_review.py`, which stamps `reviewer`, `vendor`, `fingerprint`, `round_nonce` and `files_reviewed` itself.
 
-A reviewer approves by returning `"findings": []`. Every finding must be fixed — there is no "minor, ignore" path. If a finding is wrong, the fixer writes a rebuttal in `fixes.md` and the NEXT adversary round decides whether to withdraw it.
+A reviewer approves by returning `"findings": []`. Which findings block is set by config `blocking_severities` (by risk) and `scope_later_rounds`; findings that don't block are recorded for the final review (`ratchet.py deferred`), never silently dropped. If a finding is wrong, the fixer writes a rebuttal in `fixes.md` and the NEXT adversary round decides whether to withdraw it.
 
 ## 8. .ratchet/config.json
 

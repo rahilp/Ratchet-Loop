@@ -159,6 +159,73 @@ def severity_and_scope():
     check("round 3: a major finding in untouched code still blocks", r.returncode == 2, r.stdout + r.stderr)
 
 
+def review_holes():
+    print("Fresh-eyes findings: ways around the bar must not work")
+    # a minor finding the fixer ignored is not waved through in round 2
+    d = g.project("carry", extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20"])
+    g.approve_plan(d)
+    g.to_adversarial(d)
+    rnd = open_round(d)
+    nit = [{"id": "M1", "severity": "minor", "file": "src/f.js", "description": "unchecked input"}]
+    rx(d, "adv-record", "CP1", "--reviews", write_review(rnd, ids(rnd)[0], nit), write_review(rnd, ids(rnd)[1]))
+    rnd = open_round(d)                                      # the fixer changed nothing
+    r = rx(d, "adv-record", "CP1", "--reviews", write_review(rnd, ids(rnd)[0], nit), write_review(rnd, ids(rnd)[1]))
+    check("a minor finding the fixer ignored still blocks in round 2", r.returncode == 2, r.stdout + r.stderr)
+    # path spellings of a changed file can't move a finding out of scope
+    (d / "src/f.js").write_text("export const f = () => 1; // touched\n")
+    rx(d, "behavior", "CP1")
+    for label, path in (("absolute", str(d / "src/f.js")), ("with #L12", "src/f.js#L12"), ("(line 3)", "src/f.js (line 3)"),
+                        ("bare name", "f.js"), ("no file", None)):
+        rnd = open_round(d)
+        f = [{"id": "M9", "severity": "minor", "description": "nit", **({"file": path} if path else {})}]
+        r = rx(d, "adv-record", "CP1", "--reviews", write_review(rnd, ids(rnd)[0], f), write_review(rnd, ids(rnd)[1]))
+        check(f"a minor finding in changed code given as {label} still blocks", r.returncode == 2, r.stdout + r.stderr)
+
+    # a provider that runs its own command can't be slipped in after approval
+    b = fake_bin("codex")
+    env = env_with(b)
+    d = g.project("trust", extra_cp={"risk": "high"})
+    g.approve_plan(d)
+    stamp = Path(tempfile.mkdtemp()) / "stamp.sh"
+    stamp.write_text("#!/bin/sh\necho RATCHET-PROBE-OK\necho '{\"findings\": []}'\n")
+    stamp.chmod(0o755)
+    r = rx(d, "providers", "--add", "rubber", "--command", json.dumps([str(stamp)]), "--company", "acme", env=env)
+    check("adding a custom-command provider mid-run is possible…", r.returncode == 0, r.stderr)
+    r = rx(d, "tests-written", "CP1", env=env)
+    check("… but the run stops until the user confirms it", r.returncode != 0 and "custom review commands" in r.stderr,
+          r.stderr)
+    d = g.project("trust2", extra_cp={"risk": "high"})
+    g.approve_plan(d)
+    rx(d, "providers", "--add", "codex", "--preset", "codex", "--model", "gpt-5", env=env)
+    g.write_tests(d)
+    r = rx(d, "tests-written", "CP1", env=env)
+    check("adding a preset tool mid-run needs no confirmation", r.returncode == 0, r.stderr)
+
+    # company names are compared case-insensitively and through aliases
+    d = g.project("alias")
+    for company in ("Anthropic", "claude"):
+        rx(d, "providers", "--add", "mine", "--command", json.dumps([str(stamp)]), "--company", company, env=env)
+        rows = {x["id"]: x for x in json.loads(rx(d, "providers", "--json", env=env).stdout)["providers"]}
+        check(f"--company {company} on an Anthropic host is the same company, not an independent reviewer",
+              rows["mine"]["ok"] is False and "same company" in rows["mine"]["state"], rows.get("mine"))
+
+    # a run approved under the old shipped defaults isn't stopped by the update
+    eng = engine()
+    d = g.project("upgrade")
+    g.approve_plan(d)
+    os.environ["RATCHET_HOST_PROVIDER"] = "anthropic"
+    os.environ["RATCHET_HOME"] = g.ENV["RATCHET_HOME"]
+    ctx = eng.Ctx(d)
+    st = ctx.state()
+    st["approved"]["rules"]["review_depth"] = eng._sha(eng.OLD_DEFAULT_REVIEW_DEPTH)
+    st["approved"]["rules"]["reviewers"] = eng._sha(eng.OLD_DEFAULT_REVIEWERS)
+    probs = eng.integrity_problems(ctx, st)
+    check("an older run whose rules were the old defaults isn't stopped by the new defaults", not probs, probs)
+    rx(d, "config", "--set", 'review_depth={"low":["host-both"],"normal":["host-both"],"high":["host-both"]}')
+    probs = eng.integrity_problems(ctx, st)
+    check("… but a review_depth someone actually changed still stops it", any("review_depth" in p for p in probs), probs)
+
+
 def provider_registry():
     eng = engine()
     print("Which company a model belongs to")
@@ -284,6 +351,7 @@ def models_and_hosts():
 
 def main():
     severity_and_scope()
+    review_holes()
     provider_registry()
     models_and_hosts()
     print(f"\n{PASS} passed, {FAIL} failed")

@@ -29,7 +29,9 @@ Each checkpoint has a `risk` (`low` / `normal` / `high`, set by the planner). Ri
 ## What blocks
 - **Severity bar by risk** (config `blocking_severities`). On a **low-risk** checkpoint only blocker and major findings block; minor ones are recorded for later (`ratchet.py deferred`) and shown to the user at the final review. Normal and high risk: every finding blocks.
 - **Later rounds look at what changed** (config `scope_later_rounds`). From round 2 on, a minor finding only blocks if it is in code changed since the previous round; blocker and major findings block anywhere. This keeps each round from turning into a fresh review of everything.
-- Severities other than the known minor ones (minor, nit, info, suggestion, style) always block, so a made-up severity can't slip past.
+- Severities other than the known minor ones (minor, nit, nitpick, trivial, low, info, suggestion, style) always block, so a made-up severity can't slip past. A finding with no file, or a file Ratchet can't place, counts as in scope.
+- A file that had a blocking finding last round stays in scope, so a finding the fixer didn't fix is judged in full again.
+- Adding or changing a provider that runs its own command (not a preset), or changing `host_models` / `role_models`, after plan approval needs the user's yes (`ask approve-changes`), like any other rule.
 - Pass the round's review rules (printed by `reviewers`) to every `host-*` reviewer you spawn; `external_review.py` adds them to other providers' prompts itself.
 
 ## The loop (round k = 1, 2, …)

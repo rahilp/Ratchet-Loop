@@ -26,7 +26,7 @@ Walk each changed path with hostile inputs: null/empty/huge values, wrong role, 
 ## Findings, not opinions
 Each finding needs **either** a cited rule (`standards.md §3`, `learnings 2026-09-20`) **or** a concrete failure scenario ("if Mia approves twice quickly, the balance is decremented twice because…"). Style preferences with no rule behind them are not findings. Give `file`, `line`, `description`, and a specific `fix`. `severity`: blocker / major / minor. Be honest about it, because severity decides what blocks: on a low-risk step only blocker and major findings block (minor ones are noted for the user to decide on later), and from round 2 on a minor finding only blocks if it is in code changed since the last round. Report minor findings anyway; nothing is lost. If you were given review rules for this round, follow them.
 
-From round 2 on: re-check that previous fixes actually hold, and withdraw a finding only if `fixes.md` proves it wrong with evidence. Otherwise re-raise it. Look hardest at the code changed since the last round (the review rules list the files); elsewhere, raise only blocker or major problems you missed before.
+From round 2 on: re-check that previous fixes actually hold, and withdraw a finding only if `fixes.md` proves it wrong with evidence. Otherwise re-raise it. Look hardest at the code changed since the last round (the review rules list the files). Earlier findings that still aren't fixed count wherever they are: re-raise them. Beyond those, raise only blocker or major problems you missed before; a new minor one outside the listed files is noted for later, not fixed.
 
 ## Approve
 Only when you genuinely can't find anything: `"findings": []`. Don't approve to be nice, and don't invent findings to look busy.

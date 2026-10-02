@@ -587,7 +587,7 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "fingerprint_include", "approver", "ui_single_reviewer_ok", "min_review_timeout_sec", "test_timeout_sec",
              "host_provider", "ui_reviewers", "design_md", "max_stop_blocks", "unavailable_ttl_hours",
              "verify_transcripts", "min_review_seconds", "commit_per_checkpoint", "blocking_severities",
-             "scope_later_rounds"]
+             "scope_later_rounds", "host_models", "role_models"]
 
 
 def _file_sha(p: Path) -> str | None:
@@ -613,6 +613,14 @@ def _sha(obj) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
 
 
+def _custom_providers_sha(cfg) -> str:
+    """Reviewers that run an arbitrary command are trusted code: adding or changing one after approval needs the
+    user's yes. Preset tools (and their model choice) are just availability and stay free to add."""
+    rows = sorted((pv["id"], json.dumps(pv.get("command")), bool(pv.get("stdin")), norm_company(pv.get("company")))
+                  for pv in providers(cfg) if pv.get("command"))
+    return _sha(rows)
+
+
 def approval_snapshot(ctx, st) -> dict:
     plan = ctx.plan() or {"checkpoints": []}
     cfg = ctx.config()
@@ -621,6 +629,7 @@ def approval_snapshot(ctx, st) -> dict:
             "tests": {c["id"]: _sha(test_plan(ctx, c["id"])) for c in plan["checkpoints"]},
             "rules": {k: _sha(cfg.get(k)) for k in RULE_KEYS},
             "files": _reference_files(ctx),
+            "custom_providers": _custom_providers_sha(cfg),
             "host": detect_host(cfg),
             "human_review": st.get("human_review")}
 
@@ -641,12 +650,19 @@ def integrity_problems(ctx, st) -> list[str]:
     extra = set(now_["cps"]) - set(snap.get("cps", {}))
     if extra:
         out.append(f"new checkpoints {sorted(extra)} (use feedback + plan-extend)")
+    user = read_json(ctx.config_path, {}) or {}
     for k, h in snap.get("rules", {}).items():
         if now_["rules"].get(k) != h:
+            old_defaults = [_sha(v) for v in SHIPPED_DEFAULT_HISTORY.get(k, [])]
+            if h in old_defaults and (k not in user or _sha(user.get(k)) in old_defaults):
+                continue  # only Ratchet's shipped default changed (an update), not anything the user or agent set
             out.append(f"config rule '{k}'")
     for f, h in snap.get("files", {}).items():
         if now_["files"].get(f) != h:
             out.append(f"reference file {f}")
+    if "custom_providers" in snap and snap["custom_providers"] != now_["custom_providers"]:
+        out.append("custom review commands in config 'providers' (a reviewer defined by its own command, or its "
+                   "company, was added or changed)")
     out += weakened_tests(ctx, st)
     if snap.get("host") and snap["host"] != now_["host"]:
         out.append(f"host provider ({snap['host']} → {now_['host']})")
@@ -951,7 +967,9 @@ def plain_reviewer(cfg, rid, model=None) -> str:
             return f"this agent on a different model, {' or '.join(alts)} ({lens})"
         return f"this agent, {_plain_model(role_model(cfg, 'ratchet-adversary'))} ({lens})"
     name = spec.get("provider") or rid.rsplit("-", 1)[0]
-    return f"{name.capitalize()}, {_plain_model(spec.get('model') or model)} ({lens})"
+    shown = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini", "copilot": "Copilot", "cursor": "Cursor",
+             "opencode": "OpenCode"}.get(name, name)
+    return f"{shown}, {_plain_model(spec.get('model') or model)} ({lens})"
 
 
 def models_table(cfg) -> list[tuple[str, str]]:
@@ -1046,7 +1064,7 @@ def provider_status(ctx) -> dict:
     return read_json(_status_path(ctx), {}) or {}
 
 
-def probe_provider(ctx, cfg, pv) -> tuple[bool, str]:
+def probe_provider(ctx, cfg, pv, bench=True) -> tuple[bool, str]:
     """Send a tiny request through the provider exactly as a review would go, and record the result."""
     cmd_t, use_stdin = provider_command(pv)
     if not cmd_t:
@@ -1069,8 +1087,8 @@ def probe_provider(ctx, cfg, pv) -> tuple[bool, str]:
                            stdin=None if use_stdin else subprocess.DEVNULL,  # a CLI waiting on stdin must not hang
                            timeout=int(cfg.get("probe_timeout_sec", 120)),
                            env=dict(os.environ, RATCHET_NESTED_REVIEW="1"))
-        text = (out_file.read_text() if out_file.exists() else "") + (r.stdout or "")
-        good = PROBE_TOKEN in text
+        text = (out_file.read_text() if out_file.exists() else "") + (r.stdout or "") + (r.stderr or "")
+        good = PROBE_TOKEN in text.replace("\n", "")
         detail = "answered the test request" if good else (
             f"exit {r.returncode}: " + ((r.stderr or r.stdout or "no output").strip().splitlines() or ["no output"])[-1][:200])
     except subprocess.TimeoutExpired:
@@ -1081,7 +1099,7 @@ def probe_provider(ctx, cfg, pv) -> tuple[bool, str]:
     data = provider_status(ctx)
     data[pv["id"]] = {"ok": good, "at": now(), "detail": detail}
     write_json(_status_path(ctx), data)
-    if not good:
+    if not good and bench:
         for lens in LENSES:
             mark_unavailable(ctx, f"{pv['id']}-{lens}", f"test request failed: {detail}")
     else:
@@ -1142,8 +1160,12 @@ def cmd_providers(args):
         if not provider_company(pv):
             die(f"Can't tell which company's model '{args.add}' runs. Give --model (a model name from that tool) "
                 "or --company.")
-        if not args.no_check:
-            good, detail = probe_provider(ctx, cfg, pv)
+        if args.no_check:
+            data = provider_status(ctx)
+            data.pop(pv["id"], None)  # an earlier result was about whatever had this id before
+            write_json(_status_path(ctx), data)
+        else:
+            good, detail = probe_provider(ctx, cfg, pv, bench=False)
             if not good:
                 die(f"{args.add} didn't pass the test request ({detail}). Not added. Fix the command or model and "
                     "try again (or add --no-check to add it anyway).")
@@ -1288,6 +1310,14 @@ def cmd_init(args):
     print(json.dumps(next_action(ctx), indent=2))
 
 
+OLD_DEFAULT_REVIEWERS = {
+    "host-standards": {"kind": "agent", "lens": "standards", "vendor": "host"},
+    "host-correctness": {"kind": "agent", "lens": "correctness", "vendor": "host"},
+    "host-both": {"kind": "agent", "lens": "both", "vendor": "host"},
+    **{f"{p}-{lens}": {"kind": "command", "preset": p, "lens": lens, "vendor": v}
+       for p, v in [("claude", "anthropic"), ("codex", "openai"), ("gemini", "google"), ("copilot", "github")]
+       for lens in ("correctness", "standards")},
+}
 OLD_DEFAULT_REVIEW_DEPTH = {
     "low": ["host-both"],
     "normal": ["host-standards", ["codex-correctness", "gemini-correctness", "claude-correctness", "copilot-correctness"]],
@@ -1314,14 +1344,30 @@ PRESETS = {
     "opencode": {"bin": "opencode", "company": None, "stdin": False, "model_flag": ["-m"], "model_at": 2,
                  "command": ["opencode", "run", "{prompt}"]},
 }
+SHIPPED_DEFAULT_HISTORY = {"review_depth": [OLD_DEFAULT_REVIEW_DEPTH], "reviewers": [OLD_DEFAULT_REVIEWERS]}
 PRESET_BINARIES = {k: v["bin"] for k, v in PRESETS.items()}
 PRESET_VENDORS = {k: v["company"] for k, v in PRESETS.items()}
+_B = r"(?:^|[^a-z0-9])"   # start of a name part
+_E = r"(?:$|[^a-z])"      # end of a name part (digits may follow, as in gpt5 or o3)
 MODEL_COMPANIES = [
-    (r"claude|opus|sonnet|haiku|anthropic", "anthropic"), (r"gpt|codex|chatgpt|openai|(^|[/-])o[1-9]", "openai"),
-    (r"gemini|gemma|google", "google"), (r"grok|xai", "xai"), (r"glm|zhipu|z-ai|zai", "zhipu"),
-    (r"qwen|alibaba", "alibaba"), (r"deepseek", "deepseek"), (r"kimi|moonshot", "moonshot"),
-    (r"llama|meta", "meta"), (r"mistral|codestral|devstral|magistral", "mistral"),
+    (_B + r"(claude|opus|sonnet|haiku|anthropic)" + _E, "anthropic"),
+    (_B + r"(gpt|codex|chatgpt|openai)" + _E + r"|" + _B + r"o[1-9](?:$|[^a-z0-9]|-)", "openai"),
+    (_B + r"(gemini|gemma|google)" + _E, "google"), (_B + r"(grok|xai)" + _E, "xai"),
+    (_B + r"(glm|zhipu|z-ai|zai)" + _E, "zhipu"), (_B + r"(qwen|alibaba)" + _E, "alibaba"),
+    (_B + r"deepseek" + _E, "deepseek"), (_B + r"(kimi|moonshot)" + _E, "moonshot"),
+    (_B + r"(llama|meta)" + _E, "meta"), (_B + r"(mistral|codestral|devstral|magistral)" + _E, "mistral"),
 ]
+COMPANY_ALIASES = {"claude": "anthropic", "claude-code": "anthropic", "codex": "openai", "gpt": "openai",
+                   "chatgpt": "openai", "gemini": "google", "deepmind": "google", "google deepmind": "google",
+                   "copilot": "github", "grok": "xai", "x.ai": "xai", "mistral ai": "mistral", "z.ai": "zhipu",
+                   "meta ai": "meta"}
+
+
+def norm_company(c) -> str | None:
+    if not c:
+        return None
+    c = str(c).strip().lower()
+    return COMPANY_ALIASES.get(c, c)
 LENSES = ("correctness", "standards", "both")
 
 
@@ -1345,7 +1391,7 @@ def provider_by_id(cfg, pid) -> dict | None:
 
 def provider_company(pv) -> str | None:
     if pv.get("company"):
-        return pv["company"]
+        return norm_company(pv["company"])
     from_model = company_of_model(pv.get("model"))
     if from_model:
         return from_model
@@ -1427,7 +1473,7 @@ HOST_ALIASES = {"claude": "anthropic", "claude-code": "anthropic", "codex": "ope
 def detect_host(cfg=None) -> str:
     explicit = os.environ.get("RATCHET_HOST_PROVIDER") or (cfg or {}).get("host_provider", "auto")
     if explicit and explicit != "auto":
-        return HOST_ALIASES.get(str(explicit).lower(), str(explicit).lower())
+        return norm_company(explicit)
     for vendor, keys in HOST_HINTS:
         if any(os.environ.get(k) for k in keys):
             return vendor
@@ -2290,7 +2336,7 @@ def cmd_adv_record(args):
     need = len(required)
     changed_since = _changed_since_last_round(ctx, cfg, g, fp["id"])
     raw_count = len(all_findings)
-    all_findings, deferred = split_findings(cfg, cp.get("risk", "normal"), all_findings, changed_since)
+    all_findings, deferred = split_findings(cfg, cp.get("risk", "normal"), all_findings, changed_since, ctx.root)
     if deferred:
         write_json(dest / "deferred-findings.json", deferred)
         keep = [x for x in cps.get("deferred") or [] if x.get("round") != rnd["round"]]
@@ -2299,6 +2345,8 @@ def cmd_adv_record(args):
     g["rounds"] = g.get("rounds", []) + [{"at": now(), "fingerprint": fp["id"], "verdicts": verdicts,
                                           "findings": len(all_findings), "deferred": len(deferred),
                                           "raw_findings": raw_count, "substitutions": subs,
+                                          "blocking_files": sorted({_norm_path(f.get("file") or f.get("path") or f.get("location"), ctx.root)
+                                                                    for f in all_findings} - {""}),
                                           "reviewers": [{"id": rr["id"], "vendor": rr.get("vendor"),
                                                          "model": rr.get("model")} for rr in rnd.get("resolved") or []]}]
     if not approved:
@@ -2327,24 +2375,54 @@ def cmd_adv_record(args):
 MINOR_SEVERITIES = {"minor", "nit", "nitpick", "trivial", "info", "suggestion", "low", "style"}
 
 
-def _norm_path(p) -> str:
+def _norm_path(p, root=None) -> str:
+    """A finding's file as a repo-relative path: './', backslashes, absolute paths inside the repo, a drive letter,
+    and line suffixes (':12', ':12:3', '#L12', ' (line 12)') are all handled."""
     p = str(p or "").strip().replace("\\", "/")
+    p = re.sub(r"\s*\((?:line|lines|l\.)\s*[\d\-– ,]+\)\s*$", "", p, flags=re.I)
+    p = re.sub(r"#L\d+(-L?\d+)?$", "", p)
+    p = re.sub(r":\d+(:\d+)?(-\d+)?$", "", p)
+    if root is not None:
+        r = str(Path(root).resolve()).replace("\\", "/").rstrip("/") + "/"
+        low = p.lower()
+        if re.match(r"^[a-z]:/", low) or p.startswith("/"):
+            idx = low.find(r.lower()) if r.lower() in low else -1
+            if idx >= 0:
+                p = p[idx + len(r):]
+            else:
+                tail = r.rstrip("/").rsplit("/", 1)[-1] + "/"  # the repo's own folder name, e.g. C:/work/app/src/a.js
+                if ("/" + tail.lower()) in low:
+                    p = p[low.rfind("/" + tail.lower()) + len(tail) + 1:]
     while p.startswith("./"):
         p = p[2:]
-    return p.split(":")[0]
+    return p
 
 
-def split_findings(cfg, risk: str, findings: list, changed_since: set | None) -> tuple[list, list]:
+def _in_scope(path: str, scope: set) -> bool:
+    if not path:
+        return True  # no file given: can't tell where it is, so it counts as in scope (it blocks)
+    if path in scope:
+        return True
+    base = path.rsplit("/", 1)[-1]
+    if "/" not in path:  # a bare file name: in scope if any scoped file has that name
+        return any(x.rsplit("/", 1)[-1] == base for x in scope)
+    return False
+
+
+def split_findings(cfg, risk: str, findings: list, changed_since: set | None, root=None) -> tuple[list, list]:
     """(blocking, deferred). Severities not known to be minor always block (a reviewer can't escape the bar by
-    inventing a severity name)."""
+    inventing a severity name). `changed_since` is the round's scope: files changed since the previous round plus
+    files that had a blocking finding last round (a finding the fixer ignored can't be waved through)."""
     bar = (cfg.get("blocking_severities") or {}).get(risk, "all")
+    bar_l = [str(x).strip().lower() for x in (bar or [])] if bar != "all" else None
     blocking, deferred = [], []
     for f in findings:
         sev = str(f.get("severity", "")).strip().lower()
         minor = sev in MINOR_SEVERITIES
-        if minor and bar != "all" and sev not in [str(x).lower() for x in (bar or [])]:
-            deferred.append(dict(f, deferred_because=f"{risk}-risk step: only {', '.join(bar)} findings block"))
-        elif minor and changed_since is not None and _norm_path(f.get("file")) not in changed_since:
+        where = _norm_path(f.get("file") or f.get("path") or f.get("location"), root)
+        if minor and bar_l is not None and sev not in bar_l:
+            deferred.append(dict(f, deferred_because=f"{risk}-risk step: only {' and '.join(bar)} findings block"))
+        elif minor and changed_since is not None and not _in_scope(where, changed_since):
             deferred.append(dict(f, deferred_because="later round: not in code changed since the previous round"))
         else:
             blocking.append(f)
@@ -2352,12 +2430,17 @@ def split_findings(cfg, risk: str, findings: list, changed_since: set | None) ->
 
 
 def _changed_since_last_round(ctx, cfg, g, fp_id) -> set | None:
+    """The round's scope: files changed since the previous round, plus every file that had a blocking finding in the
+    previous round (so a finding the fixer didn't fix is still judged in full)."""
     if not cfg.get("scope_later_rounds", True) or not g.get("rounds"):
         return None
-    prev = g["rounds"][-1].get("fingerprint")
+    last = g["rounds"][-1]
+    prev = last.get("fingerprint")
     if not prev:
         return None
-    return {_norm_path(x) for x in changed_files(ctx.root, {"kind": "git-tree", "id": prev}, {"kind": "git-tree", "id": fp_id})}
+    scope = {_norm_path(x) for x in changed_files(ctx.root, {"kind": "git-tree", "id": prev}, {"kind": "git-tree", "id": fp_id})}
+    scope |= set(last.get("blocking_files") or [])
+    return scope
 
 
 def review_rules(ctx, cfg, cp, g, rnd, fp_id) -> tuple[set | None, list[str]]:
@@ -2370,8 +2453,9 @@ def review_rules(ctx, cfg, cp, g, rnd, fp_id) -> tuple[set | None, list[str]]:
                      "report minor ones too, they are recorded for later.")
     if focus is not None:
         rules.append("Round " + str(rnd["round"]) + ": look hardest at the code changed since the last round ("
-                     + (", ".join(sorted(focus)[:20]) or "nothing changed") + "). Elsewhere, report only blocker "
-                     "or major problems; minor ones outside those files are recorded, not fixed.")
+                     + (", ".join(sorted(focus)[:20]) or "nothing changed") + "). Re-raise any earlier finding that "
+                     "still isn't fixed, wherever it is. Beyond that, a new minor problem outside those files is "
+                     "recorded, not fixed; blocker and major problems count anywhere.")
     return focus, rules
 
 
