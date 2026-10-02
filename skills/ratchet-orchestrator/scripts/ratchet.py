@@ -65,29 +65,53 @@ DEFAULT_CONFIG = {
     # explicitly (anthropic | openai | google | github | <any name>). Reviewers prefer a provider
     # DIFFERENT from the host; when none is available the host's own sub-agents review.
     "host_provider": "auto",
-    # Adversarial reviewer roster. kind=agent → a ratchet-adversary sub-agent run by the host model;
-    # kind=command → another provider's CLI, run by ratchet-adversarial-loop/scripts/external_review.py.
+    # Other agent CLIs that can review, in order of preference. Any agent CLI works: use a preset
+    # (claude, codex, gemini, copilot, cursor, opencode) or your own "command". "company" is whose model it runs
+    # (worked out from "model" when not given); a reviewer only counts as independent when its company differs
+    # from the host's. `ratchet.py providers --discover` checks what is installed and adds what works.
+    # Each provider gives three reviewers: <id>-correctness, <id>-standards and <id>-both.
+    "providers": [{"id": "codex", "preset": "codex"}, {"id": "gemini", "preset": "gemini"},
+                  {"id": "claude", "preset": "claude"}],
+    # Reviewers that run as the host's own sub-agents. host-alt-* use a DIFFERENT model from the host's company
+    # (see host_models.alternates), the fallback before the host reviews its own work with its own model.
     "reviewers": {
         "host-standards":   {"kind": "agent", "lens": "standards", "vendor": "host"},
         "host-correctness": {"kind": "agent", "lens": "correctness", "vendor": "host"},
         "host-both":        {"kind": "agent", "lens": "both", "vendor": "host"},
-        **{f"{p}-{lens}": {"kind": "command", "preset": p, "lens": lens, "vendor": v}
-           for p, v in [("claude", "anthropic"), ("codex", "openai"), ("gemini", "google"), ("copilot", "github")]
-           for lens in ("correctness", "standards")},
+        "host-alt-standards":   {"kind": "agent", "lens": "standards", "vendor": "host", "alt": True},
+        "host-alt-correctness": {"kind": "agent", "lens": "correctness", "vendor": "host", "alt": True},
+        "host-alt-both":        {"kind": "agent", "lens": "both", "vendor": "host", "alt": True},
     },
-    # Review SLOTS by checkpoint risk. Every slot must return zero findings.
-    # A slot is one reviewer id, or an ordered list of alternatives: the first one AVAILABLE when the
-    # review runs is used (not installed, recently failed, or same provider as the host = unavailable;
-    # a provider not yet used in this round is preferred). Any slot of only other-provider reviewers
-    # falls back to the host's own sub-agents, so a missing provider never stalls the loop.
-    # Rigor never changes (every finding is fixed); only how many independent eyes look.
+    # Review SLOTS by checkpoint risk; risk only changes how many reviewers look. "any-<lens>" means: the first
+    # available provider from a different company (a company not yet reviewing this round preferred), else the
+    # host's company on a different model (host-alt-<lens>), else the host itself (host-<lens>). A slot can also
+    # name reviewer ids, or a list of ids as ordered alternatives.
     "review_depth": {
-        "low":    ["host-both"],
-        "normal": ["host-standards", ["codex-correctness", "gemini-correctness", "claude-correctness", "copilot-correctness"]],
-        "high":   ["host-standards", "host-correctness",
-                   ["codex-correctness", "gemini-correctness", "claude-correctness", "copilot-correctness"],
-                   ["gemini-standards", "claude-standards", "codex-standards", "copilot-standards"]],
+        "low":    ["any-both"],
+        "normal": ["any-standards", "any-correctness"],
+        "high":   ["any-standards", "any-correctness", "any-correctness", "any-standards"],
     },
+    # Models for the roles the host runs as sub-agents, by tier. The tiers map to model names per host company in
+    # host_models; "inherit" (or a host not listed) means the session's own model.
+    "role_models": {
+        "ratchet-checkpoint-planner": "strong", "ratchet-implementer": "strong", "ratchet-fixer": "strong",
+        "ratchet-adversary": "strong", "ratchet-visual-reviewer": "strong",
+        "ratchet-app-scout": "standard", "ratchet-test-planner": "standard", "ratchet-test-writer": "standard",
+        "ratchet-design-system": "standard", "ratchet-prototyper": "standard", "ratchet-behavior-reviewer": "standard",
+        "ratchet-test-runner": "light",
+    },
+    "host_models": {
+        "anthropic": {"strong": "inherit", "standard": "sonnet", "light": "haiku", "alternates": ["sonnet", "opus"]},
+    },
+    "probe_providers": True,        # send a tiny test request before relying on a provider
+    "probe_ttl_minutes": 120,       # a provider that answered a test request this recently isn't tested again
+    "probe_timeout_sec": 120,
+    # Which finding severities block approval, by checkpoint risk. "all" = every finding must be fixed. On a low-risk
+    # checkpoint minor findings are recorded for later (`ratchet.py deferred`) instead of starting another round.
+    "blocking_severities": {"low": ["blocker", "major"], "normal": "all", "high": "all"},
+    # From round 2 on, a minor finding only blocks if it is in code changed since the previous round; blocker and
+    # major findings block wherever they are. Stops each round from turning into a fresh review of everything.
+    "scope_later_rounds": True,
     "unavailable_ttl_hours": 6,     # an other-provider reviewer that failed (auth, quota, timeout) is skipped this long
     "max_adversarial_rounds": 6,    # per checkpoint; after this the loop blocks and escalates
     "max_adversarial_rounds_run": 30,  # across the whole run (quota guard); then blocks and escalates
@@ -194,6 +218,8 @@ class Ctx:
     def config(self):
         cfg = json.loads(json.dumps(DEFAULT_CONFIG))
         user = read_json(self.config_path, {}) or {}
+        if user.get("review_depth") == OLD_DEFAULT_REVIEW_DEPTH:
+            user = {k: v for k, v in user.items() if k != "review_depth"}  # untouched old default: use the new one
         for k, v in user.items():
             if isinstance(v, dict) and isinstance(cfg.get(k), dict):
                 cfg[k].update(v)
@@ -560,7 +586,8 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "max_behavior_attempts", "ui_block_on_nits", "ui_globs", "regression_command", "standards",
              "fingerprint_include", "approver", "ui_single_reviewer_ok", "min_review_timeout_sec", "test_timeout_sec",
              "host_provider", "ui_reviewers", "design_md", "max_stop_blocks", "unavailable_ttl_hours",
-             "verify_transcripts", "min_review_seconds", "commit_per_checkpoint"]
+             "verify_transcripts", "min_review_seconds", "commit_per_checkpoint", "blocking_severities",
+             "scope_later_rounds"]
 
 
 def _file_sha(p: Path) -> str | None:
@@ -906,23 +933,70 @@ def cmd_status_text(ctx: Ctx):
         print(f"Live view: {url}")
 
 
-PLAIN_PROVIDER = {"host": "this agent", "claude": "Claude", "codex": "Codex", "gemini": "Gemini", "copilot": "Copilot"}
 PLAIN_LENS = {"both": "code standards and bugs", "standards": "code standards", "correctness": "bugs and security"}
+PLAIN_MODEL = {"inherit": "your session's model"}
 
 
-def _plain_reviewer(rid) -> str:
-    prov, _, lens = str(rid).partition("-")
-    return f"{PLAIN_PROVIDER.get(prov, prov)} ({PLAIN_LENS.get(lens, lens or 'review')})"
+def _plain_model(m) -> str:
+    return PLAIN_MODEL.get(str(m), str(m)) if m else "its default model"
 
 
-def _plain_slot(slot) -> str:
-    """A review slot in plain words: 'Codex (bugs and security), or the next available provider'."""
-    if isinstance(slot, list):
-        if not slot:
-            return ""
-        more = ", or the next available provider" if len(slot) > 1 else ""
-        return _plain_reviewer(slot[0]) + more + " (this agent if none is available)"
-    return _plain_reviewer(slot)
+def plain_reviewer(cfg, rid, model=None) -> str:
+    """'Codex, gpt-5 (bugs and security)' / 'this agent on a different model, sonnet or opus (code standards)'."""
+    spec = _roster_spec(cfg, rid) or {}
+    lens = PLAIN_LENS.get(spec.get("lens", "both"), spec.get("lens", "review"))
+    if spec.get("kind") == "agent":
+        if spec.get("alt"):
+            alts = host_model_map(cfg).get("alternates") or []
+            return f"this agent on a different model, {' or '.join(alts)} ({lens})"
+        return f"this agent, {_plain_model(role_model(cfg, 'ratchet-adversary'))} ({lens})"
+    name = spec.get("provider") or rid.rsplit("-", 1)[0]
+    return f"{name.capitalize()}, {_plain_model(spec.get('model') or model)} ({lens})"
+
+
+def models_table(cfg) -> list[tuple[str, str]]:
+    names = {"ratchet-checkpoint-planner": "planning the steps", "ratchet-implementer": "writing the code",
+             "ratchet-fixer": "fixing review findings", "ratchet-adversary": "code reviews by this agent",
+             "ratchet-visual-reviewer": "visual UI review", "ratchet-behavior-reviewer": "UI behaviour review",
+             "ratchet-app-scout": "checking the app runs", "ratchet-test-planner": "planning tests",
+             "ratchet-test-writer": "writing tests", "ratchet-design-system": "the design file",
+             "ratchet-prototyper": "the prototype", "ratchet-test-runner": "running tests"}
+    out = []
+    for role in sorted(set(names) | set(cfg.get("role_models") or {})):
+        out.append((role, role_model(cfg, role)))
+    return out
+
+
+ROLE_PLAIN = {"ratchet-checkpoint-planner": "planning the steps", "ratchet-implementer": "writing the code",
+              "ratchet-fixer": "fixing review findings", "ratchet-adversary": "this agent's own code reviews",
+              "ratchet-visual-reviewer": "visual UI review", "ratchet-behavior-reviewer": "UI behaviour review",
+              "ratchet-app-scout": "checking the app runs", "ratchet-test-planner": "planning tests",
+              "ratchet-test-writer": "writing tests", "ratchet-design-system": "the design file",
+              "ratchet-prototyper": "the prototype", "ratchet-test-runner": "running tests"}
+
+
+def cmd_models(args):
+    """Which model each role uses on this host, so the orchestrator can pass it when it spawns a sub-agent."""
+    cfg = Ctx(find_root()).config()
+    rows = models_table(cfg)
+    if args.json:
+        print(json.dumps({"host": detect_host(cfg), "roles": dict(rows),
+                          "alternates": host_model_map(cfg).get("alternates") or []}, indent=2))
+        return
+    print(f"Host: {detect_host(cfg)}. Spawn each role's sub-agent with this model (inherit = your own model):")
+    for role, m in rows:
+        print(f"  {role:<28} {m}")
+
+
+def _review_preview(ctx, cfg, cp) -> tuple[list[str], bool]:
+    """(plain names of who would review this step right now, every reviewer is the host's own company?)"""
+    try:
+        res = resolve_reviewers(ctx, cfg, cp)
+    except SystemExit:
+        return ["(no reviewer available)"], True
+    names = [plain_reviewer(cfg, r["id"], r.get("model")) for r in res]
+    host_only = all((_roster_spec(cfg, r["id"]) or {}).get("kind") == "agent" for r in res)
+    return names, host_only
 
 
 def cmd_plan_summary(args):
@@ -931,19 +1005,209 @@ def cmd_plan_summary(args):
     plan = ctx.plan()
     if not plan or not plan.get("checkpoints"):
         die("There is no plan yet. Finish planning first, then ask again.")
-    depth = ctx.config().get("review_depth") or {}
+    cfg = ctx.config()
     print(f"Plan: {plan.get('feature') or st.get('feature')} ({len(plan['checkpoints'])} steps)")
+    all_host = True
     for i, cp in enumerate(plan["checkpoints"], 1):
         risk = cp.get("risk", "normal")
-        slots = cp.get("reviewers") or depth.get(risk) or depth.get("normal") or []
-        who = "; ".join(_plain_slot(s) for s in slots if s)
+        who, host_only = _review_preview(ctx, cfg, cp)
+        all_host &= host_only
+        bar = (cfg.get("blocking_severities") or {}).get(risk, "all")
         print(f"\n{i}. {cp['title']}")
         print(f"   Done when: {(cp.get('done_when') or [''])[0]}")
         print(f"   UI review: {'yes' if (cp.get('gates') or {}).get('ui') else 'no'}")
-        print(f"   Risk: {risk}")
-        print(f"   Reviewed by: {who}")
+        print(f"   Risk: {risk}" + ("" if bar == "all" else f" (only {' and '.join(bar)} findings block; minor ones are noted for later)"))
+        print(f"   Reviewed by: {'; '.join(who)}")
+    rows = dict(models_table(cfg))
+    groups = {}
+    for role, m in rows.items():
+        groups.setdefault(m, []).append(role)
+    print("\nModels: " + "; ".join(f"{_plain_model(m)} for " + ", ".join(ROLE_PLAIN.get(r, r.replace('ratchet-', ''))
+                                                                         for r in roles)
+                                   for m, roles in groups.items()))
+    if all_host:
+        print("\nNote: no other provider is available right now, so every review will come from this agent's own "
+              "company's models. If you have other agent tools installed (Codex, Gemini, Copilot, Cursor, OpenCode "
+              "and so on), I can check them and use them for reviews.")
     if hooks_view(ctx, st).get("waived"):
         print("\nNote: hooks were skipped at your request, so the checks are only advice.")
+
+
+# ---- providers: discover, test and register other agent CLIs ------------------------------------------------
+
+PROBE_TOKEN = "RATCHET-PROBE-OK"
+
+
+def _status_path(ctx):
+    return ctx.ratchet / "provider-status.json"
+
+
+def provider_status(ctx) -> dict:
+    return read_json(_status_path(ctx), {}) or {}
+
+
+def probe_provider(ctx, cfg, pv) -> tuple[bool, str]:
+    """Send a tiny request through the provider exactly as a review would go, and record the result."""
+    cmd_t, use_stdin = provider_command(pv)
+    if not cmd_t:
+        return False, "no command"
+    if not shutil.which(cmd_t[0]):
+        return False, f"'{cmd_t[0]}' is not installed or not on PATH"
+    prompt = f"This is a connectivity check. Reply with exactly this and nothing else: {PROBE_TOKEN}"
+    work = Path(tempfile.mkdtemp(prefix="ratchet-probe-"))
+    out_file = work / "last-message.txt"
+    subs = {"{prompt_file}": str(work / "prompt.md"), "{prompt}": prompt, "{out_file}": str(out_file),
+            "{root}": str(ctx.root), "{model}": str(pv.get("model") or "")}
+    (work / "prompt.md").write_text(prompt)
+    cmd = []
+    for part in cmd_t:
+        for k, v in subs.items():
+            part = part.replace(k, v)
+        cmd.append(part)
+    try:
+        r = subprocess.run(cmd, cwd=work, input=prompt if use_stdin else None, capture_output=True, text=True,
+                           stdin=None if use_stdin else subprocess.DEVNULL,  # a CLI waiting on stdin must not hang
+                           timeout=int(cfg.get("probe_timeout_sec", 120)),
+                           env=dict(os.environ, RATCHET_NESTED_REVIEW="1"))
+        text = (out_file.read_text() if out_file.exists() else "") + (r.stdout or "")
+        good = PROBE_TOKEN in text
+        detail = "answered the test request" if good else (
+            f"exit {r.returncode}: " + ((r.stderr or r.stdout or "no output").strip().splitlines() or ["no output"])[-1][:200])
+    except subprocess.TimeoutExpired:
+        good, detail = False, f"no answer within {cfg.get('probe_timeout_sec', 120)}s"
+    except OSError as e:
+        good, detail = False, str(e)[:200]
+    shutil.rmtree(work, ignore_errors=True)
+    data = provider_status(ctx)
+    data[pv["id"]] = {"ok": good, "at": now(), "detail": detail}
+    write_json(_status_path(ctx), data)
+    if not good:
+        for lens in LENSES:
+            mark_unavailable(ctx, f"{pv['id']}-{lens}", f"test request failed: {detail}")
+    else:
+        live = unavailable_reviewers(ctx)
+        for lens in LENSES:
+            live.pop(f"{pv['id']}-{lens}", None)
+        write_json(_unavailable_path(ctx), live)
+    return good, detail
+
+
+def probe_due(ctx, cfg, pid) -> bool:
+    if not cfg.get("probe_providers", True):
+        return False
+    st = provider_status(ctx).get(pid) or {}
+    t = _parse_iso(st.get("at"))
+    fresh = t and (_dt.datetime.now(_dt.timezone.utc) - t).total_seconds() < 60 * float(cfg.get("probe_ttl_minutes", 120))
+    return not (st.get("ok") and fresh)
+
+
+def _write_providers(ctx, plist):
+    user = read_json(ctx.config_path, {}) or {}
+    user["providers"] = plist
+    write_json(ctx.config_path, user)
+
+
+def cmd_providers(args):
+    ctx = Ctx(find_root())
+    ctx.ratchet.mkdir(exist_ok=True)
+    cfg = ctx.config()
+    host = detect_host(cfg)
+    plist = providers(cfg)
+    if args.remove:
+        plist = [pv for pv in plist if pv["id"] != args.remove]
+        _write_providers(ctx, plist)
+        ok(f"Removed provider {args.remove}.")
+        return
+    if args.add:
+        if not (args.preset or args.command):
+            die("--add needs --preset <" + "|".join(PRESETS) + "> or --command '<json list>'")
+        pv = {"id": args.add}
+        if args.preset:
+            if args.preset not in PRESETS:
+                die(f"unknown preset {args.preset}; known: {', '.join(PRESETS)}. Use --command for anything else.")
+            pv["preset"] = args.preset
+        if args.command:
+            try:
+                pv["command"] = json.loads(args.command)
+                assert isinstance(pv["command"], list) and pv["command"]
+            except (ValueError, AssertionError):
+                die("--command must be a JSON list, e.g. '[\"mycli\", \"run\", \"{prompt}\"]'")
+            pv["stdin"] = bool(args.stdin)
+        if args.model:
+            pv["model"] = args.model
+        if args.company:
+            pv["company"] = args.company
+        if args.for_risk:
+            pv["for_risk"] = [x.strip() for x in args.for_risk.split(",") if x.strip()]
+        if not provider_company(pv):
+            die(f"Can't tell which company's model '{args.add}' runs. Give --model (a model name from that tool) "
+                "or --company.")
+        if not args.no_check:
+            good, detail = probe_provider(ctx, cfg, pv)
+            if not good:
+                die(f"{args.add} didn't pass the test request ({detail}). Not added. Fix the command or model and "
+                    "try again (or add --no-check to add it anyway).")
+        plist = [x for x in plist if x["id"] != pv["id"]] + [pv]
+        _write_providers(ctx, plist)
+        ok(f"Added provider {args.add} ({provider_company(pv)}, {_plain_model(pv.get('model'))}). It can now review.")
+        return
+    if args.discover or args.check:
+        targets = [pv for pv in plist if not args.check or args.check in ("all", pv["id"])]
+        for pv in targets:
+            company = provider_company(pv)
+            if company == host:
+                continue
+            if shutil.which(provider_binary(pv) or "") and company:
+                probe_provider(ctx, cfg, pv)
+    status = provider_status(ctx)
+    rows = []
+    for pv in plist:
+        company = provider_company(pv)
+        st_ = status.get(pv["id"]) or {}
+        installed = bool(shutil.which(provider_binary(pv) or ""))
+        if company == host:
+            state = "same company as this agent, so not used as an independent reviewer"
+        elif not company:
+            state = "needs a model (which company's model it runs is unknown)"
+        elif not installed:
+            state = f"not installed ('{provider_binary(pv)}' not found)"
+        elif not st_:
+            state = "installed, not tested yet"
+        else:
+            state = ("working" if st_.get("ok") else "failing") + f": {st_.get('detail')} ({str(st_.get('at'))[:16]}Z)"
+        rows.append({"id": pv["id"], "company": company, "model": pv.get("model"), "installed": installed,
+                     "ok": bool(st_.get("ok")) and company not in (None, host), "state": state})
+    found = []
+    if args.discover:
+        known = {provider_binary(pv) for pv in plist}
+        for name, pr in PRESETS.items():
+            if pr["bin"] in known or not shutil.which(pr["bin"]):
+                continue
+            if pr["company"] and pr["company"] != host:
+                pv = {"id": name, "preset": name}
+                good, detail = probe_provider(ctx, cfg, pv)
+                if good:
+                    plist.append(pv)
+                    _write_providers(ctx, plist)
+                    rows.append({"id": name, "company": pr["company"], "model": None, "installed": True, "ok": True,
+                                 "state": "working: added"})
+                else:
+                    rows.append({"id": name, "company": pr["company"], "model": None, "installed": True, "ok": False,
+                                 "state": f"installed but failing: {detail}"})
+            elif not pr["company"]:
+                found.append(name)
+    if args.json:
+        print(json.dumps({"host": host, "providers": rows, "needs_model": found}, indent=2))
+        return
+    print(f"This agent runs on: {host}.")
+    for r in rows:
+        print(f"  {'✓' if r['ok'] else '·'} {r['id']:<10} {str(r['company'] or '?'):<10} {r['state']}")
+    for name in found:
+        print(f"  + {name:<10} {'?':<10} installed; it can run several companies' models. Pick a capable model from "
+              f"a company other than {host} (the tool's own help lists them), then: "
+              f"ratchet.py providers --add {name} --preset {name} --model <model>")
+    if not any(r["ok"] for r in rows):
+        print(f"No working provider from another company: reviews will come from {host}'s own models.")
 
 
 # --------------------------------------------------------------------------- commands
@@ -955,13 +1219,14 @@ def cmd_init(args):
     if not ctx.config_path.exists():
         cfg = {k: DEFAULT_CONFIG[k] for k in ["human_review", "host_provider", "ui_reviewers", "regression_command",
                                                "commit_per_checkpoint", "design_md", "standards", "app"]}
-        cfg["review_depth"] = default_review_depth()
         write_json(ctx.config_path, cfg)
-        host = detect_host(cfg)
-        found = [p for p, b in PRESET_BINARIES.items() if shutil.which(b) and PRESET_VENDORS[p] != host]
+        full = ctx.config()
+        host = detect_host(full)
+        found = [pv["id"] for pv in providers(full) if provider_company(pv) not in (None, host)
+                 and shutil.which(provider_binary(pv) or "")]
         print(f"Host provider: {host}" + (" (set host_provider in .ratchet/config.json)" if host == "unknown" else "")
-              + ". Other-provider reviewers: " + (", ".join(found) + " — used first, host sub-agents as fallback"
-              if found else "none found — the host's sub-agents review everything"))
+              + ". Other providers installed: " + (", ".join(found) if found else "none found")
+              + ". Run `ratchet.py providers --discover` to test them and add other agent CLIs.")
     learn = ctx.ratchet / "learnings.md"
     if not learn.exists():
         learn.write_text("# Ratchet learnings\n\nEvery Ratchet agent reads this file before starting work. "
@@ -1023,8 +1288,130 @@ def cmd_init(args):
     print(json.dumps(next_action(ctx), indent=2))
 
 
-PRESET_BINARIES = {"claude": "claude", "codex": "codex", "gemini": "gemini", "copilot": "copilot"}
-PRESET_VENDORS = {"claude": "anthropic", "codex": "openai", "gemini": "google", "copilot": "github"}
+OLD_DEFAULT_REVIEW_DEPTH = {
+    "low": ["host-both"],
+    "normal": ["host-standards", ["codex-correctness", "gemini-correctness", "claude-correctness", "copilot-correctness"]],
+    "high": ["host-standards", "host-correctness",
+             ["codex-correctness", "gemini-correctness", "claude-correctness", "copilot-correctness"],
+             ["gemini-standards", "claude-standards", "codex-standards", "copilot-standards"]],
+}
+
+# How to run each known agent CLI non-interactively. "company" is None for CLIs that can run several companies'
+# models: for those the company comes from the chosen model. Flags differ between CLI versions; a provider entry
+# can always give its own "command" instead ({prompt} {prompt_file} {out_file} {root} {model} are filled in).
+PRESETS = {
+    "claude": {"bin": "claude", "company": "anthropic", "stdin": True, "model_flag": ["--model"], "model_at": 1,
+               "command": ["claude", "-p", "--no-session-persistence", "--setting-sources", ""]},
+    "codex": {"bin": "codex", "company": "openai", "stdin": True, "model_flag": ["-m"], "model_at": 2,
+              "command": ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
+                          "--output-last-message", "{out_file}", "-"]},
+    "gemini": {"bin": "gemini", "company": "google", "stdin": True, "model_flag": ["-m"], "model_at": 1,
+               "command": ["gemini", "-p", "Carry out the task described on stdin. Reply with only what it asks for."]},
+    "copilot": {"bin": "copilot", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
+                "command": ["copilot", "-p", "{prompt}"]},
+    "cursor": {"bin": "cursor-agent", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
+               "command": ["cursor-agent", "-p", "{prompt}", "--output-format", "text"]},
+    "opencode": {"bin": "opencode", "company": None, "stdin": False, "model_flag": ["-m"], "model_at": 2,
+                 "command": ["opencode", "run", "{prompt}"]},
+}
+PRESET_BINARIES = {k: v["bin"] for k, v in PRESETS.items()}
+PRESET_VENDORS = {k: v["company"] for k, v in PRESETS.items()}
+MODEL_COMPANIES = [
+    (r"claude|opus|sonnet|haiku|anthropic", "anthropic"), (r"gpt|codex|chatgpt|openai|(^|[/-])o[1-9]", "openai"),
+    (r"gemini|gemma|google", "google"), (r"grok|xai", "xai"), (r"glm|zhipu|z-ai|zai", "zhipu"),
+    (r"qwen|alibaba", "alibaba"), (r"deepseek", "deepseek"), (r"kimi|moonshot", "moonshot"),
+    (r"llama|meta", "meta"), (r"mistral|codestral|devstral|magistral", "mistral"),
+]
+LENSES = ("correctness", "standards", "both")
+
+
+def company_of_model(model) -> str | None:
+    m = str(model or "").lower()
+    if not m:
+        return None
+    for rx, company in MODEL_COMPANIES:
+        if re.search(rx, m):
+            return company
+    return None
+
+
+def providers(cfg) -> list[dict]:
+    return [pv for pv in (cfg.get("providers") or []) if isinstance(pv, dict) and pv.get("id")]
+
+
+def provider_by_id(cfg, pid) -> dict | None:
+    return next((pv for pv in providers(cfg) if pv["id"] == pid), None)
+
+
+def provider_company(pv) -> str | None:
+    if pv.get("company"):
+        return pv["company"]
+    from_model = company_of_model(pv.get("model"))
+    if from_model:
+        return from_model
+    return (PRESETS.get(pv.get("preset", "")) or {}).get("company")
+
+
+def provider_binary(pv) -> str | None:
+    if pv.get("command"):
+        return str(pv["command"][0])
+    return (PRESETS.get(pv.get("preset", "")) or {}).get("bin")
+
+
+def provider_command(pv) -> tuple[list[str], bool]:
+    """(command template, prompt on stdin?) with the model filled in."""
+    preset = PRESETS.get(pv.get("preset", "")) or {}
+    if pv.get("command"):
+        cmd = [str(c).replace("{model}", str(pv.get("model") or "")) for c in pv["command"]]
+        return cmd, bool(pv.get("stdin", False))
+    cmd = list(preset.get("command") or [])
+    if pv.get("model") and cmd:
+        at = preset.get("model_at", 1)
+        cmd = cmd[:at] + list(preset.get("model_flag") or ["--model"]) + [str(pv["model"])] + cmd[at:]
+    return cmd, bool(preset.get("stdin", False))
+
+
+def roster(cfg) -> dict:
+    """Every reviewer id: the host's own sub-agents, any reviewer written in config 'reviewers', and three per
+    provider (<id>-correctness / -standards / -both)."""
+    out = dict(cfg.get("reviewers") or {})
+    for pv in providers(cfg):
+        for lens in LENSES:
+            out.setdefault(f"{pv['id']}-{lens}", {"kind": "command", "provider": pv["id"], "lens": lens,
+                                                  "vendor": provider_company(pv), "model": pv.get("model"),
+                                                  "for_risk": pv.get("for_risk")})
+    return out
+
+
+def _roster_spec(cfg, rid):
+    r = roster(cfg)
+    if rid in r:
+        return r[rid]
+    m = re.fullmatch(r"([a-z0-9_.-]+)-(correctness|standards|both)", rid or "")
+    if m and m.group(1) in PRESETS:  # an older config naming a preset reviewer that isn't a provider any more
+        return {"kind": "command", "preset": m.group(1), "lens": m.group(2), "vendor": PRESETS[m.group(1)]["company"]}
+    return None
+
+
+def reviewer_command(cfg, rid) -> tuple[list[str], bool]:
+    spec = _roster_spec(cfg, rid) or {}
+    if spec.get("provider"):
+        return provider_command(provider_by_id(cfg, spec["provider"]) or {})
+    if spec.get("command"):
+        return [str(c) for c in spec["command"]], bool(spec.get("stdin", False))
+    preset = PRESETS.get(spec.get("preset", "")) or {}
+    return list(preset.get("command") or []), bool(preset.get("stdin", False))
+
+
+def host_model_map(cfg) -> dict:
+    return ((cfg.get("host_models") or {}).get(detect_host(cfg)) or {})
+
+
+def role_model(cfg, role) -> str:
+    tier = (cfg.get("role_models") or {}).get(role, "inherit")
+    if tier in ("strong", "standard", "light"):
+        return host_model_map(cfg).get(tier) or "inherit"
+    return tier or "inherit"
 HOST_HINTS = [  # environment variables the common agent CLIs set for the tools they run
     ("anthropic", ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")),
     ("openai", ("CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED")),
@@ -1033,10 +1420,14 @@ HOST_HINTS = [  # environment variables the common agent CLIs set for the tools 
 ]
 
 
+HOST_ALIASES = {"claude": "anthropic", "claude-code": "anthropic", "codex": "openai", "gpt": "openai",
+                "gemini": "google", "copilot": "github"}
+
+
 def detect_host(cfg=None) -> str:
     explicit = os.environ.get("RATCHET_HOST_PROVIDER") or (cfg or {}).get("host_provider", "auto")
     if explicit and explicit != "auto":
-        return explicit
+        return HOST_ALIASES.get(str(explicit).lower(), str(explicit).lower())
     for vendor, keys in HOST_HINTS:
         if any(os.environ.get(k) for k in keys):
             return vendor
@@ -1066,15 +1457,24 @@ def mark_unavailable(ctx, rid, reason, hours=None):
     return until
 
 
-def reviewer_availability(ctx, cfg, rid) -> tuple[bool, str]:
-    spec = (cfg.get("reviewers") or {}).get(rid)
+def reviewer_availability(ctx, cfg, rid, risk=None) -> tuple[bool, str]:
+    spec = _roster_spec(cfg, rid)
     if spec is None:
-        return False, "not defined in config 'reviewers'"
+        return False, "not defined (config 'providers' or 'reviewers')"
     if spec.get("kind") == "agent":
+        if spec.get("alt"):
+            alts = host_model_map(cfg).get("alternates") or []
+            if not alts:
+                return False, f"this agent can't pick a different model here (no host_models.alternates for {detect_host(cfg)})"
+            return True, f"sub-agent of the host on a different model ({' or '.join(alts)})"
         return True, f"sub-agent of the host ({detect_host(cfg)})"
     host = detect_host(cfg)
-    if spec.get("vendor") and spec.get("vendor") == host:
-        return False, f"same provider as the host ({host}) — the host's own sub-agents cover it"
+    if not spec.get("vendor"):
+        return False, "which company's model it runs is unknown — give it a model or a company"
+    if spec.get("vendor") == host:
+        return False, f"same company as the host ({host}) — not an independent reviewer"
+    if risk and spec.get("for_risk") and risk not in spec["for_risk"]:
+        return False, f"not set up for {risk}-risk steps (for_risk: {', '.join(spec['for_risk'])})"
     binary = reviewer_binary(cfg, rid) or ""
     if not binary or not shutil.which(binary):
         return False, f"'{binary or spec.get('preset')}' CLI not installed"
@@ -1085,18 +1485,33 @@ def reviewer_availability(ctx, cfg, rid) -> tuple[bool, str]:
 
 
 def _host_fallbacks(cfg, rid) -> list[str]:
-    """Same lens first, then the host's other reviewers, so a fallback keeps the reviewer COUNT."""
-    lens = ((cfg.get("reviewers") or {}).get(rid) or {}).get("lens", "both")
-    first = {"standards": "host-standards", "correctness": "host-correctness"}.get(lens, "host-both")
-    rest = [r for r in ("host-both", "host-correctness", "host-standards") if r != first]
-    return [first] + [r for r in rest if r in (cfg.get("reviewers") or {})]
+    """The host's company on a different model first, then the host itself; same lens first, then the others,
+    so a fallback keeps the reviewer COUNT."""
+    lens = (_roster_spec(cfg, rid) or {}).get("lens", "both")
+    order = [lens] + [x for x in ("both", "correctness", "standards") if x != lens]
+    r = roster(cfg)
+    return [f"host-alt-{x}" for x in order if f"host-alt-{x}" in r] + [f"host-{x}" for x in order if f"host-{x}" in r]
+
+
+def expand_slot(cfg, slot) -> list[str]:
+    alts = list(slot) if isinstance(slot, list) else [slot]
+    out = []
+    for a in alts:
+        m = re.fullmatch(r"any-(correctness|standards|both)", str(a))
+        if m:
+            out += [f"{pv['id']}-{m.group(1)}" for pv in providers(cfg)]
+            out += [f"host-alt-{m.group(1)}", f"host-{m.group(1)}"]
+        else:
+            out.append(a)
+    return out
 
 
 def reviewer_binary(cfg, rid):
-    spec = (cfg.get("reviewers") or {}).get(rid) or {}
+    spec = _roster_spec(cfg, rid) or {}
     if spec.get("kind") != "command":
         return None
-    return (spec.get("command") or [PRESET_BINARIES.get(spec.get("preset", ""), "")])[0] or None
+    cmd, _ = reviewer_command(cfg, rid)
+    return cmd[0] if cmd else None
 
 
 def resolve_reviewers(ctx, cfg, cp) -> list[dict]:
@@ -1113,27 +1528,30 @@ def resolve_reviewers(ctx, cfg, cp) -> list[dict]:
         slots = depth.get(cp.get("risk", "normal")) or depth.get("normal")
         if not slots:  # legacy config: "adversaries": N
             slots = ["host-both"] if int(cfg.get("adversaries", 2)) == 1 else ["host-standards", "host-correctness"]
-    roster = cfg.get("reviewers") or {}
+    roster_ = {rid: _roster_spec(cfg, rid) for rid in set(roster(cfg)) | {a for sl in slots for a in expand_slot(cfg, sl)}}
+    roster_ = {k: v for k, v in roster_.items() if v is not None}
+    risk = cp.get("risk", "normal")
     chosen, out = set(), []
     for n, slot in enumerate(slots, 1):
-        alts = list(slot) if isinstance(slot, list) else [slot]
-        unknown = [a for a in alts if a not in roster]
+        alts = expand_slot(cfg, slot)
+        unknown = [a for a in alts if a not in roster_]
         if unknown:
-            die(f"review_depth/checkpoint names unknown reviewer(s) {unknown}; define them under config 'reviewers'.")
-        if all(roster[a].get("kind") == "command" for a in alts):
+            die(f"review_depth/checkpoint names unknown reviewer(s) {unknown}; add them under config 'providers' "
+                "or 'reviewers'.")
+        if all(roster_[a].get("kind") == "command" for a in alts):
             alts += _host_fallbacks(cfg, alts[0])
         skipped, reasons, pick, candidates = [], {}, None, []
         for a in alts:
             if a in chosen:
                 continue
-            okay, why = reviewer_availability(ctx, cfg, a)
+            okay, why = reviewer_availability(ctx, cfg, a, risk)
             if okay:
                 candidates.append(a)
             else:
                 skipped.append(a)
                 reasons[a] = why
-        used_vendors = {roster[c].get("vendor") for c in chosen if roster[c].get("kind") == "command"}
-        fresh = [c for c in candidates if roster[c].get("kind") == "command" and roster[c].get("vendor") not in used_vendors]
+        used_vendors = {roster_[c].get("vendor") for c in chosen if roster_[c].get("kind") == "command"}
+        fresh = [c for c in candidates if roster_[c].get("kind") == "command" and roster_[c].get("vendor") not in used_vendors]
         pick = fresh[0] if fresh else (candidates[0] if candidates else None)
         if pick and candidates and pick != candidates[0]:
             skipped.append(candidates[0])
@@ -1141,10 +1559,15 @@ def resolve_reviewers(ctx, cfg, cp) -> list[dict]:
         if pick is None:
             continue  # every alternative already used or down: slot collapses into the others
         chosen.add(pick)
-        out.append({"id": pick, "slot": n, "vendor": roster[pick].get("vendor"),
-                    "fallback_for": skipped, "reasons": reasons})
+        spec = roster_[pick]
+        model = spec.get("model") if spec.get("kind") == "command" else (
+            "a different model: " + " or ".join(host_model_map(cfg).get("alternates") or []) if spec.get("alt")
+            else role_model(cfg, "ratchet-adversary"))
+        out.append({"id": pick, "slot": n, "vendor": spec.get("vendor"), "model": model,
+                    "fallback_for": [x for x in skipped if x in alts and alts.index(x) < alts.index(pick)],
+                    "reasons": reasons})
     if not out:
-        die("No adversarial reviewer is available for this checkpoint — check config 'reviewers'.")
+        die("No adversarial reviewer is available for this checkpoint — check config 'providers' and 'reviewers'.")
     return out
 
 
@@ -1857,7 +2280,7 @@ def cmd_adv_record(args):
     all_findings, verdicts = [], []
     for rid in required:
         rp, r = reviews[rid]
-        spec = (cfg.get("reviewers") or {}).get(rid, {})
+        spec = _roster_spec(cfg, rid) or {}
         findings = r.get("findings", []) or []
         all_findings += [dict(f, reviewer=rid) for f in findings]
         verdicts.append({"reviewer": rid, "vendor": spec.get("vendor"), "claimed": r.get("verdict"),
@@ -1865,9 +2288,19 @@ def cmd_adv_record(args):
         if Path(rp).resolve().parent != dest.resolve():
             shutil.copy2(rp, dest / f"{rid}.json")
     need = len(required)
+    changed_since = _changed_since_last_round(ctx, cfg, g, fp["id"])
+    raw_count = len(all_findings)
+    all_findings, deferred = split_findings(cfg, cp.get("risk", "normal"), all_findings, changed_since)
+    if deferred:
+        write_json(dest / "deferred-findings.json", deferred)
+        keep = [x for x in cps.get("deferred") or [] if x.get("round") != rnd["round"]]
+        cps["deferred"] = keep + [dict(x, round=rnd["round"]) for x in deferred]
     approved = not all_findings
     g["rounds"] = g.get("rounds", []) + [{"at": now(), "fingerprint": fp["id"], "verdicts": verdicts,
-                                          "findings": len(all_findings), "substitutions": subs}]
+                                          "findings": len(all_findings), "deferred": len(deferred),
+                                          "raw_findings": raw_count, "substitutions": subs,
+                                          "reviewers": [{"id": rr["id"], "vendor": rr.get("vendor"),
+                                                         "model": rr.get("model")} for rr in rnd.get("resolved") or []]}]
     if not approved:
         g["status"] = "failed"
         if g["attempts"] >= cfg["max_adversarial_rounds"]:
@@ -1877,7 +2310,8 @@ def cmd_adv_record(args):
         ctx.save_state(st)
         build_viewer(ctx)
         write_json(dest / "open-findings.json", all_findings)
-        die(f"Gate 3 (adversarial) NOT approved: {len(all_findings)} finding(s) → "
+        die(f"Gate 3 (adversarial) NOT approved: {len(all_findings)} blocking finding(s)"
+            + (f" ({len(deferred)} minor ones recorded for later)" if deferred else "") + " → "
             f"{(dest / 'open-findings.json').relative_to(ctx.root)}. Spawn ratchet-fixer with that file, "
             "re-run behavior (and UI if visible code changed), then re-run the adversaries.", 2)
     g.update(status="passed", fingerprint=fp, passed_at=now(), evidence=str(dest.relative_to(ctx.root)))
@@ -1885,7 +2319,77 @@ def cmd_adv_record(args):
     ctx.log(st, "adversarial_approved", cp=args.cp, round=g["attempts"])
     ctx.save_state(st)
     build_viewer(ctx)
-    ok(f"Gate 3 (adversarial) APPROVED by all {need} reviewer(s) for {args.cp}. Next: ratchet.py complete {args.cp}")
+    note = (f" {len(deferred)} minor finding(s) were recorded for later instead of blocking (`ratchet.py deferred`)."
+            if deferred else "")
+    ok(f"Gate 3 (adversarial) APPROVED by all {need} reviewer(s) for {args.cp}.{note} Next: ratchet.py complete {args.cp}")
+
+
+MINOR_SEVERITIES = {"minor", "nit", "nitpick", "trivial", "info", "suggestion", "low", "style"}
+
+
+def _norm_path(p) -> str:
+    p = str(p or "").strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.split(":")[0]
+
+
+def split_findings(cfg, risk: str, findings: list, changed_since: set | None) -> tuple[list, list]:
+    """(blocking, deferred). Severities not known to be minor always block (a reviewer can't escape the bar by
+    inventing a severity name)."""
+    bar = (cfg.get("blocking_severities") or {}).get(risk, "all")
+    blocking, deferred = [], []
+    for f in findings:
+        sev = str(f.get("severity", "")).strip().lower()
+        minor = sev in MINOR_SEVERITIES
+        if minor and bar != "all" and sev not in [str(x).lower() for x in (bar or [])]:
+            deferred.append(dict(f, deferred_because=f"{risk}-risk step: only {', '.join(bar)} findings block"))
+        elif minor and changed_since is not None and _norm_path(f.get("file")) not in changed_since:
+            deferred.append(dict(f, deferred_because="later round: not in code changed since the previous round"))
+        else:
+            blocking.append(f)
+    return blocking, deferred
+
+
+def _changed_since_last_round(ctx, cfg, g, fp_id) -> set | None:
+    if not cfg.get("scope_later_rounds", True) or not g.get("rounds"):
+        return None
+    prev = g["rounds"][-1].get("fingerprint")
+    if not prev:
+        return None
+    return {_norm_path(x) for x in changed_files(ctx.root, {"kind": "git-tree", "id": prev}, {"kind": "git-tree", "id": fp_id})}
+
+
+def review_rules(ctx, cfg, cp, g, rnd, fp_id) -> tuple[set | None, list[str]]:
+    """What the reviewers of this round are told about the severity bar and the round's focus."""
+    focus = _changed_since_last_round(ctx, cfg, g, fp_id) if rnd["round"] > 1 else None
+    bar = (cfg.get("blocking_severities") or {}).get(cp.get("risk", "normal"), "all")
+    rules = []
+    if bar != "all":
+        rules.append(f"This is a {cp.get('risk', 'normal')}-risk step: only {' and '.join(bar)} findings block; "
+                     "report minor ones too, they are recorded for later.")
+    if focus is not None:
+        rules.append("Round " + str(rnd["round"]) + ": look hardest at the code changed since the last round ("
+                     + (", ".join(sorted(focus)[:20]) or "nothing changed") + "). Elsewhere, report only blocker "
+                     "or major problems; minor ones outside those files are recorded, not fixed.")
+    return focus, rules
+
+
+def cmd_deferred(args):
+    """Minor findings that were recorded instead of blocking, for the user to decide on at the end."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    rows = [(cp, f) for cp, c in (st.get("checkpoints") or {}).items() for f in c.get("deferred") or []]
+    if getattr(args, "json", False):
+        print(json.dumps([dict(f, checkpoint=cp) for cp, f in rows], indent=2))
+        return
+    if not rows:
+        print("No findings were left for later.")
+        return
+    print(f"{len(rows)} minor finding(s) were left for later (they did not block):")
+    for cp, f in rows:
+        where = f" ({f['file']}{':' + str(f['line']) if f.get('line') else ''})" if f.get("file") else ""
+        print(f"- {cp}{where}: {f.get('description', '').strip()[:240]}")
 
 
 def cmd_complete(args):
@@ -2505,6 +3009,15 @@ def cmd_reviewers(args):
             ctx.save_state(st)
             die(st["blocked_reason"], 2)
         resolved = resolve_reviewers(ctx, cfg, cp)
+        for _ in range(4):  # test the providers we are about to rely on; a failing one hands its slot on
+            due = {(_roster_spec(cfg, r["id"]) or {}).get("provider") for r in resolved}
+            due = [pid for pid in due if pid and probe_due(ctx, cfg, pid)]
+            if not due:
+                break
+            for pid in due:
+                good, detail = probe_provider(ctx, cfg, provider_by_id(cfg, pid))
+                print(f"  checked {pid}: {'working' if good else 'not usable now (' + detail + ')'}", file=sys.stderr)
+            resolved = resolve_reviewers(ctx, cfg, cp)
         g["attempts"] += 1
         st["adv_rounds_total"] = int(st.get("adv_rounds_total", 0)) + 1
         prev = rnd["round"] if rnd else 0
@@ -2537,19 +3050,24 @@ def cmd_reviewers(args):
     fixes = ctx.run_dir() / "reviews" / args.cp / f"adv-round-{rnd['round'] - 1:02d}" / "fixes.md"
     fixes_arg = f" --fixes {fixes}" if rnd["round"] > 1 else ""
     ext_script = SKILL_DIR.parent / "ratchet-adversarial-loop" / "scripts" / "external_review.py"
+    focus, rules = review_rules(ctx, cfg, cp, g, rnd, fp)
     rows = []
     for res_r in rnd["resolved"]:
         rid = res_r["id"]
-        spec = dict(cfg["reviewers"][rid], id=rid, output=str(out_dir / f"{rid}.json"),
+        spec = dict(_roster_spec(cfg, rid) or {}, id=rid, output=str(out_dir / f"{rid}.json"),
                     slot=res_r["slot"], fallback_for=res_r["fallback_for"], reasons=res_r["reasons"])
         if spec["kind"] == "agent":
-            spec["how"] = (f"Spawn a ratchet-adversary sub-agent: lens={spec['lens']}, reviewer id '{rid}', "
+            want = ("a model DIFFERENT from yours: " + " or ".join(host_model_map(cfg).get("alternates") or [])
+                    if spec.get("alt") else role_model(cfg, "ratchet-adversary"))
+            spec["how"] = (f"Spawn a ratchet-adversary sub-agent (model: {want}): lens={spec['lens']}, reviewer id '{rid}', "
                            f"fingerprint {fp}, round_nonce {rnd['nonce']}, checkpoint {args.cp}, output {spec['output']}"
-                           + (f", fixes.md {fixes}" if rnd["round"] > 1 else ""))
+                           + (f", fixes.md {fixes}" if rnd["round"] > 1 else "")
+                           + ("" if not rules else ". Review rules for this round (tell it): " + " ".join(rules)))
         else:
             spec["how"] = f"python3 {ext_script} --reviewer {rid} --cp {args.cp} --out {spec['output']}{fixes_arg}"
         rows.append(spec)
     res = {"checkpoint": args.cp, "risk": cp.get("risk", "normal"), "round": rnd["round"], "fingerprint": fp,
+           "review_rules": rules, "focus_files": sorted(focus) if focus is not None else None,
            "round_nonce": rnd["nonce"], "output_dir": str(out_dir),
            "fixes_md": str(fixes) if rnd["round"] > 1 else None,
            "run_rounds_used": st.get("adv_rounds_total", 0), "run_rounds_cap": cfg["max_adversarial_rounds_run"],
@@ -2563,6 +3081,8 @@ def cmd_reviewers(args):
         print(f"  - {r['id']:<22} [{r['vendor']}/{r['lens']}] {r['how']}")
         for skipped in r["fallback_for"]:
             print(f"      (instead of {skipped}: {r['reasons'][skipped]})")
+    for rule in rules:
+        print(f"  rule: {rule}")
     print(f"Then: ratchet.py adv-record {args.cp} --reviews {out_dir}/*.json")
 
 
@@ -2578,9 +3098,9 @@ def cmd_reviewer_status(args):
         until = mark_unavailable(ctx, args.mark, args.reason or "marked unavailable")
         ok(f"{args.mark} skipped until {until[:16]}Z; the next provider, or the host's sub-agents, fill its slot")
     print(f"Host provider: {detect_host(cfg)}")
-    for rid, spec in (cfg.get("reviewers") or {}).items():
+    for rid, spec in roster(cfg).items():
         okay, why = reviewer_availability(ctx, cfg, rid)
-        print(f"  {'✓' if okay else '·'} {rid:<22} {spec.get('vendor', ''):<10} {why}")
+        print(f"  {'✓' if okay else '·'} {rid:<22} {str(spec.get('vendor') or '?'):<10} {why}")
 
 
 def status_json(ctx: Ctx) -> dict:
@@ -2695,7 +3215,22 @@ def viewer_data(ctx: Ctx):
         if tp:
             tests[cp["id"]] = tp
     learn = ctx.ratchet / "learnings.md"
-    return {"state": dict({k: v for k, v in st.items() if k not in ("history", "approved")},
+    cfg = ctx.config()
+    reviews = {}
+    for cp in plan.get("checkpoints", []):
+        g = ((st.get("checkpoints") or {}).get(cp["id"]) or {}).get("gates", {}).get("adversarial") or {}
+        rounds = []
+        for i, rd in enumerate(g.get("rounds") or [], 1):
+            who = [plain_reviewer(cfg, x["id"], x.get("model")) for x in rd.get("reviewers") or []] or \
+                  [plain_reviewer(cfg, v["reviewer"]) for v in rd.get("verdicts") or []]
+            own = all((_roster_spec(cfg, x["id"]) or {}).get("kind") == "agent" for x in rd.get("reviewers") or []) \
+                if rd.get("reviewers") else None
+            rounds.append({"round": i, "who": who, "blocking": rd.get("findings", 0),
+                           "deferred": rd.get("deferred", 0), "own_company_only": own})
+        if rounds:
+            reviews[cp["id"]] = {"rounds": rounds, "deferred_total": len(((st.get("checkpoints") or {}).get(cp["id"]) or {}).get("deferred") or [])}
+    return {"reviews": reviews,
+            "state": dict({k: v for k, v in st.items() if k not in ("history", "approved")},
                          blocked_reason_plain=plain_reason(st.get("blocked_reason"))),
             "prototype": (ctx.run_dir() / "reference" / "prototype.html").exists(),
             "history": st.get("history", [])[-40:], "plan": plan, "tests": tests,
@@ -3846,6 +4381,18 @@ def main(argv=None):
     a.add_argument("cp"); a.add_argument("--director-token"); a.set_defaults(fn=cmd_ui_respec)
     a = sp.add_parser("approve-changes", help="accept a user-confirmed change to the approved plan/tests/rules")
     a.add_argument("--director-token"); a.set_defaults(fn=cmd_approve_changes)
+    a = sp.add_parser("providers", help="list, test (--check/--discover) and register (--add) other agent CLIs")
+    a.add_argument("--discover", action="store_true", help="find installed agent CLIs, test them, add what works")
+    a.add_argument("--check", nargs="?", const="all", help="send a test request to one provider (or all)")
+    a.add_argument("--add", metavar="ID"); a.add_argument("--preset"); a.add_argument("--command")
+    a.add_argument("--stdin", action="store_true"); a.add_argument("--model"); a.add_argument("--company")
+    a.add_argument("--for-risk", help="comma list of risks it may review (default all)")
+    a.add_argument("--no-check", action="store_true"); a.add_argument("--remove", metavar="ID")
+    a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_providers)
+    a = sp.add_parser("models", help="which model each role's sub-agent uses on this host")
+    a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_models)
+    a = sp.add_parser("deferred", help="minor findings recorded for later instead of blocking")
+    a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_deferred)
     sp.add_parser("next").set_defaults(fn=cmd_next)
     a = sp.add_parser("status"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_status)
     sp.add_parser("plan-summary", help="plain per-step summary of the plan, to show the user before they approve"

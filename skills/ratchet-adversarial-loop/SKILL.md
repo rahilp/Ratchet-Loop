@@ -1,6 +1,6 @@
 ---
 name: ratchet-adversarial-loop
-description: Runs the Ratchet adversarial code-review gate — independent reviewers (from a provider different from the model hosting the loop — Claude, Codex, Gemini, Copilot or any configured CLI — whenever one is available, otherwise the host's own sub-agents) assume the checkpoint's code is wrong and hunt for violations of the written standards and for correctness/security bugs; a separate fixer fixes every finding; tests (and UI review, if visible code changed) re-run; every reviewer re-reviews the new code; repeat until all return zero findings. How many reviewers look depends on the checkpoint's risk. Use at Gate 3 of the Ratchet loop, or whenever the user wants a hostile, multi-vendor review-and-fix loop on a change rather than a one-shot code review.
+description: Runs the Ratchet adversarial code-review gate — independent reviewers (another company's model through any registered agent CLI whenever one is available and working, otherwise the host's company on a different model, otherwise the host's own sub-agents) assume the checkpoint's code is wrong and hunt for violations of the written standards and for correctness/security bugs; a separate fixer fixes every blocking finding; tests (and UI review, if visible code changed) re-run; every reviewer re-reviews the new code; repeat until no blocking findings remain. Risk decides how many reviewers look and, on low-risk steps, that only blocker and major findings block. Use at Gate 3 of the Ratchet loop, or whenever the user wants a hostile, multi-vendor review-and-fix loop on a change rather than a one-shot code review.
 ---
 
 # Ratchet Adversarial Loop (Gate 3)
@@ -15,32 +15,33 @@ ADV="python3 <this skill's base directory>/scripts/external_review.py"
 ## Standard to enforce
 Sources come from config `standards`, in order: `.ratchet/standards.md` (drafted by ratchet-app-scout, then edited by the human), `CONTRIBUTING.md`, `ARCHITECTURE.md`, lint configs, `DESIGN.md` §8 for UI code, and `.ratchet/learnings.md`. If `.ratchet/standards.md` is missing, spawn `ratchet-app-scout` in standards-only mode first.
 
-## Who reviews: risk decides the depth, availability decides the provider
-Each checkpoint has a `risk` (`low` / `normal` / `high`, set by the planner). Config `review_depth` maps each risk to a list of **review slots**, and **every slot's reviewer must return zero findings**. Every finding is always fixed; risk only changes how many independent eyes look.
+## Who reviews: a different company first, at every risk level
+Each checkpoint has a `risk` (`low` / `normal` / `high`, set by the planner). Risk only decides **how many** reviewers look: config `review_depth` gives each risk a list of review slots (defaults: low 1, normal 2, high 4). **Who** fills a slot is the same at every risk level:
 
-**The host** is whichever model is running this loop (auto-detected, or set with `host_provider` in config). `host-*` reviewers are the host's own `ratchet-adversary` sub-agents. Every other reviewer is a different provider's CLI (`claude-*`, `codex-*`, `gemini-*`, `copilot-*`, or any command you add), called through `external_review.py`.
+1. **Another company's model**, if one is available and capable: any agent CLI registered under config `providers` (Codex, Gemini, Claude, Copilot, Cursor, OpenCode or your own command). A company not yet reviewing this round is preferred.
+2. Otherwise **your own company on a different model** (`host-alt-*`): a `ratchet-adversary` sub-agent you spawn with a model other than yours (config `host_models.alternates`, e.g. Sonnet when you are Opus).
+3. Otherwise **you, on your own model** (`host-*`).
 
-A slot is either one reviewer id or an ordered list of alternatives. The first alternative that is **available right now** fills the slot, preferring a provider not already reviewing this round. Other providers are listed first, so a different model family reviews whenever one is installed and working. When none is, the host's own sub-agents fill the slot: every slot of only other-provider reviewers automatically falls back to a `host-*` reviewer with the same lens (then another lens; for high-risk checkpoints with no other provider installed the count of distinct reviewers can be smaller, and every substitution is logged). **A missing or failing provider never stalls the loop.**
+**The host** is whichever model runs this loop (auto-detected, or `host_provider` in config). A provider counts as available only if its tool is installed, its company is known and differs from the host's, it is allowed for this risk (`for_risk`), and it answered a small **test request** recently: `ratchet.py reviewers` sends one before relying on a provider it hasn't checked in the last `probe_ttl_minutes`, so a tool that is signed out or out of quota hands its slot on at once. A provider that fails mid-review is marked unavailable for `unavailable_ttl_hours` (default 6) together with every reviewer using the same tool. **A missing or failing provider never stalls the loop.** (For a high-risk checkpoint with nothing but the host available, the count of distinct reviewers can be smaller than the slots.) `ratchet.py providers` shows the picture, `providers --discover` finds and tests installed tools, `providers --add` registers one (with `--model` for tools that run several companies' models). Every substitution is logged in the run history, and the plan, the viewer and `reviewers` name who reviews each round.
 
-Defaults:
-- `low` → `host-both`
-- `normal` → `host-standards` + [`codex` → `gemini` → `claude` → `copilot` correctness]
-- `high` → `host-standards` + `host-correctness` + [`codex` → `gemini` → `claude` → `copilot` correctness] + [`gemini` → `claude` → `codex` → `copilot` standards]
+`$RATCHET reviewers CPn` resolves the slots for this round. It prints who must review, which alternative each one replaced and why, the model for each `host-*` sub-agent, the round's review rules, the fingerprint, each reviewer's output path, and the command or sub-agent to launch. **Always start the round with it, and re-run it if a reviewer exits with code 3** (unavailable): the slot will have moved to the next alternative.
 
-A reviewer counts as **unavailable** when it's the **same provider as the host** (the host's sub-agents already cover that model family), when its CLI isn't on PATH, or when it failed recently. `external_review.py` marks it (and every reviewer using the same CLI) unavailable for `unavailable_ttl_hours` (default 6) when the CLI errors, hits a quota or auth limit, times out, or returns nothing parseable. `ratchet.py reviewer-status` shows the current picture. `--reset <id>` retries a provider early. Only the director or a person at their own terminal can `--mark` a provider off. Every substitution is logged in the run history and the round's evidence, so you can see when a checkpoint was reviewed by the host's model only.
-
-`$RATCHET reviewers CPn` resolves the slots for this round. It prints who must review, which alternative each one replaced and why, the current fingerprint, each reviewer's output path, and the command or sub-agent to launch. **Always start the round with it, and re-run it if a reviewer exits with code 3** (unavailable): the slot will have moved to the next alternative.
+## What blocks
+- **Severity bar by risk** (config `blocking_severities`). On a **low-risk** checkpoint only blocker and major findings block; minor ones are recorded for later (`ratchet.py deferred`) and shown to the user at the final review. Normal and high risk: every finding blocks.
+- **Later rounds look at what changed** (config `scope_later_rounds`). From round 2 on, a minor finding only blocks if it is in code changed since the previous round; blocker and major findings block anywhere. This keeps each round from turning into a fresh review of everything.
+- Severities other than the known minor ones (minor, nit, info, suggestion, style) always block, so a made-up severity can't slip past.
+- Pass the round's review rules (printed by `reviewers`) to every `host-*` reviewer you spawn; `external_review.py` adds them to other providers' prompts itself.
 
 ## The loop (round k = 1, 2, …)
 
 1. **Plan the round.** `$RATCHET reviewers CPn`. It stamps the fingerprint and lists the reviewers. A review of older code is rejected later.
 2. **Launch every listed reviewer in parallel.** Each one starts with a fresh context.
-   - `kind: agent` (`host-*`) → spawn a `ratchet-adversary` sub-agent with its `lens`, its **reviewer id**, the fingerprint and its output path. Don't give it the implementer's reasoning, the test results, or earlier rounds' findings.
+   - `kind: agent` (`host-*`) → spawn a `ratchet-adversary` sub-agent with the model `reviewers` names (for `host-alt-*`: one of the alternates that is NOT your own model), its `lens`, its **reviewer id**, the fingerprint, the round's review rules and its output path. Don't give it the implementer's reasoning, the test results, or earlier rounds' findings.
    - `kind: command` → run `$ADV --reviewer <id> --cp CPn --out <path>` (add `--fixes <fixes.md>` from round 2 on). The script gives the other provider's CLI the adversary instructions, the standards, the learnings and the full diff inline, runs it read-only, and writes normalized findings JSON stamped with the fingerprint. **Exit code 3** means that provider is unavailable and has been marked so. Re-run `$RATCHET reviewers CPn` and launch whichever reviewer now fills that slot (possibly a `host-*` sub-agent).
    - From round 2 on, every reviewer gets `fixes.md` so it can withdraw a finding the fixer disproved with evidence. Otherwise each round is a fresh, hostile look.
 3. **Record.** `$RATCHET adv-record CPn --reviews <all output files>`
    - It refuses if any required reviewer is missing, or if any review is of a different fingerprint.
-   - Every required reviewer has zero findings → **approved**, and `next` says `complete`.
+   - No required reviewer has a blocking finding (see "What blocks") → **approved**, and `next` says `complete`. Minor findings that didn't block are kept in `deferred-findings.json` for the final review.
    - Otherwise ratchet.py writes `evidence/CPn/adversarial/round-NN/open-findings.json`, with each finding tagged by reviewer. (NN = the current round, zero-padded: 01, 02, ...)
 4. **Fix.** Spawn `ratchet-fixer` with that file. It fixes **every** finding, from every vendor, or writes an evidence-backed rebuttal in `$RUN/reviews/CPn/adv-round-NN/fixes.md`, touching nothing unrelated.
 5. **Re-prove.** `$RATCHET behavior CPn`. If it fails, send the log to `ratchet-fixer`, since the fix broke it. If the fixer touched UI files, re-run the `ratchet-ui-compare` gate.

@@ -310,20 +310,22 @@ def main():
           all(re.search(r"risk\W+" + RISKS[i] + r"\b", blks[i], re.I) for i in range(6)), [b[:120] for b in blks])
 
     print("[CP3-T07] plan summary reflects per-step differences")
-    depth = json.loads((pre / ".ratchet/config.json").read_text())["review_depth"]
+    depth = json.loads(rx(pre, "config").stdout)["review_depth"]
 
     def reviewed_by(block):
         m = re.search(r"Reviewed by: (.*)", block)
         return [x.strip() for x in m.group(1).split(";")] if m else []
     low, normal, high = reviewed_by(blks[0]), reviewed_by(blks[1]), reviewed_by(blks[3])
     check("[CP3-T07] low-risk step names its one reviewer in plain words",
-          low == ["this agent (code standards and bugs)"], low)
-    check("[CP3-T07] high-risk step lists more reviewers than the low-risk one, incl. this agent on bugs",
-          len(high) == len(depth["high"]) > len(low) and "this agent (bugs and security)" in high, high)
+          len(low) == 1 and "(code standards and bugs)" in low[0], low)
+    check("[CP3-T07] high-risk step lists more reviewers than the low-risk one, incl. one on bugs",
+          len(high) == len(depth["high"]) > len(low) and any("(bugs and security)" in h for h in high), high)
     check("[CP3-T07] normal-risk step differs from both", normal not in (low, high) and len(normal) == len(depth["normal"]),
           normal)
     check("[CP3-T07] no reviewer ids (host-both, codex-correctness) or arrows in the summary",
-          not re.search(r"host-|-correctness|-standards|→", "\n".join(blks)), blks[3])
+          not re.search(r"host-|-correctness|-standards|any-|→", "\n".join(blks)), blks[3])
+    check("[CP3-T07] the summary names the models and warns when no other provider can review",
+          "Models:" in r.stdout and "no other provider is available" in r.stdout, r.stdout[-600:])
     check("[CP3-T07] UI review says yes for exactly the two UI steps",
           [bool(m and m.group(1).lower() == "yes") for m in ui_marks] == UI, UI)
 

@@ -235,25 +235,33 @@ A reviewer approves by returning `"findings": []`. Every finding must be fixed �
 {
   "human_review": "end",          
   "host_provider": "auto",
+  "providers": [
+    {"id": "codex",  "preset": "codex"},
+    {"id": "gemini", "preset": "gemini"},
+    {"id": "claude", "preset": "claude"},
+    {"id": "cursor", "preset": "cursor", "model": "gpt-5", "for_risk": ["low", "normal", "high"]},
+    {"id": "acme",   "company": "acme", "model": "acme-large",
+                     "command": ["acme", "review", "--model", "{model}", "{prompt_file}"], "stdin": false}
+  ],
   "reviewers": {
-    "host-standards":     {"kind": "agent",   "lens": "standards",   "vendor": "host"},
-    "host-correctness":   {"kind": "agent",   "lens": "correctness", "vendor": "host"},
-    "host-both":          {"kind": "agent",   "lens": "both",        "vendor": "host"},
-    "claude-correctness": {"kind": "command", "preset": "claude",  "lens": "correctness", "vendor": "anthropic"},
-    "codex-correctness":  {"kind": "command", "preset": "codex",   "lens": "correctness", "vendor": "openai"},
-    "gemini-correctness": {"kind": "command", "preset": "gemini",  "lens": "correctness", "vendor": "google"},
-    "copilot-correctness":{"kind": "command", "preset": "copilot", "lens": "correctness", "vendor": "github"},
-    "…-standards":        "(same four providers with lens standards)",
-    "my-reviewer":        {"kind": "command", "lens": "both", "vendor": "acme",
-                           "command": ["acme", "review", "{prompt_file}"], "stdin": false}
+    "host-standards":       {"kind": "agent", "lens": "standards",   "vendor": "host"},
+    "host-correctness":     {"kind": "agent", "lens": "correctness", "vendor": "host"},
+    "host-both":            {"kind": "agent", "lens": "both",        "vendor": "host"},
+    "host-alt-standards":   {"kind": "agent", "lens": "standards",   "vendor": "host", "alt": true},
+    "host-alt-correctness": {"kind": "agent", "lens": "correctness", "vendor": "host", "alt": true},
+    "host-alt-both":        {"kind": "agent", "lens": "both",        "vendor": "host", "alt": true}
   },
   "review_depth": {
-    "low":    ["host-both"],
-    "normal": ["host-standards", ["codex-correctness", "gemini-correctness", "claude-correctness", "copilot-correctness"]],
-    "high":   ["host-standards", "host-correctness",
-               ["codex-correctness", "gemini-correctness", "claude-correctness", "copilot-correctness"],
-               ["gemini-standards", "claude-standards", "codex-standards", "copilot-standards"]]
+    "low":    ["any-both"],
+    "normal": ["any-standards", "any-correctness"],
+    "high":   ["any-standards", "any-correctness", "any-correctness", "any-standards"]
   },
+  "blocking_severities": {"low": ["blocker", "major"], "normal": "all", "high": "all"},
+  "scope_later_rounds": true,
+  "role_models": {"ratchet-implementer": "strong", "ratchet-test-writer": "standard", "ratchet-test-runner": "light", "…": "…"},
+  "host_models": {"anthropic": {"strong": "inherit", "standard": "sonnet", "light": "haiku", "alternates": ["sonnet", "opus"]}},
+  "probe_providers": true,
+  "probe_ttl_minutes": 120,
   "unavailable_ttl_hours": 6,
   "max_adversarial_rounds": 6,
   "max_adversarial_rounds_run": 30,
@@ -269,7 +277,13 @@ A reviewer approves by returning `"findings": []`. Every finding must be fixed �
 
 `human_review`: `end` (default — you review once all checkpoints pass), `each` (review every checkpoint), `none` (fully autonomous after plan approval; gates stay just as strict). Other keys and defaults: see `DEFAULT_CONFIG` in `scripts/ratchet.py`.
 
-Each `review_depth` entry is a list of **slots**: a reviewer id, or an ordered list of alternatives. At review time the first **available** alternative fills the slot (`host-*` agent reviewers are always available; a command reviewer must be a different provider from the host, have its CLI on PATH, and have no recent failure recorded in `.ratchet/unavailable-reviewers.json`). A slot of only command reviewers falls back to the host's own `host-*` reviewers automatically, same lens first. `host_provider`: `auto` detects the running agent CLI from its environment (Claude Code, Codex, Gemini CLI, Copilot CLI); set it explicitly (or `RATCHET_HOST_PROVIDER`) for anything else. `ratchet.py reviewers CPn --json` shows the resolved list with `fallback_for` and reasons. `ratchet.py reviewer-status [--reset ID]` shows or clears availability. Command placeholders: `{prompt_file}` `{prompt}` `{out_file}` `{root}`; `"stdin": true` pipes the prompt. Presets' flags may differ between CLI versions, so override `command` if needed. `approver`: `human` (chat message after the pause), `director` (signed token only), `either`. A lane enrolled with `director-enroll` is forced to `director`, whatever this key says.
+**Providers.** Each entry in `providers` is an agent CLI that can review: a `preset` (`claude`, `codex`, `gemini`, `copilot`, `cursor`, `opencode`) or its own `command`, plus an optional `model` and `company`. The company is whose model it runs; when not given it is worked out from the model name (claude/opus/sonnet → anthropic, gpt/codex → openai, gemini → google, grok → xai, glm → zhipu, qwen, deepseek, kimi, llama, mistral) or from a single-company preset. A provider whose company is unknown, or the same as the host's, is not used as an independent reviewer. `for_risk` limits it to some risk levels (for a smaller model). Each provider gives three reviewers: `<id>-correctness`, `<id>-standards`, `<id>-both`. `ratchet.py providers --discover` finds installed tools, tests them and adds what works; `--add` registers one (it is tested first); `--check` re-tests; `--remove` drops one. Test results are kept in `.ratchet/provider-status.json`. `providers` is not one of the rules locked at plan approval: adding a working provider mid-run only changes who is available.
+
+**Review slots.** Each `review_depth` entry is a list of slots. `any-<lens>` means: every provider's `<id>-<lens>` in order (a company not yet reviewing this round preferred), then `host-alt-<lens>` (the host's company on a different model, from `host_models.<company>.alternates`; unavailable when the host has no alternates), then `host-<lens>`. A slot can also be a reviewer id or a list of ids as alternatives; a slot of only command reviewers falls back to `host-alt-*`, then `host-*`, same lens first. Before relying on a provider not tested in the last `probe_ttl_minutes`, `ratchet.py reviewers` sends it a test request; one that fails is skipped for `unavailable_ttl_hours`. `blocking_severities`: which severities block, by risk (`"all"`, or a list; unknown severities always block). `scope_later_rounds`: from round 2 on, minor findings outside the code changed since the previous round are recorded instead of blocking. Recorded findings: `ratchet.py deferred`. A project whose `review_depth` is still the pre-1.5 default is moved to the new default automatically. `host_provider`: `auto` detects the running agent CLI from its environment (Claude Code, Codex, Gemini CLI, Copilot CLI); set it explicitly (or `RATCHET_HOST_PROVIDER`) for anything else. `ratchet.py reviewers CPn --json` shows the resolved list with `fallback_for`, reasons, models and the round's `review_rules`. `ratchet.py reviewer-status [--reset ID]` shows or clears availability. Command placeholders: `{prompt_file}` `{prompt}` `{out_file}` `{root}` `{model}`; `"stdin": true` pipes the prompt.
+
+**Models per role.** `role_models` gives each sub-agent role a tier (`strong`, `standard`, `light`) or a model name; `host_models.<company>` maps the tiers to model names for that host (`inherit` = the session's own model). A host with no entry runs every role on the session's model. `ratchet.py models` prints the table the orchestrator uses when it spawns sub-agents.
+
+`approver`: `human` (chat message after the pause), `director` (signed token only), `either`. A lane enrolled with `director-enroll` is forced to `director`, whatever this key says.
 
 ## 9. Director interfaces
 

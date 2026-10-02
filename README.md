@@ -69,7 +69,7 @@ You are needed twice: once to approve the plan, and once to review the finished 
 |---|---|---|---|
 | 1 | **Behavior** | Planned tests, written *before* the code, must first fail and then pass | The engine runs the tests itself and checks every planned case ID is still there |
 | 2 | **UI** | App matches the prototype/reference in the *same state*, visually and interactively | Two isolated reviewers (visual + behavior), from a provider other than the host when available, list every difference; any code-fixable one blocks |
-| 3 | **Adversarial** | Reviewers from a provider other than the host when available (otherwise the host's own sub-agents) assume the code is wrong; a fixer fixes everything they find | Loop runs until **every** required reviewer returns zero findings on the *current* code; checkpoint risk decides how many reviewers |
+| 3 | **Adversarial** | Reviewers from another company's model whenever one is available (otherwise the host's company on a different model, then the host itself) assume the code is wrong; a fixer fixes what blocks | Loop runs until no required reviewer has a blocking finding on the *current* code. Risk decides how many reviewers look; on low-risk steps only blocker and major findings block, and from round 2 on minor findings outside the changed code are noted for later |
 | 4 | **You** | You use the feature | Approval only counts if a real user message arrived after the loop paused |
 
 Modes: by default you check in twice (plan and final review). You can ask to review after every checkpoint, or to go fully autonomous after plan approval; the gates stay just as strict. Logic-only work (API, refactor, migration) skips the UI gate, and for screen migrations the reference is the old screen instead of a prototype.
@@ -78,15 +78,17 @@ Modes: by default you check in twice (plan and final review). You can ask to rev
 
 **The host** is whichever model runs the loop: Claude, GPT/Codex, Gemini, a Copilot model, or anything else. Ratchet detects the common agent CLIs from their environment, or you set `host_provider` in `.ratchet/config.json`. Nothing in the loop is tied to one provider. What changes with the host is who counts as a *different* provider.
 
-**Reviewers from a different provider, when there is one.** Every checkpoint gets a `risk` (`low` / `normal` / `high`) in the plan, which you see at approval. Risk decides **how many** independent reviewers are asked, never how strict they are: every finding is fixed.
+**Reviewers from a different company first, at every risk level.** Every checkpoint gets a `risk` (`low` / `normal` / `high`) in the plan, which you see at approval. Risk decides **how many** reviewers look (low 1, normal 2, high 4) and, on low-risk steps, that only blocker and major findings block. It never changes **who** is asked first. Each review slot is filled, in order, by:
 
-| Risk | Review slots (first available wins) |
-|---|---|
-| low (skeletons, copy, renames) | host, both lenses |
-| normal | host standards · Codex → Gemini → Claude → Copilot correctness |
-| high (auth, money, data, deletion, locks) | host standards · host correctness · Codex → Gemini → Claude → Copilot correctness · Gemini → Claude → Codex → Copilot standards |
+1. **another company's model**, through any agent CLI on your machine that works (Codex, Gemini, Claude, Copilot, Cursor, OpenCode, or any command you add);
+2. **the same company on a different model** (for example Sonnet reviewing work done by Opus);
+3. **the same model** that did the work, only when nothing else is available.
 
-A provider is skipped when it is **the same as the host** (the host's own sub-agents already cover that model family), is not installed, or just failed on quota, auth or a timeout; failed providers are skipped for 6 hours. When no other provider is left, the host's own sub-agents fill in so the loop never stalls, but for high-risk checkpoints the number of distinct reviewers can then be smaller than the table shows. Substitutions are logged, so you can see when a checkpoint was reviewed by the host's model only. Ask your agent who is reviewing and it will tell you.
+At the start of a run the agent checks which agent tools are installed, sends each a small test request, and uses the ones that answer, choosing a capable model from another company for tools that can run several. It tests a tool again before relying on it, so one that is signed out or out of quota is skipped at once (for 6 hours) and the next choice takes its slot. When nothing else works, the host's own sub-agents fill the slot so the loop never stalls; for high-risk steps the number of distinct reviewers can then be smaller than four, and substitutions are logged. The plan, the live viewer and the agent's updates say who reviewed each round, and you're told up front when every review will come from the same company as the build. Ask your agent "which providers are available?" and it will tell you.
+
+**Each role has a model.** Planning, writing code, fixing and reviewing use the strong model; lighter jobs such as planning and writing tests use a cheaper one, and running tests the cheapest. The plan lists which model does what; `role_models` and `host_models` in `.ratchet/config.json` change it. Where the agent CLI can't choose a model per sub-agent, every role runs on the session's model.
+
+**Minor findings don't loop forever.** From round 2 on, reviewers focus on the code the fixer changed: a minor finding elsewhere is noted, not fixed, while blocker and major ones still block anywhere. Everything noted for later is shown at your final review, where you decide whether any of it becomes a follow-up step.
 
 The UI gate works the same way: the `ui_reviewers` in config are chosen per role from the providers that are available, skipping the host, with the host's own reviewer sub-agents as the fallback.
 
@@ -164,6 +166,9 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py pause --reason "..."`, `resume [--claim]`, `cancel` | pause, resume, cancel (resume-claim and cancel are asked about first) |
 | `ratchet.py set-review end\|each\|none` | how often you check in |
 | `ratchet.py reviewer-status [--reset <id>]` | the host, who is available, and retrying one early |
+| `ratchet.py providers [--discover] [--check [id]] [--add <id> --preset <p> --model <m>] [--remove <id>]` | agent tools that can review: find, test, add or remove them |
+| `ratchet.py models` | which model each role's sub-agent uses on this host |
+| `ratchet.py deferred` | minor review findings noted for later instead of blocking |
 | `ratchet.py lanes --scan <dir> [--json]` | each lane's phase, progress and whether it waits on a director |
 | `ratchet.py lanes --serve --scan <dir> [--bind 0.0.0.0]` | one dashboard for every lane |
 | `ratchet.py config --set key=value` | settings in `.ratchet/config.json` (reviewer roster, retry caps, `regression_command`, `ui_globs`, app URL) |
@@ -183,6 +188,7 @@ python3 tests/test_hooks.py
 python3 tests/test_hooks_status.py
 python3 tests/test_hooks_waiver.py
 python3 tests/test_install.py
+python3 tests/test_providers.py
 python3 tests/test_status_plain.py
 python3 tests/test_viewer.py
 ```

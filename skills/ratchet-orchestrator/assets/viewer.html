@@ -150,6 +150,15 @@ function testsTable(tp){
   }</tbody></table>`;
 }
 
+function reviewsBlock(r){
+  if(!r || !r.rounds?.length) return "";
+  const own = r.rounds.every(x=>x.own_company_only);
+  const rows = r.rounds.map(x=>`<li data-testid="review-round">Round ${x.round}: ${esc(x.who.join("; "))} — ${
+    x.blocking?`${x.blocking} to fix`:"approved"}${x.deferred?`, ${x.deferred} minor noted for later`:""}</li>`).join("");
+  return `<div><h4>Second opinion</h4>${own?`<div class="meta" data-testid="same-company-warning">Every review so far came from this agent's own company's models; no other provider was available.</div>`:""}<ul>${rows}</ul>${
+    r.deferred_total?`<div class="meta">${r.deferred_total} minor finding(s) noted for later; you'll see them at the final review.</div>`:""}</div>`;
+}
+
 function renderPlan(d){
   const cps = d.plan?.checkpoints || [];
   if(!cps.length) return `<div class="empty">No checkpoints yet.</div>`;
@@ -180,6 +189,7 @@ function renderPlan(d){
           `<div><h4>UI review</h4><div class="meta">Not needed — ${esc(cp.ui_skip_reason||"no visible change; behaviour tests cover it")}.</div></div>`}
         ${cp.gates?.behavior?`<div><h4>Planned tests</h4>${testsTable(d.tests?.[cp.id])}</div>`:
           `<div><h4>Behavior tests</h4><div class="meta">Skipped — ${esc(cp.behavior_skip_reason||"")}</div></div>`}
+        ${reviewsBlock(d.reviews?.[cp.id])}
         ${ev.length?`<div class="evidence"><h4>Evidence</h4><ul>${ev.join("")}</ul></div>`:""}
       </div></details>`;
   }).join("");

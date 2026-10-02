@@ -17,6 +17,7 @@ ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator"
 HOME = Path(tempfile.mkdtemp(prefix="ratchet-home-"))
 ENV = {k: v for k, v in os.environ.items() if k not in ("RATCHET_ROLE", "RATCHET_HUMAN_OVERRIDE", "RATCHET_ROOT")}
 ENV["RATCHET_HOME"] = str(HOME)
+ENV["RATCHET_HOST_PROVIDER"] = "anthropic"  # deterministic, whichever agent CLI runs the tests
 PASS = FAIL = 0
 
 
@@ -77,7 +78,8 @@ def project(name="p", cps=1, extra_cp=None, config=None) -> Path:
     say(d, "please build the feature")          # the request that starts the run (owner session)
     r = rx(d, "init", "feature", "--slug", "f")
     assert r.returncode == 0, r.stderr
-    rx(d, "config", "--set", "min_review_seconds=0", *(config or []))
+    # no other-provider CLIs: tests never call a real agent CLI installed on the machine running them
+    rx(d, "config", "--set", "min_review_seconds=0", "providers=[]", *(config or []))
     run = d / ".ratchet/runs/f"
     (run / "app-scout.json").write_text("{}")
     plan = {"feature": "x", "checkpoints": []}
@@ -124,6 +126,11 @@ def open_round(d, cp="CP1"):
     return json.loads(r.stdout)
 
 
+def R0(rnd):
+    """The id of the round's (only) reviewer, whichever the engine picked."""
+    return rnd["reviewers"][0]["id"]
+
+
 def write_review(d, rnd, rid, findings=None, **over):
     p = Path(rnd["output_dir"]) / f"{rid}.json"
     body = {"reviewer": rid, "checkpoint": rnd["checkpoint"], "fingerprint": rnd["fingerprint"],
@@ -151,6 +158,9 @@ def cp7_host_project(name, **kw):
     ENV["PATH"] = str(b)
     try:
         d = project(name, **kw)
+        # the default providers are back: PATH holds none of their CLIs, so each one is skipped (and named)
+        rx(d, "config", "--set", 'providers=[{"id":"codex","preset":"codex"},{"id":"gemini","preset":"gemini"},'
+                                 '{"id":"claude","preset":"claude"}]')
         approve_plan(d)
     finally:
         ENV.clear()
@@ -237,8 +247,9 @@ def cp7_gates():
     check("[CP7-T02] high risk with no other provider: reviewers resolve", bool(ids), rnd)
     check("[CP7-T02] high risk with no other provider: only host reviewers, all distinct",
           bool(ids) and len(set(ids)) == len(ids) and all(i.startswith("host-") for i in ids), ids)
-    check("[CP7-T02] high risk with no other provider: fewer reviewers than the configured slots",
-          bool(ids) and len(ids) < slots and slots == 4, (ids, slots))
+    check("[CP7-T02] high risk with no other provider: the host's company on a different model fills two slots, "
+          "so all four slots are still distinct reviewers",
+          slots == 4 and len(ids) == 4 and sum(i.startswith("host-alt-") for i in ids) == 2, (ids, slots))
     d2, env2 = cp7_host_project("norm", extra_cp={"risk": "normal"})
     cp7_to_adversarial(d2, env2)
     ids2 = [r["id"] for r in cp7_reviewers(d2, env2).get("reviewers", [])]
@@ -510,7 +521,7 @@ def main():
     check("re-reading the same round doesn't count again", open_round(d)["run_rounds_used"] == 1)
     r = rx(d, "adv-record", "CP1", "--reviews", str(fake))
     check("a hand-made review without the round nonce is refused", r.returncode != 0 and "nonce" in r.stderr, r.stderr)
-    p = write_review(d, rnd, "host-both", findings=[{"id": "A1", "severity": "major", "description": "x"}])
+    p = write_review(d, rnd, R0(rnd), findings=[{"id": "A1", "severity": "major", "description": "x"}])
     r = rx(d, "adv-record", "CP1", "--reviews", p)
     check("a finding fails the gate", r.returncode == 2)
     (d / "src/f.js").write_text("export const f = () => 1; // fixed\n")
@@ -518,9 +529,9 @@ def main():
     rnd2 = open_round(d)
     check("new code opens round 2 and counts it", rnd2["round"] == 2 and rnd2["run_rounds_used"] == 2)
     check("round 2 hands reviewers the fixes.md path", (rnd2.get("fixes_md") or "").endswith("adv-round-01/fixes.md"))
-    stale = write_review(d, rnd, "host-both")
+    stale = write_review(d, rnd, R0(rnd))
     check("a review from round 1 is refused in round 2", rx(d, "adv-record", "CP1", "--reviews", stale).returncode != 0)
-    p = write_review(d, rnd2, "host-both")
+    p = write_review(d, rnd2, R0(rnd2))
     check("a clean round-2 review approves", rx(d, "adv-record", "CP1", "--reviews", p).returncode == 0)
     check("complete commits", rx(d, "complete", "CP1").returncode == 0)
     tracked = git(d, "ls-files", ".ratchet").stdout.split()
@@ -541,7 +552,7 @@ def main():
     (d / "src/__pycache__/f.cpython-312.pyc").write_bytes(b"\x00junk")          # interpreter cache written by a test run
     rx(d, "implemented", "CP1"); rx(d, "behavior", "CP1")
     rnd = open_round(d)
-    rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, "host-both"))
+    rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, R0(rnd)))
     r = rx(d, "complete", "CP1")
     files = git(d, "show", "--name-only", "--format=", "HEAD").stdout.split()
     check("complete commits the checkpoint's own files", r.returncode == 0 and "src/f.js" in files
@@ -559,7 +570,7 @@ def main():
         change(d)
         rx(d, "implemented", "CP1"); rx(d, "behavior", "CP1")
         rnd = open_round(d)
-        rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, "host-both"))
+        rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, R0(rnd)))
         return rx(d, "complete", "CP1")
 
     def shown(d):
@@ -823,7 +834,7 @@ def main():
     approve_plan(d)
     to_adversarial(d)
     rnd = open_round(d)
-    rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, "host-both"))
+    rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, R0(rnd)))
     rx(d, "complete", "CP1")
     say(d, "approved, thanks")
     check("final approval", rx(d, "human-approve").returncode == 0)

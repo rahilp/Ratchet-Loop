@@ -14,20 +14,23 @@ the learnings and the full diff (plus untracked files) — so it needs no tools 
 The review is stamped with the code fingerprint taken BEFORE it starts; if the code changes
 meanwhile, adv-record rejects it.
 
-Reviewer specs live in .ratchet/config.json → "reviewers". A "command" reviewer uses a preset
-or its own command:
+Who can review comes from .ratchet/config.json → "providers" (any agent CLI: a preset or your own command,
+plus the model it runs and, when the model doesn't say it, the company). Each provider gives three reviewers,
+<id>-correctness, <id>-standards and <id>-both:
 
-  "codex-correctness": {"kind":"command","preset":"codex","lens":"correctness","vendor":"openai"}
-  "my-reviewer":       {"kind":"command","lens":"both","vendor":"acme",
-                        "command":["acme-cli","review","--in","{prompt_file}"], "stdin": false}
+  "providers": [{"id": "codex", "preset": "codex"},
+                {"id": "cursor", "preset": "cursor", "model": "gpt-5"},
+                {"id": "acme", "company": "acme", "command": ["acme-cli", "review", "--in", "{prompt_file}"]}]
+
+`ratchet.py providers --discover` finds installed agent CLIs, sends each a test request and adds what works.
 
 If the CLI is missing, or it fails (auth, quota, timeout, no parseable answer), this script marks the
 reviewer unavailable for `unavailable_ttl_hours` and exits with code 3; `ratchet.py reviewers CPn`
 then gives that slot to the next alternative, ending with the host's own sub-agent reviewer.
 
-Placeholders in "command": {prompt_file} {prompt} {out_file} {root}. With "stdin": true the prompt
-is piped on stdin. Flags differ between CLI versions — override "command" if a preset doesn't
-match the version you have installed.
+Placeholders in "command": {prompt_file} {prompt} {out_file} {root} {model}. With "stdin": true the prompt
+is piped on stdin. Flags differ between CLI versions — give a provider its own "command" if a preset
+doesn't match the version you have installed.
 """
 from __future__ import annotations
 
@@ -46,18 +49,7 @@ PLUGIN_ROOT = HERE.parents[2]
 ENGINE = PLUGIN_ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
 AGENT_DIRS = [PLUGIN_ROOT / "agents", Path.home() / ".claude" / "agents"]
 
-PRESETS = {
-    # Anthropic Claude Code: print mode, prompt on stdin, no project settings/instructions loaded.
-    "claude": {"command": ["claude", "-p", "--no-session-persistence", "--setting-sources", ""], "stdin": True},
-    # Google Gemini CLI: non-interactive; the full review prompt arrives on stdin.
-    "gemini": {"command": ["gemini", "-p", "Carry out the code review described on stdin. Reply with only the JSON it asks for."],
-               "stdin": True},
-    # OpenAI Codex CLI: non-interactive, read-only sandbox, prompt on stdin, last message to a file.
-    "codex": {"command": ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
-                          "--output-last-message", "{out_file}", "-"], "stdin": True},
-    # GitHub Copilot CLI: non-interactive prompt mode, no tool permissions granted (read-only by construction).
-    "copilot": {"command": ["copilot", "-p", "{prompt}"], "stdin": False},
-}
+# Presets (how to run each known agent CLI) live in ratchet.py (PRESETS), next to the provider registry.
 
 MAX_DIFF = 180_000
 MAX_DOC = 40_000
@@ -118,7 +110,7 @@ def adversary_instructions() -> str:
     return "You are an adversarial code reviewer. Assume the code is wrong and prove it."
 
 
-def build_prompt(eng, ctx, cfg, cp, rid, spec, fp, fixes_path, base_tree=None, nonce=None) -> str:
+def build_prompt(eng, ctx, cfg, cp, rid, spec, fp, fixes_path, base_tree=None, nonce=None, rules=None) -> str:
     root = ctx.root
     docs = "".join(read_doc(root, s) for s in cfg.get("standards", []))
     docs += read_doc(root, ".ratchet/learnings.md")
@@ -143,6 +135,7 @@ Code fingerprint: {fp}
 ## Standards, learnings{' and DESIGN.md' if cp.get('gates', {}).get('ui') else ''}
 {docs or '(no written standards found — review for correctness and consistency with the surrounding code)'}
 {fixes}
+{("## Rules for this round" + chr(10) + chr(10).join("- " + r for r in rules)) if rules else ""}
 
 ## Code under review
 {collect_diff(root, base_tree, fp)}
@@ -198,13 +191,13 @@ def main():
     eng = load_engine()
     ctx = eng.Ctx(eng.find_root(Path(a.root) if a.root else None))
     cfg = ctx.config()
-    spec = (cfg.get("reviewers") or {}).get(a.reviewer)
+    spec = eng._roster_spec(cfg, a.reviewer)
     if not spec:
-        sys.exit(f"unknown reviewer '{a.reviewer}' (define it under config 'reviewers')")
+        sys.exit(f"unknown reviewer '{a.reviewer}' (add it under config 'providers' or 'reviewers')")
     if spec.get("kind") != "command":
         sys.exit(f"'{a.reviewer}' is kind={spec.get('kind')} — spawn it as a ratchet-adversary sub-agent instead")
     okay, why = eng.reviewer_availability(ctx, cfg, a.reviewer)
-    if not okay and "same provider as the host" in why:
+    if not okay and "same company as the host" in why:
         print(f"'{a.reviewer}' is {why}. Run `ratchet.py reviewers {a.cp}` for this round's reviewers.", file=sys.stderr)
         sys.exit(3)
     min_t = int(cfg.get("min_review_timeout_sec", 120))
@@ -219,7 +212,8 @@ def main():
     if not rnd or rnd.get("recorded") or rnd.get("fingerprint") != fp or a.reviewer not in rnd.get("reviewers", []):
         sys.exit(f"No open review round for {a.cp} that includes '{a.reviewer}' at the current code. "
                  f"Run `ratchet.py reviewers {a.cp}` first and launch exactly the reviewers it lists.")
-    prompt = build_prompt(eng, ctx, cfg, cp, a.reviewer, spec, fp, a.fixes, cps.get("base_tree"), rnd["nonce"])
+    _focus, rules = eng.review_rules(ctx, cfg, cp, cps["gates"]["adversarial"], rnd, fp)
+    prompt = build_prompt(eng, ctx, cfg, cp, a.reviewer, spec, fp, a.fixes, cps.get("base_tree"), rnd["nonce"], rules)
 
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -230,13 +224,12 @@ def main():
         print(f"prompt written: {prompt_file} ({len(prompt)} chars)")
         return
 
-    preset = PRESETS.get(spec.get("preset", ""), {})
-    cmd_t = spec.get("command") or preset.get("command")
+    cmd_t, use_stdin = eng.reviewer_command(cfg, a.reviewer)
     if not cmd_t:
-        sys.exit(f"reviewer '{a.reviewer}' has neither 'command' nor a known 'preset' ({list(PRESETS)})")
-    use_stdin = spec.get("stdin", preset.get("stdin", False))
+        sys.exit(f"reviewer '{a.reviewer}' has no command: give its provider a 'preset' ({', '.join(eng.PRESETS)}) "
+                 "or a 'command'")
     subs = {"{prompt_file}": str(prompt_file), "{prompt}": prompt, "{out_file}": str(out_file),
-            "{root}": str(ctx.root)}
+            "{root}": str(ctx.root), "{model}": str(spec.get("model") or "")}
     cmd = []
     for part in cmd_t:
         for k, v in subs.items():
@@ -245,7 +238,7 @@ def main():
     def unavailable(reason):
         # A quota/auth/outage failure takes down every reviewer that uses the same CLI.
         binary = eng.reviewer_binary(cfg, a.reviewer)
-        same = [r for r in (cfg.get("reviewers") or {}) if eng.reviewer_binary(cfg, r) == binary] or [a.reviewer]
+        same = [r for r in eng.roster(cfg) if eng.reviewer_binary(cfg, r) == binary] or [a.reviewer]
         for r in same:
             until = eng.mark_unavailable(ctx, r, reason if r == a.reviewer else f"{binary} failed: {reason}")
         print(f"{a.reviewer} UNAVAILABLE: {reason}\n"
@@ -259,6 +252,7 @@ def main():
         # run from an empty folder, flagged as nested: the reviewer needs nothing but the prompt, can't touch the
         # project, and its CLI's own hooks must not log this prompt as if the user had typed it
         r = subprocess.run(cmd, cwd=work, input=prompt if use_stdin else None, capture_output=True, text=True,
+                           stdin=None if use_stdin else subprocess.DEVNULL,
                            timeout=a.timeout, env=dict(os.environ, RATCHET_NESTED_REVIEW="1"))
     except FileNotFoundError:
         unavailable(f"'{cmd[0]}' is not installed or not on PATH")
