@@ -2545,17 +2545,42 @@ def kind_is_high_risk(st, kind) -> bool:
                for h in (st.get("finding_kinds") or {}).get(kind, []))
 
 
-def kind_occurrences(st, kind, limit=5) -> list[dict]:
-    """The real places a kind was found, newest first, one per reviewed code version (with a file). Only findings
-    that blocked (blocker/major) count: those were acted on, so the mistake was really there; a minor note may not be."""
+def _next_tree(st, h) -> str | None:
+    """The code version after the one this finding was raised on, for the same checkpoint."""
+    g = (((st.get("checkpoints") or {}).get(h["cp"]) or {}).get("gates") or {}).get("adversarial") or {}
+    fps = [r.get("fingerprint") for r in g.get("rounds") or []]
+    if h.get("tree") in fps:
+        later = [x for x in fps[fps.index(h["tree"]) + 1:] if x and x != h["tree"]]
+        if later:
+            return later[0]
+    done = (g.get("fingerprint") or {}).get("id")
+    return done if done and done != h.get("tree") else None
+
+
+def _acted_on(ctx, st, h) -> bool:
+    """Was this finding acted on, i.e. did the flagged file change in the next version of the code? A finding the
+    fixer disproved (no change) isn't evidence that the mistake was really there."""
+    nxt = _next_tree(st, h)
+    if not nxt:
+        return False
+    changed = changed_files(ctx.root, {"kind": "git-tree", "id": h["tree"]}, {"kind": "git-tree", "id": nxt})
+    if not h.get("file"):
+        return bool(changed)
+    return _norm_path(h["file"]) in {_norm_path(x) for x in changed}
+
+
+def kind_occurrences(st, kind, limit=None, ctx=None) -> list[dict]:
+    """The real places a kind was found, newest first, one per reviewed code version. Only blocking findings
+    (blocker/major) count, and, when `ctx` is given, only ones that were acted on (the flagged file changed next)."""
     out, trees = [], set()
     for h in reversed((st.get("finding_kinds") or {}).get(kind, [])):
-        if h.get("severity") in MINOR_SEVERITIES:
+        if h.get("severity") in MINOR_SEVERITIES or not h.get("tree") or h["tree"] in trees:
             continue
-        if h.get("tree") and h.get("file") and h["tree"] not in trees:
-            trees.add(h["tree"])
-            out.append(h)
-        if len(out) >= limit:
+        if ctx is not None and not _acted_on(ctx, st, h):
+            continue
+        trees.add(h["tree"])
+        out.append(h)
+        if limit and len(out) >= limit:
             break
     return out
 
@@ -2585,7 +2610,7 @@ def cmd_occurrences(args):
     ctx = Ctx(find_root())
     st = ctx.state()
     kind = norm_kind(args.kind)
-    occ = kind_occurrences(st, kind)
+    occ = [h for h in kind_occurrences(st, kind, limit=5) if h.get("file")]
     if not occ:
         die(f"No recorded occurrences of '{kind}' with code to show.")
     for h in occ:
@@ -2765,7 +2790,7 @@ def _auto_strengthen(ctx, st, cfg, kind, cp_id):
                and st["checkpoints"].get(c["id"], {}).get("status") != "done"]
     chk = next((c for c in cfg.get("checks") or [] if isinstance(c, dict) and norm_kind(c.get("kind")) == kind), {})
     occ = kind_occurrences(st, kind, limit=1)
-    where = occ[0]["file"] if occ else "a later step"
+    where = (occ[0].get("file") or occ[0]["cp"]) if occ else "a later step"
     ctx.log(st, "check_missed", kind=kind, cp=cp_id, file=where)
     if pending:
         print(f"STRENGTHEN: the check for '{kind}' missed a case in {where}; step {pending[0]['id']} will cover it too.")
@@ -2800,8 +2825,20 @@ def _materialize(ctx, tree: str, overlay: list[str]) -> Path | None:
     if r.returncode != 0:
         shutil.rmtree(tmp, ignore_errors=True)
         return None
-    with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
-        tf.extractall(tmp, filter="data") if hasattr(tarfile, "data_filter") else tf.extractall(tmp)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
+            for m in tf.getmembers():
+                name = m.name
+                if name.startswith("/") or ".." in Path(name).parts:
+                    continue  # never write outside the throwaway folder
+                if m.issym() or m.islnk():
+                    continue  # links are skipped: a link could point anywhere
+                if not (m.isfile() or m.isdir()):
+                    continue
+                tf.extract(m, tmp, set_attrs=False)
+    except (tarfile.TarError, OSError):
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None
     for rel in overlay:
         src, dst = ctx.root / rel, tmp / rel
         if src.is_file():
@@ -2809,10 +2846,30 @@ def _materialize(ctx, tree: str, overlay: list[str]) -> Path | None:
             shutil.copy2(src, dst)
         elif dst.exists() and dst.is_file():
             dst.unlink()
-    for dep in ("node_modules", ".venv", "venv", "vendor", ".bundle", "target"):
+    for dep in DEP_DIRS:
         if (ctx.root / dep).exists() and not (tmp / dep).exists():
             (tmp / dep).symlink_to(ctx.root / dep)
     return tmp
+
+
+DEP_DIRS = ("node_modules", ".venv", "venv", "vendor", ".bundle", "target")
+
+
+def _deps_snapshot(root: Path) -> dict:
+    """A cheap picture of the installed-dependency folders (names, sizes and times of their top two levels), to
+    notice a check that writes into them through the links."""
+    snap = {}
+    for dep in DEP_DIRS:
+        d = root / dep
+        if not d.is_dir():
+            continue
+        for p in [d] + [x for x in d.iterdir()][:5000]:
+            try:
+                st_ = p.stat()
+                snap[str(p.relative_to(root))] = (st_.st_mtime_ns, st_.st_size)
+            except OSError:
+                continue
+    return snap
 
 
 def _run_check_in(cwd: Path, command: str, log: Path, timeout: int) -> tuple[int, str]:
@@ -2862,21 +2919,43 @@ def verify_guardrail(ctx, st, cp, cps, fp, cfg) -> list[str]:
                 probs.append(f"it wrongly flags the look-alike good code {rel}")
     if _is_git(ctx.root):
         overlay = changed_files(ctx.root, {"kind": "git-tree", "id": cps.get("base_tree")}, fp) if cps.get("base_tree") else []
-        for i, h in enumerate(kind_occurrences(st, gr["kind"])):
+        cases = proof_cases(ctx, st, gr)
+        cps["guardrail_cases"] = cases
+        deps_before = _deps_snapshot(ctx.root)
+        for i, h in enumerate(cases):
+            where = f"{h['cp']} round {h['round']}" + (f", {h['file']}" if h.get("file") else "")
             tmp = _materialize(ctx, h["tree"], overlay)
             if tmp is None:
+                probs.append(f"Ratchet couldn't rebuild the past code it must be proven on ({where}); it won't skip a "
+                             "case, so this needs a look")
                 continue
             try:
                 cmd = gr["check_command"].replace("{target}", shlex.quote(gr.get("target") or "."))
                 code, _ = _run_check_in(tmp, cmd, ev / f"real-occurrence-{i:02d}.log", t)
                 if code == 0:
-                    probs.append(f"it passes on the real code where reviewers found the mistake ({h['cp']} round "
-                                 f"{h['round']}, {h['file']}), so it would not have caught it")
+                    probs.append(f"it passes on the real code where reviewers found the mistake ({where}), so it would "
+                                 "not have caught it")
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
+        if _deps_snapshot(ctx.root) != deps_before:
+            probs.append("running it on past code changed the project's installed dependencies; a check must only "
+                         "read the code")
     if fingerprint(ctx.root)["id"] != fp["id"]:
         probs.append("running it changed files in the project; a check must only read the code")
     return probs
+
+
+def proof_cases(ctx, st, gr) -> list[dict]:
+    """Every past case the check must catch: all cases an earlier version of this check was proven on (kept on the
+    check, so strengthening can never drop one), plus every acted-on blocking finding of the kind."""
+    cfg = ctx.config()
+    old = next((c for c in cfg.get("checks") or [] if isinstance(c, dict) and norm_kind(c.get("kind")) == gr["kind"]), {})
+    cases, trees = [], set()
+    for h in list(old.get("cases") or []) + kind_occurrences(st, gr["kind"], ctx=ctx):
+        if h.get("tree") and h["tree"] not in trees:
+            trees.add(h["tree"])
+            cases.append({k: h.get(k) for k in ("cp", "round", "file", "tree")})
+    return cases
 
 
 def _check_cmd(gr: dict, target: str) -> str:
@@ -2902,6 +2981,7 @@ def _finish_guardrail(ctx, st, cp):
                    "bad_example": gr.get("bad_example"), "why": gr.get("why"), "test_command": gr.get("test_command"),
                    "test_files": gr.get("test_files"), "high_risk": bool(gr.get("high_risk")),
                    "variants_dir": gr.get("variants_dir"),
+                   "cases": (st["checkpoints"].get(cp["id"]) or {}).get("guardrail_cases") or [],
                    "added": _dt.date.today().isoformat(), "from": f"{st['slug']}/{cp['id']}"})
     user["checks"] = checks
     write_json(ctx.config_path, user)
@@ -3073,6 +3153,7 @@ def cmd_human_approve(args):
             for g in st["checkpoints"][cur]["gates"].values():
                 if g["status"] != "passed":
                     g["attempts"] = 0
+            st["checkpoints"][cur]["guardrail_tries"] = 0
         ctx.log(st, "unblocked", by=msg["by"], note=msg.get("prompt", "")[:200], back_to=st["phase"])
     else:
         target = st.get("review_target")

@@ -246,6 +246,9 @@ def main():
     cfg = json.loads((d / ".ratchet/config.json").read_text())
     ks = [c for c in cfg["checks"] if c["kind"] == "handler-imports-db"]
     check("it replaces the old check (one check per kind)", len(ks) == 1 and ks[0]["from"].endswith("CP4"), ks)
+    first_cases = len(json.loads(g.git(d, "show", "HEAD~1:.ratchet/config.json").stdout)["checks"][0].get("cases") or [])
+    check("the check keeps every past case it was proven on, so a later strengthening can't drop one",
+          first_cases >= 2 and len(ks[0].get("cases") or []) >= first_cases + 1, (first_cases, ks[0].get("cases")))
 
     print("Checks can't be quietly removed")
     cfg = json.loads((d / ".ratchet/config.json").read_text())
@@ -368,6 +371,35 @@ def main():
     r = rx(d5, "complete", "CP3")
     check("a check that misses a disguised variant can't complete, and Ratchet names the variant",
           r.returncode != 0 and "misses the disguised bad variant" in r.stderr and "v2.js" in r.stderr, r.stderr)
+
+    print("Rebuilding past code safely, and only from findings that were acted on")
+    import importlib.util as iu2, os as _os, subprocess as sp, tempfile as tf_
+    spec = iu2.spec_from_file_location("eng_h", g.ENGINE)
+    m = iu2.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    _os.environ["RATCHET_HOST_PROVIDER"] = "anthropic"
+    _os.environ["RATCHET_HOME"] = g.ENV["RATCHET_HOME"]
+    repo = Path(tf_.mkdtemp(prefix="ratchet-mat-"))
+    sp.run(["git", "init", "-q"], cwd=repo)
+    (repo / "f.js").write_text("one\n")
+    (repo / "abs").symlink_to("/etc/passwd")
+    (repo / "up").symlink_to("../../outside")
+    ctx = m.Ctx(repo)
+    t1 = m.fingerprint(repo)["id"]
+    out = m._materialize(ctx, t1, [])
+    check("past code with links pointing outside is rebuilt without them (no crash, nothing written outside)",
+          out is not None and (out / "f.js").exists() and not (out / "abs").exists() and not (out / "up").exists(), out)
+    (repo / "g.js").write_text("other\n")
+    t2 = m.fingerprint(repo)["id"]                       # f.js unchanged: the finding on it was rebutted
+    (repo / "f.js").write_text("two\n")
+    t3 = m.fingerprint(repo)["id"]                       # f.js changed: acted on
+    hit = {"cp": "CP1", "round": 1, "file": "f.js", "tree": t1, "severity": "major"}
+    st = {"finding_kinds": {"k": [hit]},
+          "checkpoints": {"CP1": {"gates": {"adversarial": {"rounds": [{"fingerprint": t1}, {"fingerprint": t2}]}}}}}
+    check("a finding whose file didn't change afterwards (disproved) is not used as proof",
+          m.kind_occurrences(st, "k", ctx=ctx) == [])
+    st["checkpoints"]["CP1"]["gates"]["adversarial"]["rounds"][1]["fingerprint"] = t3
+    check("a finding that was fixed is used as proof", len(m.kind_occurrences(st, "k", ctx=ctx)) == 1)
 
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
