@@ -24,6 +24,8 @@ Each of these is a plain sentence to your agent. It turns them into the right co
 
 If your project uses OpenSpec, GitHub Spec Kit or the BMAD Method, Ratchet reads the spec you already wrote instead of planning from scratch. Your spec tool says *what* to build; Ratchet proves it was built right. Every scenario or acceptance criterion gets a test that has to pass, every task belongs to a step, and nothing is left out without a reason you can see. As each step passes its gates, Ratchet ticks its tasks in your spec files. A finished BMAD story is marked done with Ratchet's evidence, and when you approve the run, an OpenSpec change is archived with OpenSpec's own tool. If there is exactly one open change, feature or story, you don't even need to name it.
 
+No spec tool? Nothing changes: the plan you approve is the spec. After your first finished run, the agent asks once whether you'd like a running record of what's been built (one plain file per feature, each rule linked to the test that proves it). Say yes or no; it remembers.
+
 **Get the viewer link**
 
 > Give me the viewer link, and open it if you can.
@@ -179,7 +181,7 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py reviewer-status [--reset <id>]` | the host, who is available, and retrying one early |
 | `ratchet.py providers [--discover] [--check [id]] [--add <id> --preset <p> --model <m>] [--remove <id>]` | agent tools that can review: find, test, add or remove them |
 | `ratchet.py models` | which model each role's sub-agent uses on this host |
-| `ratchet.py spec detect`, `spec import <openspec\|speckit\|bmad\|auto> <id>`, `spec status` | build from an OpenSpec change, Spec Kit feature or BMAD story; which scenarios are proven so far |
+| `ratchet.py spec detect`, `spec import <openspec\|speckit\|bmad\|auto> <id>`, `spec status` | build from an OpenSpec change, Spec Kit feature or BMAD story; which scenarios are proven so far; `spec keep on\|off` records the user's answer about a running spec |
 | `ratchet.py deferred` | minor review findings noted for later instead of blocking |
 | `ratchet.py occurrences <kind>` | the real code where reviewers found a kind of mistake |
 | `ratchet.py repeats` | kinds of finding seen twice or more that could become an automatic check |

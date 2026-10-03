@@ -135,7 +135,8 @@ DEFAULT_CONFIG = {
         "*.sass", "*.less", "*.styl", "*.swift", "*.kt", "*.xml", "*.dart", "*.erb",
         "*.blade.php", "*.hbs", "*.njk", "*.liquid", "tailwind.config.*", "*.svg",
     ],
-    "spec_archive": True,           # archive an OpenSpec change (merge its deltas into the specs) when the run is approved
+    "spec_archive": True,
+    "spec_keep": None,              # no spec tool: keep a running spec (openspec/specs/<run>/spec.md)? None = not asked yet           # archive an OpenSpec change (merge its deltas into the specs) when the run is approved
     "regression_command": None,     # full suite run before a checkpoint can complete
     "commit_per_checkpoint": True,
     "design_md": "DESIGN.md",
@@ -3150,7 +3151,13 @@ def cmd_spec(args):
         if not found:
             print("No OpenSpec, Spec Kit or BMAD files found in this project.")
             return
+        if not any(found.values()):
+            print("This project uses " + ", ".join(TOOL_PLAIN[t].rsplit(" ", 1)[0] for t in found) +
+                  ", but nothing is open to build right now.")
+            return
         for tool, xs in found.items():
+            if not xs:
+                continue
             print(f"{TOOL_PLAIN[tool]}s still open: {len(xs)}")
             for x in xs:
                 bits = [x.get("status") or ""]
@@ -3227,6 +3234,22 @@ def cmd_spec(args):
             print("checkpoints.json already exists, so it was left alone (use --force to replace it with a draft).")
         if add:
             print("Added to the standards reviewers enforce: " + ", ".join(add))
+        return
+    if args.spec_cmd == "keep":
+        user = read_json(ctx.config_path, {}) or {}
+        user["spec_keep"] = args.choice == "on"
+        write_json(ctx.config_path, user)
+        if args.choice == "off":
+            ok("Noted: no running spec for this project. You won't be asked again.")
+            return
+        ok("Noted: Ratchet keeps a running spec for this project, updated at the end of every run.")
+        try:
+            st = ctx.state()
+        except SystemExit:
+            return
+        if st.get("phase") == "done" and not spec_source(ctx):
+            print(write_living_spec(ctx, st))
+            ctx.save_state(st)
         return
     if args.spec_cmd == "status":
         src = spec_source(ctx)
@@ -3415,10 +3438,66 @@ def _commit_paths(root: Path, paths: list[str], msg: str) -> str | None:
     return new[:7]
 
 
+OFFER_KEEP = ("Offer: this project doesn't use a spec tool. Ask the user once, in plain words, whether you should keep "
+              "a running spec of what has been built: a plain Markdown file per feature saying what the app does, each "
+              "rule linked to the test that proves it, written at the end of each run and committed with it (it follows "
+              "OpenSpec's file layout, so they could adopt OpenSpec later without losing anything). Then run "
+              "`ratchet.py spec keep on` or `spec keep off` with their answer; it is remembered and never asked again.")
+
+
+def wants_keep_offer(ctx) -> bool:
+    return ctx.config().get("spec_keep") is None and not spec_source(ctx) and not specsrc.detect(ctx.root)
+
+
+def living_spec_text(ctx, st) -> str:
+    """The finished run as an OpenSpec-format capability spec: a requirement per step, a scenario per planned test."""
+    plan = ctx.plan() or {"checkpoints": []}
+    out = [f"# {plan.get('feature') or st.get('feature') or st['slug']}", "", "## Purpose",
+           f"What this feature does, as built and checked by Ratchet (run {st['slug']}, {now()[:10]}). Each scenario "
+           "names the test that proves it.", "", "## Requirements", ""]
+    for cp in plan["checkpoints"]:
+        if cp.get("guardrail") or (st.get("checkpoints") or {}).get(cp["id"], {}).get("status") != "done":
+            continue  # automatic checks are about the code, not what the app does
+        commit = st["checkpoints"][cp["id"]].get("commit")
+        files = ", ".join((cp.get("tests") or {}).get("files") or [])
+        out += [f"### Requirement: {cp['title']}", f"The system SHALL do this: {cp['summary']}", ""]
+        out += [f"- {d}" for d in cp.get("done_when") or []] + [""]
+        for c in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
+            out.append(f"#### Scenario: {c.get('title') or c['id']}")
+            if c.get("given"):
+                out.append(f"- **GIVEN** {c['given']}")
+            out.append(f"- **WHEN** {c.get('when') or 'this behaviour is exercised'}")
+            out.append(f"- **THEN** {c.get('then') or c.get('title') or 'it works as described'}")
+            how = "checked by the UI review" if c.get("layer") == "browser" else f"test {c['id']}" + (f" in {files}" if files else "")
+            out += [f"<!-- proven by {how}" + (f", commit {commit}" if commit else "") + " -->", ""]
+    return "\n".join(out).rstrip() + "\n"
+
+
+def write_living_spec(ctx, st) -> str:
+    rel = f"openspec/specs/{st['slug']}/spec.md"
+    p = ctx.root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(living_spec_text(ctx, st), encoding="utf-8")
+    commit = None
+    cfg = ctx.config()
+    if cfg.get("commit_per_checkpoint") and _is_git(ctx.root):
+        paths = [rel] + ([f"{RATCHET_DIR}/config.json"] if ctx.config_path.exists() else [])
+        commit = _commit_paths(ctx.root, paths, f"ratchet({st['slug']}): record what was built in {rel}")
+    st["living_spec"] = rel
+    ctx.log(st, "living_spec_written", path=rel, commit=commit)
+    return f"Recorded what was built in {rel}" + (f" (commit {commit})." if commit else ".")
+
+
 def _spec_finish(ctx, st) -> list[str]:
-    """When the whole run is approved: archive OpenSpec changes (merging their deltas into the living specs)."""
+    """When the whole run is approved: archive OpenSpec changes (merging their deltas into the living specs). With no
+    spec tool: keep the running spec if the user asked for one, or say to offer it once."""
     src = spec_source(ctx)
-    if not src or st.get("spec_finished"):
+    if not src:
+        keep = ctx.config().get("spec_keep")
+        if keep is True:
+            return [write_living_spec(ctx, st)]
+        return [OFFER_KEEP] if keep is None and wants_keep_offer(ctx) else []
+    if st.get("spec_finished"):
         return []
     cfg = ctx.config()
     notes = []
@@ -3562,7 +3641,7 @@ def cmd_complete(args):
     build_viewer(ctx)
     ok(f"{args.cp} complete{f' (commit {commit})' if commit else ''}.")
     for n_ in spec_notes:
-        print(f"Spec: {n_}")
+        print(n_ if n_.startswith("Offer:") else f"Spec: {n_}")
     print(json.dumps(next_action(ctx, st), indent=2))
 
 
@@ -3633,7 +3712,7 @@ def cmd_human_approve(args):
             st["phase"] = "done"
             st["current"] = None
             for n_ in _spec_finish(ctx, st):
-                print(f"Spec: {n_}")
+                print(n_ if n_.startswith("Offer:") else f"Spec: {n_}")
             register_active(ctx.root, None)
             _stop_server(ctx.ratchet / "viewer.json")
         ctx.log(st, "approved", by=msg["by"], note=msg.get("prompt", "")[:200])
@@ -5555,6 +5634,8 @@ def main(argv=None):
     b.add_argument("tool", help="openspec | speckit | bmad | auto"); b.add_argument("items", nargs="*")
     b.add_argument("--force", action="store_true", help="replace an existing checkpoints.json with the draft")
     b.add_argument("--json", action="store_true")
+    b = ssp.add_parser("keep", help="the user's answer: keep a running spec of what was built (no spec tool), or not")
+    b.add_argument("choice", choices=["on", "off"])
     b = ssp.add_parser("status", help="which spec scenarios are proven by passing tests")
     b.add_argument("--json", action="store_true")
     a.set_defaults(fn=cmd_spec)

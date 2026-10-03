@@ -34,6 +34,8 @@ Ask at most 4 questions, and only ones whose answers change the plan. For minor 
 - `summary`: one sentence that says what a user can do afterward.
 - `done_when`: 2–5 bullets a non-engineer could check by using the app. Write "A manager sees…", not "ApprovalService returns 200".
 
+If `openspec/specs/` exists, read the specs for the parts of the app you're changing: they say what the app already does (including the running record Ratchet keeps when the user asked for one), so don't contradict them without saying so.
+
 ## Starting from a spec (OpenSpec, Spec Kit, BMAD)
 If `<run>/reference/spec-source.json` exists, the team already wrote the spec, and `$RATCHET spec import` has put a **draft** plan in `checkpoints.json` and `tests/CPn.json`. The spec answers *what*; don't re-ask it or add requirements of your own. Refine the draft instead:
 - Fill in what the spec doesn't say: `tests.files`/`command`, `risk`, UI gates, `ui_scope`/`ui_states`, plain titles and `done_when`. Merge tiny steps or split big ones as the slicing rules above say.

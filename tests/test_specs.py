@@ -581,6 +581,61 @@ def no_spec():
     check("detect says nothing was found", "No OpenSpec, Spec Kit or BMAD" in r.stdout, r.stdout)
 
 
+def finish_plain_run(d):
+    """Take a g.project run (tests/cp1.test.js, src/f.js) through every gate and the final approval."""
+    g.to_adversarial(d, "CP1")
+    rnd = g.open_round(d, "CP1")
+    assert rx(d, "adv-record", "CP1", "--reviews", *[g.write_review(d, rnd, rv["id"]) for rv in rnd["reviewers"]]).returncode == 0
+    r = rx(d, "complete", "CP1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    g.say(d, "yes, approved")
+    return rx(d, "human-approve")
+
+
+def keep_offer():
+    print("No spec tool: offer a running spec, once")
+    d = g.project("keep")
+    g.approve_plan(d)
+    r = finish_plain_run(d)
+    check("after the final approval the agent is told to offer it, once", r.returncode == 0 and "Offer:" in r.stdout
+          and "spec keep on" in r.stdout, r.stdout + r.stderr)
+    check("nothing is written before the user answers", not (d / "openspec").exists())
+    r = rx(d, "spec", "keep", "on")
+    spec = d / "openspec/specs/f/spec.md"
+    check("on a yes, what was built is recorded now and committed", r.returncode == 0 and spec.exists()
+          and "record what was built" in g.git(d, "log", "-1", "--format=%s").stdout, r.stdout + r.stderr)
+    text = spec.read_text()
+    reqs, _ = ss.parse_openspec_delta(text, "x", "f")
+    check("it is a valid OpenSpec-style spec: a requirement per step, a scenario per test, each naming its test",
+          [x["title"] for x in reqs] == ["Step 1"] and len(reqs[0]["scenarios"]) == 1 and "SHALL" in text
+          and "proven by test CP1-T01" in text and "**WHEN**" in text and "**THEN**" in text, text)
+    check("the answer is remembered in the project config",
+          json.loads((d / ".ratchet/config.json").read_text()).get("spec_keep") is True
+          and ".ratchet/config.json" in g.git(d, "show", "--name-only", "--format=", "HEAD").stdout)
+    r = rx(d, "spec", "detect")
+    check("detect then says nothing is open, not that OpenSpec has 0 items", "nothing is open" in r.stdout, r.stdout)
+
+    print("Declining")
+    d = g.project("keepoff")
+    g.approve_plan(d)
+    finish_plain_run(d)
+    r = rx(d, "spec", "keep", "off")
+    check("a no is remembered and nothing is written", r.returncode == 0 and not (d / "openspec").exists()
+          and json.loads((d / ".ratchet/config.json").read_text()).get("spec_keep") is False, r.stdout)
+
+    print("Already chosen: no question, it just happens")
+    d = g.project("keepon", config=["spec_keep=true"])
+    g.approve_plan(d)
+    r = finish_plain_run(d)
+    check("with spec_keep on, the next run records itself without asking",
+          "Offer:" not in r.stdout and "Spec: Recorded what was built in openspec/specs/f/spec.md" in r.stdout
+          and (d / "openspec/specs/f/spec.md").exists(), r.stdout + r.stderr)
+    d = g.project("keepno", config=["spec_keep=false"])
+    g.approve_plan(d)
+    r = finish_plain_run(d)
+    check("with spec_keep off, no offer and no file", "Offer:" not in r.stdout and not (d / "openspec").exists(), r.stdout)
+
+
 def main():
     parsers()
     review_fixes()
@@ -589,6 +644,7 @@ def main():
     speckit_run()
     bmad_run()
     no_spec()
+    keep_offer()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
 
