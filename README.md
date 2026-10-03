@@ -88,6 +88,8 @@ At the start of a run the agent checks which agent tools are installed, sends ea
 
 **Each role has a model.** Planning, writing code, fixing and reviewing use the strong model; lighter jobs such as planning and writing tests use a cheaper one, and running tests the cheapest. The plan lists which model does what; `role_models` and `host_models` in `.ratchet/config.json` change it. Where the agent CLI can't choose a model per sub-agent, every role runs on the session's model.
 
+**A mistake that keeps coming back becomes an automatic check.** Reviewers label every finding with the kind of mistake it is. When the same kind turns up a second time, the agent stops and offers you, in one question, to turn it into an automatic check: a lint rule, an architecture test or a type rule that fails whenever the mistake reappears. Pick that option and the check is built as its own small step (it must catch a deliberately bad example and pass on today's code, and goes through every gate), may add a lint or architecture-test tool to the project, and from then on runs with the tests, in this run and later ones. The mistake then fails in seconds instead of costing a review round, and it stays fixed in your repo.
+
 **Minor findings don't loop forever.** From round 2 on, reviewers focus on the code the fixer changed: a minor finding elsewhere is noted, not fixed, while blocker and major ones still block anywhere. Everything noted for later is shown at your final review, where you decide whether any of it becomes a follow-up step.
 
 The UI gate works the same way: the `ui_reviewers` in config are chosen per role from the providers that are available, skipping the host, with the host's own reviewer sub-agents as the fallback.
@@ -169,6 +171,8 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py providers [--discover] [--check [id]] [--add <id> --preset <p> --model <m>] [--remove <id>]` | agent tools that can review: find, test, add or remove them |
 | `ratchet.py models` | which model each role's sub-agent uses on this host |
 | `ratchet.py deferred` | minor review findings noted for later instead of blocking |
+| `ratchet.py repeats` | kinds of finding seen twice or more that could become an automatic check |
+| `ratchet.py guardrail --kind <k> --title <t> --check-command <c> --test-command <c> --test-file <f>` | after you pick the "automatic check" option: add the step that builds it |
 | `ratchet.py lanes --scan <dir> [--json]` | each lane's phase, progress and whether it waits on a director |
 | `ratchet.py lanes --serve --scan <dir> [--bind 0.0.0.0]` | one dashboard for every lane |
 | `ratchet.py config --set key=value` | settings in `.ratchet/config.json` (reviewer roster, retry caps, `regression_command`, `ui_globs`, app URL) |
@@ -184,6 +188,7 @@ Each test file is a standalone script; none needs a framework.
 ```
 python3 tests/test_docs.py
 python3 tests/test_gates.py
+python3 tests/test_guardrails.py
 python3 tests/test_hooks.py
 python3 tests/test_hooks_status.py
 python3 tests/test_hooks_waiver.py

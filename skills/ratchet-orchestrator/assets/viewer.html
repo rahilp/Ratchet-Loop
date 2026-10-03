@@ -180,7 +180,7 @@ function renderPlan(d){
     if(s.commit) ev.push(`<li>commit <span class="mono">${esc(s.commit)}</span></li>`);
     return `<details class="cp ${cls}" data-id="${esc(cp.id)}" ${openState.has(cp.id)||isCur?"open":""}>
       <summary><span class="num">${esc(cp.id)}</span>
-        <span><div class="title">${esc(cp.title)}${cp.risk&&cp.risk!=="normal"?` <span class="tag ${cp.risk==="high"?"edge":""}">${esc(cp.risk)} risk</span>`:""}</div><div class="sum">${esc(cp.summary)}</div></span>
+        <span><div class="title">${esc(cp.title)}${cp.guardrail?` <span class="tag" data-testid="guardrail-tag">automatic check</span>`:""}${cp.risk&&cp.risk!=="normal"?` <span class="tag ${cp.risk==="high"?"edge":""}">${esc(cp.risk)} risk</span>`:""}</div><div class="sum">${esc(cp.summary)}</div></span>
         <span class="gates">${gates}</span></summary>
       <div class="body">
         <div><h4>Done when</h4><ul>${(cp.done_when||[]).map(x=>`<li>${esc(x)}</li>`).join("")}</ul></div>

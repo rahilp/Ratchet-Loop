@@ -36,5 +36,7 @@ Write JSON to the given path, and return only a 1-line summary:
 ```json
 {"reviewer":"<your reviewer id>","lens":"<lens>","checkpoint":"CPn","fingerprint":"<id given to you>","round_nonce":"<nonce given to you>","files_reviewed":["every changed file you read in full"],
  "verdict":"APPROVE|CHANGES_REQUESTED",
- "findings":[{"id":"A1","severity":"major","file":"…","line":42,"rule":"…","description":"…","fix":"…"}]}
+ "findings":[{"id":"A1","severity":"major","kind":"handler-imports-db","file":"…","line":42,"rule":"…","description":"…","fix":"…"}]}
 ```
+
+`kind` is a short kebab-case label for the TYPE of mistake (`handler-imports-db`, `unvalidated-input`, `missing-error-state`, `secret-in-log`), the same label every time you see that type again, in any file. Ratchet uses it to spot a mistake that keeps coming back and to offer the user an automatic check for it. Keep it general enough to repeat (not `bug-on-line-42`) and specific enough to check (not `bad-code`).

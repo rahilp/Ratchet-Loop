@@ -144,8 +144,8 @@ Code fingerprint: {fp}
 Reply with ONLY one JSON object, no markdown fences, exactly this shape:
 {{"reviewer":"{rid}","lens":"{spec.get('lens', 'both')}","checkpoint":"{cp['id']}","fingerprint":"{fp}",
  "verdict":"APPROVE or CHANGES_REQUESTED",
- "findings":[{{"id":"X1","severity":"blocker|major|minor","file":"path","line":0,"rule":"cited rule or failure scenario","description":"...","fix":"..."}}]}}
-An empty findings list means you approve. Every finding needs a cited rule or a concrete failure scenario.
+ "findings":[{{"id":"X1","severity":"blocker|major|minor","kind":"short-kebab-label-for-this-type-of-mistake","file":"path","line":0,"rule":"cited rule or failure scenario","description":"...","fix":"..."}}]}}
+An empty findings list means you approve. Every finding needs a cited rule or a concrete failure scenario. `kind` names the TYPE of mistake (e.g. handler-imports-db, unvalidated-input), the same label whenever that type appears again.
 """
 
 
