@@ -2,7 +2,7 @@
 
 AI coding agents are fast, but they'll tell you something works when it doesn't. Ratchet Loop makes them prove it.
 
-You describe a feature. Your agent splits it into small **checkpoints** and builds them one at a time. Each checkpoint has to get through four **gates** before the next one starts: its tests pass, it looks like the design, a second AI (from another company if you have one installed) tries to break it and can't, and you sign off at the end. If a gate fails, the agent fixes the problem and tries again. It can't argue its way past.
+You describe a feature. Your agent splits it into small **checkpoints** and builds them one at a time. Each checkpoint has to get through four **gates** ([details](#the-four-gates)) before the next one starts: its tests pass, it looks like the design, a second AI (from another company if you have one installed) tries to break it and can't, and you sign off at the end. If a gate fails, the agent fixes the problem and tries again. It can't argue its way past.
 
 You don't type any commands. You talk to your agent like normal, and it runs Ratchet for you.
 
@@ -22,7 +22,7 @@ The agent will ask before it changes anything. Part of the setup is adding Ratch
 
 > Set up Ratchet and continue
 
-The agent checks everything works and tells you it's ready.
+The agent checks the hooks are working, tells you Ratchet is ready, and asks what you'd like to build. Tell it right there, or come back any time.
 
 The hooks do nothing in projects where you're not using Ratchet, so they won't get in the way of your other work. If you use more than one of these CLIs, ask each one to install Ratchet for itself.
 
@@ -40,21 +40,46 @@ A real one looks like this:
 
 > Use Ratchet to build this feature: managers can approve or reject their team's leave requests, with a reason.
 
-That's all you have to do. The agent takes it from there and asks you when it needs you.
+That's all you have to type. The agent takes it from there. It may ask a few quick questions before it shows you the plan, and it asks again whenever it needs you.
 
 ## What happens next
 
-First the agent does some quick checks on its own. Are the hooks working? Which other AI tools are installed that could review the work? Has your team already written a spec for this? If anything needs your OK, like starting a new git branch, it asks.
+First the agent does some quick checks on its own. Are the hooks working? Which other AI tools are installed that could review the work? Has your team already written a spec for this? If anything needs your OK, like installing the hooks or starting a new git branch, it asks. If it finds a problem that would get in the way (the app won't start, there's no way to run tests, the screenshot tool is missing, or you have unsaved changes), it tells you in one message and offers to fix each one.
 
-Then it shows you the plan, right in the chat. You'll see each step, what "done" means for it, whether its look will be checked, how risky it is and who will review it. Read it. Say "yes" to start, or tell it what to change. If the feature has new screens, you also get a clickable prototype to look at first, so you can see what it'll look like before anything is built.
+Then it shows you the plan, right in the chat. You'll see each step, what "done" means for it, whether its look will be checked, how risky it is and who will review it. Read it. Say "yes" to start, or tell it what to change. If the feature has new screens, you also get a clickable prototype to look at first, so you can see what it'll look like before anything is built. Once you say yes, the plan, the design file and the prototype are locked. The agent can't change them later without asking you.
 
 Now you can walk away. For each step the agent writes the tests first and makes sure they fail. Then it writes the code until they pass. Then the reviewers go looking for problems, and anything they find gets fixed and checked again. Every finished step becomes its own git commit, and you get a one-line update as each one lands.
 
-If a step gets stuck, the agent comes back to you. It quotes the problem and gives you two or three options, labelled A, B and C, with the one it recommends. Just reply with the letter.
+If a step gets stuck, the agent comes back to you. Each gate gets a limited number of tries, and when they run out the run stops. The agent quotes the problem and gives you two or three options, labelled A, B and C, with the one it recommends. Just reply with the letter. Nothing gets lowered or skipped unless you pick it.
 
-When everything is built, it tells you what to try. Try it. Say "approved" if you're happy. If you're not, say what's wrong in your own words. Your changes become new steps, and they go through the same gates.
+When everything is built, it tells you what to try. It also lists any small issues the reviewers noted but didn't hold things up for, and asks if you want any of them fixed. Try it. Say "approved" if you're happy. If you're not, say what's wrong in your own words. Your changes become new steps, and they go through the same gates.
 
 So you're needed twice: once to OK the plan and once at the end. If you'd rather check every step, or not be asked at all after the plan, just say so.
+
+## What Ratchet sets up for you
+
+You don't have to prepare anything before your first run. If your project is missing something Ratchet needs, the agent makes it. Here's what it creates, and you're free to read and edit all of it.
+
+**A design file (`DESIGN.md`).** This is your app's look written down exactly: colours, fonts, sizes, spacing, corner radius, and how each component looks in each state (normal, hover, disabled, error and so on). The prototype, the code and the screen reviewers all work from it, so a button comes out the same every time. If you don't have one, the agent writes it before the plan:
+
+- for an existing app, it reads your real styles and components and writes down what you actually use, including the places where your app isn't consistent with itself (so reviewers don't flag you for matching your own old screens);
+- for a new app, it asks a couple of questions (who it's for, the feel, any brand colour) and picks exact values, with text contrast that meets accessibility guidelines.
+
+If a new screen needs something the design file doesn't cover yet, like a new kind of button, it's added before you see the plan, so you approve it along with everything else.
+
+**Coding standards (`.ratchet/standards.md`).** The rules reviewers check the code against: where business logic lives, how errors are handled, naming, what may import what, security checks. If your project doesn't have written standards, the agent drafts 15 to 40 of them from how your code already works, with a real file as the example for each. It's marked as a draft. Read it and change anything you disagree with.
+
+**A clickable prototype,** for features with new screens and nothing to copy. You see it before you approve the plan.
+
+**Lessons (`.ratchet/learnings.md`).** Whenever you give feedback that applies beyond this one feature ("always use the shared date picker", say), it's written here, and every agent reads it before starting work. You shouldn't have to say the same thing twice.
+
+**Automatic checks,** when you say yes to turning a repeated mistake into one. They're added to your project and run with the tests from then on. Building one may add a lint or test tool to your project's dev dependencies.
+
+**A record of what's been built,** if you said yes to that (see the spec section below).
+
+You can also ask for the design file on its own, without building anything:
+
+> Create a DESIGN.md for this app from the existing screens.
 
 ## More things to ask for
 
@@ -120,15 +145,15 @@ No spec tool? That's fine. The plan you approve is the spec. After your first fi
 
 **How long does it take?** A small feature usually takes tens of minutes, with the agent working by itself. Bigger ones take longer. You don't have to watch.
 
-**Is it expensive?** It uses more AI time than letting the agent just write code, because it checks the work. Ratchet tries to keep that down: low-risk steps get one reviewer, small nitpicks don't hold them up, and later review rounds focus on what was just changed.
+**Is it expensive?** It uses more AI time than letting the agent just write code, because it checks the work. Ratchet tries to keep that down: low-risk steps get one reviewer, and small nitpicks are noted for you at the end instead of starting another round of review.
 
-**Do I need other AI tools installed?** No. Without them, reviews come from your own agent's company, using a different model when it can. With another company's tool installed and signed in (Codex, Gemini, Copilot, Cursor, OpenCode and others), that tool reviews first. A second company tends to catch things the first one misses.
+**Do I need other AI tools installed?** No. Without them, reviews come from your own agent's company, using a different model when it can. With another company's tool installed and signed in, or with its API key set (Codex, Gemini, Copilot, Cursor, OpenCode and others), that tool reviews first. A second company tends to catch things the first one misses.
 
 **The agent says the hooks aren't working.** Close the CLI, open it again in the same folder, and say "Set up Ratchet and continue". Still not working? Ask it to check that Ratchet's hooks are installed for this CLI and install them if not.
 
-**Where does my code go?** Into your project, like any other change, with one git commit per finished step. If you're on your main branch or have unsaved changes, the agent offers to start a new branch first. Ratchet keeps its own notes in a `.ratchet/` folder.
+**Where does my code go?** Into your project, like any other change, with one git commit per finished step. If you're on your main branch or have unsaved changes, the agent offers to start a new branch before it begins. If you want one, that's the easiest moment to say yes. Ratchet keeps its own notes in a `.ratchet/` folder.
 
-**Can I stop halfway?** Yes. Say "pause". When you're ready, say "carry on", even in a new chat. Nothing is lost.
+**Can I stop halfway?** Yes. Say "pause". When you're ready, say "carry on". You can even pick it up in a new chat; the agent just checks with you before moving the run over. Nothing is lost.
 
 **What if I don't like the result?** Say so at the end, the same way you'd tell a colleague. Your feedback turns into new steps, and the agent remembers the lesson for next time.
 
@@ -153,7 +178,7 @@ Work with nothing to look at, like an API change or a refactor, skips gate 2. Fo
 
 Tests can tell you a button saves the form. They can't tell you the button is the wrong shade of blue, or that the heading is a bit too small. People notice those things straight away, and nobody ever writes them down in a spec. Comparing screenshots pixel by pixel doesn't work either, because two browsers never draw exactly the same pixels. So Ratchet has a reviewer look at the screen, the way a fussy designer would.
 
-It starts with something to compare against. If you're rebuilding an old screen, that's the old screen. If you've got a design or screenshots, it uses those. If you've got neither, the agent makes a clickable prototype before any real code is written: a single web page in your app's style that you can click through when you review the plan. To keep the prototype in your app's style, Ratchet keeps a `DESIGN.md` file with your colours, fonts, spacing and components. If you don't have one, the agent writes it from your existing app.
+It starts with something to compare against. If you're rebuilding an old screen, that's the old screen. If you've got a design or screenshots, it uses those. If you've got neither, the agent makes a clickable prototype before any real code is written: a single web page in your app's style that you can click through when you review the plan. The prototype follows your design file, `DESIGN.md` (see [What Ratchet sets up for you](#what-ratchet-sets-up-for-you)).
 
 When a step changes something you can see, Ratchet opens both the reference and your real app in a browser, puts them in the same state (same data, same dialog open, same form filled in), clicks through the same few actions on each, and takes screenshots along the way. Then two reviewers look at the results:
 
