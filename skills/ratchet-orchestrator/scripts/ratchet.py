@@ -98,7 +98,7 @@ DEFAULT_CONFIG = {
         "ratchet-adversary": "strong", "ratchet-visual-reviewer": "strong",
         "ratchet-app-scout": "standard", "ratchet-test-planner": "standard", "ratchet-test-writer": "standard",
         "ratchet-design-system": "standard", "ratchet-prototyper": "standard", "ratchet-behavior-reviewer": "standard",
-        "ratchet-test-runner": "light",
+        "ratchet-test-runner": "light", "ratchet-variant-writer": "alternate",
     },
     "host_models": {
         "anthropic": {"strong": "inherit", "standard": "sonnet", "light": "haiku", "alternates": ["sonnet", "opus"]},
@@ -826,6 +826,12 @@ def next_action(ctx: Ctx, st=None) -> dict:
         "adversarial": f"{cur}: run the ratchet-adversarial-loop skill (adversary review → ratchet.py adv-record → fixer → repeat)",
         "complete": f"{cur}: run ratchet.py complete {cur}",
     }
+    gr = cp.get("guardrail") or {}
+    if step == "tests" and gr.get("high_risk") and not gr.get("strengthen"):
+        msgs["tests"] = (f"{cur}: first spawn ratchet-variant-writer with ONLY the kind '{gr['kind']}', its why and the "
+                         f"output of `ratchet.py occurrences {gr['kind']}` (never the check) to write disguised bad "
+                         f"variants in {gr['variants_dir']}/bad and look-alike good code in {gr['variants_dir']}/good; "
+                         "then " + msgs["tests"].split(": ", 1)[1])
     na = {"phase": phase, "checkpoint": cur, "step": step, "action": msgs.get(step, step), "stop_ok": False}
     reps = repeat_candidates(ctx, st) if approval_mode(ctx) != "director" else []
     if reps:
@@ -983,16 +989,7 @@ def plain_reviewer(cfg, rid, model=None) -> str:
 
 
 def models_table(cfg) -> list[tuple[str, str]]:
-    names = {"ratchet-checkpoint-planner": "planning the steps", "ratchet-implementer": "writing the code",
-             "ratchet-fixer": "fixing review findings", "ratchet-adversary": "code reviews by this agent",
-             "ratchet-visual-reviewer": "visual UI review", "ratchet-behavior-reviewer": "UI behaviour review",
-             "ratchet-app-scout": "checking the app runs", "ratchet-test-planner": "planning tests",
-             "ratchet-test-writer": "writing tests", "ratchet-design-system": "the design file",
-             "ratchet-prototyper": "the prototype", "ratchet-test-runner": "running tests"}
-    out = []
-    for role in sorted(set(names) | set(cfg.get("role_models") or {})):
-        out.append((role, role_model(cfg, role)))
-    return out
+    return [(role, role_model(cfg, role)) for role in sorted(set(ROLE_PLAIN) | set(cfg.get("role_models") or {}))]
 
 
 ROLE_PLAIN = {"ratchet-checkpoint-planner": "planning the steps", "ratchet-implementer": "writing the code",
@@ -1000,7 +997,8 @@ ROLE_PLAIN = {"ratchet-checkpoint-planner": "planning the steps", "ratchet-imple
               "ratchet-visual-reviewer": "visual UI review", "ratchet-behavior-reviewer": "UI behaviour review",
               "ratchet-app-scout": "checking the app runs", "ratchet-test-planner": "planning tests",
               "ratchet-test-writer": "writing tests", "ratchet-design-system": "the design file",
-              "ratchet-prototyper": "the prototype", "ratchet-test-runner": "running tests"}
+              "ratchet-prototyper": "the prototype", "ratchet-test-runner": "running tests",
+              "ratchet-variant-writer": "disguised examples for high-risk checks"}
 
 
 def cmd_models(args):
@@ -1467,6 +1465,8 @@ def role_model(cfg, role) -> str:
     tier = (cfg.get("role_models") or {}).get(role, "inherit")
     if tier in ("strong", "standard", "light"):
         return host_model_map(cfg).get(tier) or "inherit"
+    if tier == "alternate":  # a different model from the session's, for work that must not share its blind spots
+        return (host_model_map(cfg).get("alternates") or ["inherit"])[0]
     return tier or "inherit"
 HOST_HINTS = [  # environment variables the common agent CLIs set for the tools they run
     ("anthropic", ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")),
@@ -2028,6 +2028,16 @@ def cmd_tests_written(args):
         ctx.save_state(st)
         ok(f"{args.cp}: behavior gate off ({cp.get('behavior_skip_reason')}); go implement.")
         return
+    gr = cp.get("guardrail") or {}
+    if gr.get("high_risk") and not gr.get("strengthen"):
+        vd = ctx.root / (gr.get("variants_dir") or "")
+        nb = len([p for p in (vd / "bad").rglob("*") if p.is_file()]) if (vd / "bad").is_dir() else 0
+        ng = len([p for p in (vd / "good").rglob("*") if p.is_file()]) if (vd / "good").is_dir() else 0
+        if nb < 3 or ng < 2:
+            die(f"{args.cp} guards a high-risk kind of mistake: first spawn ratchet-variant-writer (it gets only the "
+                f"kind, the why and `ratchet.py occurrences {gr['kind']}`, never the check) to write at least 3 "
+                f"disguised bad variants in {gr.get('variants_dir')}/bad and 2 look-alike good examples in "
+                f"{gr.get('variants_dir')}/good (found {nb} and {ng}).")
     files, missing, found = _coverage(ctx, cp)
     if not found:
         die(f"No test files found at {files}. Tests must be written to tests.files.")
@@ -2378,8 +2388,12 @@ def cmd_adv_record(args):
         if Path(rp).resolve().parent != dest.resolve():
             shutil.copy2(rp, dest / f"{rid}.json")
     need = len(required)
-    record_kinds(st, args.cp, rnd["round"], all_findings, ctx.root)
+    record_kinds(st, args.cp, rnd["round"], all_findings, ctx.root, fp["id"], cp.get("risk", "normal"))
     covered = enforced_kinds(cfg)
+    escaped = sorted({finding_kind(f) for f in all_findings if finding_kind(f) in covered
+                      and str(f.get("severity", "")).strip().lower() not in MINOR_SEVERITIES})
+    for kind in escaped:
+        _auto_strengthen(ctx, st, cfg, kind, args.cp)
     covered_minor = [dict(f, deferred_because=f"an automatic check already covers '{finding_kind(f)}'")
                      for f in all_findings if finding_kind(f) in covered
                      and str(f.get("severity", "")).strip().lower() in MINOR_SEVERITIES]
@@ -2514,14 +2528,36 @@ def enforced_kinds(cfg) -> set:
     return {norm_kind(c.get("kind")) for c in (cfg.get("checks") or []) if isinstance(c, dict) and c.get("kind")}
 
 
-def record_kinds(st, cp_id, round_no, findings, root=None):
+def record_kinds(st, cp_id, round_no, findings, root=None, tree=None, risk=None):
     seen = st.setdefault("finding_kinds", {})
     for f in findings:
         k = finding_kind(f)
         if k:
             seen.setdefault(k, []).append({"cp": cp_id, "round": round_no,
                                            "file": _norm_path(f.get("file") or f.get("path") or f.get("location"), root),
-                                           "what": str(f.get("description", ""))[:160]})
+                                           "what": str(f.get("description", ""))[:160], "tree": tree, "risk": risk,
+                                           "severity": str(f.get("severity", "")).strip().lower()})
+
+
+def kind_is_high_risk(st, kind) -> bool:
+    """Found on a high-risk checkpoint, or ever rated a blocker."""
+    return any(h.get("risk") == "high" or h.get("severity") == "blocker"
+               for h in (st.get("finding_kinds") or {}).get(kind, []))
+
+
+def kind_occurrences(st, kind, limit=5) -> list[dict]:
+    """The real places a kind was found, newest first, one per reviewed code version (with a file). Only findings
+    that blocked (blocker/major) count: those were acted on, so the mistake was really there; a minor note may not be."""
+    out, trees = [], set()
+    for h in reversed((st.get("finding_kinds") or {}).get(kind, [])):
+        if h.get("severity") in MINOR_SEVERITIES:
+            continue
+        if h.get("tree") and h.get("file") and h["tree"] not in trees:
+            trees.add(h["tree"])
+            out.append(h)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def kind_places(st, kind) -> set:
@@ -2542,6 +2578,22 @@ def repeat_candidates(ctx, st, cfg=None) -> list[dict]:
             out.append({"kind": k, "times": len(places), "checkpoints": sorted({h["cp"] for h in hits}),
                         "example": hits[-1]["what"]})
     return sorted(out, key=lambda x: -x["times"])
+
+
+def cmd_occurrences(args):
+    """The real code where reviewers found a kind of mistake, as they saw it (for a variant writer)."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    kind = norm_kind(args.kind)
+    occ = kind_occurrences(st, kind)
+    if not occ:
+        die(f"No recorded occurrences of '{kind}' with code to show.")
+    for h in occ:
+        r = subprocess.run(["git", "show", f"{h['tree']}:{h['file']}"], cwd=ctx.root, capture_output=True, text=True)
+        body = r.stdout if r.returncode == 0 else "(file not in that version)"
+        lines = body.splitlines()
+        print(f"=== {h['cp']} round {h['round']}: {h['file']} — {h['what']}")
+        print("\n".join(lines[:200]) + ("\n… (cut)" if len(lines) > 200 else ""))
 
 
 def cmd_repeats(args):
@@ -2632,46 +2684,14 @@ def cmd_guardrail(args):
     elif allow.get("guardrail") != kind or allow.get("cp") != st.get("current"):
         die(f"The user hasn't picked a guardrail option for '{kind}' at this step. Offer it first: ratchet.py ask "
             f"choice --options A,B,C --guardrail \"A={kind}\", then ratchet.py choice after they reply.")
-    plan = ctx.plan()
-    ids = [int(c["id"][2:]) for c in plan["checkpoints"] if re.fullmatch(r"CP\d+", c["id"])]
-    gid = f"CP{max(ids) + 1}"
-    title = " ".join(f"Guardrail: {args.title}".split()[:8])
-    files = args.test_file or []
-    entry = {"id": gid, "title": title,
-             "summary": f"Add an automatic check that fails fast on '{kind}', a mistake reviewers kept finding.",
-             "done_when": [f"The check fails on a deliberately bad example of {kind} ({args.bad_example})",
-                           f"The check passes on the project's current code ({args.target})",
-                           "The check runs with the tests at every later step"],
-             "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "normal",
-             "ui_skip_reason": "an automatic code check, nothing visible changes",
-             "tests": {"files": files, "command": args.test_command},
-             "guardrail": {"kind": kind, "check_command": args.check_command, "target": args.target,
-                           "bad_example": args.bad_example, "why": args.why or ""},
-             "notes": ("Use the project's existing linter, type checker or test runner if it can express this check; "
-                       "otherwise you may add a lint or architecture-test tool as a dev dependency. Keep the bad "
-                       "example in a test fixture, not in the shipped code.")}
+    high = kind_is_high_risk(st, kind)
+    gr = {"kind": kind, "check_command": args.check_command, "target": args.target,
+          "bad_example": args.bad_example, "why": args.why or "", "test_command": args.test_command,
+          "test_files": args.test_file or [], "high_risk": high,
+          "variants_dir": (args.variants_dir or f"tests/fixtures/guardrails/{kind}/variants") if high else None}
+    gid, title = _insert_guardrail_step(ctx, st, gr, f"Guardrail: {args.title}",
+                                        f"Add an automatic check that fails fast on '{kind}', a mistake reviewers kept finding.")
     cur = st.get("current")
-    order = [c["id"] for c in plan["checkpoints"]]
-    at = order.index(cur) + 1 if cur in order else len(order)
-    plan["checkpoints"].insert(at, entry)
-    errs = validate_plan(plan)
-    if errs:
-        die("Guardrail step invalid:\n  - " + "\n  - ".join(errs))
-    write_json(ctx.run_dir() / "checkpoints.json", plan)
-    tp = {"checkpoint": gid, "cases": [
-        {"id": f"{gid}-T01", "layer": "code", "title": f"the check catches {kind}",
-         "given": f"the fixture {args.bad_example}, which contains the mistake ({args.why or kind})",
-         "when": f"the check runs on it ({args.check_command.replace('{target}', args.bad_example)})",
-         "then": "it fails and names the problem"},
-        {"id": f"{gid}-T02", "layer": "code", "title": "the check passes on the current code",
-         "given": "the project as it is now",
-         "when": f"the check runs ({args.check_command.replace('{target}', args.target)})", "then": "it passes"}]}
-    write_json(ctx.run_dir() / "tests" / f"{gid}.json", tp)
-    st["checkpoints"][gid] = new_cp_state(entry)
-    st["plan_hash"] = _plan_hash(plan, ctx)
-    snap = st.get("approved") or {}
-    snap.setdefault("cps", {})[gid] = _sha(entry)          # the user's pick is the approval for this one step
-    snap.setdefault("tests", {})[gid] = _sha(test_plan(ctx, gid))
     if not token:
         allow["guardrail"] = None
         if not allow.get("files") and not allow.get("unblock"):
@@ -2681,6 +2701,182 @@ def cmd_guardrail(args):
     build_viewer(ctx)
     ok(f"Added {gid} ({title}) right after {cur}. It is built next, through every gate; its check then runs with the "
        "tests at every later step.")
+
+
+GUARDRAIL_NOTES = ("Prefer a check that understands the code over one that matches text: an import-graph rule "
+                   "(dependency-cruiser, import-linter, ArchUnit), a syntax-aware lint rule (ESLint, Semgrep, Ruff) or a "
+                   "type rule, using the project's existing tools first; you may add such a tool as a dev dependency. "
+                   "Keep bad examples in test fixtures, never in shipped code. Ratchet will also run the check on the "
+                   "real code where the mistake was found, so it must catch those, not only your fixture.")
+
+
+def _insert_guardrail_step(ctx, st, gr: dict, title: str, summary: str, extra_case: dict | None = None):
+    """Put a guardrail (or strengthen) step right after the current checkpoint, with its own red/green test plan.
+    The user's pick (or the automatic strengthening rule) is the approval for this one step."""
+    plan = ctx.plan()
+    ids = [int(c["id"][2:]) for c in plan["checkpoints"] if re.fullmatch(r"CP\d+", c["id"])]
+    gid = f"CP{max(ids) + 1}"
+    title = " ".join(title.split()[:8])
+    kind = gr["kind"]
+    done_when = [f"The check fails on a deliberately bad example of {kind} ({gr['bad_example']})",
+                 "The check fails on the real code where reviewers found the mistake",
+                 f"The check passes on the project's current code ({gr['target']})",
+                 "The check runs with the tests at every later step"]
+    if gr.get("high_risk"):
+        done_when.insert(2, f"It catches every disguised bad variant in {gr['variants_dir']}/bad and none of the "
+                            f"look-alike good code in {gr['variants_dir']}/good")
+    entry = {"id": gid, "title": title, "summary": summary, "done_when": done_when,
+             "gates": {"behavior": True, "ui": False, "adversarial": True},
+             "risk": "high" if gr.get("high_risk") else "normal",
+             "ui_skip_reason": "an automatic code check, nothing visible changes",
+             "tests": {"files": gr.get("test_files") or [], "command": gr["test_command"]},
+             "guardrail": gr, "notes": GUARDRAIL_NOTES}
+    cur = st.get("current")
+    order = [c["id"] for c in plan["checkpoints"]]
+    at = order.index(cur) + 1 if cur in order else len(order)
+    plan["checkpoints"].insert(at, entry)
+    errs = validate_plan(plan)
+    if errs:
+        die("Guardrail step invalid:\n  - " + "\n  - ".join(errs))
+    write_json(ctx.run_dir() / "checkpoints.json", plan)
+    cases = [{"id": f"{gid}-T01", "layer": "code", "title": f"the check catches {kind}",
+              "given": f"the fixture {gr['bad_example']}, which contains the mistake ({gr.get('why') or kind})",
+              "when": f"the check runs on it ({gr['check_command'].replace('{target}', gr['bad_example'])})",
+              "then": "it fails and names the problem"},
+             {"id": f"{gid}-T02", "layer": "code", "title": "the check passes on the current code",
+              "given": "the project as it is now",
+              "when": f"the check runs ({gr['check_command'].replace('{target}', gr['target'])})", "then": "it passes"}]
+    if extra_case:
+        cases.append(dict(extra_case, id=f"{gid}-T03", layer="code"))
+    write_json(ctx.run_dir() / "tests" / f"{gid}.json", {"checkpoint": gid, "cases": cases})
+    st["checkpoints"][gid] = new_cp_state(entry)
+    st["plan_hash"] = _plan_hash(plan, ctx)
+    snap = st.get("approved") or {}
+    snap.setdefault("cps", {})[gid] = _sha(entry)
+    snap.setdefault("tests", {})[gid] = _sha(test_plan(ctx, gid))
+    return gid, title
+
+
+def _auto_strengthen(ctx, st, cfg, kind, cp_id):
+    """A reviewer found a blocker/major mistake of a kind an automatic check covers: the check let it through. Add a
+    step that strengthens the check (no question: the user asked for this to happen automatically)."""
+    plan = ctx.plan()
+    pending = [c for c in plan["checkpoints"] if (c.get("guardrail") or {}).get("kind") == kind
+               and st["checkpoints"].get(c["id"], {}).get("status") != "done"]
+    chk = next((c for c in cfg.get("checks") or [] if isinstance(c, dict) and norm_kind(c.get("kind")) == kind), {})
+    occ = kind_occurrences(st, kind, limit=1)
+    where = occ[0]["file"] if occ else "a later step"
+    ctx.log(st, "check_missed", kind=kind, cp=cp_id, file=where)
+    if pending:
+        print(f"STRENGTHEN: the check for '{kind}' missed a case in {where}; step {pending[0]['id']} will cover it too.")
+        return
+    if not chk.get("template") or not chk.get("test_command"):
+        print(f"STRENGTHEN: the check for '{kind}' missed a case in {where}, but it was added without the details "
+              "needed to strengthen it automatically. Tell the user in one line.")
+        return
+    gr = {"kind": kind, "check_command": chk["template"], "target": chk.get("target") or ".",
+          "bad_example": chk.get("bad_example") or "", "why": chk.get("why") or "", "strengthen": True,
+          "test_command": chk["test_command"], "test_files": chk.get("test_files") or [],
+          "high_risk": bool(chk.get("high_risk")), "variants_dir": chk.get("variants_dir")}
+    gid, _ = _insert_guardrail_step(
+        ctx, st, gr, f"Strengthen check: {kind}",
+        f"The automatic check for '{kind}' let a case through in {where}. Make it catch that case too, without "
+        "losing any it already catches.",
+        {"title": f"the check now catches the case it missed in {where}",
+         "given": f"a fixture with the code reviewers flagged in {where}", "when": "the check runs on it",
+         "then": "it fails and names the problem"})
+    ctx.log(st, "guardrail_strengthen_added", cp=gid, kind=kind)
+    print(f"STRENGTHEN: the automatic check for '{kind}' missed a case in {where}. Step {gid} was added right after "
+          f"{st.get('current')} to strengthen it (no question needed). Tell the user in one line.")
+
+
+def _materialize(ctx, tree: str, overlay: list[str]) -> Path | None:
+    """A throwaway copy of an earlier reviewed version of the code, with this step's own files (the check, its config,
+    fixtures) laid over it and the project's installed dependencies linked in."""
+    import io
+    import tarfile
+    tmp = Path(tempfile.mkdtemp(prefix="ratchet-occurrence-"))
+    r = subprocess.run(["git", "archive", "--format=tar", tree], cwd=ctx.root, capture_output=True)
+    if r.returncode != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None
+    with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
+        tf.extractall(tmp, filter="data") if hasattr(tarfile, "data_filter") else tf.extractall(tmp)
+    for rel in overlay:
+        src, dst = ctx.root / rel, tmp / rel
+        if src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        elif dst.exists() and dst.is_file():
+            dst.unlink()
+    for dep in ("node_modules", ".venv", "venv", "vendor", ".bundle", "target"):
+        if (ctx.root / dep).exists() and not (tmp / dep).exists():
+            (tmp / dep).symlink_to(ctx.root / dep)
+    return tmp
+
+
+def _run_check_in(cwd: Path, command: str, log: Path, timeout: int) -> tuple[int, str]:
+    try:
+        r = subprocess.run(command, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                           env=dict(os.environ, CI="1", FORCE_COLOR="0"))
+        code, out = r.returncode, (r.stdout or "") + "\n" + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        code, out = 124, f"TIMEOUT after {timeout}s"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(f"$ (in {cwd}) {command}\n# exit={code}\n\n{out}")
+    return code, out
+
+
+def verify_guardrail(ctx, st, cp, cps, fp, cfg) -> list[str]:
+    """Ratchet runs the real check itself. It must fail on the bad example, on the real code where the mistake was
+    found, and (high-risk kinds) on every disguised bad variant; and pass on today's code and on look-alike good code.
+    No run may change a project file."""
+    import shlex
+    gr = cp["guardrail"]
+    ev = ctx.evidence(cp["id"]) / "guardrail"
+    t = cfg["test_timeout_sec"]
+    probs = []
+    bad = ctx.root / (gr.get("bad_example") or "")
+    if not gr.get("bad_example") or not bad.exists() or (bad.is_dir() and not any(bad.rglob("*"))):
+        return [f"its bad example ({gr.get('bad_example')}) is missing or empty"]
+    code, _, _ = _run_cmd(ctx, _check_cmd(gr, gr["bad_example"]), ev / "bad-example.log", t)
+    if code == 0:
+        probs.append(f"it passes on the bad example ({gr['bad_example']}), so it doesn't catch the mistake")
+    code, _, _ = _run_cmd(ctx, _check_cmd(gr, gr.get("target") or "."), ev / "today.log", t)
+    if code != 0:
+        probs.append("it fails on the current code; it must pass on today's code")
+    if gr.get("high_risk"):
+        vd = ctx.root / (gr.get("variants_dir") or "")
+        bads = sorted(p for p in (vd / "bad").rglob("*") if p.is_file()) if (vd / "bad").is_dir() else []
+        goods = sorted(p for p in (vd / "good").rglob("*") if p.is_file()) if (vd / "good").is_dir() else []
+        if len(bads) < 3 or len(goods) < 2:
+            probs.append(f"a high-risk kind needs at least 3 disguised bad variants and 2 look-alike good examples in "
+                         f"{gr.get('variants_dir')}/bad and /good (found {len(bads)} and {len(goods)})")
+        for i, v in enumerate(bads):
+            rel = str(v.relative_to(ctx.root))
+            if _run_cmd(ctx, _check_cmd(gr, rel), ev / f"variant-bad-{i:02d}.log", t)[0] == 0:
+                probs.append(f"it misses the disguised bad variant {rel}")
+        for i, v in enumerate(goods):
+            rel = str(v.relative_to(ctx.root))
+            if _run_cmd(ctx, _check_cmd(gr, rel), ev / f"variant-good-{i:02d}.log", t)[0] != 0:
+                probs.append(f"it wrongly flags the look-alike good code {rel}")
+    if _is_git(ctx.root):
+        overlay = changed_files(ctx.root, {"kind": "git-tree", "id": cps.get("base_tree")}, fp) if cps.get("base_tree") else []
+        for i, h in enumerate(kind_occurrences(st, gr["kind"])):
+            tmp = _materialize(ctx, h["tree"], overlay)
+            if tmp is None:
+                continue
+            try:
+                cmd = gr["check_command"].replace("{target}", shlex.quote(gr.get("target") or "."))
+                code, _ = _run_check_in(tmp, cmd, ev / f"real-occurrence-{i:02d}.log", t)
+                if code == 0:
+                    probs.append(f"it passes on the real code where reviewers found the mistake ({h['cp']} round "
+                                 f"{h['round']}, {h['file']}), so it would not have caught it")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+    if fingerprint(ctx.root)["id"] != fp["id"]:
+        probs.append("running it changed files in the project; a check must only read the code")
+    return probs
 
 
 def _check_cmd(gr: dict, target: str) -> str:
@@ -2695,10 +2891,17 @@ def _finish_guardrail(ctx, st, cp):
         return
     user = read_json(ctx.config_path, {}) or {}
     checks = [c for c in (user.get("checks") or []) if isinstance(c, dict)]
-    if any(norm_kind(c.get("kind")) == gr["kind"] for c in checks):
+    existing = [c for c in checks if norm_kind(c.get("kind")) == gr["kind"]]
+    if existing and not gr.get("strengthen"):
         die(f"An automatic check for '{gr['kind']}' already exists; it is never replaced silently.")
+    # a strengthen step replaces its own kind's check, after proving it still catches every past case
+    checks = [c for c in checks if norm_kind(c.get("kind")) != gr["kind"]]
     command = _check_cmd(gr, gr.get("target") or ".")
     checks.append({"kind": gr["kind"], "command": command, "title": cp["title"],
+                   "template": gr["check_command"], "target": gr.get("target") or ".",
+                   "bad_example": gr.get("bad_example"), "why": gr.get("why"), "test_command": gr.get("test_command"),
+                   "test_files": gr.get("test_files"), "high_risk": bool(gr.get("high_risk")),
+                   "variants_dir": gr.get("variants_dir"),
                    "added": _dt.date.today().isoformat(), "from": f"{st['slug']}/{cp['id']}"})
     user["checks"] = checks
     write_json(ctx.config_path, user)
@@ -2774,27 +2977,21 @@ def cmd_complete(args):
             die("The regression command changed files in the project. Those changes were never reviewed — find out "
                 "what wrote them (generated files? snapshots?) and either add them to .gitignore or re-run the gates.", 2)
     if cp.get("guardrail"):
-        gr = cp["guardrail"]
-        bad = ctx.root / gr.get("bad_example", "")
-        if not gr.get("bad_example") or not bad.exists() or (bad.is_dir() and not any(bad.rglob("*"))):
-            die(f"{args.cp} cannot complete: its bad example ({gr.get('bad_example')}) is missing or empty. The check "
-                "has to be shown catching a real example of the mistake.", 2)
-        ev = ctx.evidence(args.cp)
-        rcode, rout, _ = _run_cmd(ctx, _check_cmd(gr, gr["bad_example"]), ev / "guardrail-catches-bad-example.log",
-                                  cfg["test_timeout_sec"])
-        gcode, gout, _ = _run_cmd(ctx, _check_cmd(gr, gr.get("target") or "."), ev / "guardrail-passes-today.log",
-                                  cfg["test_timeout_sec"])
-        if fingerprint(ctx.root)["id"] != fp["id"]:
-            die(f"{args.cp} cannot complete: running the new check changed files in the project. A check must only "
-                "read the code.", 2)
-        if rcode == 0:
-            print(_tail(rout))
-            die(f"{args.cp} cannot complete: the new check passes on the bad example ({gr['bad_example']}), so it "
-                "doesn't catch the mistake. A check that can't fail guards nothing.", 2)
-        if gcode != 0:
-            print(_tail(gout))
-            die(f"{args.cp} cannot complete: the new check fails on the current code. It must pass on today's code "
-                "before it can guard later steps.", 2)
+        probs = verify_guardrail(ctx, st, cp, cps, fp, cfg)
+        if probs:
+            cps["guardrail_tries"] = int(cps.get("guardrail_tries", 0)) + 1
+            if cps["guardrail_tries"] >= cfg["max_behavior_attempts"]:
+                _set_blocked(st, f"{args.cp}: the new automatic check still fails Ratchet's own proof after "
+                                 f"{cps['guardrail_tries']} tries — needs a human decision.")
+            for g_ in ("behavior", "adversarial"):
+                if cps["gates"][g_]["status"] == "passed":
+                    cps["gates"][g_]["status"] = "stale"
+            cps["step"] = "behavior"
+            ctx.log(st, "guardrail_proof_failed", cp=args.cp, problems="; ".join(probs)[:400])
+            ctx.save_state(st)
+            die(f"{args.cp} cannot complete: Ratchet ran the new check itself and " + "; ".join(probs) + ". Give this "
+                "to ratchet-implementer to fix the check (evidence/" + args.cp + "/guardrail has every run), then "
+                "re-run the gates.", 2)
         _finish_guardrail(ctx, st, cp)  # before the commit, so the new check's config entry is committed with it
     commit = None
     if cfg.get("commit_per_checkpoint") and _is_git(ctx.root):
@@ -4774,8 +4971,11 @@ def main(argv=None):
     a.add_argument("--target", default=".", help="what the check runs on in the real project (default .)")
     a.add_argument("--test-command", required=True, help="command that runs the step's tests (red/green proof)")
     a.add_argument("--test-file", action="append", required=True, help="test file(s) the step's tests go in")
+    a.add_argument("--variants-dir", help="high-risk kinds: where the disguised bad/ and look-alike good/ variants go")
     a.add_argument("--why", help="the mistake in one plain sentence (goes into learnings.md)")
     a.add_argument("--director-token"); a.set_defaults(fn=cmd_guardrail)
+    a = sp.add_parser("occurrences", help="the real code where reviewers found a kind of mistake")
+    a.add_argument("kind"); a.set_defaults(fn=cmd_occurrences)
     a = sp.add_parser("repeats", help="kinds of review finding seen twice or more, not yet guarded or asked about")
     a.add_argument("--json", action="store_true")
     a.add_argument("--offered", metavar="KIND", help="record that this kind was put to the user or director")

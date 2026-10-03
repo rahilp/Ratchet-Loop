@@ -49,7 +49,7 @@ const root = process.argv[2] || 'src';
 let bad = [];
 const walk = d => { for (const n of fs.readdirSync(d)) { const p = path.join(d, n);
   if (fs.statSync(p).isDirectory()) walk(p); else if (fs.readFileSync(p, 'utf8').includes('FORBIDDEN')) bad.push(p); } };
-walk(root);
+if (fs.statSync(root).isDirectory()) walk(root); else if (fs.readFileSync(root, 'utf8').includes('FORBIDDEN')) bad.push(root);
 if (bad.length) { console.error('guardrail: forbidden pattern in ' + bad.join(', ')); process.exit(1); }
 """
 
@@ -60,21 +60,34 @@ t('[{cp}-T02] the check passes on the current code', () => a.equal(run('src').st
 """
 
 
+def put(d, cp, files):
+    """Make the reviewed code really look like this (the reviewers' findings must be true: Ratchet later proves the
+    check against these exact versions)."""
+    for rel, text in files.items():
+        (d / rel).write_text(text)
+    r = rx(d, "behavior", cp)
+    assert r.returncode == 0, r.stderr
+
+
+OK_F = "export const f = () => 1;\n"
+BAD_F = "export const f = () => 1; // FORBIDDEN: import db\n"
+BAD_A = "// FORBIDDEN: import db\nexport const a = 1;\n"
+
+
 def main():
     print("Spotting a repeat")
     d = g.project("guard", cps=2, extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20"])
     g.approve_plan(d)
     g.to_adversarial(d, "CP1")
+    put(d, "CP1", {"src/f.js": BAD_F})
     rnd = open_round(d, "CP1")
     r = record(d, "CP1", rnd, {0: DBF("src/f.js")})
     check("round 1: the finding blocks, no repeat yet", r.returncode == 2 and "REPEAT" not in r.stdout, r.stdout)
-    (d / "src/f.js").write_text("export const f = () => 1; // fixed\n")
-    rx(d, "behavior", "CP1")
+    put(d, "CP1", {"src/f.js": BAD_F.replace("1;", "1; ")})          # "fixed", but the mistake is still there
     rnd = open_round(d, "CP1")
     r = record(d, "CP1", rnd, {1: DBF("src/f.js")})
     check("the same unfixed finding raised again is not a repeat", "REPEAT" not in r.stdout, r.stdout)
-    (d / "src/f.js").write_text("export const f = () => 1; // fixed twice\n")
-    rx(d, "behavior", "CP1")
+    put(d, "CP1", {"src/f.js": OK_F, "src/a.js": BAD_A})
     rnd = open_round(d, "CP1")
     r = record(d, "CP1", rnd, {1: DBF("src/a.js")})
     check("the same kind in another place is announced as a repeat", "REPEAT" in r.stdout and "handler-imports-db" in r.stdout,
@@ -117,6 +130,7 @@ def main():
     check("adding it doesn't trip the approval lock", st["phase"] == "building" and "changed after" not in r.stderr, r.stderr)
 
     print("Finishing the current step, then building the guardrail next")
+    put(d, "CP1", {"src/a.js": "export const a = 1;\n"})
     rnd = open_round(d, "CP1")
     r = record(d, "CP1", rnd)
     check("CP1's review approves", r.returncode == 0, r.stdout + r.stderr)
@@ -141,6 +155,16 @@ def main():
     r = rx(d, "complete", "CP3")
     check("a check that passes on the bad example can't complete (it guards nothing)",
           r.returncode != 0 and ("doesn't catch the mistake" in r.stderr or "behavior" in r.stderr), r.stderr)
+    narrow = real.replace("fs.readFileSync(p, 'utf8').includes('FORBIDDEN')",
+                          "p.endsWith('handler.js') && fs.readFileSync(p, 'utf8').includes('FORBIDDEN')")
+    (d / "guard/check.mjs").write_text(narrow)                 # catches the fixture, misses the real code
+    rx(d, "behavior", "CP3")
+    record(d, "CP3", open_round(d, "CP3"))
+    r = rx(d, "complete", "CP3")
+    check("a check that only catches its own fixture is refused: Ratchet runs it on the real past code",
+          r.returncode != 0 and "real code where reviewers found the mistake" in r.stderr, r.stderr)
+    check("… and every run is kept as evidence",
+          any((d / ".ratchet/runs/f/evidence/CP3/guardrail").glob("real-occurrence-*.log")))
     (d / "guard/check.mjs").write_text(real)
     for gate in ("behavior",):
         rx(d, gate, "CP3")
@@ -172,14 +196,25 @@ def main():
     (d / "src/g.js").write_text("export const g = () => 2;\n")
     r = rx(d, "behavior", "CP2")
     check("fixed code passes the tests and the check", r.returncode == 0, r.stdout + r.stderr)
+    put(d, "CP2", {"src/g.js": "// forbidden: import db\nexport const g = () => 2;\n"})  # the check misses lower case
     rnd = open_round(d, "CP2")
     check("reviewers are told the kind is already covered",
           any("handler-imports-db" in x for x in rnd["review_rules"]), rnd["review_rules"])
     r = record(d, "CP2", rnd, {0: DBF("src/g.js")})
     check("a MAJOR finding of a covered kind still blocks (a label never switches a finding off)",
           r.returncode == 2, r.stdout + r.stderr)
-    (d / "src/g.js").write_text("export const g = () => 2; // reviewed\n")
-    rx(d, "behavior", "CP2")
+    check("the check's miss is spotted and a step to strengthen it is added automatically, no question",
+          "STRENGTHEN" in r.stdout and "CP4" in r.stdout, r.stdout)
+    plan = json.loads((d / ".ratchet/runs/f/checkpoints.json").read_text())
+    check("the strengthen step comes right after the current one",
+          [c["id"] for c in plan["checkpoints"]] == ["CP1", "CP3", "CP2", "CP4"], [c["id"] for c in plan["checkpoints"]])
+    cp4 = plan["checkpoints"][-1]
+    check("it reuses the check's command and tests, and is marked as strengthening",
+          cp4["guardrail"]["strengthen"] is True and cp4["guardrail"]["check_command"] == "node guard/check.mjs {target}"
+          and cp4["tests"]["command"] == "node --test tests/guard.test.js", cp4)
+    tp4 = json.loads((d / ".ratchet/runs/f/tests/CP4.json").read_text())
+    check("its test plan adds the missed case", [c["id"] for c in tp4["cases"]] == ["CP4-T01", "CP4-T02", "CP4-T03"], tp4)
+    put(d, "CP2", {"src/g.js": "export const g = () => 2; // reviewed\n"})
     rnd = open_round(d, "CP2")
     minor = [dict(DBF("src/g.js")[0], severity="minor")]
     r = rx(d, "adv-record", "CP2", "--reviews", g.write_review(d, rnd, rnd["reviewers"][0]["id"], findings=minor,
@@ -188,15 +223,46 @@ def main():
           r.stdout + r.stderr)
     check("… and the deferred list says why", "automatic check already covers" in rx(d, "deferred", "--json").stdout)
 
+    print("Strengthening the check automatically")
+    r = rx(d, "complete", "CP2")
+    check("CP2 completes; the strengthen step is next", r.returncode == 0
+          and json.loads(rx(d, "status", "--json").stdout)["current"] == "CP4", r.stdout + r.stderr)
+    (d / "tests/fixtures/bad2").mkdir(parents=True)
+    (d / "tests/fixtures/bad2/g.js").write_text("// forbidden: import db\n")
+    with (d / "tests/guard.test.js").open("a") as fh:
+        fh.write("t('[CP4-T01] still catches', () => a.notEqual(run('tests/fixtures/bad').status, 0));\n"
+                 "t('[CP4-T02] still passes today', () => a.equal(run('src').status, 0));\n"
+                 "t('[CP4-T03] catches the missed case', () => a.notEqual(run('tests/fixtures/bad2').status, 0));\n")
+    check("tests written", rx(d, "tests-written", "CP4").returncode == 0)
+    check("red: the missed case fails before the fix", rx(d, "red", "CP4").returncode == 0)
+    (d / "guard/check.mjs").write_text(real.replace(".includes('FORBIDDEN')", ".toUpperCase().includes('FORBIDDEN')"))
+    rx(d, "implemented", "CP4")
+    r = rx(d, "behavior", "CP4")
+    check("green", r.returncode == 0, r.stdout + r.stderr)
+    record(d, "CP4", open_round(d, "CP4"))
+    r = rx(d, "complete", "CP4")
+    check("the strengthened check is proven on every real past case (including the one it missed) and completes",
+          r.returncode == 0, r.stdout + r.stderr)
+    cfg = json.loads((d / ".ratchet/config.json").read_text())
+    ks = [c for c in cfg["checks"] if c["kind"] == "handler-imports-db"]
+    check("it replaces the old check (one check per kind)", len(ks) == 1 and ks[0]["from"].endswith("CP4"), ks)
+
     print("Checks can't be quietly removed")
     cfg = json.loads((d / ".ratchet/config.json").read_text())
     cfg["checks"] = []
     (d / ".ratchet/config.json").write_text(json.dumps(cfg))
-    r = rx(d, "complete", "CP2")
-    st = json.loads((d / ".ratchet/runs/f/state.json").read_text())
-    r2 = rx(d, "reviewers", "CP2")
+    r = rx(d, "status", "--json")
+    r2 = rx(d, "deferred")
+    probs = __import__("importlib.util").util
+    spec = probs.spec_from_file_location("eng_rm", g.ENGINE)
+    m_ = probs.module_from_spec(spec)
+    spec.loader.exec_module(m_)
+    import os as _os
+    _os.environ["RATCHET_HOST_PROVIDER"] = "anthropic"
+    _os.environ["RATCHET_HOME"] = g.ENV["RATCHET_HOME"]
+    ctx_ = m_.Ctx(d)
     check("removing a check after approval stops the run until the user confirms",
-          "checks" in (r.stderr + r2.stderr), (r.stderr[-300:], r2.stderr[-300:]))
+          any("checks" in p for p in m_.integrity_problems(ctx_, ctx_.state())), m_.integrity_problems(ctx_, ctx_.state()))
 
     print("Kinds come only from the reviewer's own label")
     import importlib.util as iu
@@ -225,10 +291,10 @@ def main():
     g.approve_plan(d3)
     g.to_adversarial(d3, "CP1")
     for where in ("src/f.js", "src/a.js"):
+        put(d3, "CP1", {where: BAD_F if where.endswith("f.js") else BAD_A})
         rnd = open_round(d3, "CP1")
         record(d3, "CP1", rnd, {0: DBF(where)})
-        (d3 / "src/f.js").write_text(f"export const f = () => 1; // {where}\n")
-        rx(d3, "behavior", "CP1")
+    put(d3, "CP1", {"src/f.js": OK_F, "src/a.js": "export const a = 1;\n"})
     rx(d3, "ask", "choice", "--options", "A,B,C", "--guardrail", "A=handler-imports-db")
     g.say(d3, "A")
     rx(d3, "choice")
@@ -254,6 +320,54 @@ def main():
           r.returncode != 0 and "doesn't catch the mistake" in r.stderr, r.stderr)
     cfg = json.loads((d3 / ".ratchet/config.json").read_text())
     check("… and nothing was added to the project's checks", not cfg.get("checks"), cfg.get("checks"))
+
+    print("High-risk kinds: disguised variants written without seeing the check")
+    d5 = g.project("guard5", cps=2, extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20"])
+    g.approve_plan(d5)
+    g.to_adversarial(d5, "CP1")
+    BLK = lambda where: [dict(DBF(where)[0], severity="blocker")]
+    for where, text in (("src/f.js", BAD_F), ("src/a.js", BAD_A)):
+        put(d5, "CP1", {where: text})
+        record(d5, "CP1", open_round(d5, "CP1"), {0: BLK(where)})
+    put(d5, "CP1", {"src/f.js": OK_F, "src/a.js": "export const a = 1;\n"})
+    rx(d5, "ask", "choice", "--options", "A,B,C", "--guardrail", "A=handler-imports-db")
+    g.say(d5, "A")
+    rx(d5, "choice")
+    check("guardrail added", rx(d5, "guardrail", "--kind", "handler-imports-db", *GARGS).returncode == 0)
+    plan = json.loads((d5 / ".ratchet/runs/f/checkpoints.json").read_text())
+    gcp = next(c for c in plan["checkpoints"] if c.get("guardrail"))
+    check("a kind once rated a blocker makes a high-risk guardrail step", gcp["risk"] == "high"
+          and gcp["guardrail"]["high_risk"] is True, gcp)
+    record(d5, "CP1", open_round(d5, "CP1"))
+    rx(d5, "complete", "CP1")
+    nx = json.loads(rx(d5, "next").stdout)
+    check("next says to have the variant writer go first, without the check",
+          "ratchet-variant-writer" in nx["action"] and "never the check" in nx["action"], nx["action"])
+    (d5 / "tests/fixtures/bad").mkdir(parents=True)
+    (d5 / "tests/fixtures/bad/handler.js").write_text("// FORBIDDEN: import db\n")
+    (d5 / "tests/guard.test.js").write_text(GUARD_TEST.replace("{cp}", "CP3"))
+    r = rx(d5, "tests-written", "CP3")
+    check("tests can't be marked written before the variants exist", r.returncode != 0 and "ratchet-variant-writer" in r.stderr,
+          r.stderr)
+    vd = d5 / "tests/fixtures/guardrails/handler-imports-db/variants"
+    for i, text in enumerate(["// FORBIDDEN import db\n", "/* FORBIDDEN */ const x = 1;\n", "// forbidden: db\n"]):
+        (vd / "bad").mkdir(parents=True, exist_ok=True)
+        (vd / "bad" / f"v{i}.js").write_text(text)
+    for i, text in enumerate(["// allowed: import logger\n", "const forbiddenWords = [];\n".replace("forbidden", "banned")]):
+        (vd / "good").mkdir(parents=True, exist_ok=True)
+        (vd / "good" / f"ok{i}.js").write_text(text)
+    check("tests written once the variants exist", rx(d5, "tests-written", "CP3").returncode == 0)
+    rx(d5, "red", "CP3")
+    (d5 / "guard").mkdir()
+    (d5 / "guard/check.mjs").write_text(CHECK_JS)                 # upper case only: misses the lower-case variant
+    rx(d5, "implemented", "CP3")
+    check("behavior passes", rx(d5, "behavior", "CP3").returncode == 0)
+    rnd = open_round(d5, "CP3")
+    check("a high-risk guardrail gets four reviewers", len(rnd["reviewers"]) == 4, rnd["reviewers"])
+    record(d5, "CP3", rnd)
+    r = rx(d5, "complete", "CP3")
+    check("a check that misses a disguised variant can't complete, and Ratchet names the variant",
+          r.returncode != 0 and "misses the disguised bad variant" in r.stderr and "v2.js" in r.stderr, r.stderr)
 
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
