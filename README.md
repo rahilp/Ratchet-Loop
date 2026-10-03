@@ -8,21 +8,25 @@ You don't type any commands. You talk to your agent like normal, and it runs Rat
 
 ## Step 1: Install Ratchet (once)
 
-Ratchet works in Claude Code, Codex, Gemini CLI and GitHub Copilot CLI.
+Ratchet works in Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. You install it once per computer, not once per project. After that it's available in every project you open.
 
 **1. Download this repo.** Clone it or download the zip. Remember where you put it (or copy its web address).
 
-**2. Ask your agent to install it.** Open your agent in your project folder and paste this, with your own address or folder path in the angle brackets:
+**2. Ask your agent to install it.** Open your agent (in any folder) and paste this, with your own address or folder path in the angle brackets:
 
 > Please install Ratchet Loop from <this repo's address, or the path of my local clone> and set it up for this CLI.
 
 The agent will ask before it changes anything. Part of the setup is adding Ratchet's hooks to your CLI. Hooks are what stop the agent from skipping a gate, so they matter.
 
-**3. Restart your CLI.** Hooks only load when the CLI starts, so the agent will ask you to close it and open it again. Do that in the same folder, then say:
+**3. Restart your CLI.** Hooks only load when the CLI starts, so the agent will ask you to close it and open it again. Do that, then say:
 
 > Set up Ratchet and continue
 
 The agent checks everything works and tells you it's ready.
+
+The hooks do nothing in projects where you're not using Ratchet, so they won't get in the way of your other work. If you use more than one of these CLIs, ask each one to install Ratchet for itself.
+
+Prefer to keep Ratchet's setup inside a single project instead? Ask your agent to "install Ratchet Loop for this project only".
 
 You'll need your project in a git repository, and Python 3, which most computers already have. If you're building screens or pages, Ratchet also uses Node and Playwright to take screenshots. The agent will offer to set those up if they're missing.
 
