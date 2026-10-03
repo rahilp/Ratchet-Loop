@@ -110,7 +110,7 @@ pre.learn{white-space:pre-wrap;background:var(--surface);border:1px solid var(--
 const EMBEDDED = /*__RATCHET_DATA__*/null;
 const GATE_LABEL = {behavior:"Tests", ui:"Look and feel", adversarial:"Second opinion", human:"Your OK"};
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const openState = new Set();
+const openState = new Set(["spec"]);
 
 function callout(d){
   const st = d.state, phase = st.phase;
@@ -159,10 +159,19 @@ function reviewsBlock(r){
     r.deferred_total?`<div class="meta">${r.deferred_total} minor finding(s) noted for later; you'll see them at the final review.</div>`:""}</div>`;
 }
 
+function specBlock(sp){
+  if(!sp || !sp.rows) return "";
+  const proven = sp.rows.filter(r=>r.state==="proven").length;
+  const rows = sp.rows.map(r=>`<tr data-testid="spec-row"><td>${esc(r.requirement)}${r.name&&r.name!==r.requirement?`<div class="meta">${esc(r.name)}</div>`:""}</td><td>${
+    r.tests.map(t=>`<code>${esc(t)}</code>`).join(" ")||"—"}</td><td><span class="tag ${r.state==="proven"?"":r.state==="not planned"?"edge":""}">${esc(r.state)}</span></td></tr>`).join("");
+  return `<details class="cp" data-id="spec" data-testid="spec-coverage" ${openState.has("spec")?"open":""}><summary><span class="num">Spec</span><span><div class="title">From the spec: ${esc(sp.items.map(i=>i.label).join("; "))}</div><div class="sum">${proven} of ${sp.rows.length} scenario(s) proven by passing tests · ${sp.tasks_ticked} of ${sp.tasks_total} task(s) ticked</div></span></summary>
+    <div class="body"><table><thead><tr><th>Requirement / scenario</th><th>Tests</th><th>State</th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
+}
+
 function renderPlan(d){
   const cps = d.plan?.checkpoints || [];
   if(!cps.length) return `<div class="empty">No checkpoints yet.</div>`;
-  return cps.map((cp,i)=>{
+  return specBlock(d.spec) + cps.map((cp,i)=>{
     const s = d.state.checkpoints?.[cp.id] || {};
     const isCur = d.state.current===cp.id && d.state.phase==="building";
     const cls = s.status==="done"?"done":isCur?"active":"";

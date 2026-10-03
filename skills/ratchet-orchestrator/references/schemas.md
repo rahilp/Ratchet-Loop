@@ -13,6 +13,7 @@ Contents
 8. `.ratchet/config.json`
 9. `ratchet.py status --json` / `lanes --json` — director interfaces
 10. Hooks
+11. Building from a spec tool (OpenSpec, Spec Kit, BMAD)
 
 ---
 
@@ -39,7 +40,7 @@ Contents
     checkpoints.json
     tests/CP1.json …
     states/CP1.json …  # UI capture specs
-    reference/         # prototype.html or reference screenshots
+    reference/         # prototype.html or reference screenshots; spec-source.json when built from a spec (section 11)
     reviews/           # scratch area where reviewers write JSON
     evidence/CP1/…     # logs, screenshots, reviews archived by ratchet.py (protected)
     viewer.html
@@ -119,6 +120,7 @@ Rules enforced by `ratchet.py plan-submit`:
 - optional `ui_skip_reason` shown in the viewer when `ui:false`
 - `risk`: `low` | `normal` (default) | `high`, which picks the adversarial reviewer set from config `review_depth`
 - optional `reviewers`: an explicit list of reviewer ids that overrides `review_depth` for this checkpoint
+- on a run built from a spec (section 11): every spec task ref is in some checkpoint's `spec_refs`, every scenario or acceptance-criterion ref has a test case with that `spec_ref` (or is in `spec_refs` of a UI-gated checkpoint), every ref exists in the spec, and anything left out is in the top-level `spec_unmapped` as `{"ref", "reason"}`
 
 Feedback (EXTEND mode) only appends new checkpoints with the next free ids; completed checkpoints are never edited or removed.
 
@@ -142,6 +144,8 @@ Feedback (EXTEND mode) only appends new checkpoints with the next free ids; comp
   ]
 }
 ```
+
+On a run built from a spec, a case carries `"spec_ref": "<scenario ref>"` (or a list) for the scenario or acceptance criterion it proves.
 
 `layer`: `code` (unit/integration/API/CLI — MUST be automated and tagged with its ID in the test name) or `browser` (only checkable by clicking — handed to the UI gate). `ratchet.py tests-written` and `ratchet.py behavior` fail if any `code` case ID is missing from `tests.files`.
 
@@ -337,4 +341,26 @@ Runtime files: `.ratchet/hook-heartbeat.json` (last time each hook fired and via
 | `waived` | bool | (`status --json`, `next`, viewer-data `hooks`, plain `status`; not `doctor`) the user chose to build without hooks (`ask hooks-waive`, then `hooks-waive` after their reply, which must be one of a fixed allow-list of full phrases, `HOOKS_WAIVE_PHRASES` in ratchet.py, after lowercasing and dropping punctuation and a trailing \"please\": \"yes go ahead without hooks\", \"yes skip the hooks\", \"yes build without hooks\", \"go ahead without hooks\", \"skip the hooks\", \"proceed without hooks\"; anything else is refused and clears the question; stored in state.json as `hooks_waived {at, by, prompt}`, with a `hooks_waived` history event). True only while no enforcement hook is installed or seen firing: the guard and stop hooks decide, not the prompt hook (which is how the yes is recorded) and not `missing`. Once they are installed or fire, the next state save removes `hooks_waived` (history event `hooks_waive_cleared`), so it cannot resurface later without new consent. `hooks-waive` refuses to record anything while they are active. Never blocks anything |
 
 `hooks_warning` (string or null) is null when `fresh`. Otherwise it tells the agent either that the hooks are installed but silent (restart the CLI) or that none fired yet (offer to run `install-hooks`, ask the user first). A corrupt or odd `hook-heartbeat.json` or `config.json` counts as empty here; `doctor` never raises for it.
+
+## 11. Building from a spec tool (OpenSpec, Spec Kit, BMAD)
+
+`ratchet.py spec detect [--json]` lists open items: OpenSpec changes (`openspec/changes/<id>/`, not `archive/`), Spec Kit features (`specs/<NNN-name>/` with `.specify/`; the current one from `SPECIFY_FEATURE_DIRECTORY`, `.specify/feature.json` or `SPECIFY_FEATURE`), BMAD stories (v4: `devStoryLocation` in `bmad-core/core-config.yaml`, default `docs/stories/{epic}.{story}.*.md`; v6: `_bmad-output/implementation-artifacts/{epic}-{story}-*.md` with `sprint-status.yaml`), skipping finished ones.
+
+`ratchet.py spec import <openspec|speckit|bmad|auto> <id…> [--force]` (while planning) writes `reference/spec-source.json` (`{"items": [{"tool", "id", "path"}], "imported_at"}`), a draft `checkpoints.json` and `tests/CPn.json` (unless a plan exists; `--force` replaces it), and adds the tool's standards files to config `standards` (OpenSpec `openspec/config.yaml` / `project.md`, Spec Kit `.specify/memory/constitution.md`, BMAD `docs/architecture/coding-standards.md` or `docs/architecture.md`). `auto` picks the only open item (or the only one matching the ids given).
+
+Refs (stable ids the plan points at):
+
+| Tool | Scenario / criterion (needs a test) | Requirement | Task (needs a step) |
+|---|---|---|---|
+| OpenSpec | `<change>#req:<capability>/<requirement-slug>/sc:<scenario-slug>` (each `#### Scenario:` under ADDED/MODIFIED) | `<change>#req:<cap>/<slug>` | `<change>#task:1.1` |
+| Spec Kit | `<feature>#US1/AS2` (user story acceptance scenarios); `<feature>#FR-001` (a functional requirement is tested itself) | `<feature>#US1` | `<feature>#T012` |
+| BMAD | `<story>#AC2` | same | `<story>#task:1` (subtasks `#task:1.2` follow their task) |
+
+Draft plan: one checkpoint per OpenSpec task group (each requirement goes with the group that talks about the same things), per Spec Kit user story (setup tasks in the first, FRs in the last), per BMAD story. Each checkpoint gets `spec_refs` and a `spec` block (`source`, `requirements` with their scenarios) that reviewers see. The draft has no test command, so the planner must refine it before `plan-submit`.
+
+Locking: the spec's requirements, scenarios and task list (not task ticks or status) are part of the plan approval; changing them mid-build stops the run like any other locked file.
+
+Write-back: when a checkpoint completes, Ratchet ticks its `spec_refs` tasks (`- [ ]` → `- [x]`; a BMAD task ticks its subtasks) and commits those files with the checkpoint. When the last checkpoint touching a BMAD story completes, the story's status becomes `Done` (v4) / `done` (v6, also in `sprint-status.yaml`) and a `### Ratchet verification` note (steps, commits, the test proving each acceptance criterion) goes under `## QA Results`. When the run is approved (or finishes in `none` mode), each OpenSpec change whose tasks are all ticked is archived with `openspec archive <id> -y` and committed on its own; without the CLI the change stays open and Ratchet says so. Config `spec_archive: false` turns archiving off.
+
+`ratchet.py spec status [--json]`: per scenario, its tests, steps and state (`not planned`, `planned`, `proven` once every step covering it is done, `left out: <reason>`), and which tasks are ticked. `viewer-data.json` has the same under `spec`.
 

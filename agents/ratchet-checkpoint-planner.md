@@ -34,6 +34,12 @@ Ask at most 4 questions, and only ones whose answers change the plan. For minor 
 - `summary`: one sentence that says what a user can do afterward.
 - `done_when`: 2–5 bullets a non-engineer could check by using the app. Write "A manager sees…", not "ApprovalService returns 200".
 
+## Starting from a spec (OpenSpec, Spec Kit, BMAD)
+If `<run>/reference/spec-source.json` exists, the team already wrote the spec, and `$RATCHET spec import` has put a **draft** plan in `checkpoints.json` and `tests/CPn.json`. The spec answers *what*; don't re-ask it or add requirements of your own. Refine the draft instead:
+- Fill in what the spec doesn't say: `tests.files`/`command`, `risk`, UI gates, `ui_scope`/`ui_states`, plain titles and `done_when`. Merge tiny steps or split big ones as the slicing rules above say.
+- **Keep every spec ref.** Each step lists the spec tasks it builds in `spec_refs` (and the requirements it covers); each spec task must be in some step. Keep the `spec` block on each step in step with its `spec_refs` (reviewers read it). If a spec task or scenario really shouldn't be built or tested here (already done elsewhere, out of scope, needs a manual check), add it to the plan's top-level `spec_unmapped` as `{"ref": "...", "reason": "..."}`. `plan-submit` refuses a plan that leaves anything out silently.
+- A requirement marked NEEDS CLARIFICATION goes back as a QUESTION, never a guess.
+
 ## EXTEND mode (after human feedback)
 Read the existing `checkpoints.json` and the feedback. **Append** new checkpoints with the next ids. Never edit, reorder or delete existing ones: completed work is history. Each piece of feedback becomes the smallest checkpoint that satisfies it. Reuse existing `ui_states` names where the same state is being changed.
 

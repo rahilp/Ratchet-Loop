@@ -44,6 +44,10 @@ RATCHET_DIR = ".ratchet"
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 VIEWER_TEMPLATE = SKILL_DIR / "assets" / "viewer.html"
+sys.path.insert(0, str(SCRIPT_DIR))
+_dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True  # never litter the installed plugin with __pycache__
+import spec_sources as specsrc  # noqa: E402
+sys.dont_write_bytecode = _dwb
 
 GATES = ["behavior", "ui", "adversarial", "human"]
 STEPS = ["tests", "red", "implement", "behavior", "ui", "adversarial", "complete"]
@@ -131,6 +135,7 @@ DEFAULT_CONFIG = {
         "*.sass", "*.less", "*.styl", "*.swift", "*.kt", "*.xml", "*.dart", "*.erb",
         "*.blade.php", "*.hbs", "*.njk", "*.liquid", "tailwind.config.*", "*.svg",
     ],
+    "spec_archive": True,           # archive an OpenSpec change (merge its deltas into the specs) when the run is approved
     "regression_command": None,     # full suite run before a checkpoint can complete
     "commit_per_checkpoint": True,
     "design_md": "DESIGN.md",
@@ -328,7 +333,7 @@ def fingerprint(root: Path) -> dict:
     return {"kind": "manifest", "id": fid}
 
 
-def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str):
+def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str, extra: dict | None = None):
     """Commit exactly what this checkpoint changed, byte for byte as reviewed: HEAD plus the difference between the
     checkpoint's starting tree and the reviewed tree. Unrelated work already in the tree, and anything the user has
     staged, stays out. Built with a private index, so renames, deletions, odd file names and fingerprint_include
@@ -337,7 +342,7 @@ def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str):
         die("This checkpoint has no recorded starting tree, so Ratchet can't tell which changes are its own. "
             "Commit it by hand, or set commit_per_checkpoint to false.")
     paths = changed_files(root, {"kind": "git-tree", "id": base_tree}, fp)
-    if not paths:
+    if not paths and not extra:
         return None
     shared = []  # the .ratchet files people edit and share ride along with the checkpoint (never run state)
     for name in (".gitignore", "config.json", "standards.md", "learnings.md"):
@@ -347,6 +352,11 @@ def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str):
                                  text=True).stdout.strip()
             if oid:
                 shared.append((f"{RATCHET_DIR}/{name}", oid))
+    for rel, text in (extra or {}).items():  # files Ratchet itself updated after review (spec task ticks), as given
+        oid = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=root, capture_output=True,
+                             input=text.encode("utf-8", "surrogateescape")).stdout.decode().strip()
+        if oid:
+            shared.append((rel, oid))
     def git(*a, env=None, inp=None):
         r = subprocess.run(["git", *a], cwd=root, capture_output=True, input=inp, env=env)
         if r.returncode != 0:
@@ -371,7 +381,7 @@ def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str):
                 info.append(f"{mode} {oid}\t{p}")
             else:
                 info.append(f"0 {'0' * 40}\t{p}")  # mode 0 removes the path
-        info += [f"100644 {oid}\t{rel}" for rel, oid in shared]
+        info += [f"{(entries.get(rel) or ['100644'])[0]} {oid}\t{rel}" for rel, oid in shared]  # later lines win
         git("update-index", "-z", "--index-info", env=env,
             inp="\0".join(info).encode("utf-8", "surrogateescape") + b"\0")
         tree = git("write-tree", env=env).strip()
@@ -634,6 +644,7 @@ def approval_snapshot(ctx, st) -> dict:
             "rules": {k: _sha(cfg.get(k)) for k in RULE_KEYS},
             "files": _reference_files(ctx),
             "custom_providers": _custom_providers_sha(cfg),
+            "spec": _spec_snapshot(ctx),
             "host": detect_host(cfg),
             "human_review": st.get("human_review")}
 
@@ -667,6 +678,9 @@ def integrity_problems(ctx, st) -> list[str]:
     if "custom_providers" in snap and snap["custom_providers"] != now_["custom_providers"]:
         out.append("custom review commands in config 'providers' (a reviewer defined by its own command, or its "
                    "company, was added or changed)")
+    if snap.get("spec") and snap["spec"] != now_.get("spec"):
+        out.append("the spec this run was built from (" + ", ".join(
+            f"{r['tool']} {r['id']}" for r in (spec_source(ctx) or {}).get("items") or []) + ")")
     out += weakened_tests(ctx, st)
     if snap.get("host") and snap["host"] != now_["host"]:
         out.append(f"host provider ({snap['host']} → {now_['host']})")
@@ -1033,6 +1047,8 @@ def cmd_plan_summary(args):
         die("There is no plan yet. Finish planning first, then ask again.")
     cfg = ctx.config()
     print(f"Plan: {plan.get('feature') or st.get('feature')} ({len(plan['checkpoints'])} steps)")
+    for line in spec_summary_lines(ctx, plan):
+        print(line)
     all_host = True
     for i, cp in enumerate(plan["checkpoints"], 1):
         risk = cp.get("risk", "normal")
@@ -1044,6 +1060,9 @@ def cmd_plan_summary(args):
         print(f"   UI review: {'yes' if (cp.get('gates') or {}).get('ui') else 'no'}")
         print(f"   Risk: {risk}" + ("" if bar == "all" else f" (only {' and '.join(bar)} findings block; minor ones are noted for later)"))
         print(f"   Reviewed by: {'; '.join(who)}")
+        sl = _step_spec_line(cp)
+        if sl:
+            print(f"   From the spec: {sl}")
     rows = dict(models_table(cfg))
     groups = {}
     for role, m in rows.items():
@@ -1646,7 +1665,7 @@ def cmd_plan_submit(args):
     plan = ctx.plan()
     if plan is None:
         die("checkpoints.json not found in the run folder")
-    errs = validate_plan(plan)
+    errs = validate_plan(plan) + spec_plan_problems(ctx, plan)
     if errs:
         die("Plan invalid:\n  - " + "\n  - ".join(errs))
     st["phase"] = "awaiting_plan_approval"
@@ -2990,6 +3009,446 @@ def _finish_guardrail(ctx, st, cp):
     _append_learning(ctx, f"{gr.get('why') or gr['kind']}: enforced by `{command}`", f"guardrail {cp['id']}")
 
 
+# ---- spec tools: OpenSpec, Spec Kit, BMAD ---------------------------------------------------------------------
+# The team's spec says WHAT to build; Ratchet proves it was built. A run can start from a spec item: its scenarios /
+# acceptance criteria each need a planned test (case "spec_ref"), its tasks each belong to a step ("spec_refs"),
+# and when a step passes every gate Ratchet ticks those tasks in the spec tool's own files.
+
+TOOL_PLAIN = {"openspec": "OpenSpec change", "speckit": "Spec Kit feature", "bmad": "BMAD story"}
+
+
+def _spec_source_path(ctx) -> Path:
+    return ctx.run_dir() / "reference" / "spec-source.json"
+
+
+def spec_source(ctx) -> dict | None:
+    try:
+        src = read_json(_spec_source_path(ctx))
+    except SystemExit:
+        return None
+    return src if isinstance(src, dict) and src.get("items") else None
+
+
+def spec_items(ctx, src=None) -> list[dict]:
+    """The spec items this run was built from, read fresh from the tool's files."""
+    src = src or spec_source(ctx)
+    out = []
+    for ref in (src or {}).get("items") or []:
+        try:
+            out.append(specsrc.load(ctx.root, ref["tool"], ref["id"]))
+        except (FileNotFoundError, ValueError) as e:
+            out.append({"tool": ref["tool"], "id": ref["id"], "title": ref["id"], "missing": str(e),
+                        "requirements": [], "tasks": [], "standards": []})
+    return out
+
+
+def _spec_label(it) -> str:
+    return f"{TOOL_PLAIN.get(it['tool'], it['tool'])} {it['id']}" + (f" ({it['title']})" if it.get("title") not in (None, it["id"]) else "")
+
+
+def _as_list(v) -> list:
+    return [x for x in (v if isinstance(v, list) else [v]) if isinstance(x, str) and x]
+
+
+def spec_coverage(ctx, plan, items) -> dict:
+    """Which spec refs the plan covers: scenarios need a test case (or a UI-reviewed step), tasks need a step."""
+    tests_need = specsrc.scenario_refs(items)
+    task_refs = [t["ref"] for it in items for t in it["tasks"] if not t.get("subtask")]
+    done_tasks = {t["ref"] for it in items for t in it["tasks"] if t["done"]}
+    known = set(tests_need) | {t["ref"] for it in items for t in it["tasks"]} | \
+        {r["ref"] for it in items for r in it["requirements"]}
+    unmapped, bad_unmapped = {}, []
+    for u in plan.get("spec_unmapped") or []:
+        ref = u.get("ref") if isinstance(u, dict) else None
+        if not ref:
+            bad_unmapped.append(str(u)[:80])
+        elif not str(u.get("reason") or "").strip():
+            bad_unmapped.append(ref)
+        else:
+            unmapped[ref] = u["reason"].strip()
+    by_case, by_step, ui_steps, unknown = {}, {}, {}, set()
+    for cp in plan.get("checkpoints") or []:
+        for ref in _as_list(cp.get("spec_refs") or []):
+            by_step.setdefault(ref, []).append(cp["id"])
+            if (cp.get("gates") or {}).get("ui"):
+                ui_steps.setdefault(ref, []).append(cp["id"])
+            if ref not in known:
+                unknown.add(ref)
+        for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
+            for ref in _as_list(case.get("spec_ref")):
+                by_case.setdefault(ref, []).append({"case": case.get("id"), "checkpoint": cp["id"]})
+                if ref not in known:
+                    unknown.add(ref)
+    unknown |= {r for r in unmapped if r not in known}
+    no_test = [r for r in tests_need if r not in by_case and r not in ui_steps and r not in unmapped]
+    no_step = [r for r in task_refs if r not in by_step and r not in done_tasks and r not in unmapped]
+    return {"scenarios": tests_need, "tasks": task_refs, "by_case": by_case, "by_step": by_step,
+            "ui_steps": ui_steps, "unmapped": unmapped, "no_test": no_test, "no_step": no_step,
+            "unknown": sorted(unknown), "bad_unmapped": bad_unmapped, "done_tasks": sorted(done_tasks),
+            "unclear": [r for it in items for r in it.get("unclear") or []],
+            "missing": [f"{it['tool']} {it['id']}" for it in items if it.get("missing")]}
+
+
+def spec_plan_problems(ctx, plan) -> list[str]:
+    src = spec_source(ctx)
+    if not src:
+        return []
+    items = spec_items(ctx, src)
+    cov = spec_coverage(ctx, plan, items)
+    errs = [f"the spec item {m} can't be read any more" for m in cov["missing"]]
+    if cov["no_test"]:
+        errs.append("no planned test covers these spec scenarios/criteria (give a test case \"spec_ref\", or list "
+                    "them in the plan's spec_unmapped with a reason): " + ", ".join(cov["no_test"][:20]))
+    if cov["no_step"]:
+        errs.append("these spec tasks aren't in any step's spec_refs (add them, or list them in spec_unmapped with "
+                    "a reason): " + ", ".join(cov["no_step"][:20]))
+    if cov["unknown"]:
+        errs.append("these refs aren't in the spec (typo, or the spec changed?): " + ", ".join(cov["unknown"][:20]))
+    if cov["bad_unmapped"]:
+        errs.append("every spec_unmapped entry needs a ref and a reason: " + ", ".join(cov["bad_unmapped"][:10]))
+    return errs
+
+
+def _spec_snapshot(ctx) -> str | None:
+    src = spec_source(ctx)
+    return _sha(specsrc.spec_digest(spec_items(ctx, src))) if src else None
+
+
+def _spec_standards(items) -> list[str]:
+    seen = []
+    for it in items:
+        for s in it.get("standards") or []:
+            if s not in seen:
+                seen.append(s)
+    return seen
+
+
+def _pick_spec_items(ctx, tool, ids) -> list[tuple[str, str]]:
+    found = specsrc.detect(ctx.root)
+    if tool == "auto":
+        cands = [(t, x["id"]) for t, xs in found.items() for x in xs]
+        if ids:
+            cands = [c for c in cands if c[1] in ids]
+        if len(cands) != 1:
+            names = "; ".join(f"{TOOL_PLAIN[t]} {i}" for t, i in cands) or "none"
+            die(f"Can't pick a spec item automatically ({len(cands)} open: {names}). Name the tool and item.")
+        return cands
+    if tool not in TOOL_PLAIN:
+        die(f"Unknown spec tool '{tool}'. Use openspec, speckit, bmad or auto.")
+    if not ids:
+        die(f"Name the {TOOL_PLAIN[tool]} to build (see `ratchet.py spec detect`).")
+    return [(tool, i) for i in ids]
+
+
+def cmd_spec(args):
+    ctx = Ctx(find_root())
+    if args.spec_cmd == "detect":
+        found = specsrc.detect(ctx.root)
+        if args.json:
+            print(json.dumps(found, indent=2))
+            return
+        if not found:
+            print("No OpenSpec, Spec Kit or BMAD files found in this project.")
+            return
+        for tool, xs in found.items():
+            print(f"{TOOL_PLAIN[tool]}s still open: {len(xs)}")
+            for x in xs:
+                bits = [x.get("status") or ""]
+                if "scenarios" in x:
+                    bits.append(f"{x['scenarios']} scenarios")
+                if "criteria" in x:
+                    bits.append(f"{x['criteria']} acceptance criteria")
+                bits.append(f"{x.get('tasks', 0)} tasks")
+                if x.get("current"):
+                    bits.append("current feature")
+                if x.get("unclear"):
+                    bits.append(f"{len(x['unclear'])} requirement(s) marked NEEDS CLARIFICATION")
+                if tool == "bmad" and not x.get("approved"):
+                    bits.append("not approved yet")
+                print(f"  - {x['id']}: {x['title']} ({', '.join(b for b in bits if b)})")
+        return
+    if args.spec_cmd == "import":
+        st = ctx.state()
+        if st["phase"] not in ("planning", "awaiting_plan_approval"):
+            die(f"Import a spec while planning (phase is {st['phase']}).")
+        picks = _pick_spec_items(ctx, args.tool, args.items or [])
+        items = []
+        for tool, iid in picks:
+            try:
+                items.append(specsrc.load(ctx.root, tool, iid))
+            except (FileNotFoundError, ValueError) as e:
+                die(str(e))
+        rd = ctx.run_dir()
+        (rd / "reference").mkdir(parents=True, exist_ok=True)
+        write_json(_spec_source_path(ctx), {"items": [{"tool": it["tool"], "id": it["id"], "path": it["path"]}
+                                                       for it in items], "imported_at": now()})
+        plan, tests = specsrc.draft_plan(items, st.get("feature") or items[0]["title"])
+        wrote_plan = args.force or not (rd / "checkpoints.json").exists()
+        if wrote_plan:
+            write_json(rd / "checkpoints.json", plan)
+            for cid, tp in tests.items():
+                if args.force or not (rd / "tests" / f"{cid}.json").exists():
+                    write_json(rd / "tests" / f"{cid}.json", tp)
+        stds = _spec_standards(items)
+        user = read_json(ctx.config_path, {}) or {}
+        cur = list(ctx.config().get("standards") or [])
+        add = [s for s in stds if s not in cur]
+        if add:
+            user["standards"] = cur + add
+            write_json(ctx.config_path, user)
+        ctx.log(st, "spec_imported", items=[f"{it['tool']}:{it['id']}" for it in items])
+        ctx.save_state(st)
+        cov_scen = sum(len(specsrc.scenario_refs([it])) for it in items)
+        out = {"items": [{"tool": it["tool"], "id": it["id"], "title": it["title"], "status": it.get("status"),
+                          "approved": it.get("approved"), "unclear": it.get("unclear") or [],
+                          "removed": [r["ref"] for r in it.get("removed") or []]} for it in items],
+               "scenarios": cov_scen, "tasks": sum(len(it["tasks"]) for it in items),
+               "draft_steps": len(plan["checkpoints"]) if wrote_plan else None, "standards_added": add}
+        if args.json:
+            print(json.dumps(out, indent=2))
+            return
+        for it in items:
+            ok(f"Imported {_spec_label(it)}: {len(specsrc.scenario_refs([it]))} scenario(s) to test, "
+               f"{len(it['tasks'])} task(s).")
+            if not it.get("approved"):
+                print(f"  Note: its status is '{it.get('status')}', so the team may not have approved it yet.")
+            if not specsrc.scenario_refs([it]):
+                print("  Note: no requirements, scenarios or acceptance criteria could be read from it, so nothing in it "
+                      "would need a test. Check how it is written before relying on the coverage check.")
+            if it.get("unclear"):
+                print(f"  Note: {len(it['unclear'])} requirement(s) are marked NEEDS CLARIFICATION: "
+                      + ", ".join(it["unclear"]))
+            if it.get("removed"):
+                print(f"  Removes {len(it['removed'])} requirement(s): " + ", ".join(r["title"] for r in it["removed"]))
+        if wrote_plan:
+            print(f"Draft plan written: {len(plan['checkpoints'])} step(s) in checkpoints.json and tests/. "
+                  "The planner fills in test commands, files, risk and UI checks, and keeps every spec ref.")
+        else:
+            print("checkpoints.json already exists, so it was left alone (use --force to replace it with a draft).")
+        if add:
+            print("Added to the standards reviewers enforce: " + ", ".join(add))
+        return
+    if args.spec_cmd == "status":
+        src = spec_source(ctx)
+        if not src:
+            print("This run wasn't started from a spec.")
+            return
+        st = ctx.state()
+        items = spec_items(ctx, src)
+        plan = ctx.plan() or {"checkpoints": []}
+        cov = spec_coverage(ctx, plan, items)
+        done = {cid for cid, c in (st.get("checkpoints") or {}).items() if c.get("status") == "done"}
+        rows = []
+        for ref in cov["scenarios"]:
+            cases = cov["by_case"].get(ref) or []
+            steps = sorted({c["checkpoint"] for c in cases} | set(cov["ui_steps"].get(ref) or []))
+            state = "not planned" if not steps else ("proven" if all(s in done for s in steps) else "planned")
+            if ref in cov["unmapped"]:
+                state = "left out: " + cov["unmapped"][ref]
+            rows.append({"ref": ref, "tests": [c["case"] for c in cases], "steps": steps, "state": state})
+        ticked = set(cov["done_tasks"])
+        trows = [{"ref": r, "steps": cov["by_step"].get(r) or [], "ticked": r in ticked} for r in cov["tasks"]]
+        if args.json:
+            print(json.dumps({"items": [{"tool": it["tool"], "id": it["id"], "title": it.get("title"),
+                                         "status": it.get("status")} for it in items],
+                              "scenarios": rows, "tasks": trows, "problems": spec_plan_problems(ctx, plan)}, indent=2))
+            return
+        proven = sum(1 for r in rows if r["state"] == "proven")
+        print("Built from: " + "; ".join(_spec_label(it) for it in items))
+        print(f"Scenarios proven by passing tests: {proven} of {len(rows)}; tasks ticked: "
+              f"{sum(1 for t in trows if t['ticked'])} of {len(trows)}")
+        for r in rows:
+            print(f"  - {r['ref']}: {r['state']}" + (f" ({', '.join(r['tests'])})" if r["tests"] else ""))
+        return
+
+
+def spec_summary_lines(ctx, plan) -> list[str]:
+    src = spec_source(ctx)
+    if not src:
+        return []
+    items = spec_items(ctx, src)
+    cov = spec_coverage(ctx, plan, items)
+    approved = all(it.get("approved") for it in items)
+    lines = ["Built from: " + "; ".join(_spec_label(it) for it in items) +
+             (" (already agreed by the team)" if approved else " (not marked approved yet)")]
+    n = len(cov["scenarios"])
+    lines.append(f"Spec coverage: {n - len(cov['no_test']) - sum(1 for r in cov['scenarios'] if r in cov['unmapped'])}"
+                 f" of {n} scenario(s) have a planned test; {len(cov['tasks']) - len(cov['no_step'])} of "
+                 f"{len(cov['tasks'])} task(s) are in a step.")
+    for ref, why in cov["unmapped"].items():
+        lines.append(f"Left out on purpose: {ref} ({why})")
+    if cov["unclear"]:
+        lines.append("Still marked NEEDS CLARIFICATION in the spec: " + ", ".join(cov["unclear"]))
+    return lines
+
+
+def _step_spec_line(cp) -> str | None:
+    refs = _as_list(cp.get("spec_refs") or [])
+    if not refs:
+        return None
+    tasks = [r.split("#", 1)[1] for r in refs if "#task:" in r or re.search(r"#T\d+$", r)]
+    scen = [r for r in refs if r not in tasks and not ("#task:" in r or re.search(r"#T\d+$", r))]
+    bits = []
+    if scen:
+        bits.append(f"{len(scen)} requirement(s)/criteria")
+    if tasks:
+        bits.append("tasks " + ", ".join(t.replace("task:", "") for t in tasks[:8]) + ("…" if len(tasks) > 8 else ""))
+    return ", ".join(bits)
+
+
+def _compose(fns):
+    def run(text):
+        for fn in fns:
+            text = fn(text)
+        return text
+    return run
+
+
+def _spec_write_back(ctx, st, cp, fp, base_tree=None) -> tuple[dict, list[str]]:
+    """After a step passes every gate: tick its tasks in the spec files, and finish a BMAD story whose steps are all
+    done. The working files are updated, and the same edits are applied to the reviewed version of each file for the
+    commit, so the user's own unrelated edits to a spec file never ride along. Returns ({file: text to commit},
+    plain notes)."""
+    src = spec_source(ctx)
+    refs = set(_as_list(cp.get("spec_refs") or []))
+    if not src or not refs:
+        return {}, []
+    items = [it for it in spec_items(ctx, src) if not it.get("missing")]
+    edits, notes = {}, []
+    for rel, (iid, style) in specsrc.task_files(ctx.root, items, refs).items():
+        edits.setdefault(rel, []).append(lambda t, iid=iid, style=style: specsrc.tick_text(t, iid, style, refs))
+    fresh_ticks = sum(1 for it in items for t in it["tasks"] if t["ref"] in refs and not t["done"])
+    plan = ctx.plan() or {"checkpoints": []}
+    for it in items:
+        if it["tool"] != "bmad":
+            continue
+        mine = [c for c in plan["checkpoints"] if any(r.startswith(it["id"] + "#") for r in _as_list(c.get("spec_refs") or []))]
+        if not mine or cp["id"] not in [c["id"] for c in mine] or \
+                any(c["id"] != cp["id"] and st["checkpoints"][c["id"]]["status"] != "done" for c in mine):
+            continue
+        lines = [f"Built and checked by Ratchet (run {st['slug']}). Every step passed its tests and an independent "
+                 "code review before it was committed."]
+        for c in mine:
+            commit = st["checkpoints"][c["id"]].get("commit")
+            lines.append(f"- {c['id']} {c['title']}" + (f" (commit {commit})" if commit else ""))
+        for ac in it["requirements"]:
+            proof = [x["id"] for c in mine for x in (test_plan(ctx, c["id"]) or {}).get("cases") or []
+                     if ac["ref"] in _as_list(x.get("spec_ref"))]
+            lines.append(f"- {ac['title']}: " + (", ".join(proof) if proof else "no automated test (see the plan)"))
+        evidence, version = "\n".join(lines), it.get("version", "v4")
+        edits.setdefault(it["path"], []).append(lambda t, e=evidence, v=version: specsrc.bmad_finish_text(t, v, e)[0])
+        ss = specsrc.sprint_status_path(it)
+        if ss and (ctx.root / ss).exists():
+            key = Path(it["path"]).stem
+            edits.setdefault(ss, []).append(lambda t, k=key: specsrc.sprint_done_text(t, k))
+        if it.get("status_line"):
+            notes.append(f"marked BMAD story {it['id']} done and added Ratchet's evidence to it")
+        else:
+            notes.append(f"added Ratchet's evidence to BMAD story {it['id']}, but couldn't find its Status line to mark "
+                         "it done")
+    changed = [rel for rel, fns in edits.items()
+               if (ctx.root / rel).is_file() and specsrc._edit_file(ctx.root / rel, _compose(fns))]
+    if fresh_ticks:
+        notes.insert(0, f"ticked {fresh_ticks} task(s) in " + ", ".join(sorted(changed) or sorted(edits)))
+    blobs = {}
+    if fp.get("kind") == "git-tree":
+        # the version to tick: the reviewed one if this step changed the file, else the committed one (so edits the
+        # user had made to it before the step started stay theirs, uncommitted, like any other file)
+        stepped = set(changed_files(ctx.root, {"kind": "git-tree", "id": base_tree}, fp)) if base_tree else set()
+        for rel, fns in edits.items():
+            r = None
+            if rel not in stepped:
+                r = subprocess.run(["git", "cat-file", "blob", f"HEAD:{rel}"], cwd=ctx.root, capture_output=True)
+            if r is None or r.returncode != 0:
+                r = subprocess.run(["git", "cat-file", "blob", f"{fp['id']}:{rel}"], cwd=ctx.root, capture_output=True)
+            if r.returncode == 0:  # in neither (e.g. ignored by git): nothing to commit
+                blobs[rel] = specsrc._edit_text(specsrc._decode(r.stdout), _compose(fns))
+    return blobs, notes
+
+
+def _openspec_files(root: Path) -> dict:
+    out = {}
+    base = root / "openspec"
+    for dp, dns, fns in os.walk(base) if base.is_dir() else []:
+        for fn in fns:
+            f = Path(dp) / fn
+            try:
+                out[str(f.relative_to(root))] = hashlib.sha1(f.read_bytes()).hexdigest()
+            except OSError:
+                continue
+    return out
+
+
+def _commit_paths(root: Path, paths: list[str], msg: str) -> str | None:
+    """Commit exactly these paths as they are in the working tree (deleted ones removed), and nothing else: e.g. the
+    files an OpenSpec archive moved and merged. The user's other changes and staged files stay as they were."""
+    head = subprocess.run(["git", "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=root, capture_output=True,
+                          text=True).stdout.strip()
+    if not head or not paths:
+        return None
+    info = []
+    for rel in paths:
+        f = root / rel
+        if f.is_file() and not f.is_symlink():
+            oid = subprocess.run(["git", "hash-object", "-w", "--", str(f)], cwd=root, capture_output=True,
+                                 text=True).stdout.strip()
+            info.append(f"{'100755' if os.access(f, os.X_OK) else '100644'} {oid}\t{rel}")
+        else:
+            info.append(f"0 {'0' * 40}\t{rel}")
+    with tempfile.TemporaryDirectory() as td:
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(td) / "index"), GIT_LITERAL_PATHSPECS="1")
+        subprocess.run(["git", "read-tree", head], cwd=root, env=env, capture_output=True)
+        subprocess.run(["git", "update-index", "-z", "--index-info"], cwd=root, env=env, capture_output=True,
+                       input="\0".join(info).encode("utf-8", "surrogateescape") + b"\0")
+        tree = subprocess.run(["git", "write-tree"], cwd=root, env=env, capture_output=True, text=True).stdout.strip()
+        if not tree or tree == subprocess.run(["git", "rev-parse", f"{head}^{{tree}}"], cwd=root, capture_output=True,
+                                              text=True).stdout.strip():
+            return None
+        new = subprocess.run(["git", "commit-tree", tree, "-p", head, "-m", msg], cwd=root, capture_output=True,
+                             text=True).stdout.strip()
+    if not new:
+        return None
+    subprocess.run(["git", "update-ref", "HEAD", new, head], cwd=root, capture_output=True)
+    subprocess.run(["git", "reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], cwd=root,
+                   capture_output=True, input="\0".join(paths).encode("utf-8", "surrogateescape"),
+                   env=dict(os.environ, GIT_LITERAL_PATHSPECS="1"))
+    return new[:7]
+
+
+def _spec_finish(ctx, st) -> list[str]:
+    """When the whole run is approved: archive OpenSpec changes (merging their deltas into the living specs)."""
+    src = spec_source(ctx)
+    if not src or st.get("spec_finished"):
+        return []
+    cfg = ctx.config()
+    notes = []
+    for it in spec_items(ctx, src):
+        if it["tool"] != "openspec" or it.get("missing") or it.get("archived"):
+            continue
+        if not cfg.get("spec_archive", True):
+            notes.append(f"OpenSpec change {it['id']} is built; archiving is turned off (spec_archive), so it stays open.")
+            continue
+        open_tasks = [t["ref"] for t in it["tasks"] if not t["done"]]
+        if open_tasks:
+            notes.append(f"OpenSpec change {it['id']} still has {len(open_tasks)} unticked task(s), so it wasn't archived.")
+            continue
+        before = _openspec_files(ctx.root)
+        done, why = specsrc.openspec_archive(ctx.root, it["id"])
+        after = _openspec_files(ctx.root)
+        moved = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+        if not done:
+            notes.append(f"OpenSpec change {it['id']} is built but wasn't archived: {why}.")
+            continue
+        commit = None
+        if cfg.get("commit_per_checkpoint") and _is_git(ctx.root):
+            commit = _commit_paths(ctx.root, moved, f"ratchet({st['slug']}): archive OpenSpec change {it['id']}")
+        notes.append(f"Archived OpenSpec change {it['id']}: its spec changes are now part of the main specs"
+                     + (f" (commit {commit})." if commit else "."))
+    st["spec_finished"] = notes or True
+    ctx.log(st, "spec_finished", notes="; ".join(notes)[:400])
+    return notes
+
+
 def cmd_deferred(args):
     """Minor findings that were recorded instead of blocking, for the user to decide on at the end."""
     ctx = Ctx(find_root())
@@ -3073,11 +3532,14 @@ def cmd_complete(args):
                 "to ratchet-implementer to fix the check (evidence/" + args.cp + "/guardrail has every run), then "
                 "re-run the gates.", 2)
         _finish_guardrail(ctx, st, cp)  # before the commit, so the new check's config entry is committed with it
+    spec_files, spec_notes = _spec_write_back(ctx, st, cp, fp, cps.get("base_tree"))  # tick the step's tasks in the spec tool's own files
     commit = None
     if cfg.get("commit_per_checkpoint") and _is_git(ctx.root):
         msg = f"ratchet({st['slug']}): {args.cp} {cp['title']}\n\n{cp['summary']}\n\nGates: " + ", ".join(
             f"{n}={cps['gates'][n]['status']}" for n in ["behavior", "ui", "adversarial"])
-        commit = _commit_reviewed(ctx.root, cps.get("base_tree"), fp, msg)
+        if cp.get("spec_refs"):
+            msg += "\nSpec: " + ", ".join(_as_list(cp["spec_refs"]))[:600]
+        commit = _commit_reviewed(ctx.root, cps.get("base_tree"), fp, msg, extra=spec_files)
     cps.update(status="done", completed_at=now(), commit=commit)
     ctx.log(st, "checkpoint_complete", cp=args.cp, commit=commit)
     order = [c["id"] for c in ctx.plan()["checkpoints"]]
@@ -3094,10 +3556,13 @@ def cmd_complete(args):
         st["phase"] = "awaiting_final_review" if mode != "none" else "done"
         st["awaiting_since"] = now()
         if st["phase"] == "done":
+            spec_notes += _spec_finish(ctx, st)
             register_active(ctx.root, None)
     ctx.save_state(st)
     build_viewer(ctx)
     ok(f"{args.cp} complete{f' (commit {commit})' if commit else ''}.")
+    for n_ in spec_notes:
+        print(f"Spec: {n_}")
     print(json.dumps(next_action(ctx, st), indent=2))
 
 
@@ -3167,6 +3632,8 @@ def cmd_human_approve(args):
         else:
             st["phase"] = "done"
             st["current"] = None
+            for n_ in _spec_finish(ctx, st):
+                print(f"Spec: {n_}")
             register_active(ctx.root, None)
             _stop_server(ctx.ratchet / "viewer.json")
         ctx.log(st, "approved", by=msg["by"], note=msg.get("prompt", "")[:200])
@@ -3880,7 +4347,26 @@ def viewer_data(ctx: Ctx):
                            "deferred": rd.get("deferred", 0), "own_company_only": own})
         if rounds:
             reviews[cp["id"]] = {"rounds": rounds, "deferred_total": len(((st.get("checkpoints") or {}).get(cp["id"]) or {}).get("deferred") or [])}
-    return {"reviews": reviews,
+    spec = None
+    src = spec_source(ctx)
+    if src:
+        items = spec_items(ctx, src)
+        cov = spec_coverage(ctx, plan, items)
+        done = {cid for cid, c in (st.get("checkpoints") or {}).items() if c.get("status") == "done"}
+        rows = []
+        for it in items:
+            for r in it["requirements"]:
+                for sc in r.get("scenarios") or [{"ref": r["ref"], "name": r["title"]}]:
+                    steps = sorted({c["checkpoint"] for c in cov["by_case"].get(sc["ref"]) or []} |
+                                   set(cov["ui_steps"].get(sc["ref"]) or []))
+                    rows.append({"ref": sc["ref"], "requirement": r["title"], "name": sc.get("name"),
+                                 "tests": [c["case"] for c in cov["by_case"].get(sc["ref"]) or []], "steps": steps,
+                                 "state": "left out" if sc["ref"] in cov["unmapped"] else
+                                 ("not planned" if not steps else ("proven" if all(x in done for x in steps) else "planned"))})
+        spec = {"items": [{"tool": it["tool"], "label": _spec_label(it), "status": it.get("status")} for it in items],
+                "rows": rows, "tasks_total": len(cov["tasks"]), "tasks_ticked": len(cov["done_tasks"]),
+                "unmapped": cov["unmapped"]}
+    return {"reviews": reviews, "spec": spec,
             "state": dict({k: v for k, v in st.items() if k not in ("history", "approved")},
                          blocked_reason_plain=plain_reason(st.get("blocked_reason"))),
             "prototype": (ctx.run_dir() / "reference" / "prototype.html").exists(),
@@ -5061,6 +5547,17 @@ def main(argv=None):
     a.add_argument("--json", action="store_true")
     a.add_argument("--offered", metavar="KIND", help="record that this kind was put to the user or director")
     a.set_defaults(fn=cmd_repeats)
+    a = sp.add_parser("spec", help="build from an OpenSpec change, Spec Kit feature or BMAD story")
+    ssp = a.add_subparsers(dest="spec_cmd", required=True)
+    b = ssp.add_parser("detect", help="which spec tools this project uses and what is still open")
+    b.add_argument("--json", action="store_true")
+    b = ssp.add_parser("import", help="start this run's plan from spec items")
+    b.add_argument("tool", help="openspec | speckit | bmad | auto"); b.add_argument("items", nargs="*")
+    b.add_argument("--force", action="store_true", help="replace an existing checkpoints.json with the draft")
+    b.add_argument("--json", action="store_true")
+    b = ssp.add_parser("status", help="which spec scenarios are proven by passing tests")
+    b.add_argument("--json", action="store_true")
+    a.set_defaults(fn=cmd_spec)
     a = sp.add_parser("deferred", help="minor findings recorded for later instead of blocking")
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_deferred)
     sp.add_parser("next").set_defaults(fn=cmd_next)
