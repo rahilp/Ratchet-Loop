@@ -46,7 +46,7 @@ That's all you have to do. The agent takes it from there and asks you when it ne
 
 First the agent does some quick checks on its own. Are the hooks working? Which other AI tools are installed that could review the work? Has your team already written a spec for this? If anything needs your OK, like starting a new git branch, it asks.
 
-Then it shows you the plan, right in the chat. You'll see each step, what "done" means for it, whether its look will be checked, how risky it is and who will review it. Read it. Say "yes" to start, or tell it what to change.
+Then it shows you the plan, right in the chat. You'll see each step, what "done" means for it, whether its look will be checked, how risky it is and who will review it. Read it. Say "yes" to start, or tell it what to change. If the feature has new screens, you also get a clickable prototype to look at first, so you can see what it'll look like before anything is built.
 
 Now you can walk away. For each step the agent writes the tests first and makes sure they fail. Then it writes the code until they pass. Then the reviewers go looking for problems, and anything they find gets fixed and checked again. Every finished step becomes its own git commit, and you get a one-line update as each one lands.
 
@@ -148,6 +148,26 @@ You don't need any of this to use Ratchet. It's here if you want to know why the
 | 4 | **You** | You try it and say yes | Only a real message from you counts |
 
 Work with nothing to look at, like an API change or a refactor, skips gate 2. For rebuilding an old screen, gate 2 compares against the old screen instead of a new design.
+
+### How screens are checked
+
+Tests can tell you a button saves the form. They can't tell you the button is the wrong shade of blue, or that the heading is a bit too small. People notice those things straight away, and nobody ever writes them down in a spec. Comparing screenshots pixel by pixel doesn't work either, because two browsers never draw exactly the same pixels. So Ratchet has a reviewer look at the screen, the way a fussy designer would.
+
+It starts with something to compare against. If you're rebuilding an old screen, that's the old screen. If you've got a design or screenshots, it uses those. If you've got neither, the agent makes a clickable prototype before any real code is written: a single web page in your app's style that you can click through when you review the plan. To keep the prototype in your app's style, Ratchet keeps a `DESIGN.md` file with your colours, fonts, spacing and components. If you don't have one, the agent writes it from your existing app.
+
+When a step changes something you can see, Ratchet opens both the reference and your real app in a browser, puts them in the same state (same data, same dialog open, same form filled in), clicks through the same few actions on each, and takes screenshots along the way. Then two reviewers look at the results:
+
+- one checks how it **looks**: layout, spacing, colours, text, alignment;
+- one checks how it **behaves**: what happens when you click, type, submit or get an error.
+
+They're picked from a different AI company than the one building, if one is available. They only get the screenshots, the page structure and the design file. They never see the code or the chat, so they can't be told "it's fine". They list every difference and where it is on the screen. Any difference that can be fixed in code blocks the step. The agent fixes it, the tests run again, and the screens are compared again, until nothing fixable is left.
+
+Some things keep it honest:
+
+- Each step is only judged on what it built so far. The first step might only be the page header, so the reviewers ignore the table that doesn't exist yet.
+- If the two screenshots aren't showing the same thing (say, an empty order next to a full one), the comparison is thrown out and redone. The app isn't changed to match the wrong picture.
+- Once a comparison has found problems, the agent can't quietly change what gets compared, or tell the reviewers a difference is "expected". It has to ask you.
+- The prototype is never changed to match the app. If you decide the app looks better, that's your call, and the agent will ask.
 
 ### Who reviews the work
 
