@@ -1,44 +1,66 @@
 # Ratchet Loop
 
-**Ratchet Loop** is a checkpoint-and-gate build workflow for AI coding agents, and it works with any model provider. Like a ratchet, it only turns one way: every checkpoint that clears its gates is locked in, and nothing slips back. You ask one skill, the **orchestrator**, to build a feature. It splits the work into small **checkpoints**, and no checkpoint moves forward until it passes four **gates**.
+**You describe a feature. Your AI coding agent builds it in small steps, and no step is accepted until it has proven it works.**
 
-You use it by talking to your agent. You never need to type a command.
+Ratchet Loop is an add-on for AI coding agents (Claude Code, Codex, Gemini CLI and GitHub Copilot CLI). It splits your feature into small **checkpoints** and puts each one through four **gates**: its tests must pass, it must look like the design, an independent reviewer (ideally a different company's AI) must find nothing wrong, and finally you try it and say yes. Like a ratchet, it only turns one way: a checkpoint that clears its gates is locked in, and nothing slips back.
 
-## Get started
+You never type a command. You talk to your agent in plain words, and it runs Ratchet for you.
 
-Works in Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. Ratchet Loop is this repo, so first get it onto your machine: clone it or download it, and note its web address or the folder you put it in. Then open your agent in your project and say, with your own address or folder path in place of the part in angle brackets:
+> An attempt is allowed to be wrong. It is not allowed to ship until it isn't.
 
-> Please install Ratchet Loop from <this repo's address, or the path of my local clone> and set it up for this CLI, then start it on this feature: managers can approve or reject their reports' leave requests with a reason.
+## Install and start (3 steps)
 
-You give the agent the repo address or the local clone path, and the agent runs the installer from it. It works out which CLI it is running in, asks before it changes anything, installs Ratchet's hooks for that CLI, and tells you when to restart it (hooks load when the CLI starts). After the restart, say "Set up Ratchet and continue", and the agent picks up where it left off.
+Works in **Claude Code**, **Codex**, **Gemini CLI** and **GitHub Copilot CLI**.
 
-## Things you can say
+**1. Get Ratchet Loop onto your computer.** Download or clone this repository, and note where it is: its web address, or the folder you put it in.
 
-Each of these is a plain sentence to your agent. It turns them into the right commands itself.
+**2. Open your agent in your project's folder and paste this,** with your own details in place of the parts in angle brackets:
 
-**Build from your team's spec (OpenSpec, Spec Kit, BMAD)**
+> Please install Ratchet Loop from <this repo's address, or the path of my local clone> and set it up for this CLI, then start it on this feature: <describe your feature in a sentence or two>.
+
+For example: *"…then start it on this feature: managers can approve or reject their reports' leave requests with a reason."*
+
+**3. Restart when asked.** The agent works out which CLI it is in, asks before changing anything, and installs Ratchet's hooks (small checks the CLI runs, which make the gates binding rather than advice). Hooks load when the CLI starts, so it will ask you to restart. Open the CLI again in the same folder and say:
+
+> Set up Ratchet and continue
+
+That's it. From here on you just answer the agent's questions.
+
+**What you need:** a project in a git repository, and Python 3 (almost every computer has it). For screens and pages, Ratchet also uses Node and Playwright to take screenshots; the agent offers to set them up if they're missing. Nothing else is required. If you have other agent tools installed (say Codex alongside Claude Code), Ratchet uses them for independent second opinions.
+
+## Your first run, step by step
+
+Here is what happens after you ask for a feature, and when you're needed.
+
+1. **A few quick checks (no action from you).** The agent makes sure the hooks work, finds which other AI tools can review the work, and looks for a spec your team already wrote. If something needs your OK, such as installing hooks or working on a new branch, it asks first.
+2. **You see the plan (you're needed).** Every step is shown right in the chat: what it delivers, how you'd know it's done, whether its look gets checked, how risky it is, and who reviews it. Reply **"yes"** to go ahead, or say what to change.
+3. **It builds (you can walk away).** For each step, tests are written first and must fail, then the code is written until they pass, then reviewers try to break it and a fixer fixes what they find. You get a short line as each step finishes, and each passing step is saved as its own git commit.
+4. **If it gets stuck, it asks you.** When a step can't get past a gate, the agent quotes the problem and offers two or three lettered options with a recommendation. Reply with just the letter.
+5. **You try the result (you're needed).** The agent tells you what was built and what to try. Say **"approved"**, or describe what you'd like changed. Changes become new steps that go through every gate again, and the lesson is remembered for next time.
+
+So you're needed twice: to approve the plan, and to try the finished feature. You can choose to check in after every step instead, or not at all after the plan.
+
+## Good things to ask for
+
+> Build this feature: customers can save items to a wishlist and get an email when one goes on sale.
+
+> Rebuild the old settings screen in the new design. The old screen is at src/legacy/Settings.tsx.
+
+> Refactor the billing module so it no longer talks to the database directly. Nothing the user sees should change.
 
 > Build the add-dark-mode change.
 
-> Build story 1.3.
+Smaller is better: a feature you could describe in a few sentences usually becomes 3 to 8 steps.
 
-If your project uses OpenSpec, GitHub Spec Kit or the BMAD Method, Ratchet reads the spec you already wrote instead of planning from scratch. Your spec tool says *what* to build; Ratchet proves it was built right. Every scenario or acceptance criterion gets a test that has to pass, every task belongs to a step, and nothing is left out without a reason you can see. As each step passes its gates, Ratchet ticks its tasks in your spec files. A finished BMAD story is marked done with Ratchet's evidence, and when you approve the run, an OpenSpec change is archived with OpenSpec's own tool. If there is exactly one open change, feature or story, you don't even need to name it.
+## Things you can say
 
-No spec tool? Nothing changes: the plan you approve is the spec. After your first finished run, the agent asks once whether you'd like a running record of what's been built (one plain file per feature, each rule linked to the test that proves it). Say yes or no; it remembers.
+Each of these is a plain sentence to your agent, at any time. It turns them into the right commands itself.
 
-**Get the viewer link**
-
-> Give me the viewer link, and open it if you can.
-
-**See who reviews and which providers are available**
-
-> Which reviewers and providers are available on this machine?
-
-**Pause, resume, cancel, status**
-
-> Pause the build, and resume it when I say so.
+**Where are we, pause, resume, cancel**
 
 > Where are we?
+
+> Pause the build, and resume it when I say so.
 
 > Cancel this run. (The agent asks you to confirm before it abandons anything.)
 
@@ -46,11 +68,21 @@ No spec tool? Nothing changes: the plan you approve is the spec. After your firs
 
 > Only check in with me at the end, not after every checkpoint.
 
+**See the plan and progress in your browser**
+
+> Give me the viewer link, and open it if you can.
+
+The viewer is a live page with every step, its tests, its reviews and its evidence. It's optional; everything you need is also in the chat.
+
+**See who reviews and which providers are available**
+
+> Which reviewers and providers are available on this machine?
+
 **Install and verify hooks**
 
 > Check that Ratchet's hooks are installed for this CLI, and install them if they are not.
 
-**Set up a director and lanes**
+**Run several features at once (director and lanes)**
 
 > Set up a director for these three lanes, and ask me what you need to know.
 
@@ -62,16 +94,39 @@ Without hooks the gates are only advice, so the agent explains that and asks fir
 
 A bare "yes", "maybe" or "I guess" does not count, and this reply never approves the plan. Ratchet records your reply through its prompt hook, so this choice is only possible when that hook runs. If no Ratchet hook runs at all in your CLI, Ratchet cannot record any answer from you, not even this one, and the agent will recommend installing the hooks instead.
 
+## Build from your team's spec (OpenSpec, Spec Kit, BMAD)
+
+> Build the add-dark-mode change.
+
+> Build story 1.3.
+
+If your project uses OpenSpec, GitHub Spec Kit or the BMAD Method, Ratchet reads the spec you already wrote instead of planning from scratch. Your spec tool says *what* to build; Ratchet proves it was built right. Every scenario or acceptance criterion gets a test that has to pass, every task belongs to a step, and nothing is left out without a reason you can see. As each step passes its gates, Ratchet ticks its tasks in your spec files. A finished BMAD story is marked done with Ratchet's evidence, and when you approve the run, an OpenSpec change is archived with OpenSpec's own tool. If there is exactly one open change, feature or story, you don't even need to name it.
+
+No spec tool? Nothing changes: the plan you approve is the spec. After your first finished run, the agent asks once whether you'd like a running record of what's been built (one plain file per feature, each rule linked to the test that proves it). Say yes or no; it remembers.
+
 ## What to expect in chat
 
 - **The whole plan, in the chat.** Before anything is built you see every checkpoint: its title, what done looks like, whether it gets a UI review, its risk and who reviews it. A viewer link is offered as an optional extra.
 - **Plain progress.** Short updates about what is done and what is next, with no raw JSON and no jargon.
 - **Blocks are conversations.** When a gate cannot converge, the agent quotes the finding and offers two or three lettered options (A, B, C) with a recommendation. Reply with just the letter. If an option changes something you approved (the prototype, say), it says so, and picking it is your approval: you won't be asked a second time.
 - **Only a clear yes approves.** "Yes", "go ahead" or "approved" counts. Silence, a question, a hedge, a bare "ok" or thumbs-up, or a yes with something else attached ("yes, but change the header", "ok cancel it") does not, and no message from another agent can stand in for you. A yes answers only the question the agent just asked: saying yes to "only check in at the end?" never approves the plan.
+- **Repeated mistakes become automatic checks.** If reviewers keep finding the same kind of mistake, the agent offers once to add a check (a lint rule, say) that catches it in seconds from then on. You choose.
 
-You are needed twice: once to approve the plan, and once to review the finished feature. Anything you ask to change becomes new checkpoints that go through every gate again, and the lesson is written to `.ratchet/learnings.md`, which every agent reads.
+Anything you ask to change becomes new checkpoints that go through every gate again, and the lesson is written to `.ratchet/learnings.md`, which every agent reads.
 
-> An attempt is allowed to be wrong. It is not allowed to ship until it isn't.
+## Common questions
+
+**How long does it take, and what does it cost?** It depends on the feature and your plan with your AI provider. Ratchet keeps it down: low-risk steps get one reviewer, only serious findings block them, and later review rounds look only at what changed. A small feature typically takes tens of minutes of the agent working on its own.
+
+**Do I need other AI tools installed?** No. Without them, your agent's own company reviews the work using a different model where it can. With another company's tool installed and signed in (Codex, Gemini, Copilot, Cursor, OpenCode and others), reviews come from there first, which catches more.
+
+**The agent says the hooks aren't working.** Restart the CLI in the same folder (hooks load at start-up), then say "Set up Ratchet and continue". If it still says so, ask it: "Check that Ratchet's hooks are installed for this CLI, and install them if they are not."
+
+**Where does my code end up?** In your project, as normal files, with one git commit per finished step. The agent offers to work on a new branch if you're on your main branch or have unsaved changes. Ratchet's own notes live in a `.ratchet/` folder in your project.
+
+**Can I stop halfway?** Yes. Say "pause" any time, and "carry on" when you're ready, even in a new chat. Everything is saved as it goes.
+
+**I don't like what it built.** Say so at the final review, in your own words. Your feedback becomes new steps, and the lesson is remembered for future runs.
 
 ## The four gates
 
