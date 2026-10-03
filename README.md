@@ -8,25 +8,37 @@ You never type a command. You talk to your agent in plain words, and it runs Rat
 
 > An attempt is allowed to be wrong. It is not allowed to ship until it isn't.
 
-## Install and start (3 steps)
+## Step 1: Install Ratchet (once)
 
-Works in **Claude Code**, **Codex**, **Gemini CLI** and **GitHub Copilot CLI**.
+Works in **Claude Code**, **Codex**, **Gemini CLI** and **GitHub Copilot CLI**. You do this once per computer and CLI.
 
-**1. Get Ratchet Loop onto your computer.** Download or clone this repository, and note where it is: its web address, or the folder you put it in.
+**a. Get Ratchet Loop onto your computer.** Download or clone this repository, and note where it is: its web address, or the folder you put it in.
 
-**2. Open your agent in your project's folder and paste this,** with your own details in place of the parts in angle brackets:
+**b. Open your agent in your project's folder and paste this,** with the repo's address or folder in place of the part in angle brackets:
 
-> Please install Ratchet Loop from <this repo's address, or the path of my local clone> and set it up for this CLI, then start it on this feature: <describe your feature in a sentence or two>.
+> Please install Ratchet Loop from <this repo's address, or the path of my local clone> and set it up for this CLI.
 
-For example: *"…then start it on this feature: managers can approve or reject their reports' leave requests with a reason."*
+The agent works out which CLI it is in, asks before changing anything, and installs Ratchet's hooks (small checks the CLI runs, which make the gates binding rather than advice).
 
-**3. Restart when asked.** The agent works out which CLI it is in, asks before changing anything, and installs Ratchet's hooks (small checks the CLI runs, which make the gates binding rather than advice). Hooks load when the CLI starts, so it will ask you to restart. Open the CLI again in the same folder and say:
+**c. Restart when asked.** Hooks load when the CLI starts, so the agent will ask you to restart it. Open the CLI again in the same folder and say:
 
 > Set up Ratchet and continue
 
-That's it. From here on you just answer the agent's questions.
+The agent checks that the hooks are working and tells you Ratchet is ready.
 
 **What you need:** a project in a git repository, and Python 3 (almost every computer has it). For screens and pages, Ratchet also uses Node and Playwright to take screenshots; the agent offers to set them up if they're missing. Nothing else is required. If you have other agent tools installed (say Codex alongside Claude Code), Ratchet uses them for independent second opinions.
+
+## Step 2: Start work on a feature
+
+Whenever you want something built, open your agent in your project's folder and say:
+
+> Use Ratchet to build this feature: <describe the feature in a sentence or two>.
+
+For example:
+
+> Use Ratchet to build this feature: managers can approve or reject their reports' leave requests, with a reason.
+
+That's it. From here on you just answer the agent's questions. There are more example requests [below](#good-things-to-ask-for).
 
 ## Your first run, step by step
 
@@ -42,13 +54,13 @@ So you're needed twice: to approve the plan, and to try the finished feature. Yo
 
 ## Good things to ask for
 
-> Build this feature: customers can save items to a wishlist and get an email when one goes on sale.
+> Use Ratchet to build this feature: customers can save items to a wishlist and get an email when one goes on sale.
 
-> Rebuild the old settings screen in the new design. The old screen is at src/legacy/Settings.tsx.
+> Use Ratchet to rebuild the old settings screen in the new design. The old screen is at src/legacy/Settings.tsx.
 
-> Refactor the billing module so it no longer talks to the database directly. Nothing the user sees should change.
+> Use Ratchet to refactor the billing module so it no longer talks to the database directly. Nothing the user sees should change.
 
-> Build the add-dark-mode change.
+> Use Ratchet to build the add-dark-mode change. (A change written in OpenSpec; see below.)
 
 Smaller is better: a feature you could describe in a few sentences usually becomes 3 to 8 steps.
 
