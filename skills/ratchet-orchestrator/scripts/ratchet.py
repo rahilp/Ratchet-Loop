@@ -827,7 +827,7 @@ def next_action(ctx: Ctx, st=None) -> dict:
         "complete": f"{cur}: run ratchet.py complete {cur}",
     }
     na = {"phase": phase, "checkpoint": cur, "step": step, "action": msgs.get(step, step), "stop_ok": False}
-    reps = repeat_candidates(ctx, st)
+    reps = repeat_candidates(ctx, st) if approval_mode(ctx) != "director" else []
     if reps:
         na["guardrail_candidates"] = reps
         na["action"] = (f"First offer the user a guardrail for the repeated finding '{reps[0]['kind']}' (ratchet.py ask "
@@ -1948,7 +1948,12 @@ def cmd_director_sign(args):
                             "awaiting_checkpoint_review", "awaiting_final_review"]}[args.action]
     if st["phase"] not in want:
         die(f"Run {st['slug']} is in phase {st['phase']}; {args.action} applies to {want}.")
-    print(_sign(_director_key(), _approval_payload(ctx, st, args.action)))
+    action = args.action
+    if action == "guardrail":
+        if not args.kind:
+            die("director-sign guardrail needs --kind <kind> (from ratchet.py repeats)")
+        action = f"guardrail:{norm_kind(args.kind)}"
+    print(_sign(_director_key(), _approval_payload(ctx, st, action)))
 
 
 def cmd_approve_plan(args):
@@ -2156,6 +2161,7 @@ def cmd_behavior(args):
     log = ctx.evidence(args.cp) / f"behavior-{g['attempts']:02d}.log"
     code, out, dur = _run_cmd(ctx, cp["tests"]["command"], log, cfg["test_timeout_sec"])
     failed_check = None
+    fp_tests = fingerprint(ctx.root)["id"] if code == 0 and cfg.get("checks") else None
     if code == 0:
         for chk in cfg.get("checks") or []:
             if not isinstance(chk, dict) or not chk.get("command"):
@@ -2166,6 +2172,11 @@ def cmd_behavior(args):
                 code, out, log, failed_check = ccode, cout, clog, chk
                 break
     fp = fingerprint(ctx.root)
+    if fp_tests and fp["id"] != fp_tests and not failed_check:
+        g["status"] = "failed"
+        ctx.save_state(st)
+        die(f"Behavior gate FAILED for {args.cp}: an automatic check changed files in the project. Checks must only read "
+            "the code; restore the files (git) and fix the check's command.", 2)
     if code != 0 and failed_check:
         g["status"] = "failed"
         g["last"] = {"exit": code, "log": str(log.relative_to(ctx.root)), "at": now(), "check": failed_check.get("kind")}
@@ -2367,12 +2378,19 @@ def cmd_adv_record(args):
         if Path(rp).resolve().parent != dest.resolve():
             shutil.copy2(rp, dest / f"{rid}.json")
     need = len(required)
-    record_kinds(st, args.cp, rnd["round"], all_findings)
+    record_kinds(st, args.cp, rnd["round"], all_findings, ctx.root)
     covered = enforced_kinds(cfg)
-    all_findings = [f for f in all_findings if finding_kind(f) not in covered]  # its check runs at the behavior gate
+    covered_minor = [dict(f, deferred_because=f"an automatic check already covers '{finding_kind(f)}'")
+                     for f in all_findings if finding_kind(f) in covered
+                     and str(f.get("severity", "")).strip().lower() in MINOR_SEVERITIES]
+    # only MINOR findings of a covered kind step aside (their check runs at the behavior gate); blocker and major
+    # findings always block, whatever label they carry
+    all_findings = [f for f in all_findings if not any(f is c or (f.get("id"), f.get("reviewer")) == (c.get("id"), c.get("reviewer"))
+                                                       for c in covered_minor)]
     changed_since = _changed_since_last_round(ctx, cfg, g, fp["id"])
     raw_count = len(all_findings)
     all_findings, deferred = split_findings(cfg, cp.get("risk", "normal"), all_findings, changed_since, ctx.root)
+    deferred = covered_minor + deferred
     if deferred:
         write_json(dest / "deferred-findings.json", deferred)
         keep = [x for x in cps.get("deferred") or [] if x.get("round") != rnd["round"]]
@@ -2481,43 +2499,45 @@ def _changed_since_last_round(ctx, cfg, g, fp_id) -> set | None:
     return scope
 
 
+def norm_kind(k) -> str | None:
+    k = re.sub(r"[^a-z0-9]+", "-", str(k or "").strip().lower()).strip("-")[:60]
+    return k or None
+
+
 def finding_kind(f) -> str | None:
-    """What kind of mistake a finding is, for spotting repeats: the reviewer's own `kind` label, else the rule it
-    cites (standards.md §3, a learnings entry...)."""
-    k = str(f.get("kind") or "").strip().lower()
-    if k:
-        return re.sub(r"[^a-z0-9]+", "-", k).strip("-")[:60] or None
-    rule = str(f.get("rule") or "").lower()
-    m = re.search(r"(standards\.md|contributing\.md|architecture\.md|design\.md)\s*§\s*([\w.]+)", rule)
-    if m:
-        return f"{m.group(1).split('.')[0]}-{m.group(2)}"
-    m = re.search(r"learnings[^0-9]{0,12}(\d{4}-\d{2}-\d{2})", rule)
-    if m:
-        return f"learnings-{m.group(1)}"
-    return None
+    """The reviewer's own label for the TYPE of mistake. Only an explicit `kind` counts: a cited rule is too broad to
+    stand for one checkable mistake."""
+    return norm_kind(f.get("kind"))
 
 
 def enforced_kinds(cfg) -> set:
-    return {str(c.get("kind")) for c in (cfg.get("checks") or []) if isinstance(c, dict) and c.get("kind")}
+    return {norm_kind(c.get("kind")) for c in (cfg.get("checks") or []) if isinstance(c, dict) and c.get("kind")}
 
 
-def record_kinds(st, cp_id, round_no, findings):
+def record_kinds(st, cp_id, round_no, findings, root=None):
     seen = st.setdefault("finding_kinds", {})
     for f in findings:
         k = finding_kind(f)
         if k:
             seen.setdefault(k, []).append({"cp": cp_id, "round": round_no,
+                                           "file": _norm_path(f.get("file") or f.get("path") or f.get("location"), root),
                                            "what": str(f.get("description", ""))[:160]})
 
 
+def kind_places(st, kind) -> set:
+    """Distinct places a kind was found: (checkpoint, file). The same unfixed finding raised again in a later round is
+    one place, not a repeat."""
+    return {(h["cp"], h.get("file") or "") for h in (st.get("finding_kinds") or {}).get(kind, [])}
+
+
 def repeat_candidates(ctx, st, cfg=None) -> list[dict]:
-    """Kinds of mistake seen in two or more review rounds (or checkpoints) that no automatic check covers yet and
-    that the user hasn't been asked about. Offer each one as a guardrail as soon as it shows up."""
+    """Kinds of mistake found in two or more places that no automatic check covers yet and that the user hasn't been
+    asked about. Offer each one as a guardrail as soon as it shows up."""
     cfg = cfg or ctx.config()
-    done = enforced_kinds(cfg) | set(st.get("guardrails_offered") or [])
+    done = enforced_kinds(cfg) | {norm_kind(k) for k in st.get("guardrails_offered") or []}
     out = []
     for k, hits in (st.get("finding_kinds") or {}).items():
-        places = {(h["cp"], h["round"]) for h in hits}
+        places = kind_places(st, k)
         if len(places) >= 2 and k not in done:
             out.append({"kind": k, "times": len(places), "checkpoints": sorted({h["cp"] for h in hits}),
                         "example": hits[-1]["what"]})
@@ -2527,6 +2547,14 @@ def repeat_candidates(ctx, st, cfg=None) -> list[dict]:
 def cmd_repeats(args):
     ctx = Ctx(find_root())
     st = ctx.state()
+    if args.offered:
+        k = norm_kind(args.offered)
+        offered = st.setdefault("guardrails_offered", [])
+        if k and k not in offered:
+            offered.append(k)
+        ctx.save_state(st)
+        ok(f"'{k}' marked as offered; it won't be suggested again.")
+        return
     rows = repeat_candidates(ctx, st)
     if args.json:
         print(json.dumps(rows, indent=2))
@@ -2548,8 +2576,9 @@ def review_rules(ctx, cfg, cp, g, rnd, fp_id) -> tuple[set | None, list[str]]:
                      "report minor ones too, they are recorded for later.")
     kinds = sorted(enforced_kinds(cfg))
     if kinds:
-        rules.append("These are already caught by automatic checks that run with the tests; don't report them: "
-                     + ", ".join(kinds) + ".")
+        rules.append("These kinds of mistake are already caught by automatic checks that run with the tests: "
+                     + ", ".join(kinds) + ". Still report a blocker or major problem of these kinds (it still blocks); "
+                     "minor ones of these kinds are noted, not fixed.")
     if focus is not None:
         rules.append("Round " + str(rnd["round"]) + ": look hardest at the code changed since the last round ("
                      + (", ".join(sorted(focus)[:20]) or "nothing changed") + "). Re-raise any earlier finding that "
@@ -2559,7 +2588,13 @@ def review_rules(ctx, cfg, cp, g, rnd, fp_id) -> tuple[set | None, list[str]]:
 
 
 def _announce_repeats(ctx, st):
+    director = approval_mode(ctx) == "director"
     for r in repeat_candidates(ctx, st):
+        if director:
+            print(f"REPEAT: reviewers have now found '{r['kind']}' in {r['times']} places. This lane is "
+                  f"director-enrolled: tell the director, who can approve a guardrail with "
+                  f"`director-sign guardrail --kind {r['kind']}`; then run ratchet.py repeats --offered {r['kind']}.")
+            continue
         print(f"REPEAT: reviewers have now found '{r['kind']}' {r['times']} times (e.g. {r['example']}). Offer the user "
               f"a guardrail now: ratchet.py ask choice --options A,B,C --guardrail \"A={r['kind']}\" "
               "(see 'When the same mistake repeats' in the orchestrator skill).")
@@ -2574,14 +2609,29 @@ def cmd_guardrail(args):
     st = ctx.state()
     if st["phase"] not in ("building", "blocked"):
         die(f"A guardrail can only be added while building (phase {st['phase']}).")
-    kind = re.sub(r"[^a-z0-9]+", "-", args.kind.lower()).strip("-")
+    kind = norm_kind(args.kind)
     token = getattr(args, "director_token", None)
     allow = st.get("choice_allow") or {}
+    cfg = ctx.config()
+    if not kind or len(kind_places(st, kind)) < 2:
+        die(f"'{kind}' hasn't been found in two places by the reviewers, so it isn't a repeated mistake. Guardrails are "
+            "only for kinds of finding that keep coming back (`ratchet.py repeats`).")
+    if kind in enforced_kinds(cfg):
+        die(f"An automatic check for '{kind}' already exists. Changing or replacing it is a rule change the user must "
+            "confirm (show them the change, then `ratchet.py ask approve-changes`).")
+    if "{target}" not in args.check_command:
+        die("--check-command must contain {target}, where Ratchet puts what to check: the project's code "
+            "(--target, default .) or the bad example (--bad-example). E.g. --check-command \"npx eslint {target}\".")
+    bad = (ctx.root / args.bad_example).resolve()
+    try:
+        bad.relative_to(ctx.root.resolve())
+    except ValueError:
+        die("--bad-example must be inside the project (a test fixture).")
     if token:
-        _require_approval(ctx, st, "guardrail", token)
-    elif allow.get("guardrail") != kind:
-        die(f"The user hasn't picked a guardrail option for '{kind}'. Offer it first: ratchet.py ask choice "
-            f"--options A,B,C --guardrail \"A={kind}\", then ratchet.py choice after they reply.")
+        _require_approval(ctx, st, f"guardrail:{kind}", token)
+    elif allow.get("guardrail") != kind or allow.get("cp") != st.get("current"):
+        die(f"The user hasn't picked a guardrail option for '{kind}' at this step. Offer it first: ratchet.py ask "
+            f"choice --options A,B,C --guardrail \"A={kind}\", then ratchet.py choice after they reply.")
     plan = ctx.plan()
     ids = [int(c["id"][2:]) for c in plan["checkpoints"] if re.fullmatch(r"CP\d+", c["id"])]
     gid = f"CP{max(ids) + 1}"
@@ -2589,13 +2639,14 @@ def cmd_guardrail(args):
     files = args.test_file or []
     entry = {"id": gid, "title": title,
              "summary": f"Add an automatic check that fails fast on '{kind}', a mistake reviewers kept finding.",
-             "done_when": [f"`{args.check_command}` fails on a deliberately bad example of {kind}",
-                           f"`{args.check_command}` passes on the project's current code",
+             "done_when": [f"The check fails on a deliberately bad example of {kind} ({args.bad_example})",
+                           f"The check passes on the project's current code ({args.target})",
                            "The check runs with the tests at every later step"],
              "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "normal",
              "ui_skip_reason": "an automatic code check, nothing visible changes",
              "tests": {"files": files, "command": args.test_command},
-             "guardrail": {"kind": kind, "check_command": args.check_command, "why": args.why or ""},
+             "guardrail": {"kind": kind, "check_command": args.check_command, "target": args.target,
+                           "bad_example": args.bad_example, "why": args.why or ""},
              "notes": ("Use the project's existing linter, type checker or test runner if it can express this check; "
                        "otherwise you may add a lint or architecture-test tool as a dev dependency. Keep the bad "
                        "example in a test fixture, not in the shipped code.")}
@@ -2609,11 +2660,12 @@ def cmd_guardrail(args):
     write_json(ctx.run_dir() / "checkpoints.json", plan)
     tp = {"checkpoint": gid, "cases": [
         {"id": f"{gid}-T01", "layer": "code", "title": f"the check catches {kind}",
-         "given": f"a small fixture that contains the mistake ({args.why or kind})",
-         "when": f"the check runs ({args.check_command}) against it", "then": "it fails and names the problem"},
+         "given": f"the fixture {args.bad_example}, which contains the mistake ({args.why or kind})",
+         "when": f"the check runs on it ({args.check_command.replace('{target}', args.bad_example)})",
+         "then": "it fails and names the problem"},
         {"id": f"{gid}-T02", "layer": "code", "title": "the check passes on the current code",
-         "given": "the project as it is now", "when": f"the check runs ({args.check_command})",
-         "then": "it passes"}]}
+         "given": "the project as it is now",
+         "when": f"the check runs ({args.check_command.replace('{target}', args.target)})", "then": "it passes"}]}
     write_json(ctx.run_dir() / "tests" / f"{gid}.json", tp)
     st["checkpoints"][gid] = new_cp_state(entry)
     st["plan_hash"] = _plan_hash(plan, ctx)
@@ -2631,20 +2683,28 @@ def cmd_guardrail(args):
        "tests at every later step.")
 
 
+def _check_cmd(gr: dict, target: str) -> str:
+    import shlex
+    return gr["check_command"].replace("{target}", shlex.quote(target))
+
+
 def _finish_guardrail(ctx, st, cp):
     """A guardrail step passed every gate: its check becomes permanent (config `checks`) and is noted in learnings."""
     gr = cp.get("guardrail") or {}
     if not gr.get("check_command"):
         return
     user = read_json(ctx.config_path, {}) or {}
-    checks = [c for c in (user.get("checks") or []) if isinstance(c, dict) and c.get("kind") != gr["kind"]]
-    checks.append({"kind": gr["kind"], "command": gr["check_command"], "title": cp["title"],
+    checks = [c for c in (user.get("checks") or []) if isinstance(c, dict)]
+    if any(norm_kind(c.get("kind")) == gr["kind"] for c in checks):
+        die(f"An automatic check for '{gr['kind']}' already exists; it is never replaced silently.")
+    command = _check_cmd(gr, gr.get("target") or ".")
+    checks.append({"kind": gr["kind"], "command": command, "title": cp["title"],
                    "added": _dt.date.today().isoformat(), "from": f"{st['slug']}/{cp['id']}"})
     user["checks"] = checks
     write_json(ctx.config_path, user)
     if st.get("approved"):
         st["approved"].setdefault("rules", {})["checks"] = _sha(ctx.config().get("checks"))
-    _append_learning(ctx, f"{gr.get('why') or gr['kind']}: enforced by `{gr['check_command']}`", f"guardrail {cp['id']}")
+    _append_learning(ctx, f"{gr.get('why') or gr['kind']}: enforced by `{command}`", f"guardrail {cp['id']}")
 
 
 def cmd_deferred(args):
@@ -2714,12 +2774,27 @@ def cmd_complete(args):
             die("The regression command changed files in the project. Those changes were never reviewed — find out "
                 "what wrote them (generated files? snapshots?) and either add them to .gitignore or re-run the gates.", 2)
     if cp.get("guardrail"):
-        gcode, gout, _ = _run_cmd(ctx, cp["guardrail"]["check_command"], ctx.evidence(args.cp) / "guardrail-check.log",
+        gr = cp["guardrail"]
+        bad = ctx.root / gr.get("bad_example", "")
+        if not gr.get("bad_example") or not bad.exists() or (bad.is_dir() and not any(bad.rglob("*"))):
+            die(f"{args.cp} cannot complete: its bad example ({gr.get('bad_example')}) is missing or empty. The check "
+                "has to be shown catching a real example of the mistake.", 2)
+        ev = ctx.evidence(args.cp)
+        rcode, rout, _ = _run_cmd(ctx, _check_cmd(gr, gr["bad_example"]), ev / "guardrail-catches-bad-example.log",
                                   cfg["test_timeout_sec"])
+        gcode, gout, _ = _run_cmd(ctx, _check_cmd(gr, gr.get("target") or "."), ev / "guardrail-passes-today.log",
+                                  cfg["test_timeout_sec"])
+        if fingerprint(ctx.root)["id"] != fp["id"]:
+            die(f"{args.cp} cannot complete: running the new check changed files in the project. A check must only "
+                "read the code.", 2)
+        if rcode == 0:
+            print(_tail(rout))
+            die(f"{args.cp} cannot complete: the new check passes on the bad example ({gr['bad_example']}), so it "
+                "doesn't catch the mistake. A check that can't fail guards nothing.", 2)
         if gcode != 0:
             print(_tail(gout))
-            die(f"{args.cp} cannot complete: its new check ({cp['guardrail']['check_command']}) fails on the current "
-                "code. It must pass on today's code before it can guard later steps.", 2)
+            die(f"{args.cp} cannot complete: the new check fails on the current code. It must pass on today's code "
+                "before it can guard later steps.", 2)
         _finish_guardrail(ctx, st, cp)  # before the commit, so the new check's config entry is committed with it
     commit = None
     if cfg.get("commit_per_checkpoint") and _is_git(ctx.root):
@@ -3030,7 +3105,7 @@ def _ask_choice(ctx, st, args):
     guards = {}
     for spec in getattr(args, "guardrail", None) or []:
         letter, _, kind = spec.partition("=")
-        letter, kind = letter.strip().upper(), kind.strip()
+        letter, kind = letter.strip().upper(), norm_kind(kind)
         if letter not in opts or not kind:
             die(f"--guardrail {spec}: use LETTER=<kind>, with LETTER one of {','.join(opts)}")
         guards[letter] = kind
@@ -3092,7 +3167,8 @@ def cmd_choice(args):
                 "then run `ratchet.py approve-changes`. No further question is needed.")
     if guard:
         msg += (f" That adds a guardrail step for '{guard}': run `ratchet.py guardrail --kind {guard} --title \"...\" "
-                "--check-command \"...\" --test-command \"...\" --test-file <path>`.")
+                "--why \"...\" --check-command \"<check> {target}\" --bad-example <fixture path> "
+                "--test-command \"...\" --test-file <path>`.")
     if unblock:
         msg += " The run is blocked: run `ratchet.py human-approve` to resume it, then act on their choice."
     ok(msg)
@@ -4692,13 +4768,18 @@ def main(argv=None):
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_models)
     a = sp.add_parser("guardrail", help="after the user picks a guardrail option: add a step that builds an automatic check")
     a.add_argument("--kind", required=True); a.add_argument("--title", required=True)
-    a.add_argument("--check-command", required=True, help="shell command that runs the new check on the project")
+    a.add_argument("--check-command", required=True,
+                   help="the check, with {target} where the code to check goes, e.g. \"npx eslint {target}\"")
+    a.add_argument("--bad-example", required=True, help="a fixture inside the project that contains the mistake")
+    a.add_argument("--target", default=".", help="what the check runs on in the real project (default .)")
     a.add_argument("--test-command", required=True, help="command that runs the step's tests (red/green proof)")
-    a.add_argument("--test-file", action="append", help="test file(s) the step's tests go in")
+    a.add_argument("--test-file", action="append", required=True, help="test file(s) the step's tests go in")
     a.add_argument("--why", help="the mistake in one plain sentence (goes into learnings.md)")
     a.add_argument("--director-token"); a.set_defaults(fn=cmd_guardrail)
     a = sp.add_parser("repeats", help="kinds of review finding seen twice or more, not yet guarded or asked about")
-    a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_repeats)
+    a.add_argument("--json", action="store_true")
+    a.add_argument("--offered", metavar="KIND", help="record that this kind was put to the user or director")
+    a.set_defaults(fn=cmd_repeats)
     a = sp.add_parser("deferred", help="minor findings recorded for later instead of blocking")
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_deferred)
     sp.add_parser("next").set_defaults(fn=cmd_next)
@@ -4720,7 +4801,8 @@ def main(argv=None):
     sp.add_parser("director-enroll").set_defaults(fn=cmd_director_enroll)
     a = sp.add_parser("director-sign"); a.add_argument("action", choices=["approve-plan", "human-approve", "feedback",
                                                                           "approve-changes", "cancel", "set-review",
-                                                                          "hooks-waive"])
+                                                                          "hooks-waive", "ui-respec", "guardrail"])
+    a.add_argument("--kind", help="guardrail: the kind of finding it covers")
     a.set_defaults(fn=cmd_director_sign)
     sp.add_parser("fingerprint").set_defaults(fn=cmd_fingerprint)
     a = sp.add_parser("config"); a.add_argument("--set", nargs="*"); a.set_defaults(fn=cmd_config)
