@@ -10,15 +10,13 @@ You don't type any commands. You talk to your agent like normal, and it runs Rat
 
 Ratchet works in Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. You install it once per computer, not once per project. After that it's available in every project you open.
 
-**1. Download this repo.** Clone it or download the zip. Remember where you put it (or copy its web address).
+**1. Ask your agent to install it.** Open your agent (in any folder) and paste this:
 
-**2. Ask your agent to install it.** Open your agent (in any folder) and paste this, with your own address or folder path in the angle brackets:
+> Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI.
 
-> Please install Ratchet Loop from <this repo's address, or the path of my local clone> and set it up for this CLI.
+Already cloned it? Give the folder path instead of the link. The agent will ask before it changes anything. Part of the setup is adding Ratchet's hooks to your CLI. Hooks are what stop the agent from skipping a gate, so they matter.
 
-The agent will ask before it changes anything. Part of the setup is adding Ratchet's hooks to your CLI. Hooks are what stop the agent from skipping a gate, so they matter.
-
-**3. Restart your CLI.** Hooks only load when the CLI starts, so the agent will ask you to close it and open it again. Do that, then say:
+**2. Restart your CLI.** Hooks only load when the CLI starts, so the agent will ask you to close it and open it again. Do that, then say:
 
 > Set up Ratchet and continue
 
