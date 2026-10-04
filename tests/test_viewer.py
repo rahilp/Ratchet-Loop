@@ -21,6 +21,15 @@ PHASES = ["planning", "awaiting_plan_approval", "building", "awaiting_checkpoint
 JARGON = re.compile(r"\b(fingerprint|lens|slot)\b", re.I)
 PASS = FAIL = 0
 
+# Run as if on a clean machine: no agent CLI session around us and a private home folder, so hooks
+# installed for the real user (say in ~/.claude) can't change what these lanes see.
+for _k in ("RATCHET_ROLE", "RATCHET_HUMAN_OVERRIDE", "RATCHET_ROOT", "RATCHET_HOST_PROVIDER", "CLAUDECODE",
+           "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED",
+           "GEMINI_CLI", "COPILOT_CLI", "GITHUB_COPILOT_CLI", "CODEX_HOME", "COPILOT_HOME", "RATCHET_HOOKS_WAIVE"):
+    os.environ.pop(_k, None)
+_HOME = Path(tempfile.mkdtemp(prefix="ratchet-viewer-userhome-"))
+os.environ.update(HOME=str(_HOME), CODEX_HOME=str(_HOME / "codexhome"), COPILOT_HOME=str(_HOME / "copilothome"))
+
 
 def sh(*args, cwd):
     return subprocess.run([sys.executable, str(ENGINE), *args], cwd=cwd, capture_output=True, text=True)
@@ -155,7 +164,53 @@ def plain_viewer_checks(base: Path):
         sh("view", "--stop", cwd=d)
 
 
+def patched_python(code: str) -> dict:
+    """An environment whose Python runs `code` at start-up (via sitecustomize), to simulate a slow machine."""
+    d = Path(tempfile.mkdtemp(prefix="ratchet-viewer-site-"))
+    (d / "sitecustomize.py").write_text(code)
+    return dict(os.environ, PYTHONPATH=str(d))
+
+
+def servers_for(root: Path) -> list:
+    return [l.strip() for l in subprocess.run(["ps", "-eo", "pid,args"], capture_output=True, text=True).stdout.splitlines()
+            if "ratchet.py" in l and "--foreground" in l and str(root) in l]
+
+
+def slow_start_checks():
+    print("Slow machines")
+    base = Path(tempfile.mkdtemp(prefix="ratchet-viewer-slow-"))
+    c, d = lane(base, "gamma"), lane(base, "delta")
+    # A machine whose reverse DNS is slow: resolving 0.0.0.0 can take 5s or more, longer than the start-up wait.
+    slow_dns = patched_python("import socket, time\n_real = socket.getfqdn\n"
+                              "def _slow(*a, **k):\n    time.sleep(8)\n    return _real(*a, **k)\n"
+                              "socket.getfqdn = _slow\n")
+    try:
+        r = subprocess.run([sys.executable, str(ENGINE), "view", "--serve"], cwd=c, capture_output=True, text=True,
+                           env=slow_dns)
+        check("the viewer starts even when reverse DNS is slow", r.returncode == 0 and
+              (c / ".ratchet/viewer.json").exists(), r.stdout + r.stderr)
+        r = subprocess.run([sys.executable, str(ENGINE), "lanes", "--serve", "--scan", str(base)], cwd=base,
+                           capture_output=True, text=True, env=slow_dns)
+        check("the lanes dashboard starts even when reverse DNS is slow", r.returncode == 0 and
+              (base / ".ratchet-lanes.json").exists(), r.stdout + r.stderr)
+        # A server that never comes up must not be left running in the background after the start gives up.
+        hang = patched_python("import socketserver, time\n"
+                              "socketserver.TCPServer.server_bind = lambda self: time.sleep(60)\n")
+        r = subprocess.run([sys.executable, str(ENGINE), "view", "--serve"], cwd=d, capture_output=True, text=True,
+                           env=hang)
+        check("a server that never starts is reported", r.returncode != 0 and "did not start" in r.stdout + r.stderr,
+              r.stdout + r.stderr)
+        check("a server that never starts is not left running", not servers_for(d), servers_for(d))
+    finally:
+        sh("lanes", "--stop", "--scan", str(base), cwd=base)
+        for x in (c, d):
+            sh("view", "--stop", cwd=x)
+        for line in servers_for(base):  # never leak a process from this test, even when a check fails
+            subprocess.run(["kill", line.split()[0]], capture_output=True)
+
+
 def main():
+    slow_start_checks()
     base = Path(tempfile.mkdtemp(prefix="ratchet-viewer-"))
     a, b = lane(base, "alpha"), lane(base, "beta")
     try:

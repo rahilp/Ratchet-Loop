@@ -14,6 +14,7 @@ Assumed interface (the implementation must provide it):
 Everything runs in throwaway git projects with a temp HOME / RATCHET_HOME; the repo's own .ratchet is never touched.
 """
 import datetime as dt
+import importlib.util
 import json
 import os
 import re
@@ -29,9 +30,41 @@ SCRUB = ("RATCHET_ROLE", "RATCHET_HUMAN_OVERRIDE", "RATCHET_ROOT", "RATCHET_HOST
          "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED",
          "GEMINI_CLI", "COPILOT_CLI", "GITHUB_COPILOT_CLI", "CODEX_HOME", "COPILOT_HOME", "RATCHET_HOOKS_WAIVE")
 HOME = Path(tempfile.mkdtemp(prefix="ratchet-sp-home-"))
+
+
+def path_without_agent_clis() -> str:
+    """The real PATH minus every agent CLI the engine knows, so a machine with Codex or Gemini installed
+    sees the same 'no other provider' plan as one without them."""
+    spec = importlib.util.spec_from_file_location("ratchet_engine_sp", ENGINE)
+    eng = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(eng)
+    agents = {pr["bin"].lower() for pr in eng.PRESETS.values()}
+
+    def is_agent(name):  # on Windows, codex.cmd or gemini.exe is still codex or gemini
+        return (os.path.splitext(name)[0] if os.name == "nt" else name).lower() in agents
+
+    folders = []
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        names = os.listdir(folder) if os.path.isdir(folder) else []
+        if not any(is_agent(n) for n in names):
+            folders.append(folder)  # most folders hold no agent CLI and are kept as they are
+            continue
+        # a folder that holds one (a mise or npm bin, say) is replaced by a copy of its other tools
+        shadow = Path(tempfile.mkdtemp(prefix="ratchet-sp-bin-"))
+        for name in names:
+            src = Path(folder) / name
+            if not is_agent(name) and src.is_file():
+                try:
+                    (shadow / name).symlink_to(src)
+                except OSError:  # no symlinks allowed (stock Windows): that one tool is left out
+                    pass
+        folders.append(str(shadow))
+    return os.pathsep.join(folders)
+
+
 ENV = {k: v for k, v in os.environ.items() if k not in SCRUB}
 ENV.update(HOME=str(HOME), RATCHET_HOME=str(HOME / "rh"), CODEX_HOME=str(HOME / "codexhome"),
-           COPILOT_HOME=str(HOME / "copilothome"), RATCHET_HOST_PROVIDER="anthropic")
+           COPILOT_HOME=str(HOME / "copilothome"), RATCHET_HOST_PROVIDER="anthropic", PATH=path_without_agent_clis())
 TRANSCRIPTS = Path(tempfile.mkdtemp(prefix="ratchet-sp-transcripts-"))
 PASS = FAIL = 0
 GO = "yes, go ahead without hooks"

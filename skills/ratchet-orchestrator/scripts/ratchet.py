@@ -4337,9 +4337,8 @@ def cmd_lanes(args):
         ok("Lanes dashboard stopped" if _stop_server(state_file) else "No lanes dashboard was running")
         return
     if args.serve and args.foreground:
-        import http.server
         token = os.environ.get("RATCHET_VIEWER_TOKEN") or None
-        srv = http.server.ThreadingHTTPServer((args.bind, args.port), _make_handler(_dashboard_routes(base), token))
+        srv = _http_server(args.bind, args.port, _make_handler(_dashboard_routes(base), token))
         srv.serve_forever()
         return
     if args.serve:
@@ -4581,6 +4580,11 @@ def _start_server(kind, root: Path, state_file: Path, bind, port, token_mode, pu
         import time
         time.sleep(0.1)
     else:
+        try:  # don't leave a half-started server behind
+            import signal
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
         die(f"Viewer server did not start — see {log}")
     host = _public_host(bind, public_host)
     url = f"http://{host}:{port}/" + (f"?t={token}" if token else "")
@@ -4605,6 +4609,19 @@ def _stop_server(state_file: Path) -> bool:
         pass
     state_file.unlink(missing_ok=True)
     return True
+
+
+def _http_server(bind, port, handler):
+    """ThreadingHTTPServer without its reverse-DNS lookup of the bind address. That lookup can take
+    5s or more (0.0.0.0 on a machine with slow DNS), long enough to outlast the start-up wait."""
+    import http.server
+    import socketserver
+
+    class Server(http.server.ThreadingHTTPServer):
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = str(self.server_address[0]), self.server_address[1]
+    return Server((bind, port), handler)
 
 
 def _make_handler(routes, token):
@@ -4668,10 +4685,9 @@ def cmd_view(args):
         ok("Viewer server stopped" if _stop_server(state_file) else "No viewer server was running")
         return
     if args.serve and args.foreground:
-        import http.server
         token = os.environ.get("RATCHET_VIEWER_TOKEN") or None
         handler = _make_handler(_viewer_routes(lambda: Ctx(find_root())), token)
-        srv = http.server.ThreadingHTTPServer((args.bind, args.port), handler)
+        srv = _http_server(args.bind, args.port, handler)
         srv.serve_forever()
         return
     path = build_viewer(ctx)
