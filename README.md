@@ -227,7 +227,7 @@ Reviewers label every finding with the kind of mistake it is. When the same kind
 
 Claude Code finds Ratchet's skills on its own. For the non-Claude CLIs (Codex, Gemini CLI and Copilot CLI), the installer puts one shared copy in `~/.ratchet-loop/skills` (or `$RATCHET_HOME/skills` if you set that). Your CLI needs to be able to see it, for example with the skill folders linked into its own skills folder. The agent can do this for you. Just ask it to "link the Ratchet skills into this CLI's skills folder".
 
-The hooks work the same on all four CLIs. If a hook itself breaks, it lets the action through and writes the error to `.ratchet/hook-errors.log`, rather than blocking everything.
+The hooks work the same on all four CLIs. If a hook itself breaks, it lets the action through and writes the error to `.ratchet/hook-errors.log`, rather than blocking everything. For the next 24 hours, `status` says in plain words that a safety hook failed and what to do, and the agent sees the same errors in `next`. Until that hook runs cleanly again, Ratchet does not count it as working.
 
 **Full requirements:** Python 3.8+, git, and Node 18+ with Playwright for checking screens. Other AI tools are optional (`claude`, `codex`, `gemini`, `copilot` and others); without them, your agent's own sub-agents do every review.
 
@@ -318,5 +318,6 @@ python3 tests/test_install.py
 python3 tests/test_providers.py
 python3 tests/test_specs.py
 python3 tests/test_status_plain.py
+python3 tests/test_trust.py
 python3 tests/test_viewer.py
 ```

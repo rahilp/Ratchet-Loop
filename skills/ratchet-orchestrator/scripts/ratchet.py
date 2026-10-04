@@ -947,6 +947,74 @@ def plain_now(ctx: Ctx, st, plan=None) -> str:
             + STEP_PLAIN.get(cps[cur].get("step"), "in progress") + ".")
 
 
+HOOK_EVENT_PLAIN = {"guard": "the check that runs before each edit or command",
+                    "stop": "the check that runs when the agent finishes a turn",
+                    "prompt": "the hook that records your replies"}
+
+
+def _plain_ago(at) -> str:
+    t = _parse_iso(at)
+    secs = (_dt.datetime.now(_dt.timezone.utc) - t).total_seconds() if t else 0
+    if secs < 60:
+        return "less than a minute ago"
+    if secs < 3600:
+        n = int(secs // 60)
+        return f"{n} minute{'s' if n != 1 else ''} ago"
+    n = int(secs // 3600)
+    return f"{n} hour{'s' if n != 1 else ''} ago"
+
+
+def _plain_hook_tail(event: str) -> str:
+    return ("so Ratchet's checks are not enforced right now" if event in ("guard", "stop")
+            else "so your replies may not be recorded")
+
+
+def plain_hook_errors(root: Path, host: str) -> list:
+    """Plain lines for `status` about hook crashes: the last 24 hours of the log, plus every hook that has not run
+    cleanly since its last crash, each named by its own event and crash time (none when there are none). Never shows
+    the raw error text: that is in `status --json` / `next` (`hook_errors`) and `doctor` for the agent."""
+    errs = read_hook_errors(root, host)
+    broken = broken_hooks(root, host, errors=errs)  # newest first, one entry per (host, event)
+    ask = "Ask the agent to run the doctor check and fix it."
+    lines, last, others, asked = [], None, broken, False
+    if errs:
+        last = errs[0]
+        what = HOOK_EVENT_PLAIN.get(last["event"], "one of its checks")
+        if len(errs) == 1:
+            lines.append(f"A Ratchet safety hook failed {_plain_ago(last['at'])} ({what}), so it let that action "
+                         "through without checking it.")
+        else:
+            lines.append(f"Ratchet safety hooks failed {len(errs)} times in the last day, most recently "
+                         f"{_plain_ago(last['at'])} ({what}), so those actions went through without being checked.")
+        last_broken = any((b["host"], b["event"]) == (last["host"], last["event"]) for b in broken)
+        others = [b for b in broken if (b["host"], b["event"]) != (last["host"], last["event"])
+                  and not (last_broken and b["event"] == last["event"])]
+        if last_broken:
+            lines.append(f"It has not run cleanly since, {_plain_hook_tail(last['event'])}. {ask}")
+            asked = True
+        elif not others:
+            lines.append("It has run cleanly since then. If it happens again, ask the agent to run the doctor check.")
+        else:
+            lines.append("It has run cleanly since then.")
+    seen = set()
+    for b in others:  # a different hook that is still broken: name it, and its own crash time
+        if b["event"] in seen:
+            continue  # the same check on another host (unknown-host view): one line is enough
+        seen.add(b["event"])
+        lines.append(f"{'Separately, a' if last else 'A'} Ratchet safety hook failed {_plain_ago(b['at'])} "
+                     f"({HOOK_EVENT_PLAIN.get(b['event'], 'one of its checks')}) and has not run cleanly since, "
+                     f"{_plain_hook_tail(b['event'])}.")
+    if seen and not asked:
+        lines[-1] += " " + ask
+    if hook_crash_state_unreadable(root):
+        lines.append("Ratchet cannot read its record of safety hook failures, so it counts its checks as not "
+                     "enforced right now. " + ask)
+    elif hook_crash_state_problem(root):
+        lines.append("Ratchet cannot save its record of safety hook failures, so a failed check could go unnoticed "
+                     "and it counts its checks as not enforced right now. " + ask)
+    return lines
+
+
 def cmd_status_text(ctx: Ctx):
     st = ctx.state()
     plan = ctx.plan() or {"checkpoints": []}
@@ -973,8 +1041,11 @@ def cmd_status_text(ctx: Ctx):
         print("What would you like to do?")
         for o in blocked_options(st.get("blocked_reason")):
             print(f"  {o['letter']}) {o['text']}")
-    if hooks_view(ctx, st).get("waived"):
+    hs = hooks_view(ctx, st)
+    if hs.get("waived"):
         print("Hooks were skipped at your request, so the checks are only advice.")
+    for line in plain_hook_errors(ctx.root, hs.get("host", "unknown")):
+        print(line)
     url = viewer_link(ctx)["url"]
     if url:
         print(f"Live view: {url}")
@@ -1368,7 +1439,8 @@ PRESETS = {
     "copilot": {"bin": "copilot", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
                 "command": ["copilot", "-p", "{prompt}"]},
     "cursor": {"bin": "cursor-agent", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
-               "command": ["cursor-agent", "-p", "{prompt}", "--output-format", "text"]},
+               # --trust: no workspace-trust prompt in headless runs; --mode ask: read-only, cannot edit files
+               "command": ["cursor-agent", "-p", "{prompt}", "--output-format", "text", "--trust", "--mode", "ask"]},
     "opencode": {"bin": "opencode", "company": None, "stdin": False, "model_flag": ["-m"], "model_at": 2,
                  "command": ["opencode", "run", "{prompt}"]},
 }
@@ -4170,6 +4242,7 @@ def cmd_next(args):
     if hw and na.get("phase") not in ("planning",):
         na["warning"] = hw
     na["hooks"] = hs
+    na["hook_errors"] = hook_errors_view(ctx.root, hs.get("host", "unknown"))
     print(json.dumps(na, indent=2))
 
 
@@ -4324,7 +4397,7 @@ def status_json(ctx: Ctx) -> dict:
             "adv_rounds_used": st.get("adv_rounds_total", 0),
             "unavailable_reviewers": unavailable_reviewers(ctx), "host_provider": detect_host(ctx.config()),
             "hooks_warning": hw, "hook_heartbeat": read_heartbeat(ctx.root),
-            "hooks": hs,
+            "hooks": hs, "hook_errors": hook_errors_view(ctx.root, hs.get("host", "unknown")),
             "viewer_url": viewer_link(ctx)["url"], "viewer_live": viewer_link(ctx)["live"],
             "done": sum(1 for c in cps if c["status"] == "done"), "total": len(cps),
             "checkpoints": cps, "updated_at": st.get("updated_at")}
@@ -4883,13 +4956,26 @@ def normalize_hook(data: dict, host: str) -> dict:
 
 
 def _heartbeat(root: Path, event: str, host: str):
+    """Record that a hook fired (liveness only). It never carries crash state: crash records live only in per-run
+    marker files and appended lines (see _record_hook_run), so a stale rewrite of this shared file by a concurrent
+    hook can at worst roll an entry back to an older time, which only makes a hook look less healthy.
+    The rewrite goes to a per-process temp file that then replaces the heartbeat in one rename, so a concurrent
+    hook never reads a truncated, half-written heartbeat (that read would fail and crash the reading hook)."""
     p = root / RATCHET_DIR / "hook-heartbeat.json"
+    tmp = p.with_name(f"{p.name}.{os.getpid()}-{secrets.token_hex(4)}.tmp")
     try:
         hb = read_json(p, {}) or {}
         hb[event] = {"at": now(), "host": host}
-        p.write_text(json.dumps(hb))
+        with open(tmp, "w") as f:  # every hook-state write uses open(), one name a test can fault
+            f.write(json.dumps(hb))
+        os.replace(tmp, p)
     except Exception:
         pass
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 ENGINE_PATH = str(Path(__file__).resolve())
@@ -5294,16 +5380,24 @@ def emit_hook(host: str, event: str, block: bool, message: str) -> int:
 def run_hook(event: str, host_arg: str | None) -> int:
     data = _hook_input()
     host = detect_hook_host(data, host_arg)
+    started = now()  # a clean run resolves only crashes recorded before it began
     try:
         n = normalize_hook(data, host)
         block, msg = {"stop": decide_stop, "prompt": decide_prompt, "guard": decide_guard}[event](n)
-        return emit_hook(host, event, block, msg)
+        rc = emit_hook(host, event, block, msg)
+        clean_root = _ratchet_root_of(n.get("cwd"))
+        if clean_root is not None:
+            _record_hook_run(clean_root, host, event, crashed=False, started=started)  # a clean run resolves this hook's crash
+        return rc
     except (Exception, SystemExit) as e:  # guard/prompt fail OPEN — never brick the host session
-        root = None
+        root, saved = None, True
         try:
             root = find_root(Path(data.get("cwd") or os.getcwd()))
             if (root / RATCHET_DIR).is_dir():
-                with (root / RATCHET_DIR / "hook-errors.log").open("a") as f:
+                saved = False
+                saved = (_record_hook_run(root, host, event, crashed=True)  # first: an unwritable log must not hide it
+                         or _record_unsaved_crash(root, host, event))  # durable fallback: unresolved, whatever its age
+                with open(root / RATCHET_DIR / "hook-errors.log", "a") as f:
                     f.write(f"{now()} {host} {event}: {type(e).__name__}: {e}\n")
         except Exception:
             pass
@@ -5311,6 +5405,14 @@ def run_hook(event: str, host_arg: str | None) -> int:
             try:  # stop fails CLOSED (a few times) — a corrupted state file must not end the loop quietly
                 block, msg = _stop_error(root, f"Ratchet could not read its run state ({type(e).__name__}: {e}).")
                 return emit_hook(host, event, block, msg)
+            except Exception:
+                pass
+        if not saved:  # say it plainly where the host shows hook output; never block (fail open)
+            try:
+                return emit_hook(host, event, False, (
+                    f"RATCHET: the {event} hook failed ({type(e).__name__}) and Ratchet could not save that failure "
+                    f"(it cannot write to {RATCHET_DIR}/{HOOK_CRASHES}/), so its checks are not enforced. Make that "
+                    "folder writable and run the doctor command."))
             except Exception:
                 pass
         return 0
@@ -5446,10 +5548,27 @@ def cmd_doctor(args):
     if not _enforcement_active(root, cfg):
         print("  For the agent: offer to set up the hooks for the user's agent CLI (ask first; a restart is needed "
               "afterwards). Do not ask the user to run commands.")
-    errs = root / RATCHET_DIR / "hook-errors.log"
-    if errs.exists():
-        tail = errs.read_text().strip().splitlines()[-3:]
-        print("  recent hook errors (hooks failed open):\n    " + "\n    ".join(tail))
+    recent = hook_errors_view(root, hs["host"])
+    if recent:
+        broken = {h: crashed_hook_events(root, h) for h in {e["host"] for e in recent}}  # judged per host
+        print("  recent hook errors, last 24 hours, newest first (hooks failed open):")
+        for e in recent:
+            still = "  (still broken: no clean run since)" if e["event"] in broken[e["host"]] else ""
+            print(f"    {e['at'][:19]}Z {e['host']} {e['event']}: {e['message']}{still}")
+    shown = {(e["host"], e["event"]) for e in recent}
+    for e in unresolved_hook_crashes(root, hs["host"]):
+        if (e["host"], e["event"]) not in shown:
+            print(f"  {e['host']} {e['event']} hook crashed at {e['at'][:19]}Z and has not run cleanly since "
+                  "(not among the recent errors listed); the next clean run of that hook on that host clears this.")
+    problem = hook_crash_state_problem(root)
+    if problem:
+        print(f"  hook crash records: {problem}. Until it is fixed every hook counts as not working; fix its "
+              "permissions (it must be readable and writable), or remove it if it is not a folder of crash markers.")
+    elif any(((read_hook_crashes(root).get(h) or {}).get(ev) or {}).get("unresolved")
+             for h, ev, _ in _unsaved_crashes(root) or []):
+        print(f"  some hook crashes could not be saved in {RATCHET_DIR}/{HOOK_CRASHES}/ and were kept in "
+              f"{RATCHET_DIR}/{HOOK_CRASHES_UNSAVED}; make that folder writable. Each clears on that hook's next "
+              "clean run.")
 
 
 def _safe_config(root: Path) -> dict:
@@ -5498,6 +5617,273 @@ def _parse_iso(v):
         return None
 
 
+HOOK_ERROR_RE = re.compile(r"^(\S+) (\S+) (\w+): (.*)$")  # run_hook's line: "<iso time> <host> <event>: <detail>"
+HOOK_ERRORS_SHOWN = 3
+
+
+def read_hook_errors(root: Path, host: str = "unknown", hours: int = 24) -> list:
+    """Hook crashes from .ratchet/hook-errors.log in the last `hours` (not more than 5 minutes in the future), for
+    `host` (every host when 'unknown'), newest first: [{event, host, at, message}]. Tolerant: a missing, unreadable
+    or garbage file, or any line that is not run_hook's format, counts as no error."""
+    p = root / RATCHET_DIR / "hook-errors.log"
+    try:
+        with p.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            raw = f.read()
+    except OSError:
+        return []
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    if size > 65536 and lines:
+        lines = lines[1:]  # the first line may be cut in half by the seek
+    now_t = _dt.datetime.now(_dt.timezone.utc)
+    cutoff, latest = now_t - _dt.timedelta(hours=hours), now_t + _dt.timedelta(minutes=5)
+    out = []
+    for line in lines:
+        m = HOOK_ERROR_RE.match(line.strip())
+        if not m:
+            continue
+        at, h, ev, msg = m.groups()
+        t = _parse_iso(at) if "T" in at else None
+        if not t or not (cutoff < t <= latest) or (host != "unknown" and h != host):
+            continue
+        out.append({"event": ev, "host": h, "at": at, "message": msg[:300], "_t": t})
+    out.sort(key=lambda e: e["_t"], reverse=True)
+    for e in out:
+        e.pop("_t")
+    return out
+
+
+def hook_errors_view(root: Path, host: str) -> list:
+    """The newest few recent hook errors, as carried by `next` and `status --json` (key `hook_errors`)."""
+    return read_hook_errors(root, host)[:HOOK_ERRORS_SHOWN]
+
+
+HOOK_CRASHES = "hook-crashes"  # a folder of empty marker files: one per recorded crash or clean run of a hook
+HOOK_CRASHES_UNSAVED = "hook-crashes-unsaved.log"  # fallback, one line per crash whose marker could not be saved
+_UNSAVED_RE = re.compile(r"^(\S+) ([A-Za-z0-9_-]+) (guard|stop|prompt)$")
+_HOOK_MARK_RE = re.compile(r"^([A-Za-z0-9_-]+)\.(guard|stop|prompt)\.(crash|clean)\.(\d+)\.[A-Za-z0-9_-]+$")
+_EPOCH = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+
+
+def _iso_us(v) -> int:
+    """An ISO time as whole microseconds since 1970 (exact; 0 when unreadable)."""
+    t = _parse_iso(v)
+    return (t - _EPOCH) // _dt.timedelta(microseconds=1) if t else 0
+
+
+def _hook_marks(root: Path):
+    """[(host, event, kind, microseconds, path)] for every marker in .ratchet/hook-crashes/; other names are ignored.
+    The time lives in the name, so reading never opens a file another process may be creating or deleting.
+    A missing folder means no crash was ever recorded ([]); a folder that cannot be listed gives None."""
+    folder = root / RATCHET_DIR / HOOK_CRASHES
+    try:
+        names = os.listdir(folder)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    out = []
+    for n in names:
+        m = _HOOK_MARK_RE.match(n)
+        if m:
+            out.append((m.group(1), m.group(2), m.group(3), int(m.group(4)), folder / n))
+    return out
+
+
+def _unsaved_crashes(root: Path):
+    """[(host, event, microseconds)] from .ratchet/hook-crashes-unsaved.log: crashes whose marker could not be saved
+    in hook-crashes/. [] when the file is missing; None when it exists but cannot be read."""
+    try:
+        text = (root / RATCHET_DIR / HOOK_CRASHES_UNSAVED).read_text(errors="replace")
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    out = []
+    for line in text.splitlines():
+        m = _UNSAVED_RE.match(line.strip())
+        if m and _iso_us(m.group(1)):
+            out.append((m.group(2), m.group(3), _iso_us(m.group(1))))
+    return out
+
+
+def _record_unsaved_crash(root: Path, host: str, event: str) -> bool:
+    """Fallback when run_hook cannot save a crash marker: append one line (no read-modify-write), so the crash still
+    counts as unresolved after its log line ages out. Returns False when this fails too: run_hook then tells the
+    host, and readers count every hook as broken while the crash store refuses writes (_crash_store_unwritable)."""
+    try:
+        with open(root / RATCHET_DIR / HOOK_CRASHES_UNSAVED, "a") as f:
+            f.write(f"{now()} {_mark_host(host)} {event}\n")
+        return True
+    except Exception:
+        return False
+
+
+def hook_crash_state_unreadable(root: Path):
+    """Why the recorded crash state cannot be read (None when it can)."""
+    if _hook_marks(root) is None:
+        return f"{RATCHET_DIR}/{HOOK_CRASHES}/ cannot be read (not a folder, or no permission)"
+    if _unsaved_crashes(root) is None:
+        return f"{RATCHET_DIR}/{HOOK_CRASHES_UNSAVED} cannot be read"
+    return None
+
+
+def _crash_store_unwritable(root: Path):
+    """Why Ratchet could not save a hook crash right now (None when it can), proven with a real write: create and
+    delete a probe file where run_hook saves crash markers (in .ratchet/ itself, where that folder would be made,
+    before the first crash). The probe name never matches a marker, so readers ignore it."""
+    rdir = root / RATCHET_DIR
+    if not rdir.is_dir():
+        return None  # no Ratchet state here: nothing to record
+    folder = rdir / HOOK_CRASHES
+    where = folder if folder.is_dir() else rdir
+    probe = where / f".write-probe.{os.getpid()}-{secrets.token_hex(4)}"
+    try:
+        with open(probe, "x"):
+            pass
+    except OSError:
+        return f"{RATCHET_DIR}/{HOOK_CRASHES}/ cannot be written (no permission, read-only or full disk)"
+    try:
+        probe.unlink()
+    except OSError:
+        pass
+    return None
+
+
+def hook_crash_state_problem(root: Path):
+    """Why Ratchet cannot trust its crash records (None when it can). Fail closed: a hook counts as working only while
+    Ratchet can both read and save its crash state, so while either fails every hook counts as broken: the records
+    cannot be read, or they cannot be written right now (a crash would be lost). Known limit (schemas.md section 10):
+    a crash at a moment when neither crash store can be written leaves no lasting record, so it counts as broken
+    only while the writes are refused; no shared file is ever rewritten to remember it."""
+    return hook_crash_state_unreadable(root) or _crash_store_unwritable(root)
+
+
+def read_hook_crashes(root: Path) -> dict:
+    """{host: {event: {crashed_at?, clean_at?, unresolved}}} from the markers run_hook leaves in
+    .ratchet/hook-crashes/ (plus the fallback hook-crashes-unsaved.log): the newest crash and the newest clean run of
+    each hook on each host. A crash is unresolved until a clean run that started after it. Missing or unreadable
+    files count as empty here; hook_crash_state_problem reports unreadable ones, and they make every hook broken."""
+    newest: dict = {}
+    marks = [m[:4] for m in _hook_marks(root) or []]
+    marks += [(h, ev, "crash", us) for h, ev, us in _unsaved_crashes(root) or []]
+    for h, ev, kind, us in marks:
+        rec = newest.setdefault(h, {}).setdefault(ev, {})
+        rec[kind] = max(rec.get(kind, 0), us)
+
+    def iso(us):
+        return (_EPOCH + _dt.timedelta(microseconds=us)).isoformat(timespec="microseconds")
+    out: dict = {}
+    for h, evs in newest.items():
+        for ev, rec in evs.items():
+            crash, clean = rec.get("crash"), rec.get("clean")
+            r = {"unresolved": bool(crash) and not (clean and clean > crash)}
+            if crash:
+                r["crashed_at"] = iso(crash)
+            if clean:
+                r["clean_at"] = iso(clean)
+            out.setdefault(h, {})[ev] = r
+    return out
+
+
+def _mark_host(host) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", str(host)) or "unknown"
+
+
+def _record_hook_run(root: Path, host: str, event: str, crashed: bool, started: str | None = None) -> bool:
+    """Crash state per (host, event), kept apart from the 24-hour log window: a crash stays unresolved until that
+    same hook, on that same host, runs cleanly in a call that started after it. No file is ever read, changed and
+    written back, so concurrent hooks cannot erase each other's records: each run only creates its own uniquely
+    named empty marker (exclusive create, the same on every OS), then deletes markers it supersedes, which never
+    changes the outcome: a crash removes that hook's older crash markers; a clean run removes that hook's older
+    crash and clean markers. `started` is when the clean run began, so a crash recorded while it ran stays
+    unresolved. A clean run writes only when it resolves a recorded crash (the hot path stays read-only otherwise).
+    Returns False when the record could not be saved (run_hook then falls back to hook-crashes-unsaved.log)."""
+    try:
+        h = _mark_host(host)
+        at = _iso_us(started or now())
+        if not at:
+            return False
+        if not crashed:
+            rec = (read_hook_crashes(root).get(h) or {}).get(event) or {}
+            if not rec.get("unresolved") or _iso_us(rec.get("crashed_at")) >= at:
+                return True  # nothing to resolve, or that crash came after this run started
+        kind = "crash" if crashed else "clean"
+        folder = root / RATCHET_DIR / HOOK_CRASHES
+        folder.mkdir(parents=True, exist_ok=True)
+        with open(folder / f"{h}.{event}.{kind}.{at}.{os.getpid()}-{secrets.token_hex(4)}", "x"):
+            pass
+        for mh, mev, mkind, us, path in _hook_marks(root) or []:
+            if (mh, mev) == (h, event) and us < at and (mkind == "crash" or not crashed):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass  # another run removed it first, or (Windows) it is busy: a stale marker changes nothing
+        return True
+    except Exception:
+        return False
+
+
+def _ratchet_root_of(cwd) -> Path | None:
+    """The nearest ancestor of `cwd` holding .ratchet (no git call: this runs on every clean hook)."""
+    try:
+        p = Path(str(cwd or os.getcwd())).resolve()
+        return next((c for c in [p, *p.parents] if (c / RATCHET_DIR).is_dir()), None)
+    except Exception:
+        return None
+
+
+def unresolved_hook_crashes(root: Path, host: str, crashes=None) -> list:
+    """Crashes run_hook recorded that the same hook on the same host has not yet run cleanly after, whatever their
+    age, for `host` (every host when 'unknown'), newest first: [{event, host, at}]."""
+    crashes = read_hook_crashes(root) if crashes is None else crashes
+    out = [{"event": ev, "host": h, "at": str(r.get("crashed_at") or "")}
+           for h, evs in crashes.items() if host in ("unknown", h)
+           for ev, r in evs.items() if r.get("unresolved") is True]
+    old = _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+    return sorted(out, key=lambda e: _parse_iso(e["at"]) or old, reverse=True)
+
+
+def broken_hooks(root: Path, host: str, hb=None, errors=None, crashes=None) -> list:
+    """Hooks that broke on their last run, judged per (host, event) so one host never clears another's crash:
+    (a) a crash recorded by run_hook with no clean run of that hook on that host since, however old; or (b) a recent
+    logged crash with no later clean run (hook-crashes/) or heartbeat from that same host (the heartbeat is
+    written before the decision, so a crash in the same call is logged after it). Newest first: [{event, host, at}],
+    `at` being its latest known crash."""
+    hb = read_heartbeat(root) if hb is None else hb
+    errors = read_hook_errors(root, host) if errors is None else errors
+    crashes = read_hook_crashes(root) if crashes is None else crashes
+    old = _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+    out = {(e["host"], e["event"]): e for e in unresolved_hook_crashes(root, host, crashes)}
+    done = set()
+    for e in errors:  # newest first, so the first error per (host, event) is its latest
+        h, ev = e["host"], e["event"]
+        if (h, ev) in done:
+            continue
+        done.add((h, ev))
+        et = _parse_iso(e["at"])
+        ct = _parse_iso(((crashes.get(h) or {}).get(ev) or {}).get("clean_at"))
+        if ct and et and ct > et:
+            continue  # that hook ran cleanly on that host after this crash
+        beat = hb.get(ev)
+        bt = _parse_iso(beat.get("at")) if isinstance(beat, dict) and beat.get("host") == h else None
+        if not bt or (et and et >= bt):
+            prev = out.get((h, ev))
+            if not prev or (et or old) > (_parse_iso(prev["at"]) or old):
+                out[(h, ev)] = {"event": ev, "host": h, "at": e["at"]}
+    return sorted(out.values(), key=lambda e: _parse_iso(e["at"]) or old, reverse=True)
+
+
+def crashed_hook_events(root: Path, host: str, hb=None, errors=None, crashes=None) -> set:
+    """Events whose hook broke on its last run (see broken_hooks). Fail safe: while the recorded crash state cannot
+    be read, every hook counts as broken."""
+    if hook_crash_state_problem(root):
+        return set(HOOK_EVENT_PLAIN)
+    return {b["event"] for b in broken_hooks(root, host, hb, errors, crashes)}
+
+
 def hooks_status(root: Path, cfg=None) -> dict:
     """Read-only: {host, installed, heartbeat_seen, fresh, missing} for the CLI running this command."""
     # Unknown host (e.g. unrecognised host_provider): we cannot tell which CLI this is, so a heartbeat from ANY
@@ -5521,11 +5907,12 @@ def hooks_status(root: Path, cfg=None) -> dict:
             return False
         t = _parse_iso(e.get("at"))
         return bool(t and cutoff < t <= latest)
-    # enforcing: the guard or stop hook fired recently (these are what enforce the gates);
-    # prompt_hook: the prompt hook fired recently (it only records the user's replies, it enforces nothing)
-    enforcing = _fresh("guard") or _fresh("stop")
+    # enforcing: the guard or stop hook fired recently (these are what enforce the gates) and neither broke on its
+    # last run; prompt_hook: the prompt hook fired recently and did not break (it only records the user's replies)
+    crashed = crashed_hook_events(root, host, hb)
+    enforcing = (_fresh("guard") or _fresh("stop")) and not (crashed & {"guard", "stop"})
     return {"host": host, "installed": installed, "heartbeat_seen": bool(entries), "fresh": fresh,
-            "enforcing": enforcing, "prompt_hook": _fresh("prompt"),
+            "enforcing": enforcing, "prompt_hook": _fresh("prompt") and "prompt" not in crashed,
             "missing": not installed and not enforcing}
 
 
@@ -5536,6 +5923,19 @@ def hooks_warning(ctx, hs=None) -> str | None:
         return None  # the user already chose to build without hooks; do not re-offer
     if hs.get("enforcing"):
         return None  # only guard/stop heartbeats count: the prompt hook alone enforces nothing
+    problem = hook_crash_state_problem(ctx.root)
+    if problem and hook_crash_state_unreadable(ctx.root):
+        return (f"Ratchet cannot read its hook crash records ({problem}), so it counts the safety hooks as not "
+                "working and the gates as not enforced. Run the doctor command, fix or remove that file, and tell "
+                "the user in one plain sentence.")
+    if problem:
+        return (f"Ratchet cannot save its hook crash records ({problem}), so a hook crash could go unrecorded and it "
+                "counts the safety hooks as not working and the gates as not enforced. Run the doctor command, make "
+                "that folder writable, and tell the user in one plain sentence.")
+    if crashed_hook_events(ctx.root, hs.get("host", "unknown")) & {"guard", "stop"}:
+        return ("A Ratchet safety hook broke on its last run and let the action through (see hook_errors), so the "
+                "gates are not enforced right now. Run the doctor command to see the error, fix the cause, and tell "
+                "the user in one plain sentence. The next clean hook run restores enforcement.")
     if hs["installed"]:
         return ("Ratchet hooks are installed for this agent CLI but none has fired recently. Tell the user the "
                 "agent CLI probably needs a restart (and, for Codex, hooks enabled) so the gates are enforced.")

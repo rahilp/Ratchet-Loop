@@ -13,7 +13,7 @@
       "codex"
     ]
   },
-  "regression_command": "for t in tests/test_*.py; do python3 \"$t\" > /dev/null || exit 1; done",
+  "regression_command": "for t in tests/test_*.py; do python3 \"$t\" > /tmp/rt-$(basename $t).log 2>&1 || { echo \"FAIL $t\"; tail -20 /tmp/rt-$(basename $t).log; exit 1; }; done",
   "commit_per_checkpoint": true,
   "design_md": "DESIGN.md",
   "standards": [
@@ -53,5 +53,35 @@
         "copilot-standards"
       ]
     ]
-  }
+  },
+  "providers": [
+    {
+      "id": "codex",
+      "preset": "codex"
+    },
+    {
+      "id": "gemini",
+      "preset": "gemini"
+    },
+    {
+      "id": "claude",
+      "preset": "claude"
+    },
+    {
+      "id": "cursor",
+      "command": [
+        "cursor-agent",
+        "-p",
+        "{prompt}",
+        "--output-format",
+        "text",
+        "--trust",
+        "--mode",
+        "ask"
+      ],
+      "stdin": false,
+      "model": "gemini-3.7-flash-high",
+      "company": "google"
+    }
+  ]
 }
