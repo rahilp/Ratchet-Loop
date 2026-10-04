@@ -34,6 +34,7 @@ import os
 import re
 import unicodedata
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2327,6 +2328,116 @@ def _ui_verdict(review: dict, cfg) -> tuple[str, list]:
     return ("PASS" if not blockers else "FAIL"), blockers
 
 
+MAX_REVIEW_BYTES = 8 * 1024 * 1024  # a reviewer's output or combined UI review larger than this is refused outright
+
+
+def _review_round_dir(ctx, cp_id: str, kind: str, n: int) -> Path:
+    """The one folder a review round's files must sit in: reviews/<CP>/adv-round-NN/ (adversarial) or
+    reviews/<CP>/round-NN/ (UI)."""
+    return ctx.run_dir() / "reviews" / cp_id / f"{'adv-round' if kind == 'adv' else 'round'}-{n:02d}"
+
+
+def _read_round_review(ctx, path, folder: Path, what: str, hint: str = ""):
+    """Check a review file's location FIRST, then read it exactly once from the opened file.
+
+    Refuses a file whose real location (symlinks and `..` resolved) is not directly inside this round's own folder,
+    before anything in it is read, so a file from anywhere else always gets the folder message (even if it is
+    malformed or stale). The file is then opened inside that folder without following links (relative to the
+    opened folder where the platform allows), checked through the open descriptor to be the same regular,
+    single-link file that was located, and read from that descriptor. Returns (resolved path, bytes, fstat): every
+    later check and the evidence copy use these bytes, so swapping the file after the check changes nothing."""
+    try:
+        rel = folder.relative_to(ctx.root).as_posix()
+    except ValueError:
+        rel = folder.as_posix()
+    where = (f"{what} must be written directly inside this round's own folder, {rel}/ "
+             f"({folder}). Run the review again with its output in that folder.{hint}")
+    try:
+        real = Path(os.path.realpath(str(path)))
+        base = Path(os.path.realpath(str(folder)))
+    except (OSError, ValueError):
+        die(f"Can't resolve {path}. {where}")
+    if os.path.normcase(str(real.parent)) != os.path.normcase(str(base)):
+        die(f"{path} is not in this round's folder (it resolves to {real}). {where}")
+    try:
+        lst = os.lstat(str(real))
+        base_st = os.stat(str(base))
+    except OSError:
+        die(f"Review not found: {path}. {where}")
+    if not stat.S_ISREG(lst.st_mode) or lst.st_nlink > 1:
+        die(f"{path} is a link to another file, not a review written here. {where}")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | nofollow | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    changed = f"{path} changed while it was being checked (replaced, or turned into a link). {where}"
+    dfd = fd = None
+    try:
+        if os.open in os.supports_dir_fd and hasattr(os, "O_DIRECTORY"):
+            dfd = os.open(str(base), os.O_RDONLY | os.O_DIRECTORY | nofollow)
+            if not os.path.samestat(os.fstat(dfd), base_st):
+                die(changed)
+            fd = os.open(real.name, flags, dir_fd=dfd)
+        else:  # e.g. Windows: no dir_fd; the descriptor identity check below still catches a swap
+            fd = os.open(str(real), flags)
+    except OSError as e:
+        if fd is not None:
+            os.close(fd)
+        die(f"{changed} ({e.strerror or e})")
+    finally:
+        if dfd is not None:
+            os.close(dfd)
+    try:
+        try:
+            fst = os.fstat(fd)
+        except OSError as e:
+            die(f"Could not inspect {path} after opening it: {e.strerror or e}. {where}")
+        if not stat.S_ISREG(fst.st_mode) or fst.st_nlink > 1 or not os.path.samestat(lst, fst):
+            die(changed)
+        if fst.st_size > MAX_REVIEW_BYTES:
+            die(f"{path} is {fst.st_size} bytes, over the {MAX_REVIEW_BYTES}-byte review size limit. A real "
+                f"reviewer output is never this large; trim it (or check it is the right file) and try again. {where}")
+        chunks = []
+        total = 0
+        try:
+            while True:
+                b = os.read(fd, 1 << 20)
+                if not b:
+                    break
+                total += len(b)
+                if total > MAX_REVIEW_BYTES:
+                    die(f"{path} grew past the {MAX_REVIEW_BYTES}-byte review size limit while it was being read "
+                        f"(it changed size concurrently). {where}")
+                chunks.append(b)
+        except OSError as e:
+            die(f"Could not read {path}: {e.strerror or e}. {where}")
+    finally:
+        os.close(fd)
+    return real, b"".join(chunks), fst
+
+
+def _parse_review(raw: bytes, path) -> dict:
+    """Parse review bytes already read by _read_round_review (never re-read the file by name)."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        die(f"{path} is not valid JSON: {e}")
+    if not isinstance(data, dict):
+        die(f"{path} must hold a JSON object (see schemas.md).")
+    return data
+
+
+def _write_review_evidence(dst: Path, raw: bytes, fst):
+    """Copy the review into evidence from the bytes that were checked, keeping the original timestamps."""
+    try:
+        dst.write_bytes(raw)
+    except OSError as e:
+        die(f"Could not write the evidence copy to {dst}: {e.strerror or e}. Check that the evidence folder "
+            f"({dst.parent}) exists and is writable with room for the file, then try again.")
+    try:
+        os.utime(str(dst), ns=(fst.st_atime_ns, fst.st_mtime_ns))
+    except OSError:
+        pass
+
+
 def cmd_ui_record(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -2336,10 +2447,11 @@ def cmd_ui_record(args):
     if not cp["gates"].get("ui"):
         die(f"{args.cp} has no UI gate")
     cfg = ctx.config()
-    review_path = Path(args.review).resolve()
-    review = read_json(review_path)
-    if review is None:
-        die(f"Review file not found: {args.review}")
+    g = cps["gates"]["ui"]
+    n = g["attempts"] + 1
+    review_path, raw, fst = _read_round_review(ctx, args.review, _review_round_dir(ctx, args.cp, "ui", n),
+                                               f"The combined UI review for round {n}")
+    review = _parse_review(raw, args.review)
     for key in ("reviewers", "differences"):
         if key not in review:
             die(f"combined review must contain '{key}' (see ratchet-ui-compare skill)")
@@ -2351,7 +2463,6 @@ def cmd_ui_record(args):
     if review.get("fingerprint") != cur_fp:
         die("combined review is not stamped with the current code fingerprint (it was produced for other code, or by "
             "hand). Capture and review again with ui_review.py — it stamps the fingerprint itself.")
-    g = cps["gates"]["ui"]
     compared = review.get("compared") or {}
     if not compared.get("spec_sha256") or compared.get("scope") is None:
         die("The combined review doesn't say what was compared (capture spec and scope). Produce it with "
@@ -2371,7 +2482,7 @@ def cmd_ui_record(args):
     dest = ctx.evidence(args.cp) / "ui" / f"round-{g['attempts']:02d}"
     dest.mkdir(parents=True, exist_ok=True)
     if review_path.parent != dest:
-        shutil.copy2(review_path, dest / "combined.json")
+        _write_review_evidence(dest / "combined.json", raw, fst)
     if verdict == "INVALID":
         g["status"] = "invalid"
         ctx.log(st, "ui_invalid", cp=args.cp, reason=review.get("invalid_reason"))
@@ -2438,10 +2549,12 @@ def cmd_adv_record(args):
     required = rnd["reviewers"]
     subs = rnd.get("substitutions") or []
     reviews = {}
+    round_dir = _review_round_dir(ctx, args.cp, "adv", rnd["round"])
     for rp in args.reviews:
-        r = read_json(Path(rp))
-        if r is None:
-            die(f"Review not found: {rp}")
+        rpath, raw, fst = _read_round_review(
+            ctx, rp, round_dir, f"Adversarial reviews for round {rnd['round']}",
+            f" `ratchet.py reviewers {args.cp}` gives each reviewer this folder and the round nonce to stamp.")
+        r = _parse_review(raw, rp)
         rid = r.get("reviewer") or Path(rp).stem
         if r.get("fingerprint") != fp["id"]:
             die(f"{rp} ({rid}) is not stamped with the current fingerprint {fp['id'][:10]}. Re-run that reviewer.")
@@ -2450,7 +2563,7 @@ def cmd_adv_record(args):
                 f"round {rnd['round']} (see `ratchet.py reviewers {args.cp}`).")
         if r.get("checkpoint") not in (None, args.cp):
             die(f"{rp} is a review of {r.get('checkpoint')}, not {args.cp}.")
-        age = Path(rp).stat().st_mtime - _iso(rnd["opened_at"])
+        age = fst.st_mtime - _iso(rnd["opened_at"])
         if age < cfg.get("min_review_seconds", 20):
             die(f"{rp} ({rid}) was written {age:.0f}s after the round opened — too fast to be a real review. "
                 "Launch the reviewer and let it do the work.")
@@ -2461,7 +2574,7 @@ def cmd_adv_record(args):
             if not seen or (changed and not (seen & changed)):
                 die(f"{rp} ({rid}) approves without listing the changed files it reviewed (files_reviewed). "
                     f"Changed in this checkpoint: {', '.join(sorted(changed)[:8]) or '(none recorded)'}.")
-        reviews[rid] = (rp, r)
+        reviews[rid] = (rpath, r, raw, fst)
     missing = [i for i in required if i not in reviews]
     if missing:
         die(f"{args.cp} (risk={cp.get('risk', 'normal')}) needs reviews from {required}; missing {missing}. "
@@ -2471,14 +2584,14 @@ def cmd_adv_record(args):
     dest.mkdir(parents=True, exist_ok=True)
     all_findings, verdicts = [], []
     for rid in required:
-        rp, r = reviews[rid]
+        rp, r, raw, fst = reviews[rid]
         spec = _roster_spec(cfg, rid) or {}
         findings = r.get("findings", []) or []
         all_findings += [dict(f, reviewer=rid) for f in findings]
         verdicts.append({"reviewer": rid, "vendor": spec.get("vendor"), "claimed": r.get("verdict"),
                          "findings": len(findings)})
-        if Path(rp).resolve().parent != dest.resolve():
-            shutil.copy2(rp, dest / f"{rid}.json")
+        if rp.parent != dest.resolve():
+            _write_review_evidence(dest / f"{rid}.json", raw, fst)
     need = len(required)
     record_kinds(st, args.cp, rnd["round"], all_findings, ctx.root, fp["id"], cp.get("risk", "normal"))
     covered = enforced_kinds(cfg)
@@ -4315,7 +4428,7 @@ def cmd_reviewers(args):
             rnd["reviewers"] = [r["id"] for r in rnd["resolved"]]
             ctx.log(st, "reviewer_fallback", cp=args.cp, detail="re-resolved within round " + str(rnd["round"]))
             ctx.save_state(st)
-    out_dir = ctx.run_dir() / "reviews" / args.cp / f"adv-round-{rnd['round']:02d}"
+    out_dir = _review_round_dir(ctx, args.cp, "adv", rnd["round"])
     out_dir.mkdir(parents=True, exist_ok=True)
     fixes = ctx.run_dir() / "reviews" / args.cp / f"adv-round-{rnd['round'] - 1:02d}" / "fixes.md"
     fixes_arg = f" --fixes {fixes}" if rnd["round"] > 1 else ""
@@ -4353,6 +4466,7 @@ def cmd_reviewers(args):
             print(f"      (instead of {skipped}: {r['reasons'][skipped]})")
     for rule in rules:
         print(f"  rule: {rule}")
+    print(f"Reviews must be written in this round's folder: {out_dir} (adv-record refuses a file from anywhere else)")
     print(f"Then: ratchet.py adv-record {args.cp} --reviews {out_dir}/*.json")
 
 

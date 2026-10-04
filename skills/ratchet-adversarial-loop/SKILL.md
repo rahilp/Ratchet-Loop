@@ -43,6 +43,7 @@ Each checkpoint has a `risk` (`low` / `normal` / `high`, set by the planner). Ri
    - From round 2 on, every reviewer gets `fixes.md` so it can withdraw a finding the fixer disproved with evidence. Otherwise each round is a fresh, hostile look.
 3. **Record.** `$RATCHET adv-record CPn --reviews <all output files>`
    - It refuses if any required reviewer is missing, or if any review is of a different fingerprint.
+   - It refuses any review that is not directly inside this round's own folder, `$RUN/reviews/CPn/adv-round-NN/` (`reviewers` prints it). Links and `..` paths are resolved first, and a file from an earlier round's folder doesn't count. If a reviewer wrote somewhere else, launch it again with its output in that folder.
    - No required reviewer has a blocking finding (see "What blocks") → **approved**, and `next` says `complete`. Minor findings that didn't block are kept in `deferred-findings.json` for the final review.
    - Otherwise ratchet.py writes `evidence/CPn/adversarial/round-NN/open-findings.json`, with each finding tagged by reviewer. (NN = the current round, zero-padded: 01, 02, ...)
 4. **Fix.** Spawn `ratchet-fixer` with that file. It fixes **every** finding, from every vendor, or writes an evidence-backed rebuttal in `$RUN/reviews/CPn/adv-round-NN/fixes.md`, touching nothing unrelated.

@@ -50,6 +50,7 @@ python3 $UIC/ui_review.py review \
 $RATCHET ui-record CPn --review $RUN/reviews/CPn/round-NN/combined.json
 ```
 `ratchet.py` recomputes the verdict itself: any `fixable_in_code: true` difference is a **blocker**.
+- **Wrong folder**: `ui-record` only accepts a `combined.json` that really sits in this round's own folder, `$RUN/reviews/CPn/round-NN/` (NN is one more than the UI rounds recorded so far). Links and `..` paths are resolved first, and a file from an earlier round's folder doesn't count. The refusal names the right folder: review again with `--out` set to it.
 - **INVALID**: the states didn't match (e.g. unfulfilled vs fulfilled order). Fix the capture spec or seed data and go back to step 3. Don't touch app code for this.
 - **FAIL**: spawn `ratchet-implementer` with the combined.json path. The only job is to fix the listed differences using DESIGN.md tokens. Then `$RATCHET behavior CPn` (the fix must not break behavior), then capture and review again as the next round.
 - **PASS**: continue to the adversarial gate.

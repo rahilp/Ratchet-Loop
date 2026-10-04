@@ -131,6 +131,17 @@ def R0(rnd):
     return rnd["reviewers"][0]["id"]
 
 
+def ui_round_dir(d, cp="CP1", slug="f"):
+    """CP3: a combined UI review must be written directly inside its round's own folder
+    (reviews/<cp>/round-NN/), not any temp folder. NN is however many rounds this gate has
+    already recorded, plus one."""
+    st = json.loads((d / f".ratchet/runs/{slug}/state.json").read_text())
+    attempts = st["checkpoints"][cp]["gates"]["ui"].get("attempts", 0)
+    p = d / f".ratchet/runs/{slug}/reviews/{cp}/round-{attempts + 1:02d}"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def write_review(d, rnd, rid, findings=None, **over):
     p = Path(rnd["output_dir"]) / f"{rid}.json"
     body = {"reviewer": rid, "checkpoint": rnd["checkpoint"], "fingerprint": rnd["fingerprint"],
@@ -613,6 +624,7 @@ def main():
     c = Path(tempfile.mkdtemp()) / "combined.json"
     c.write_text(json.dumps({"reviewers": ["visual", "behavior"], "differences": []}))
     check("a combined review without a fingerprint is refused", rx(d, "ui-record", "CP1", "--review", str(c)).returncode != 0)
+    c = ui_round_dir(d) / "combined.json"  # CP3: moved into this round's own folder, see ui_round_dir
     c.write_text(json.dumps({"checkpoint": "CP1", "fingerprint": fp, "reviewers": ["visual", "behavior"],
                              "compared": {"spec_sha256": "s1", "scope": "all"},
                              "differences": [{"severity": "blocker", "location": "x", "description": "broken",
@@ -623,7 +635,7 @@ def main():
 
     print("What the UI check compares is frozen after a FAIL (smoke-run finding)")
     def ui_round(d, compared, diffs):
-        c = Path(tempfile.mkdtemp()) / "combined.json"
+        c = ui_round_dir(d) / "combined.json"  # CP3: moved into this round's own folder, see ui_round_dir
         c.write_text(json.dumps({"checkpoint": "CP1", "fingerprint": json.loads(rx(d, "fingerprint").stdout)["id"],
                                  "reviewers": ["visual", "behavior"], "compared": compared, "differences": diffs}))
         return rx(d, "ui-record", "CP1", "--review", str(c))
