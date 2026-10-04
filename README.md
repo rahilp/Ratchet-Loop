@@ -227,7 +227,18 @@ Reviewers label every finding with the kind of mistake it is. When the same kind
 
 Claude Code finds Ratchet's skills on its own. For the non-Claude CLIs (Codex, Gemini CLI and Copilot CLI), the installer puts one shared copy in `~/.ratchet-loop/skills` (or `$RATCHET_HOME/skills` if you set that). Your CLI needs to be able to see it, for example with the skill folders linked into its own skills folder. The agent can do this for you. Just ask it to "link the Ratchet skills into this CLI's skills folder".
 
-The hooks work the same on all four CLIs. If a hook itself breaks, it lets the action through and writes the error to `.ratchet/hook-errors.log`, rather than blocking everything. For the next 24 hours, `status` says in plain words that a safety hook failed and what to do, and the agent sees the same errors in `next`. Until that hook runs cleanly again, Ratchet does not count it as working.
+The four CLIs do not all enforce the same things. Here is what each one actually does today:
+
+| CLI | Protects Ratchet's records | Confirms reviewer identity | Stop hook | Records your replies |
+|---|---|---|---|---|
+| Claude Code | Yes, Ratchet's state and evidence files are protected from hand-edits. | Yes, Claude Code tells Ratchet which sub-agent is acting, so Ratchet can confirm reviewer identity. | Yes, the stop hook stops the agent from ending its turn early. | Yes, the prompt hook records your replies and shows Ratchet's guidance back to the agent. |
+| Codex | Yes, Ratchet's state and evidence files are protected from hand-edits. | No, Ratchet has no way to know which sub-agent (reviewer) is at work, so it cannot confirm reviewer identity. | Yes, the stop hook stops the agent from ending its turn early. | Yes, the prompt hook records your replies and shows Ratchet's guidance back to the agent. |
+| Gemini | Yes, Ratchet's state and evidence files are protected from hand-edits. | No, Ratchet has no way to know which sub-agent (reviewer) is at work, so it cannot confirm reviewer identity. | Yes, the stop hook stops the agent from ending its turn early. | Yes, the prompt hook records your replies and shows Ratchet's guidance back to the agent. |
+| Copilot | Yes, Ratchet's state and evidence files are protected from hand-edits. | No, Ratchet has no way to know which sub-agent (reviewer) is at work, so it cannot confirm reviewer identity. | Yes, the stop hook stops the agent from ending its turn early. | Copilot's prompt hook drops its own message, so the agent never sees Ratchet's guidance, but the reply is still recorded in Ratchet's log. |
+
+Only Claude Code tells Ratchet which sub-agent is acting; none of the other three can do that today, so Ratchet cannot confirm reviewer identity on Codex, Gemini or Copilot the way it can on Claude Code.
+
+If the guard or prompt hook breaks, it lets the action through and writes the error to `.ratchet/hook-errors.log`, rather than blocking everything, because a crashing guard must never brick a session. If the stop hook breaks while a run is active, it fails closed instead: it blocks the agent from ending its turn and tells it to explain the failure to you, for up to five tries in a row; after that it lets the agent stop too, logged the same way, so a broken install can't trap the session forever. For the next 24 hours, `status` says in plain words that a safety hook failed and what to do, and the agent sees the same errors in `next`. Until that hook runs cleanly again, Ratchet does not count it as working.
 
 **Full requirements:** Python 3.8+, git, and Node 18+ with Playwright for checking screens. Other AI tools are optional (`claude`, `codex`, `gemini`, `copilot` and others); without them, your agent's own sub-agents do every review.
 

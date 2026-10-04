@@ -4884,6 +4884,26 @@ HOOK_EVENTS = {  # host -> (stop, prompt, guard) event names in that host's conf
 }
 VENDOR_TO_HOST = {"anthropic": "claude", "openai": "codex", "google": "gemini", "github": "copilot"}
 
+# What Ratchet enforces on each host CLI today. This is the one source for the per-CLI table in README.md
+# ("Using it with Codex, Gemini or Copilot"); tests/test_docs.py renders that table from it cell by cell and
+# checks every fact against the code that does the work:
+#   records   the guard hook blocks hand-edits to .ratchet/ state and evidence (build_hook_config, decide_guard)
+#   identity  the host names the acting sub-agent, so review files are checked against their owner (decide_guard)
+#   stop      the stop hook keeps the agent from ending its turn early (build_hook_config, emit_hook)
+#   replies   the prompt hook records what the user typed (decide_prompt)
+#   guidance  the prompt hook's message reaches the agent (emit_hook; Copilot drops it)
+HOST_ENFORCEMENT = {
+    "claude": {"records": True, "identity": True, "stop": True, "replies": True, "guidance": True},
+    "codex": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": True},
+    "gemini": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": True},
+    "copilot": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": False},
+}
+
+
+def _host_names_subagent(host: str) -> bool:
+    return bool(HOST_ENFORCEMENT.get(host, {}).get("identity"))
+
+
 TOOL_KINDS = {
     "shell": {"bash", "powershell", "run_shell_command", "shell", "exec_command", "local_shell",
               "container.exec", "terminal", "run_in_terminal"},
@@ -5330,10 +5350,10 @@ def decide_guard(n: dict) -> tuple[bool, str]:
     marks = False
     if (root / RATCHET_DIR).is_dir():
         _heartbeat(root, "guard", n["host"])
-        if n.get("agent_type") and n["host"] == "claude":
+        if n.get("agent_type") and _host_names_subagent(n["host"]):
             _heartbeat(root, "agent_marks", n["host"])  # this CLI names the sub-agent on its tool calls
         marks = isinstance(read_heartbeat(root).get("agent_marks"), dict)
-    who = {"enforce": marks and n["host"] == "claude", "agent_type": n.get("agent_type")}
+    who = {"enforce": marks and _host_names_subagent(n["host"]), "agent_type": n.get("agent_type")}
     if n["kind"] == "shell" and cmd:
         why = _guard_shell(cmd, cwd, who)
         if why:

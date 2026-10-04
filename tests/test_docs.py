@@ -34,6 +34,1166 @@ def providers_named(text):
     return {p for p in PROVIDERS if re.search(r"\b" + p, text, re.I)}
 
 
+# ---- CP2 ----
+# README: a per-CLI table replaces the "hooks work the same on all four CLIs" claim, and the hook-error
+# paragraph says plainly that status/next surface recent hook errors (not only the log file).
+
+HOOKS_SAME_RX = re.compile(
+    r"hooks?\s+work\s+(the\s+same|identically|equally)\b[^.\n]{0,80}"
+    r"(all\s+four|four\s+(agent\s+)?CLIs|every\s+CLI|each\s+(of\s+the\s+)?(four|CLIs))", re.I)
+
+ONLY_CLAUDE_SUBAGENT_RX = re.compile(
+    r"only\s+claude\s+code\b[^.\n]{0,100}"
+    r"(tells?\s+ratchet\s+which\s+sub-?agent|which\s+sub-?agent\s+is\s+acting)", re.I)
+
+SUBAGENT_CLAIM_RX = re.compile(
+    r"tells?\s+ratchet\s+which\s+sub-?agent|which\s+sub-?agent\s+is\s+acting|identifies?\s+which\s+sub-?agent", re.I)
+
+CONTRADICTION_RX = re.compile(
+    r"only\s+writ(e|es|ten)\s+to\s+(the\s+)?log|never\s+(shown|surfaced|visible|seen)\s+elsewhere|"
+    r"only\s+(shows?|appears?)\s+in\s+(the\s+)?log(\s+file)?\b|nowhere\s+else", re.I)
+
+RECORD_PATTERNS = (r"record|state(-|\s)?file", r"protect|guard|block|hand-edit|hand edit|safe from")
+REVIEWER_PATTERNS = (r"review(er)?|sub-?agent", r"identit|confirm|verif|which\s+(sub-?agent|reviewer)|know")
+STOP_PATTERNS = (r"\bstop\b", r"hook|enforc|block|end\w*\s+(its|their|your)?\s*turn|quit|early")
+PROMPT_PATTERNS = (r"prompt\s*hook|user'?s?\s+repl(y|ies)|replies", r"record")
+
+
+def md_table_rows(text):
+    """Rows of the first markdown table in text, as [cell, cell, ...]; the separator row is dropped."""
+    rows = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if cells and all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+            continue
+        rows.append(cells)
+    return rows
+
+
+def cli_rows(sect):
+    """Data rows of the table (header row dropped), or [] when no table is present."""
+    rows = md_table_rows(sect)
+    return rows[1:] if len(rows) >= 2 else []
+
+
+def row_text(r):
+    return " | ".join(r)
+
+
+def sentences(text):
+    return re.split(r"(?<=[.!?])\s+", text)
+
+
+def l_hooks_same_claim(sect):  # T01
+    return HOOKS_SAME_RX.search(sect) is not None
+
+
+def l_table_four_cli(sect):  # T02
+    rows = cli_rows(sect)
+    if not rows:
+        return False
+    matches = []
+    for r in rows:
+        name = r[0] if r else ""
+        matches.append([p for p in PROVIDERS if re.search(r"\b" + p, name, re.I)])
+    if any(len(h) != 1 for h in matches):
+        return False
+    found = [h[0] for h in matches]
+    return sorted(found) == sorted(PROVIDERS) and len(found) == len(set(found))
+
+
+def l_rows_cover(sect, patterns):  # T03-T06
+    rows = cli_rows(sect)
+    if len(rows) != 4:
+        return False
+    return all(has(row_text(r), *patterns) for r in rows)
+
+
+# Additive hardening (adversarial round 1, finding X1: l_rows_cover above is keyword-only across the whole
+# row, so a row phrased as a negation of the capability ("records are not protected", "reviewer identity is
+# not confirmed", "stop hook does not block early exit", "replies are not recorded") would still satisfy it).
+# These look at the specific column for each capability and fail when that cell's own clause negates the
+# claim, with the one named exception (reviewer identity: only the Claude row may affirm it) built in.
+NEGATED_CLAIM_RX = re.compile(
+    r"(not|n't|never|\bno\b|cannot|can't|without|lack(s|ing)?|fail(s)?\s+to|unable\s+to)"
+    r"[^.;,]{0,25}(protect|guard|block|confirm|verif|stop|record|enforc)", re.I)
+
+RECORD_CELL_RX = re.compile(r"protect|guard|hand-edit|hand edit|safe\s+from", re.I)
+STOP_CELL_RX = re.compile(r"\bstop\b|block|early", re.I)
+REVIEWER_CELL_RX = re.compile(r"reviewer\s+identity|which\s+sub-?agent|confirm", re.I)
+PROMPT_CELL_RX = re.compile(r"repl(y|ies)|record(s|ed)?|prompt\s*hook", re.I)
+
+
+def l_cell_affirms(cell, rx):
+    """`rx` names the capability; true only when the cell both names it and does not immediately negate it
+    (e.g. "not protected", "cannot confirm", "does not block", "not recorded")."""
+    return bool(rx.search(cell)) and NEGATED_CLAIM_RX.search(cell) is None
+
+
+def cols_by_cli(sect):
+    """{cli_name_lower: [cell, ...]} for the 4 data rows, only when every row has the 5 expected columns."""
+    rows = cli_rows(sect)
+    if len(rows) != 4 or any(len(r) < 5 for r in rows):
+        return {}
+    out = {}
+    for r in rows:
+        for p in PROVIDERS:
+            if re.search(r"\b" + p, r[0], re.I):
+                out[p] = r
+    return out if len(out) == 4 else {}
+
+
+def l_record_col_affirms(sect):  # X01
+    cols = cols_by_cli(sect)
+    return bool(cols) and all(l_cell_affirms(r[1], RECORD_CELL_RX) for r in cols.values())
+
+
+def l_stop_col_affirms(sect):  # X02
+    cols = cols_by_cli(sect)
+    return bool(cols) and all(l_cell_affirms(r[3], STOP_CELL_RX) for r in cols.values())
+
+
+def l_prompt_col_affirms(sect):  # X03
+    cols = cols_by_cli(sect)
+    return bool(cols) and all(l_cell_affirms(r[4], PROMPT_CELL_RX) for r in cols.values())
+
+
+def l_reviewer_col_polarity(sect):  # X04
+    cols = cols_by_cli(sect)
+    if not cols:
+        return False
+    if not l_cell_affirms(cols["claude"][2], REVIEWER_CELL_RX):
+        return False
+    return all(not l_cell_affirms(cols[p][2], REVIEWER_CELL_RX) for p in cols if p != "claude")
+
+
+def l_claude_only_subagent(sect):  # T07
+    if not ONLY_CLAUDE_SUBAGENT_RX.search(sect):
+        return False
+    rows = cli_rows(sect)
+    if len(rows) != 4:
+        return False
+    others = [r for r in rows if not re.search(r"claude", r[0], re.I)]
+    if len(others) != 3:
+        return False
+    return not any(SUBAGENT_CLAIM_RX.search(row_text(r)) for r in others)
+
+
+def l_copilot_drops_message(sect, hooks_test_src):  # T08
+    cand = [s for s in sentences(sect) if re.search(r"copilot", s, re.I)]
+    claim = any(has(s, r"prompt\s*hook|userPromptSubmitted", r"\bdrop", r"message") for s in cand)
+    grounded = "dropped anyway" in hooks_test_src.lower()
+    contradiction = any(has(s, r"copilot", r"record", r"repl(y|ies)",
+                            r"(same as|like the other|just as well|fully)") for s in cand)
+    return claim and grounded and not contradiction
+
+
+def hook_error_paragraph(sect):
+    for p in re.split(r"\n\s*\n", sect):
+        if "hook-errors.log" in p:
+            return p
+    return ""
+
+
+def l_status_next_surfaced(sect):  # T09
+    p = hook_error_paragraph(sect)
+    return bool(p) and has(p, r"`status`") and has(p, r"`next`") and has(p, r"see|show|surface|appear|say|tell")
+
+
+def l_no_contradiction(sect):  # T10
+    p = hook_error_paragraph(sect)
+    return bool(p) and CONTRADICTION_RX.search(p) is None
+
+
+def cp2_docs_lint():
+    print("CP2: README states what each CLI enforces")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    sect = hsection(readme, r"Using it with Codex, Gemini or Copilot")
+    hooks_test_path = ROOT / "tests" / "test_hooks.py"
+    hooks_test_src = hooks_test_path.read_text(encoding="utf-8") if hooks_test_path.exists() else ""
+    rows = cli_rows(sect)
+
+    check("[CP2-T01] the 'hooks work the same on all four CLIs' claim is gone",
+          bool(sect) and not l_hooks_same_claim(sect), sect[:200])
+    check("[CP2-T02] a table names all four CLIs, exactly one row each, no fifth CLI",
+          l_table_four_cli(sect), [r[0] if r else "" for r in rows])
+    check("[CP2-T03] every row covers record/state-file protection", l_rows_cover(sect, RECORD_PATTERNS), rows)
+    check("[CP2-T04] every row covers reviewer identity checks", l_rows_cover(sect, REVIEWER_PATTERNS), rows)
+    check("[CP2-T05] every row covers the stop hook", l_rows_cover(sect, STOP_PATTERNS), rows)
+    check("[CP2-T06] every row covers recording the user's replies (the prompt hook)",
+          l_rows_cover(sect, PROMPT_PATTERNS), rows)
+    check("[CP2-T07] only Claude Code is credited with telling Ratchet which sub-agent is acting",
+          l_claude_only_subagent(sect))
+    check("[CP2-T08] Copilot's prompt hook dropping the message is called out, matching the real dialect handling",
+          l_copilot_drops_message(sect, hooks_test_src))
+    check("[CP2-T09] README says hook errors now surface in status and next",
+          l_status_next_surfaced(sect), hook_error_paragraph(sect)[:200])
+    check("[CP2-T10] the log-file sentence and the status/next sentence don't contradict each other",
+          l_no_contradiction(sect), hook_error_paragraph(sect)[:200])
+    check("[CP2-T11] no em dashes in the new table or surrounding prose", bool(sect) and "—" not in sect)
+
+    cols = cols_by_cli(sect)
+    check("[CP2-X01] the record/state-file protection cell is affirmed (not negated) in all four rows",
+          l_record_col_affirms(sect), cols)
+    check("[CP2-X02] the stop-hook cell is affirmed (not negated) in all four rows", l_stop_col_affirms(sect), cols)
+    check("[CP2-X03] the records-your-replies cell is affirmed (not negated) in all four rows",
+          l_prompt_col_affirms(sect), cols)
+    check("[CP2-X04] the reviewer-identity cell affirms it only for Claude Code and negates it for the other three",
+          l_reviewer_col_polarity(sect), cols)
+
+    # Teeth: prove X01-X04 are not keyword-only like T03-T06 by turning one real cell into the adversary's own
+    # negated-row examples (evidence/CP2/adversarial/round-01/open-findings.json id X1) and checking the
+    # matching predicate goes red.
+    negation_mutants = [
+        ("X01", "Yes, Ratchet's state and evidence files are protected from hand-edits.",
+         "No, records are not protected from hand-edits.", l_record_col_affirms),
+        ("X02", "Yes, the stop hook stops the agent from ending its turn early.",
+         "No, the stop hook does not block early exit.", l_stop_col_affirms),
+        ("X03", "Yes, the prompt hook records your replies and shows Ratchet's guidance back to the agent.",
+         "No, replies are not recorded.", l_prompt_col_affirms),
+        ("X04", "Yes, Claude Code tells Ratchet which sub-agent is acting, so Ratchet can confirm reviewer identity.",
+         "No, reviewer identity is not confirmed.", l_reviewer_col_polarity),
+    ]
+    for tid, old, new, pred in negation_mutants:
+        present = old in sect
+        red = present and not pred(sect.replace(old, new, 1))
+        check(f"[CP2-{tid}] teeth: negating that row ({new!r}) turns the check red", red,
+              "example text not found in README" if not present else "still green")
+    swapped = sect.replace(
+        "No, Ratchet has no way to know which sub-agent (reviewer) is at work, so it cannot confirm reviewer identity.",
+        "Yes, Codex tells Ratchet which sub-agent is acting, so Ratchet can confirm reviewer identity.", 1)
+    check("[CP2-X04] teeth: a non-Claude row falsely claiming it confirms reviewer identity is also rejected",
+          not l_reviewer_col_polarity(swapped))
+    # Adversarial round 2 (X05-X10): the table must equal the rows rendered from ratchet.py's HOST_ENFORCEMENT,
+    # and every fact there is measured against the code. This supersedes the keyword checks T03-T07 and X01-X04.
+    cp2_single_source_checks(sect)
+    # Adversarial round 3 (X11-X13): identity is checked against each CLI's real hook payload, not the table.
+    cp2_real_payload_checks()
+    # Adversarial round 4 (X14-X18): every column measured through the installed hook commands on real runs.
+    cp2_hook_entry_checks(sect)
+    # Adversarial round 5 (X19-X25, finding X1): the hook-crash paragraph must say what each hook actually does
+    # when it breaks, not one blanket claim; grounded against decide_stop's real fail-closed limit.
+    cp2_r5_hook_crash_checks(sect)
+
+
+# ---- CP2 adversarial round 2: one source of truth for what each CLI enforces ----
+# Keyword and negation regexes cannot prove a cell means the right thing ("Hand-edits are allowed" names the
+# capability and has no negation word). Instead ratchet.py's HOST_ENFORCEMENT states the facts, the README table
+# must equal the rows rendered from it exactly, and each fact is checked by running the code that enforces it.
+import json as cp2_json
+import os as cp2_os
+import subprocess as cp2_subprocess
+import tempfile as cp2_tempfile
+
+CP2_ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+CP2_CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "gemini": "Gemini", "copilot": "Copilot"}
+CP2_HEADER = ["CLI", "Protects Ratchet's records", "Confirms reviewer identity", "Stop hook", "Records your replies"]
+CP2_FIELDS = ("records", "identity", "stop", "replies", "guidance")
+
+# Runs in a child process (this lint never loads the engine itself): loads ratchet.py and, for every host it
+# installs hooks for, measures what the code actually does, in the same shape as HOST_ENFORCEMENT. Every probe
+# uses a fresh throwaway project in a temp dir.
+CP2_PROBE = r'''
+import contextlib, importlib.util, io, json, os, shutil, sys, tempfile
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ratchet_engine_cp2", sys.argv[1])
+eng = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(eng)
+os.environ.pop("RATCHET_NESTED_REVIEW", None)
+
+
+def emit(host, event, block, message):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = eng.emit_hook(host, event, block, message)
+    return rc, out.getvalue(), err.getvalue()
+
+
+def field(text, key):
+    try:
+        return json.loads(text).get(key)
+    except Exception:
+        return None
+
+
+def project():
+    d = Path(tempfile.mkdtemp(prefix="ratchet-cp2-"))
+    (d / eng.RATCHET_DIR).mkdir()
+    return d
+
+
+def guard_blocks(host, rel_path, agent_type=""):
+    d = project()
+    try:
+        payload = {"cwd": str(d), "tool_name": "Write",
+                   "tool_input": {"file_path": str(d / eng.RATCHET_DIR / rel_path), "content": "{}"}}
+        if agent_type:
+            payload.update(agent_type=agent_type, agent_id="a-1")
+        return eng.decide_guard(eng.normalize_hook(payload, host))[0]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def prompt_recorded(host):
+    d = project()
+    try:
+        eng.decide_prompt(eng.normalize_hook({"cwd": str(d), "prompt": "cp2 reply probe", "session_id": "s"}, host))
+        log = d / eng.RATCHET_DIR / "human_log.jsonl"
+        return log.exists() and "cp2 reply probe" in log.read_text(encoding="utf-8")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+measured = {}
+for host in eng.HOOK_HOSTS:
+    installed = json.dumps(eng.build_hook_config(host, {}))
+    rc, out, _ = emit(host, "guard", True, "cp2 guard probe")
+    guard_ok = rc == 2 or field(out, "permissionDecision") == "deny"
+    rc, out, _ = emit(host, "stop", True, "cp2 stop probe")
+    stop_ok = rc == 2 or field(out, "decision") == "block"
+    rc, out, err = emit(host, "prompt", False, "cp2 guidance probe")
+    measured[host] = {
+        "records": (("hook guard --host " + host) in installed and guard_ok
+                    and guard_blocks(host, "runs/x/state.json")),
+        # a fixer writing an adversary's review file is refused only where the host names the acting sub-agent
+        "identity": guard_blocks(host, "runs/x/reviews/CP1/adv-round-01/a.json", "ratchet-fixer"),
+        "stop": ("hook stop --host " + host) in installed and stop_ok,
+        "replies": ("hook prompt --host " + host) in installed and prompt_recorded(host),
+        "guidance": rc == 0 and "cp2 guidance probe" in out + err,
+    }
+print(json.dumps({"data": eng.HOST_ENFORCEMENT, "hosts": list(eng.HOOK_HOSTS), "events": sorted(eng.HOOK_EVENTS),
+                  "measured": measured}))
+'''
+
+
+def cp2_probe(engine=CP2_ENGINE):
+    """{"data": HOST_ENFORCEMENT, "hosts": HOOK_HOSTS, "events": [...], "measured": {host: facts}} from the engine."""
+    env = {k: v for k, v in cp2_os.environ.items() if k != "RATCHET_ROOT"}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"  # loading the engine must not write __pycache__ into the repo
+    with cp2_tempfile.TemporaryDirectory() as cwd:
+        r = cp2_subprocess.run([sys.executable, "-c", CP2_PROBE, str(engine)], capture_output=True, text=True,
+                               timeout=120, cwd=cwd, env=env)
+    if r.returncode != 0:
+        raise RuntimeError(f"CP2 engine probe failed: {r.stderr[-600:]}")
+    return cp2_json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def cp2_render_row(host, f):
+    """The README row for one CLI, rendered from its HOST_ENFORCEMENT facts. Each fact has one fixed sentence per
+    value, so a cell that says anything else (negated, softened, opposite action) no longer matches."""
+    name = CP2_CLI_NAMES[host]
+    records = ("Yes, Ratchet's state and evidence files are protected from hand-edits." if f["records"] else
+               "No, Ratchet's state and evidence files are not protected from hand-edits.")
+    identity = (f"Yes, {name} tells Ratchet which sub-agent is acting, so Ratchet can confirm reviewer identity."
+                if f["identity"] else
+                "No, Ratchet has no way to know which sub-agent (reviewer) is at work, so it cannot confirm reviewer "
+                "identity.")
+    stop = ("Yes, the stop hook stops the agent from ending its turn early." if f["stop"] else
+            "No, the stop hook cannot stop the agent from ending its turn early.")
+    if not f["replies"]:
+        replies = "No, the prompt hook does not record your replies."
+    elif f["guidance"]:
+        replies = "Yes, the prompt hook records your replies and shows Ratchet's guidance back to the agent."
+    else:
+        replies = (f"{name}'s prompt hook drops its own message, so the agent never sees Ratchet's guidance, but the "
+                   "reply is still recorded in Ratchet's log.")
+    return [name, records, identity, stop, replies]
+
+
+def cp2_table_diff(sect, data, order):
+    """[] when the README table equals the rendered table row by row and cell by cell, else what differs."""
+    got = md_table_rows(sect)
+    want = [CP2_HEADER] + [cp2_render_row(h, data[h]) for h in order]
+    diffs = [] if len(got) == len(want) else [f"{len(got)} rows, expected {len(want)}"]
+    for i, (g, w) in enumerate(zip(got, want)):
+        if len(g) != len(w):
+            diffs.append(f"row {i}: {len(g)} cells, expected {len(w)}")
+            continue
+        diffs += [f"row {i} cell {j}: {a!r} != {b!r}" for j, (a, b) in enumerate(zip(g, w)) if a != b]
+    return diffs
+
+
+def cp2_fact_mismatches(hosts, data, measured):
+    """(host, fact, what the data says, what the code does) for every fact where they disagree."""
+    return [(h, f, data.get(h, {}).get(f), measured[h][f]) for h in hosts for f in CP2_FIELDS
+            if data.get(h, {}).get(f) is not measured[h][f]]
+
+
+def cp2_single_source_checks(sect):
+    probe = cp2_probe()
+    data, order, measured = probe["data"], probe["hosts"], probe["measured"]
+
+    diffs = cp2_table_diff(sect, data, order)
+    check("[CP2-X05] the README table equals the rows rendered from HOST_ENFORCEMENT, cell by cell", diffs == [],
+          diffs)
+    # Teeth: the adversary's round-2 examples, an ambiguous reviewer-identity cell, a negated cell and one altered
+    # word each break the exact match. str.replace(old, new, 1) changes only the first (Claude Code or Codex) row.
+    mutants = [
+        ("Yes, Ratchet's state and evidence files are protected from hand-edits.", "Hand-edits are allowed."),
+        ("Yes, the stop hook stops the agent from ending its turn early.", "Stop hook allows early exit."),
+        ("Yes, the prompt hook records your replies and shows Ratchet's guidance back to the agent.",
+         "Prompt hook discards replies."),
+        ("No, Ratchet has no way to know which sub-agent (reviewer) is at work, so it cannot confirm reviewer "
+         "identity.", "Ratchet may be able to confirm reviewer identity."),
+        ("Yes, Claude Code tells Ratchet which sub-agent is acting, so Ratchet can confirm reviewer identity.",
+         "No, Claude Code does not tell Ratchet which sub-agent is acting, so Ratchet cannot confirm reviewer "
+         "identity."),
+        ("Yes, the stop hook stops the agent from ending its turn early.",
+         "Yes, the stop hook lets the agent end its turn early."),
+    ]
+    for old, new in mutants:
+        present = old in sect
+        check(f"[CP2-X05] teeth: changing one cell to {new!r} breaks the exact match",
+              present and cp2_table_diff(sect.replace(old, new, 1), data, order) != [],
+              "cell text not found in README" if not present else "still matches")
+    flipped = cp2_json.loads(cp2_json.dumps(data))
+    flipped["codex"]["identity"] = True
+    check("[CP2-X05] teeth: when the data changes (Codex confirms identity) the unchanged README no longer matches",
+          cp2_table_diff(sect, flipped, order) != [])
+
+    check("[CP2-X06] HOST_ENFORCEMENT names exactly the CLIs Ratchet installs hooks for, each with every fact",
+          sorted(data) == sorted(order) == probe["events"]
+          and all(sorted(data[h]) == sorted(CP2_FIELDS) and all(isinstance(v, bool) for v in data[h].values())
+                  for h in data), data)
+
+    for tid, fields, what in [("X07", ("records",), "the guard hook is installed and blocks hand-edits to state"),
+                              ("X07", ("stop",), "the stop hook is installed and blocks in the host's dialect"),
+                              ("X08", ("identity",), "decide_guard checks sub-agent identity on exactly these CLIs"),
+                              ("X09", ("replies", "guidance"),
+                               "the prompt hook records replies and passes guidance on exactly these CLIs")]:
+        bad = [m for m in cp2_fact_mismatches(order, data, measured) if m[1] in fields]
+        check(f"[CP2-{tid}] HOST_ENFORCEMENT matches the code: {what}", bad == [], bad)
+    check("[CP2-X08] the CLIs where decide_guard checks sub-agent identity are exactly those the data credits",
+          [h for h in order if measured[h]["identity"]] == [h for h in order if data[h]["identity"]],
+          {h: measured[h]["identity"] for h in order})
+
+    for host, field in [("codex", "identity"), ("copilot", "guidance"), ("gemini", "stop"), ("claude", "records")]:
+        wrong = cp2_json.loads(cp2_json.dumps(data))
+        wrong[host][field] = not wrong[host][field]
+        check(f"[CP2-X10] teeth: flipping {host}.{field} in the data is caught by the code check",
+              (host, field, wrong[host][field], measured[host][field]) in cp2_fact_mismatches(order, wrong, measured))
+
+    # Teeth on the code side: an engine copy whose guard checks sub-agent identity on every host (the data left
+    # unchanged) is caught as Codex, Gemini and Copilot doing something the data and README deny.
+    src = CP2_ENGINE.read_text(encoding="utf-8")
+    real = 'return bool(HOST_ENFORCEMENT.get(host, {}).get("identity"))'
+    with cp2_tempfile.TemporaryDirectory() as tmp:
+        for sib in CP2_ENGINE.parent.glob("*.py"):
+            (Path(tmp) / sib.name).write_text(sib.read_text(encoding="utf-8"), encoding="utf-8")
+        (Path(tmp) / CP2_ENGINE.name).write_text(src.replace(real, "return True", 1), encoding="utf-8")
+        mutant = cp2_probe(Path(tmp) / CP2_ENGINE.name)
+    caught = sorted(m[0] for m in cp2_fact_mismatches(order, data, mutant["measured"]) if m[1] == "identity")
+    check("[CP2-X10] teeth: an engine that checks sub-agent identity on every CLI is caught on the other three",
+          real in src and caught == ["codex", "copilot", "gemini"], caught)
+
+
+# ---- CP2 adversarial round 3: sub-agent identity checked against each CLI's real hook payload ----
+# The round 2 identity probe gave every host a fabricated agent_type, and decide_guard then asked HOST_ENFORCEMENT
+# whether to believe it, so the table was checked against itself. The independent ground truth here is the shape of
+# the PreToolUse (guard) payload each CLI really sends, copied from where the suite already models it:
+#   claude   tests/test_gates.py:54 (guard(): agent_type + agent_id on a sub-agent's tool call, as Claude Code sends
+#            them; see also the REVIEW_OWNERS comment in ratchet.py) plus Claude Code's common PreToolUse fields
+#   codex    tests/test_hooks.py:101 (snake_case + turn_id, apply_patch carrying the patch text)
+#   gemini   tests/test_hooks.py:107 (hook_event_name BeforeTool, write_file)
+#   copilot  tests/test_hooks.py:113 (camelCase, toolArgs is a JSON string)
+# Each is a sub-agent (the fixer, where the CLI can say so) writing an adversary's review file. {CWD} and {REVIEW}
+# are filled in by the child process with the throwaway project and the review file's path.
+CP2_REVIEW_REL = ".ratchet/runs/x/reviews/CP1/adv-round-01/a.json"
+CP2_REAL_GUARD_PAYLOADS = {
+    "claude": {"session_id": "s", "transcript_path": "/tmp/t.jsonl", "cwd": "{CWD}", "permission_mode": "default",
+               "hook_event_name": "PreToolUse", "tool_name": "Write",
+               "tool_input": {"file_path": "{REVIEW}", "content": "{}"}, "tool_use_id": "toolu_1",
+               "agent_id": "a-ratchet-fixer", "agent_type": "ratchet-fixer"},
+    "codex": {"session_id": "s", "turn_id": "t", "cwd": "{CWD}", "hook_event_name": "PreToolUse",
+              "tool_name": "apply_patch",
+              "tool_input": {"input": "*** Begin Patch\n*** Add File: " + CP2_REVIEW_REL + "\n+{}\n*** End Patch"}},
+    "gemini": {"session_id": "s", "cwd": "{CWD}", "hook_event_name": "BeforeTool", "tool_name": "write_file",
+               "tool_input": {"file_path": "{REVIEW}", "content": "{}"}},
+    "copilot": {"sessionId": "s", "timestamp": 1, "cwd": "{CWD}", "toolName": "create",
+                "toolArgs": cp2_json.dumps({"path": "{REVIEW}", "file_text": "{}"})},
+}
+# Any key a CLI could use to say which sub-agent is acting. Deliberately wider than what ratchet.py reads.
+CP2_SUBAGENT_KEYS = {"agent_type", "agent_id", "agentType", "agentId", "agent_name", "agentName", "subagent",
+                     "subagent_type", "subagentType", "subagentName"}
+
+# Child process: loads the engine, reports its HOST_ENFORCEMENT and, for each real payload as-is (nothing injected),
+# whether decide_guard refuses it. Also the Claude payload with the owner's agent_type, to show the refusal is about
+# who is acting and not a blanket block on review files.
+CP2_REAL_PROBE = r"""
+import importlib.util, json, os, shutil, sys, tempfile
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ratchet_engine_cp2_real", sys.argv[1])
+eng = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(eng)
+os.environ.pop("RATCHET_NESTED_REVIEW", None)
+payloads, review_rel = json.loads(sys.argv[2]), sys.argv[3]
+
+
+def refused(host, payload):
+    d = Path(tempfile.mkdtemp(prefix="ratchet-cp2r-"))
+    try:
+        (d / eng.RATCHET_DIR).mkdir()
+        text = json.dumps(payload).replace("{CWD}", str(d)).replace("{REVIEW}", str(d / review_rel))
+        return eng.decide_guard(eng.normalize_hook(json.loads(text), host))[0]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+owner = dict(payloads["claude"], agent_type="ratchet-adversary", agent_id="a-ratchet-adversary")
+print(json.dumps({"data": eng.HOST_ENFORCEMENT, "hosts": list(eng.HOOK_HOSTS),
+                  "refused": {h: refused(h, payloads[h]) for h in eng.HOOK_HOSTS},
+                  "owner_refused": refused("claude", owner)}))
+"""
+
+
+def cp2_real_probe(engine=CP2_ENGINE):
+    env = {k: v for k, v in cp2_os.environ.items() if k != "RATCHET_ROOT"}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"  # loading the engine must not write __pycache__ into the repo
+    with cp2_tempfile.TemporaryDirectory() as cwd:
+        r = cp2_subprocess.run([sys.executable, "-c", CP2_REAL_PROBE, str(engine),
+                                cp2_json.dumps(CP2_REAL_GUARD_PAYLOADS), CP2_REVIEW_REL],
+                               capture_output=True, text=True, timeout=120, cwd=cwd, env=env)
+    if r.returncode != 0:
+        raise RuntimeError(f"CP2 real-payload probe failed: {r.stderr[-600:]}")
+    return cp2_json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def cp2_identity_problems(probe):
+    """[] when the CLIs whose real payload names the sub-agent, the CLIs HOST_ENFORCEMENT credits with identity and
+    the CLIs where the guard refuses the fixer's real payload are the same set; else what differs."""
+    order = probe["hosts"]
+    in_payload = [h for h in order if CP2_SUBAGENT_KEYS & set(CP2_REAL_GUARD_PAYLOADS[h])]
+    in_table = [h for h in order if probe["data"][h]["identity"]]
+    refused = [h for h in order if probe["refused"][h]]
+    out = []
+    if in_table != in_payload:
+        out.append(f"HOST_ENFORCEMENT credits {in_table}, real payloads name the sub-agent on {in_payload}")
+    if refused != in_payload:
+        out.append(f"guard refuses the fixer's real payload on {refused}, real payloads name it on {in_payload}")
+    return out
+
+
+def cp2_engine_variant(tmp, old, new):
+    """A copy of the engine (and its sibling scripts) in tmp with one exact text replaced; its path."""
+    src = CP2_ENGINE.read_text(encoding="utf-8")
+    if old not in src:
+        raise RuntimeError(f"engine text to mutate not found: {old!r}")
+    for sib in CP2_ENGINE.parent.glob("*.py"):
+        (Path(tmp) / sib.name).write_text(sib.read_text(encoding="utf-8"), encoding="utf-8")
+    (Path(tmp) / CP2_ENGINE.name).write_text(src.replace(old, new, 1), encoding="utf-8")
+    return Path(tmp) / CP2_ENGINE.name
+
+
+def cp2_real_payload_checks():
+    probe = cp2_real_probe()
+    order = probe["hosts"]
+    check("[CP2-X11] a real guard payload is modelled for every CLI Ratchet installs hooks for",
+          sorted(CP2_REAL_GUARD_PAYLOADS) == sorted(order), (sorted(CP2_REAL_GUARD_PAYLOADS), order))
+    check("[CP2-X11] only Claude Code's real payload names the acting sub-agent (ground truth, independent of the "
+          "engine)", [h for h in order if CP2_SUBAGENT_KEYS & set(CP2_REAL_GUARD_PAYLOADS[h])] == ["claude"])
+    problems = cp2_identity_problems(probe)
+    check("[CP2-X12] HOST_ENFORCEMENT identity, the real payloads and the guard's decision on them agree",
+          problems == [], problems)
+    check("[CP2-X12] the guard's refusal is about who is acting: the adversary's own real payload is allowed",
+          probe["refused"]["claude"] and not probe["owner_refused"], probe)
+
+    # Teeth: flip the real table inside an engine copy (not the expected data) and the check goes red.
+    flips = [('"codex": {"records": True, "identity": False,', '"codex": {"records": True, "identity": True,',
+              "codex"),
+             ('"claude": {"records": True, "identity": True,', '"claude": {"records": True, "identity": False,',
+              "claude")]
+    for old, new, host in flips:
+        with cp2_tempfile.TemporaryDirectory() as tmp:
+            mutant = cp2_real_probe(cp2_engine_variant(tmp, old, new))
+        bad = cp2_identity_problems(mutant)
+        check(f"[CP2-X13] teeth: an engine whose HOST_ENFORCEMENT flips {host}.identity fails the real-payload check",
+              mutant["data"][host]["identity"] is not probe["data"][host]["identity"] and bad != [], bad)
+
+
+# ---- CP2 adversarial round 4: every table claim measured through the real hook entry point, on real runs ----
+# Round 2's "records" probe tried one path (state.json) and its "stop" probe called emit_hook(block=True) itself, so
+# an engine that stopped guarding evidence, or whose stop decision always let the agent stop, still passed. Here
+# every column is measured by running the exact command build_hook_config installs for each CLI (`ratchet.py hook
+# <stop|prompt|guard> --host <cli>`) with that CLI's own payload shape (the shapes tests/test_hooks.py models) in
+# throwaway projects that carry real runs, driven to each state with ratchet.py's own commands:
+#   project "paused": plan approved, building (unfinished) -> `pause` (paused)
+#   project "done":   plan approved -> tests-written, red, implemented, behavior, adv-record (unfinished, with real
+#                     evidence files) -> complete (done; --human-review none, so nothing is left to do)
+# A block is read the way each CLI reads it (exit 2 on Claude Code, Codex and Gemini; the JSON decision on Copilot),
+# not through emit_hook. RATCHET_HOME is a throwaway folder, so nothing outside the temp dirs is touched.
+CP2_R4_PROBE = r'''
+import concurrent.futures, datetime as dt, importlib.util, json, os, shlex, shutil, subprocess, sys, tempfile
+from pathlib import Path
+ENGINE, PARTS = sys.argv[1], set(sys.argv[2].split(","))
+ID_PAYLOADS, ID_REVIEW_REL = json.loads(sys.argv[3]), sys.argv[4]
+spec = importlib.util.spec_from_file_location("ratchet_engine_cp2_r4", ENGINE)
+eng = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(eng)
+TMP = Path(tempfile.mkdtemp(prefix="ratchet-cp2r4-"))
+OWNER = "s-owner"
+KINDS = ("stop", "prompt", "guard")
+
+
+def installed(host, kind):
+    """The argv of the command build_hook_config installs for this CLI and hook (what the CLI runs), or None."""
+    cfg = eng.build_hook_config(host, {})
+    want = " hook %s --host %s" % (kind, host)
+    for e in cfg["hooks"].get(eng.HOOK_EVENTS[host][KINDS.index(kind)], []):
+        for h in e.get("hooks") or [e]:
+            cmd = h.get("command") or h.get("bash") or ""
+            if "ratchet.py" in cmd and cmd.endswith(want):
+                return shlex.split(cmd)
+    return None
+
+
+def hook(d, host, kind, payload):
+    argv = installed(host, kind)
+    if argv is None:
+        return {"rc": None, "out": "", "err": "not installed", "reason": "", "blocked": False, "allowed": False}
+    r = subprocess.run(argv, cwd=d, input=json.dumps(payload), capture_output=True, text=True, timeout=120)
+    if host == "copilot":  # Copilot reads a JSON decision on stdout; exit code 0
+        try:
+            out = json.loads(r.stdout) if r.stdout.strip() else {}
+        except ValueError:
+            out = {}
+        blocked = r.returncode == 0 and (out.get("permissionDecision") == "deny" if kind == "guard"
+                                         else out.get("decision") == "block")
+        reason = str(out.get("permissionDecisionReason") or out.get("reason") or "")
+    else:  # Claude Code, Codex and Gemini: exit 2 blocks, the reason goes to stderr
+        blocked, reason = r.returncode == 2, r.stderr
+    return {"rc": r.returncode, "out": r.stdout, "err": r.stderr, "reason": reason, "blocked": blocked,
+            "allowed": r.returncode == 0 and not blocked}
+
+
+def rx(d, *a):
+    r = subprocess.run([sys.executable, ENGINE, *a], cwd=d, capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise SystemExit("ratchet.py %s failed: %s %s" % (" ".join(a), r.stdout[-400:], r.stderr[-400:]))
+    return r
+
+
+def say(d, text):
+    """The user typing in Claude Code: the CLI writes its transcript, then runs the installed prompt hook."""
+    tp = TMP / (d.name + "-transcript.jsonl")
+    with tp.open("a") as f:
+        f.write(json.dumps({"type": "user", "message": {"role": "user", "content": text},
+                            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
+    hook(d, "claude", "prompt", {"session_id": OWNER, "transcript_path": str(tp), "cwd": str(d),
+                                 "hook_event_name": "UserPromptSubmit", "prompt": text})
+
+
+def project(name):
+    d = TMP / name
+    d.mkdir()
+    for c in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", *c], cwd=d, check=True, capture_output=True)
+    (d / "src").mkdir()
+    (d / "tests").mkdir()
+    (d / "src" / "a.py").write_text("A = 1\n")
+    subprocess.run(["git", "add", "-A"], cwd=d, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=d, check=True, capture_output=True)
+    say(d, "please build the feature")
+    rx(d, "init", "feature", "--slug", "f", "--human-review", "none")
+    rx(d, "config", "--set", "min_review_seconds=0", "providers=[]")
+    run = d / ".ratchet" / "runs" / "f"
+    (run / "app-scout.json").write_text("{}")
+    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "checkpoints": [{
+        "id": "CP1", "title": "Step 1", "summary": "s", "done_when": ["works"], "risk": "low",
+        "gates": {"behavior": True, "ui": False, "adversarial": True},
+        "tests": {"files": ["tests/test_cp1.py"], "command": "python3 tests/test_cp1.py"}}]}))
+    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
+    rx(d, "plan-submit")
+    say(d, "yes, build it")
+    rx(d, "approve-plan")
+    return d
+
+
+def through_adversarial(d):
+    (d / "tests" / "test_cp1.py").write_text("import sys\nsys.path.insert(0, 'src')\nprint('[CP1-T01] works')\n"
+                                             "from f import f\nassert f() == 1\n")
+    rx(d, "tests-written", "CP1")
+    rx(d, "red", "CP1")
+    (d / "src" / "f.py").write_text("def f():\n    return 1\n")
+    rx(d, "implemented", "CP1")
+    rx(d, "behavior", "CP1")
+    rnd = json.loads(rx(d, "reviewers", "CP1", "--json").stdout)
+    rid = rnd["reviewers"][0]["id"]
+    p = Path(rnd["output_dir"]) / (rid + ".json")
+    p.write_text(json.dumps({"reviewer": rid, "checkpoint": "CP1", "fingerprint": rnd["fingerprint"],
+                             "round_nonce": rnd["round_nonce"], "findings": [], "files_reviewed": ["src/f.py"]}))
+    rx(d, "adv-record", "CP1", "--reviews", str(p))
+
+
+def write_payload(host, d, rel, new):
+    """Each CLI's own file-writing tool call on rel (a path relative to the project)."""
+    p = str(d / rel)
+    if host == "claude":
+        return {"session_id": OWNER, "transcript_path": "/tmp/t.jsonl", "cwd": str(d), "permission_mode": "default",
+                "hook_event_name": "PreToolUse", "tool_name": "Write", "tool_input": {"file_path": p, "content": "{}"},
+                "tool_use_id": "toolu_1"}
+    if host == "codex":
+        body = ("*** Add File: %s\n+{}\n" if new else "*** Update File: %s\n@@\n-x\n+y\n") % rel
+        return {"session_id": OWNER, "turn_id": "t", "cwd": str(d), "hook_event_name": "PreToolUse",
+                "tool_name": "apply_patch", "tool_input": {"input": "*** Begin Patch\n" + body + "*** End Patch"}}
+    if host == "gemini":
+        return {"session_id": OWNER, "cwd": str(d), "hook_event_name": "BeforeTool", "tool_name": "write_file",
+                "tool_input": {"file_path": p, "content": "{}"}}
+    args = {"path": p, "file_text": "{}"} if new else {"path": p, "old_str": "a", "new_str": "b"}
+    return {"sessionId": OWNER, "timestamp": 1, "cwd": str(d), "toolName": "create" if new else "edit",
+            "toolArgs": json.dumps(args)}
+
+
+def shell_payload(host, d, command):
+    """Each CLI's own shell tool call running command."""
+    if host == "claude":
+        return {"session_id": OWNER, "transcript_path": "/tmp/t.jsonl", "cwd": str(d), "permission_mode": "default",
+                "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command},
+                "tool_use_id": "toolu_2"}
+    if host == "codex":
+        return {"session_id": OWNER, "turn_id": "t", "cwd": str(d), "hook_event_name": "PreToolUse",
+                "tool_name": "Bash", "tool_input": {"command": ["bash", "-lc", command]}}
+    if host == "gemini":
+        return {"session_id": OWNER, "cwd": str(d), "hook_event_name": "BeforeTool", "tool_name": "run_shell_command",
+                "tool_input": {"command": command}}
+    return {"sessionId": OWNER, "timestamp": 1, "cwd": str(d), "toolName": "bash",
+            "toolArgs": json.dumps({"command": command})}
+
+
+def stop_payload(host, d):
+    if host == "claude":
+        return {"session_id": OWNER, "transcript_path": "/tmp/t.jsonl", "cwd": str(d), "hook_event_name": "Stop",
+                "stop_hook_active": False}
+    if host == "codex":
+        return {"session_id": OWNER, "turn_id": "t1", "cwd": str(d), "hook_event_name": "Stop",
+                "model": "gpt-5-codex", "stop_hook_active": False}
+    if host == "gemini":
+        return {"session_id": OWNER, "cwd": str(d), "hook_event_name": "AfterAgent", "prompt": "go",
+                "prompt_response": "done!", "stop_hook_active": False, "timestamp": "2026-09-28T00:00:00Z"}
+    return {"sessionId": OWNER, "timestamp": 1790000000000, "cwd": str(d), "transcriptPath": "/tmp/t",
+            "stopReason": "end_turn", "stop_hook_active": False}
+
+
+def prompt_payload(host, d, text):
+    if host == "claude":
+        return {"session_id": OWNER, "transcript_path": "/tmp/t.jsonl", "cwd": str(d),
+                "hook_event_name": "UserPromptSubmit", "prompt": text}
+    if host == "codex":
+        return {"session_id": OWNER, "turn_id": "t", "cwd": str(d), "hook_event_name": "UserPromptSubmit",
+                "prompt": text}
+    if host == "gemini":
+        return {"session_id": OWNER, "cwd": str(d), "hook_event_name": "BeforeAgent", "prompt": text}
+    return {"sessionId": OWNER, "timestamp": 1, "cwd": str(d), "prompt": text}
+
+
+def stops(d, label, out):
+    for host in eng.HOOK_HOSTS:
+        r = hook(d, host, "stop", stop_payload(host, d))
+        out.setdefault(host, {})[label] = {"blocked": r["blocked"], "allowed": r["allowed"],
+                                           "gate": "RATCHET GATE" in r["reason"], "rc": r["rc"],
+                                           "said": (r["reason"] or r["out"] or r["err"])[:160]}
+
+
+def records(d):
+    """Every kind of record the table promises is protected, each tried through every CLI's write and shell tool."""
+    ratchet = d / ".ratchet"
+    files = sorted(str(p.relative_to(d)) for p in ratchet.rglob("*") if p.is_file())
+    kinds = {
+        "state": [".ratchet/runs/f/state.json"],
+        "evidence": [f for f in files if f.startswith(".ratchet/runs/f/evidence/")]
+                    + [".ratchet/runs/f/evidence/CP1/forged-behavior.log"],
+        "human log": [".ratchet/human_log.jsonl"],
+        # wherever the engine wrote down the plan approval and the adversarial approval
+        "approvals": [f for f in files if '"plan_approved"' in (d / f).read_text(errors="replace")
+                      or '"adversarial_approved"' in (d / f).read_text(errors="replace")],
+        "run bookkeeping": [".ratchet/active.json", ".ratchet/config.json"],
+    }
+    calls = {}
+    for host in eng.HOOK_HOSTS:
+        for kind, rels in kinds.items():
+            for rel in rels:
+                new = not (d / rel).exists()
+                calls[(host, kind, rel, "write")] = write_payload(host, d, rel, new)
+                calls[(host, kind, rel, "shell")] = shell_payload(host, d, "echo forged > " + str(d / rel))
+        calls[(host, "control", "src/new_module.py", "write")] = write_payload(host, d, "src/new_module.py", True)
+        calls[(host, "control", "src/scratch.txt", "shell")] = shell_payload(
+            host, d, "echo forged > " + str(d / "src/scratch.txt"))
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        res = dict(zip(calls, pool.map(lambda k: hook(d, k[0], "guard", calls[k]), calls)))
+    out = {h: [] for h in eng.HOOK_HOSTS}
+    for (host, kind, rel, tool), r in res.items():
+        out[host].append({"kind": kind, "rel": rel, "tool": tool, "blocked": r["blocked"], "allowed": r["allowed"],
+                          "about_records": ".ratchet/" in r["reason"] and "RATCHET GUARD" in r["reason"]})
+    return out
+
+
+result = {"data": eng.HOST_ENFORCEMENT, "hosts": list(eng.HOOK_HOSTS),
+          "installed": {h: {k: installed(h, k) is not None for k in KINDS} for h in eng.HOOK_HOSTS}}
+try:
+    if PARTS & {"stop", "replies", "identity"}:
+        p = project("paused")
+        result["stop"] = {}
+        stops(p, "building", result["stop"])
+        if "replies" in PARTS:
+            result["replies"] = {}
+            for host in eng.HOOK_HOSTS:
+                text = "stop for a moment, cp2r4 reply via " + host
+                r = hook(p, host, "prompt", prompt_payload(host, p, text))
+                log = [json.loads(x) for x in (p / ".ratchet" / "human_log.jsonl").read_text().splitlines() if x]
+                result["replies"][host] = {
+                    "recorded": r["rc"] == 0 and any(e.get("prompt") == text and e.get("host") == host for e in log),
+                    "guidance": "[ratchet] The user asked you to stop" in r["out"] + r["err"]}
+        rx(p, "pause", "--reason", "cp2r4 probe")
+        stops(p, "paused", result["stop"])
+        if "identity" in PARTS:
+            result["identity"] = {}
+            for host in eng.HOOK_HOSTS:
+                text = json.dumps(ID_PAYLOADS[host]).replace("{CWD}", str(p)).replace("{REVIEW}", str(p / ID_REVIEW_REL))
+                result["identity"][host] = hook(p, host, "guard", json.loads(text))["blocked"]
+            owner = dict(ID_PAYLOADS["claude"], agent_type="ratchet-adversary", agent_id="a-ratchet-adversary")
+            text = json.dumps(owner).replace("{CWD}", str(p)).replace("{REVIEW}", str(p / ID_REVIEW_REL))
+            result["identity_owner_allowed"] = hook(p, "claude", "guard", json.loads(text))["allowed"]
+    if PARTS & {"stop", "records"}:
+        b = project("done")
+        through_adversarial(b)
+        if "records" in PARTS:
+            result["records"] = records(b)
+        if "stop" in PARTS:
+            stops(b, "with evidence", result["stop"])
+            rx(b, "complete", "CP1")
+            result["done_phase"] = json.loads((b / ".ratchet/runs/f/state.json").read_text())["phase"]
+            stops(b, "done", result["stop"])
+finally:
+    shutil.rmtree(TMP, ignore_errors=True)
+print(json.dumps(result))
+'''
+CP2_R4_RECORD_KINDS = ("state", "evidence", "human log", "approvals", "run bookkeeping")
+CP2_R4_UNFINISHED = ("building", "with evidence")  # a run with work left: stopping must be refused
+CP2_R4_FINISHED = ("paused", "done")  # a paused or finished run: stopping must be allowed
+
+
+def cp2_r4_start(engine=CP2_ENGINE, parts=("records", "stop", "replies", "identity")):
+    """Start the probe child process (several run side by side); cp2_r4_finish collects it."""
+    env = {k: v for k, v in cp2_os.environ.items()
+           if k not in ("RATCHET_ROOT", "RATCHET_NESTED_REVIEW", "RATCHET_HUMAN_OVERRIDE", "RATCHET_ROLE",
+                        "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID", "GEMINI_CLI",
+                        "COPILOT_CLI")}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"  # loading the engine must not write __pycache__ into the repo
+    home = cp2_tempfile.TemporaryDirectory(prefix="ratchet-cp2r4-home-")
+    cwd = cp2_tempfile.TemporaryDirectory()
+    env["RATCHET_HOME"] = home.name  # per-user files (hashes, active-run markers) stay in a throwaway folder
+    proc = cp2_subprocess.Popen([sys.executable, "-c", CP2_R4_PROBE, str(engine), ",".join(parts),
+                                 cp2_json.dumps(CP2_REAL_GUARD_PAYLOADS), CP2_REVIEW_REL],
+                                stdout=cp2_subprocess.PIPE, stderr=cp2_subprocess.PIPE, text=True, cwd=cwd.name,
+                                env=env)
+    return proc, (home, cwd)
+
+
+def cp2_r4_finish(started):
+    proc, dirs = started
+    try:
+        out, err = proc.communicate(timeout=600)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+        for d in dirs:
+            d.cleanup()
+    if proc.returncode != 0:
+        raise RuntimeError(f"CP2 round-4 hook probe failed: {err[-800:]}")
+    return cp2_json.loads(out.strip().splitlines()[-1])
+
+
+def cp2_r4_probe(engine=CP2_ENGINE, parts=("records", "stop", "replies", "identity")):
+    return cp2_r4_finish(cp2_r4_start(engine, parts))
+
+
+def cp2_r4_unguarded(probe, kind):
+    """(host, path, tool) for every hand-edit of this kind of record that some CLI's guard hook let through."""
+    return [(h, e["rel"], e["tool"]) for h in probe["hosts"] for e in probe["records"][h]
+            if e["kind"] == kind and not (e["blocked"] and e["about_records"])]
+
+
+def cp2_r4_stop_wrong(probe, labels, want_block):
+    """(host, run state, what the hook said) wherever the stop decision did not block / allow as required."""
+    return [(h, s, probe["stop"][h][s]["said"]) for h in probe["hosts"] for s in labels
+            if not (probe["stop"][h][s]["blocked"] and probe["stop"][h][s]["gate"] if want_block
+                    else probe["stop"][h][s]["allowed"])]
+
+
+def cp2_r4_facts(probe):
+    """What each CLI really does, per table column, measured only through the installed hook commands."""
+    out = {}
+    for h in probe["hosts"]:
+        recs = probe["records"][h]
+        out[h] = {
+            "records": probe["installed"][h]["guard"]
+                       and all(e["blocked"] and e["about_records"] for e in recs if e["kind"] != "control")
+                       and all(e["allowed"] for e in recs if e["kind"] == "control")
+                       and all(any(e["kind"] == k for e in recs) for k in CP2_R4_RECORD_KINDS),
+            "identity": probe["identity"][h],
+            "stop": probe["installed"][h]["stop"]
+                    and all(probe["stop"][h][s]["blocked"] and probe["stop"][h][s]["gate"] for s in CP2_R4_UNFINISHED)
+                    and all(probe["stop"][h][s]["allowed"] for s in CP2_R4_FINISHED),
+            "replies": probe["installed"][h]["prompt"] and probe["replies"][h]["recorded"],
+            "guidance": probe["replies"][h]["guidance"],
+        }
+    return out
+
+
+def cp2_hook_entry_checks(sect):
+    # The real engine and the teeth mutants (cp2_r4_mutants, below) are probed side by side to keep the run short.
+    copies = [cp2_tempfile.TemporaryDirectory() for _ in cp2_r4_mutants()]
+    jobs, done, errors = [], [], []
+    try:
+        jobs.append(cp2_r4_start())
+        for tmp, (what, parts, old, new, caught) in zip(copies, cp2_r4_mutants()):
+            jobs.append(cp2_r4_start(cp2_engine_variant(tmp.name, old, new), parts))
+    finally:
+        for j in jobs:  # collect every started child, even when one fails, so none is left running
+            try:
+                done.append(cp2_r4_finish(j))
+            except Exception as e:
+                errors.append(e)
+        for tmp in copies:
+            tmp.cleanup()
+    if errors:
+        raise errors[0]
+    probe, mutant_probes = done[0], done[1:]
+    order, data = probe["hosts"], probe["data"]
+    recs = probe["records"]
+
+    # Records column: every kind of record, every CLI, both its write tool and its shell tool.
+    evidence = sorted({e["rel"] for e in recs[order[0]] if e["kind"] == "evidence"})
+    check("[CP2-X14] the probe run holds real evidence (red, behavior and adversarial) plus a forged new evidence file",
+          any("/red" in f for f in evidence) and any("/behavior" in f for f in evidence)
+          and any("/adversarial/" in f for f in evidence) and any("forged" in f for f in evidence), evidence)
+    approvals = sorted({e["rel"] for e in recs[order[0]] if e["kind"] == "approvals"})
+    check("[CP2-X14] the probe found where the engine records approvals", bool(approvals), approvals)
+    for kind in CP2_R4_RECORD_KINDS:
+        bad = cp2_r4_unguarded(probe, kind)
+        check(f"[CP2-X14] hand-edits to {kind} files are blocked on every CLI, through its write tool and its shell "
+              "tool, by the installed guard hook", bad == [] and all(any(e["kind"] == kind for e in recs[h])
+                                                                      for h in order), bad)
+    leaks = [(h, e["rel"], e["tool"]) for h in order for e in recs[h] if e["kind"] == "control" and not e["allowed"]]
+    check("[CP2-X14] the guard is not a blanket block: the same write-tool and shell calls on a project file are "
+          "allowed on every CLI", leaks == [], leaks)
+
+    # Stop column: the real stop decision on real run states.
+    check("[CP2-X15] the finished probe run really reached phase done", probe.get("done_phase") == "done",
+          probe.get("done_phase"))
+    for labels, block, what in [(CP2_R4_UNFINISHED, True, "an unfinished run (building; and with evidence, before "
+                                 "complete) is refused a stop by the gate on every CLI"),
+                                (("paused",), False, "a paused run is allowed to stop on every CLI"),
+                                (("done",), False, "a finished run is allowed to stop on every CLI")]:
+        bad = cp2_r4_stop_wrong(probe, labels, block)
+        check(f"[CP2-X15] {what}", bad == [], bad)
+
+    # Replies and identity columns, through the same installed commands.
+    rep = probe["replies"]
+    check("[CP2-X16] the installed prompt hook records the user's reply, tagged with the CLI, on every CLI",
+          all(rep[h]["recorded"] for h in order), rep)
+    check("[CP2-X16] Ratchet's guidance reaches the agent exactly on the CLIs the table says (not Copilot)",
+          [h for h in order if rep[h]["guidance"]] == [h for h in order if data[h]["guidance"]], rep)
+    check("[CP2-X16] the installed guard hook refuses the fixer's real payload exactly where the CLI names the "
+          "sub-agent, and allows the owner", [h for h in order if probe["identity"][h]] ==
+          [h for h in order if CP2_SUBAGENT_KEYS & set(CP2_REAL_GUARD_PAYLOADS[h])]
+          and probe["identity_owner_allowed"], (probe["identity"], probe["identity_owner_allowed"]))
+
+    # The table: README == rendered(HOST_ENFORCEMENT) (X05), and HOST_ENFORCEMENT == what the hooks really do.
+    facts = cp2_r4_facts(probe)
+    bad = cp2_fact_mismatches(order, data, facts)
+    check("[CP2-X17] every README table cell (rendered from HOST_ENFORCEMENT) equals what the installed hook does on "
+          "that CLI", bad == [] and cp2_table_diff(sect, data, order) == [], bad)
+
+    # Teeth: break one decision inside an engine copy; the matching check must go red while the others stay green.
+    for (what, parts, old, new, caught), mutant in zip(cp2_r4_mutants(), mutant_probes):
+        check(f"[CP2-X18] teeth: an engine with {what} fails the hook-entry check", caught(mutant))
+
+
+def cp2_r4_mutants():
+    """(what is broken, probe parts needed, engine text, replacement, how the check must catch it)."""
+    return [
+        ("evidence files left unguarded (state.json still guarded)", ("records",),
+         r'r"^runs/[^/]+/(reviews|states|reference|tests)(/.*)?$',
+         r'r"^runs/[^/]+/(reviews|states|reference|tests|evidence)(/.*)?$',
+         lambda m: cp2_r4_unguarded(m, "evidence") != [] and cp2_r4_unguarded(m, "state") == []),
+        ("the human log left unguarded", ("records",),
+         r'r"|^(standards\.md|learnings\.md|app\.log)$"', r'r"|^(standards\.md|learnings\.md|app\.log|human_log\.jsonl)$"',
+         lambda m: cp2_r4_unguarded(m, "human log") != [] and cp2_r4_unguarded(m, "state") == []),
+        ("the stop decision always lets the agent stop", ("stop",),
+         '    na = next_action(ctx, st)\n    if na.get("stop_ok"):', '    na = next_action(ctx, st)\n    if True:',
+         lambda m: cp2_r4_stop_wrong(m, CP2_R4_UNFINISHED, True) != []
+         and cp2_r4_stop_wrong(m, CP2_R4_FINISHED, False) == []),
+        ("a paused or finished run is never allowed to stop", ("stop",),
+         'na = {"phase": phase, "action": st.get("blocked_reason") or phase, "stop_ok": True}',
+         'na = {"phase": phase, "action": st.get("blocked_reason") or phase, "stop_ok": False}',
+         lambda m: cp2_r4_stop_wrong(m, CP2_R4_FINISHED, False) != []
+         and cp2_r4_stop_wrong(m, CP2_R4_UNFINISHED, True) == []),
+        # (Claude Code still records, so the probe's own plan approval works; the other three must go red)
+        ("a prompt hook that records replies on Claude Code only", ("replies",),
+         '    _heartbeat(root, "prompt", n["host"])\n    log = rdir / "human_log.jsonl"',
+         '    if n["host"] != "claude":\n        return False, ""\n    _heartbeat(root, "prompt", n["host"])\n'
+         '    log = rdir / "human_log.jsonl"',
+         lambda m: [h for h in m["hosts"] if not m["replies"][h]["recorded"]] == ["codex", "gemini", "copilot"]),
+    ]
+
+
+# ---- CP2 adversarial round 5: the hook-crash paragraph, grounded against decide_stop's real fail-closed limit ----
+# Round 1's finding (evidence/CP2/adversarial/round-05/open-findings.json, id X1): README said "if a hook itself
+# breaks, it lets the action through", but run_hook's except block fails CLOSED for the stop hook while a run is
+# active (_stop_error), up to a limit, before falling back to fail-open. The checks below reject any return to that
+# blanket claim and measure the real limit by actually crashing the hooks, instead of trusting the prose.
+BLANKET_HOOK_FAILOPEN_RX = re.compile(
+    r"if\s+(a|the|any|every)\s+hook\s+(itself\s+)?breaks,?\s+it\s+lets\s+the\s+action\s+through", re.I)
+
+CP2_R5_WORDNUM = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+                  "ten": 10}
+
+
+def cp2_r5_stop_tries_claim(p):
+    """The fail-closed limit README claims for the stop hook ("up to five tries"/"up to 5 tries"), or None."""
+    m = re.search(r"up to (\w+) tr(?:y|ies)", p, re.I)
+    if not m:
+        return None
+    w = m.group(1).lower()
+    return int(w) if w.isdigit() else CP2_R5_WORDNUM.get(w)
+
+
+CP2_R5_PROBE = r'''
+import contextlib, importlib.util, io, json, os, shutil, subprocess, sys, tempfile
+from pathlib import Path
+ENGINE = sys.argv[1]
+spec = importlib.util.spec_from_file_location("ratchet_engine_cp2_r5", ENGINE)
+eng = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(eng)
+
+
+def project():
+    return Path(tempfile.mkdtemp(prefix="ratchet-cp2r5-"))
+
+
+def run_stop_hook(d, home):
+    env = dict(os.environ)
+    env["RATCHET_HOME"] = str(home)
+    payload = json.dumps({"session_id": "s", "cwd": str(d), "hook_event_name": "Stop"})
+    r = subprocess.run([sys.executable, ENGINE, "hook", "stop", "--host", "claude"],
+                       input=payload, capture_output=True, text=True, cwd=d, env=env, timeout=60)
+    return r.returncode
+
+
+# A corrupt state.json for an active run crashes decide_stop (read_json -> die() -> SystemExit), which run_hook's
+# except block must turn into a blocked stop, repeatedly, before it ever lets the agent stop.
+d = project()
+(d / ".ratchet").mkdir()
+(d / ".ratchet" / "active.json").write_text(json.dumps({"slug": "f"}))
+(d / ".ratchet" / "runs" / "f").mkdir(parents=True)
+(d / ".ratchet" / "runs" / "f" / "state.json").write_text("{not json")
+home = d / "home"
+home.mkdir()
+sequence = []
+for _ in range(10):
+    rc = run_stop_hook(d, home)
+    sequence.append(rc)
+    if rc != 2:
+        break
+log = d / ".ratchet" / "hook-errors.log"
+stop_logged_every_attempt = log.exists() and log.read_text().count(" claude stop:") == len(sequence)
+shutil.rmtree(d, ignore_errors=True)
+
+# A crashing guard hook must fail OPEN (never block a tool call) and still log the crash.
+d2 = project()
+(d2 / ".ratchet").mkdir()
+orig_guard = eng.decide_guard
+
+
+def boom(n):
+    raise RuntimeError("boom")
+
+
+eng.decide_guard = boom
+old_stdin = sys.stdin
+sys.stdin = io.StringIO(json.dumps({"session_id": "s", "cwd": str(d2), "hook_event_name": "PreToolUse",
+                                    "tool_name": "Write",
+                                    "tool_input": {"file_path": str(d2 / "x.txt"), "content": "hi"}}))
+try:
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        rc_guard = eng.run_hook("guard", "claude")
+finally:
+    sys.stdin = old_stdin
+    eng.decide_guard = orig_guard
+guard_failed_open = rc_guard == 0
+guard_logged = (d2 / ".ratchet" / "hook-errors.log").exists()
+shutil.rmtree(d2, ignore_errors=True)
+
+print(json.dumps({
+    "stop_sequence": sequence,
+    "stop_blocked_count": sum(1 for rc in sequence if rc == 2),
+    "stop_logged_every_attempt": stop_logged_every_attempt,
+    "guard_failed_open": guard_failed_open,
+    "guard_logged": guard_logged,
+}))
+'''
+
+
+def cp2_r5_measure(engine=CP2_ENGINE):
+    """{"stop_sequence", "stop_blocked_count", "stop_logged_every_attempt", "guard_failed_open", "guard_logged"}
+    measured by actually crashing the stop hook and the guard hook, not by reading the docs or the code."""
+    env = {k: v for k, v in cp2_os.environ.items() if k != "RATCHET_ROOT"}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    with cp2_tempfile.TemporaryDirectory() as cwd:
+        r = cp2_subprocess.run([sys.executable, "-c", CP2_R5_PROBE, str(engine)], capture_output=True, text=True,
+                               timeout=120, cwd=cwd, env=env)
+    if r.returncode != 0:
+        raise RuntimeError(f"CP2 round-5 hook-crash probe failed: {r.stderr[-800:]}")
+    return cp2_json.loads(r.stdout.strip().splitlines()[-1])
+
+
+CP2_R5_OLD_BLANKET = ("If a hook itself breaks, it lets the action through and writes the error to "
+                      "`.ratchet/hook-errors.log`, rather than blocking everything.")
+
+
+def cp2_r5_hook_crash_checks(sect):
+    p = hook_error_paragraph(sect)
+    measured = cp2_r5_measure()
+
+    check("[CP2-X19] no blanket 'if a hook breaks, it lets the action through' claim remains (the stop hook "
+          "fails closed on crash, up to its limit)", bool(p) and BLANKET_HOOK_FAILOPEN_RX.search(p) is None, p[:300])
+    check("[CP2-X20] the paragraph says the stop hook can block (fail closed) when it breaks while a run is active",
+          bool(p) and has(p, r"stop hook", r"fails?\s+closed|blocks?\s+the\s+agent\s+from|can'?t\s+end\s+its\s+turn|"
+                            r"cannot\s+end\s+its\s+turn"), p[:300])
+    claimed = cp2_r5_stop_tries_claim(p)
+    check("[CP2-X21] the stated stop-hook fail-closed limit matches what the code actually enforces (measured by "
+          "crashing decide_stop repeatedly, not read from the source)",
+          claimed is not None and claimed == measured["stop_blocked_count"],
+          (claimed, measured["stop_blocked_count"], measured["stop_sequence"]))
+    check("[CP2-X22] every crash attempt (the blocked ones and the eventual allow) is logged to hook-errors.log, "
+          "as the paragraph says", measured["stop_logged_every_attempt"])
+    check("[CP2-X23] a crashing guard hook really fails open (lets the action through) and logs the error, "
+          "matching the paragraph's guard/prompt claim", measured["guard_failed_open"] and measured["guard_logged"])
+
+    # Teeth: reverting to the old blanket claim, or understating/overstating the limit, must turn checks red.
+    reverted = p.replace(README_CP2_R5_SENTENCE, CP2_R5_OLD_BLANKET, 1) if README_CP2_R5_SENTENCE in p else p
+    check("[CP2-X24] teeth: reverting to the old blanket claim turns the no-blanket-claim check red",
+          reverted != p and BLANKET_HOOK_FAILOPEN_RX.search(reverted) is not None)
+    wrong_limit = p.replace("up to five tries", "up to three tries", 1)
+    check("[CP2-X25] teeth: claiming the wrong fail-closed limit no longer matches the measured code behavior",
+          wrong_limit != p and cp2_r5_stop_tries_claim(wrong_limit) != measured["stop_blocked_count"])
+
+
+README_CP2_R5_SENTENCE = (
+    "If the guard or prompt hook breaks, it lets the action through and writes the error to "
+    "`.ratchet/hook-errors.log`, rather than blocking everything, because a crashing guard must never brick a "
+    "session. If the stop hook breaks while a run is active, it fails closed instead: it blocks the agent from "
+    "ending its turn and tells it to explain the failure to you, for up to five tries in a row; after that it "
+    "lets the agent stop too, logged the same way, so a broken install can't trap the session forever.")
+
+
+# ---- end CP2 ----
+
+
 # ---- CP4 ----
 # Orchestrator SKILL.md: agent-led hooks check, blockers message, whole-plan review, clear-yes approvals.
 
@@ -1440,7 +2600,10 @@ def cp7_docs_lint():
 
 # ---- end CP7 ----
 
-SECTIONS = [("CP4", cp4_orchestrator_setup_and_plan_review), ("CP5", cp5_docs_lint), ("CP6", cp6_docs_lint), ("CP7", cp7_docs_lint)]
+SECTIONS = [("CP4", cp4_orchestrator_setup_and_plan_review), ("CP5", cp5_docs_lint), ("CP6", cp6_docs_lint),
+            ("CP7", cp7_docs_lint), ("CP2", cp2_docs_lint)]
+# single-line restatement so CP5-T20's single-line SECTIONS probe pattern still matches and can replace it
+SECTIONS = [s for s in SECTIONS]
 
 
 def main():
