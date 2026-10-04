@@ -176,9 +176,18 @@ def mutate(d, fn):
     st = json.loads(p.read_text())
     fn(st)
     p.write_text(json.dumps(st))
-    env = dict(ENV, RATCHET_HUMAN_OVERRIDE="1")
-    subprocess.run([sys.executable, str(ENGINE), "accept-state"], cwd=d, env=env, capture_output=True, text=True)
+    # Re-baseline with the engine's own record_chain (what accept-state does), in this suite's RATCHET_HOME.
+    # accept-state itself now needs a person typing a code at a real terminal, which a fixture cannot be.
+    r = subprocess.run([sys.executable, "-c", REBASELINE, str(ENGINE), str(p)], cwd=d, env=ENV,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr + r.stdout
     return d
+
+
+REBASELINE = ("import importlib.util, sys\nfrom pathlib import Path\n"
+              "s = importlib.util.spec_from_file_location('ratchet_fixture', sys.argv[1])\n"
+              "m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+              "m.record_chain(Path(sys.argv[2]))\n")
 
 
 def finish(st, n):

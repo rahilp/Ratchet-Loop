@@ -574,8 +574,15 @@ def main():
         st = stj_read(d)
         st["hooks_waived"] = {"at": iso_ago(ago_h), "by": "human", "prompt": GO}
         stp(d).write_text(json.dumps(st))
-        # state.json is integrity-checked: accept the hand edit as the user would, so status reads it
-        r = rx(d, "accept-state", env=dict(ENV, RATCHET_HUMAN_OVERRIDE="1"))
+        # state.json is integrity-checked: re-baseline the hand edit with the engine's own record_chain (what
+        # accept-state does), so status reads it. accept-state itself now needs a person typing a code at a real
+        # terminal, which a fixture cannot be.
+        snippet = ("import importlib.util, sys\nfrom pathlib import Path\n"
+                   "s = importlib.util.spec_from_file_location('ratchet_fixture', sys.argv[1])\n"
+                   "m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+                   "m.record_chain(Path(sys.argv[2]))\n")
+        r = subprocess.run([sys.executable, "-c", snippet, str(ENGINE), str(stp(d))], cwd=d, env=ENV,
+                           capture_output=True, text=True)
         assert r.returncode == 0, r.stderr + r.stdout
 
     print("[CP2-T31] only an exact waiver phrase counts (strict allow-list)")

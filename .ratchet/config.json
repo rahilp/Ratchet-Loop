@@ -66,22 +66,6 @@
     {
       "id": "claude",
       "preset": "claude"
-    },
-    {
-      "id": "cursor",
-      "command": [
-        "cursor-agent",
-        "-p",
-        "{prompt}",
-        "--output-format",
-        "text",
-        "--trust",
-        "--mode",
-        "ask"
-      ],
-      "stdin": false,
-      "model": "gemini-3.7-flash-high",
-      "company": "google"
     }
   ]
 }

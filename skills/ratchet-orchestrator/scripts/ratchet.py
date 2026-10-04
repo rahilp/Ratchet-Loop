@@ -426,7 +426,7 @@ def touches_ui(files: list[str], globs: list[str]) -> list[str]:
 # to agents). A write by any other route — a helper script, an editor, a "quick fix" — is detected on the next read.
 
 def _chain_path() -> Path:
-    return Path(os.environ.get("RATCHET_HOME") or Path.home() / ".config" / "ratchet") / "file-hashes.json"
+    return ratchet_home() / "file-hashes.json"
 
 
 def record_chain(p: Path):
@@ -443,19 +443,166 @@ def record_chain(p: Path):
 
 
 def verify_chain(p: Path, label: str):
+    if not _IN_HOOK:  # the record of hashes lives in the per-user folder: only trust the one the hooks use
+        for cand in p.resolve().parents:
+            if cand.name == RATCHET_DIR:
+                require_hook_env(cand.parent)
+                break
     known = (read_json(_chain_path(), {}) or {}).get(str(p.resolve()))
     if not known or not p.exists():
         return
     if hashlib.sha256(p.read_bytes()).hexdigest() != known:
         die(f"{label} was changed outside ratchet.py ({p}). Ratchet won't trust it. Tell the user; restore the file, "
-            "or — only if they are sure — they can accept it from their own terminal with "
-            "`RATCHET_HUMAN_OVERRIDE=1 ratchet.py accept-state`.")
+            "or, only if they are sure, they can accept it from their own terminal with "
+            "`RATCHET_HUMAN_OVERRIDE=1 ratchet.py accept-state` (it asks them to type back a short code).")
+
+
+# ---- the human override: a person at their own terminal ------------------------------------------------------
+# RATCHET_HUMAN_OVERRIDE=1 alone proves nothing: any agent can set an environment variable. So the override also
+# opens the real terminal (/dev/tty; CONIN$/CONOUT$ on Windows), prints a short random code there and reads it back
+# in the same process. A command with no terminal (an agent's shell tool runs on pipes) or a wrong or missing
+# answer is refused. This is best-effort: an agent that can start its own pseudo-terminal and read the code from it
+# can still answer; the PreToolUse guard refuses commands that set the variable, which covers the usual route.
+
+_OVERRIDE_CONFIRMED = False
+OVERRIDE_TIMEOUT = 300  # seconds a person has to type the code back
+NO_TERMINAL_MSG = ("RATCHET_HUMAN_OVERRIDE is for a person at their own terminal, and this command has no terminal "
+                   "attached (an agent's shell tool runs without one), so nothing was approved. If you are the "
+                   "person, run the command yourself in a terminal window and type back the code it shows.")
+
+
+def _read_line_with_timeout(readline, timeout):
+    """One line from a blocking `readline` (the Windows console has no select()), or None when nothing arrives
+    within `timeout` seconds, at end of input, or when the read fails. The reader thread is a daemon: a refusal
+    exits the process even while it still waits on the console."""
+    import threading
+    box = []
+
+    def run():
+        try:
+            box.append(readline())
+        except Exception:
+            box.append(None)
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive() or not box:
+        return None
+    return box[0] or None
+
+
+def _open_terminal():
+    """(read, write) callables bound to the real terminal, or None when there is none."""
+    if os.name == "nt":
+        try:
+            fin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+            fout = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+        def w(s):
+            fout.write(s)
+            fout.flush()
+        return (lambda: _read_line_with_timeout(fin.readline, OVERRIDE_TIMEOUT)), w
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | getattr(os, "O_NOCTTY", 0))
+    except OSError:
+        return None
+    if not os.isatty(fd):
+        os.close(fd)
+        return None
+
+    def r():
+        import select
+        import time
+        buf, deadline = b"", time.time() + OVERRIDE_TIMEOUT
+        while b"\n" not in buf and b"\r" not in buf:
+            left = deadline - time.time()
+            if left <= 0:
+                return None
+            try:
+                ready, _, _ = select.select([fd], [], [], left)
+                if not ready:
+                    return None
+                chunk = os.read(fd, 256)
+            except OSError:
+                return None  # the terminal went away
+            if not chunk:
+                return None  # end of input before an answer
+            buf += chunk
+        return buf.decode("utf-8", "replace")
+
+    def w(s):
+        os.write(fd, s.encode("utf-8", "replace"))
+    return r, w
+
+
+def human_override(purpose: str, ctx=None, action: str | None = None) -> bool:
+    """False when RATCHET_HUMAN_OVERRIDE is not set. When it is set, the person must type back a printed code at a
+    real terminal in this same process; anything else dies with a plain message (never falls back to the bare
+    variable). Asked at most once per process.
+    The audit line is part of the override itself: before it returns True, it appends `action` to human_log.jsonl
+    (log_override) and dies when that line can't be written. Callers check it BEFORE they change anything, so no
+    caller can use a confirmed override without its audit line, and a refusal leaves everything unchanged. A caller
+    that passes no ctx/action is refused too (fail closed), never approved unaudited."""
+    global _OVERRIDE_CONFIRMED
+    if os.environ.get("RATCHET_HUMAN_OVERRIDE") != "1":
+        return False
+    if not _OVERRIDE_CONFIRMED:
+        _confirm_override(purpose)
+    if ctx is None or not action:
+        die("The override was confirmed, but this command did not say what to record in the audit log, so nothing "
+            "was approved or changed: an override is only used when it is recorded.")
+    log_override(ctx, action)
+    return True
+
+
+def _confirm_override(purpose: str):
+    """Ask for the printed code at the real terminal; dies unless it is typed back correctly."""
+    global _OVERRIDE_CONFIRMED
+    term = _open_terminal()
+    if term is None:
+        die(NO_TERMINAL_MSG)
+    read, write = term
+    code = f"{secrets.randbelow(10 ** 6):06d}"
+    try:
+        write(f"RATCHET: RATCHET_HUMAN_OVERRIDE is set, to {purpose}.\n"
+              f"To confirm you are a person at this terminal, type this code and press Enter: {code}\n> ")
+        answer = read()
+    except OSError:
+        answer = None
+    if answer is None:
+        die("No code was typed back at the terminal, so nothing was approved. RATCHET_HUMAN_OVERRIDE only works "
+            "when a person types back the code Ratchet shows.")
+    if not hmac.compare_digest(answer.strip().encode(), code.encode()):
+        die("The code typed back does not match the one shown, so nothing was approved. Run the command again "
+            "and type the new code it shows.")
+    _OVERRIDE_CONFIRMED = True
+
+
+def log_override(ctx, action: str):
+    """Leave an audit line in human_log.jsonl. It is not a chat message, so it never answers a question.
+    Only human_override calls this (the audit is part of the override), and every caller of human_override checks
+    it BEFORE it changes anything, so an override that can't be recorded is refused (die) and
+    nothing is approved, accepted or replaced: a confirmed override is never used without its audit line."""
+    log = ctx.ratchet / "human_log.jsonl"
+    try:
+        with log.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"at": now(), "by": "human", "override": True, "action": action,
+                                "via": "RATCHET_HUMAN_OVERRIDE, code typed back at the terminal"}) + "\n")
+    except OSError as e:
+        die(f"The override was confirmed, but Ratchet could not write its audit line to {log} "
+            f"({type(e).__name__}: {e.strerror or e}), so nothing was approved or changed: an override is only used "
+            "when it is recorded. Make that file (and .ratchet/) writable, then run the command again.")
+    record_chain(log)
 
 
 def cmd_accept_state(args):
     if os.environ.get("RATCHET_HUMAN_OVERRIDE") != "1":
-        die("accept-state is for a person at their own terminal (RATCHET_HUMAN_OVERRIDE=1).")
+        die("accept-state is for a person at their own terminal: run `RATCHET_HUMAN_OVERRIDE=1 ratchet.py "
+            "accept-state` yourself in a terminal window and type back the code it shows.")
     ctx = Ctx(find_root())
+    human_override("accept the current state.json and human_log.jsonl as the new baseline", ctx, "accept-state")
     for p in (ctx.state_path(), ctx.ratchet / "human_log.jsonl"):
         if p.exists():
             record_chain(p)
@@ -476,6 +623,260 @@ def _set_blocked(st, reason):
 def ratchet_home() -> Path:
     """Per-user Ratchet data OUTSIDE any repository (director key, active-run markers)."""
     return Path(os.environ.get("RATCHET_HOME") or Path.home() / ".config" / "ratchet")
+
+
+# ---- the per-user folder the hooks use ------------------------------------------------------------------------
+# A hook runs with the agent CLI's own environment, not the environment of a shell the agent controls. So every hook
+# records which per-user folder (RATCHET_HOME) and director key file it sees, in .ratchet/hook-env.json (written by
+# ratchet.py only; the guard refuses agent writes there). Any other ratchet.py command then refuses to run when its
+# own RATCHET_HOME or RATCHET_DIRECTOR_KEY_FILE points somewhere else: a folder an agent made up would hold no
+# integrity record and could hold a director key of its own making. The guard also records the role of the session
+# that last ran a command here (see "who counts as the director").
+
+_IN_HOOK = False  # set while a hook runs: its own environment is the one that counts
+
+
+def _hook_env_path(root: Path) -> Path:
+    return root / RATCHET_DIR / "hook-env.json"
+
+
+def _same_path(a, b) -> bool:
+    return os.path.normcase(os.path.realpath(str(a))) == os.path.normcase(os.path.realpath(str(b)))
+
+
+def _current_hook_env() -> dict:
+    return {"home": os.path.realpath(str(ratchet_home())), "key_file": os.path.realpath(str(director_key_path()))}
+
+
+def _hook_role() -> str:
+    """The role of the agent CLI a hook runs for, from the hook's own (launch-time) environment."""
+    return "director" if os.environ.get("RATCHET_ROLE") == "director" else "builder"
+
+
+HOOK_ENV_RECORDS = "hook-env"  # a folder of per-run hook records; hook-env.json is their combined view
+_HOOK_ENV_REC_RE = re.compile(r"^hook-env\.json\.(guard|env)\.(\d+)\.(director|builder|-)\.[A-Za-z0-9_-]+$")
+_HOOK_ENV_CORE = ("home", "key_file", "guard_role")
+_HOOK_ENV_TIE_RANK = {"director": 0, "-": 1, "builder": 2}  # same start time: the higher rank is the newer record
+
+
+def _hook_env_records(root: Path):
+    """[(microseconds, kind, role, name, path)] for every per-run hook record in .ratchet/hook-env/, oldest first
+    ([] when there is none; None when the folder can't be listed). The start time of the hook run and, for a guard,
+    the session role live in the name, so the role is read without opening a file another hook may be deleting."""
+    folder = root / RATCHET_DIR / HOOK_ENV_RECORDS
+    try:
+        names = os.listdir(folder)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    out = []
+    for name in names:
+        m = _HOOK_ENV_REC_RE.match(name)
+        if m:
+            out.append((int(m.group(2)), m.group(1), m.group(3), name, folder / name))
+    # Same start microsecond: the less privileged role counts as the newer one, so on an exact tie between a director
+    # and a builder guard the builder wins (never a random pick by the name's token, which would favour the director
+    # half the time). Only then the name, so the order is always the same.
+    return sorted(out, key=lambda r: (r[0], _HOOK_ENV_TIE_RANK.get(r[2], 1), r[3]))
+
+
+def _combined_hook_env(recs) -> dict | None:
+    """hook-env.json as the records say: `home` and `key_file` from the newest record, `guard_role` from the newest
+    guard record (newest by when each hook run started). None when a listed record vanished while it was read (a
+    newer hook removed it): the caller lists again."""
+    view = None
+    for _us, _kind, _role, _name, path in reversed(recs):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            continue  # not a record Ratchet wrote (records are renamed into place whole): skip it
+        if isinstance(data, dict) and data.get("home") and data.get("key_file"):
+            view = {"home": data["home"], "key_file": data["key_file"], "at": data.get("at"), "host": data.get("host")}
+            break
+    if view is None:
+        return None
+    guards = [r for r in recs if r[1] == "guard"]
+    if guards:
+        view["guard_role"] = guards[-1][2]
+    return view
+
+
+def record_hook_env(root: Path, host: str, event: str = "", started: str | None = None) -> bool:
+    """Called by every hook: remember the per-user folder and key file this agent CLI uses, and (guard only: it runs
+    right before every command a session runs) the role of the session that last ran a command here.
+    No file is read, changed and written back, so concurrent hooks cannot drop each other's newer values (the same
+    design as the crash markers): each run only creates its own uniquely named record in .ratchet/hook-env/ (the
+    run's start time and, for a guard, its role in the name; renamed into place whole), removes the records its own
+    supersedes, and then makes hook-env.json (rewritten in one rename, so a reader never sees half a file) agree
+    with the records: the newest record gives `home` and `key_file`, the newest guard record gives `guard_role`.
+    Each writer checks again after its rewrite and repeats while the records say something else, so once the hooks
+    finish the file matches the newest records whatever order they finished in (_recorded_guard_role also reads the
+    role from the records directly). Returns False when the record could not be saved: run_hook then reports it as
+    a hook error (never silently), and the readers refuse instead of reading a missing record as permission
+    (hook_env_problem, director_session_problem)."""
+    p = _hook_env_path(root)
+    folder = root / RATCHET_DIR / HOOK_ENV_RECORDS
+    cur = _current_hook_env()
+    us = _iso_us(started or now()) or _iso_us(now())
+    kind = "guard" if event == "guard" else "env"
+    role = _hook_role() if kind == "guard" else "-"
+    tag = f"{os.getpid()}-{secrets.token_hex(4)}"
+    tmp = folder / f"{p.name}.{tag}.tmp"
+    try:
+        folder.mkdir(exist_ok=True)
+        with open(tmp, "x", encoding="utf-8") as f:
+            f.write(json.dumps(dict(cur, at=now(), host=host)))
+        os.replace(tmp, folder / f"{p.name}.{kind}.{us}.{role}.{tag}")
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+    for r_us, r_kind, _r, _n, path in _hook_env_records(root) or []:
+        if r_us < us and (kind == "guard" or r_kind == "env"):  # a guard record supersedes every older record
+            try:
+                path.unlink()
+            except OSError:
+                pass  # another run removed it first, or (Windows) it is busy: an old record changes nothing
+    for _ in range(50):
+        recs = _hook_env_records(root)
+        if recs is None:
+            return False
+        view = _combined_hook_env(recs)
+        if view is None:
+            continue  # a record vanished while it was read: list again
+        try:
+            disk = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            disk = None
+        if isinstance(disk, dict) and all(disk.get(k) == view.get(k) for k in _HOOK_ENV_CORE):
+            return True
+        vtmp = p.with_name(f"{p.name}.{os.getpid()}-{secrets.token_hex(4)}.tmp")
+        try:
+            with open(vtmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps({k: v for k, v in view.items() if v is not None}))
+            os.replace(vtmp, p)
+        except OSError:
+            return False
+        finally:
+            try:
+                vtmp.unlink()
+            except OSError:
+                pass
+    return False
+
+
+def hooks_installed_anywhere(*roots) -> bool:
+    """True when Ratchet's hooks are installed for ANY agent CLI, at user scope or in the project scope of any of
+    `roots`. Any host, not just the detected one: host detection reads environment variables a builder's script
+    can set, so it must not be able to make installed hooks look absent."""
+    return any(installed_hook_files(h, Path(r)) for h in HOOK_HOSTS for r in roots if r is not None)
+
+
+def hooks_in_use(*roots) -> bool:
+    """True when Ratchet's hooks are in use for any of these projects: installed for any agent CLI (user scope or a
+    project's own config), or delivered some other way (a plugin) and seen working: a guard or stop hook (the ones
+    that enforce) has run in one of these projects, or a hook failure there is still unresolved. A prompt hook
+    alone does not count (it enforces nothing, as in hooks_status)."""
+    if hooks_installed_anywhere(*roots):
+        return True
+    for r in roots:
+        if r is None or not (Path(r) / RATCHET_DIR).is_dir():
+            continue
+        hb = read_heartbeat(Path(r))
+        if isinstance(hb.get("guard"), dict) or isinstance(hb.get("stop"), dict) or unresolved_hook_crashes(Path(r),
+                                                                                                         "unknown"):
+            return True
+    return False
+
+
+def _hook_record_may_have_failed(root: Path) -> bool:
+    """True when a missing hook-env record here may be a failed write rather than "no hook has run yet": a hook that
+    cannot save its record records that as a crash (_hook_record_failed), which stays unresolved until a later run
+    saves the record cleanly; and while Ratchet cannot read or save its crash state, a failure could go unrecorded."""
+    return bool(hook_crash_state_problem(root) or unresolved_hook_crashes(root, "unknown"))
+
+
+def _hook_record_doubt(root: Path) -> str | None:
+    """Why the hook record of this project may be out of date (None when it can be trusted): a hook failure here is
+    still unresolved (a crash, or a record it could not save: run_hook records both the same way), or Ratchet can't
+    read or save its crash state. A failed write leaves the OLD record in place, which may name a director that no
+    longer runs commands here, so no existing record is trusted while any such failure stands."""
+    problem = hook_crash_state_problem(root)
+    if problem:
+        return f"Ratchet can't trust its hook crash records ({problem})"
+    crashes = unresolved_hook_crashes(root, "unknown")
+    if crashes:
+        c = crashes[0]
+        return (f"the {c['event']} hook on {c['host']} failed at {c['at'][:19]}Z (it crashed or could not save its "
+                "record) and has not run cleanly since")
+    return None
+
+
+def hook_env_problem(root: Path, doubt: bool = True) -> str | None:
+    """A plain reason when this process's per-user folder or director key file differs from what the hooks of
+    this project recorded; None when they agree. A missing record is accepted only while it can mean "no hook has
+    run here yet": hooks not installed, or installed but not yet run here (the agent CLI was not restarted). When a
+    hook may have failed to save it (an unresolved hook crash, which is how run_hook records that failure, or crash
+    state Ratchet can't read or save), the missing record is refused, never read as "anything goes". With `doubt`
+    (the default), an existing record that agrees is refused too while such a failure stands (_hook_record_doubt):
+    the failed write may have left it out of date."""
+    try:
+        rec = json.loads(_hook_env_path(root).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if not (root / RATCHET_DIR).is_dir() or not hooks_in_use(root):
+            return None  # no Ratchet state here, or no hooks in use: nothing records (or enforces) anything
+        if not _hook_record_may_have_failed(root):
+            return None  # hooks installed but none has run here yet (the agent CLI needs a restart)
+        return (f"Refused: Ratchet's hooks are installed, but {_hook_env_path(root)} is missing and a hook may have "
+                "failed to save it, so Ratchet can't confirm which per-user folder and director key file its hooks "
+                "use, or whether this is the director's session. Every command here is refused until a hook saves "
+                "it, director commands included (RATCHET_ROLE=director counts for nothing without that record); "
+                f"only {', '.join(RECOVERY_CMDS)} still run, to show what is wrong. "
+                "Make sure .ratchet/ is writable, then restart your agent CLI (or send it any message) so its hooks "
+                "write the record again.")
+    except (OSError, ValueError):
+        return (f"{_hook_env_path(root)} is unreadable, so Ratchet can't tell which per-user folder its hooks use. "
+                "Delete it; the next hook run (send any message in your agent CLI) writes it again.")
+    if not isinstance(rec, dict) or not rec.get("home") or not rec.get("key_file"):
+        return (f"{_hook_env_path(root)} is not a complete record (a JSON object with `home` and `key_file`). "
+                "Delete it; the next hook run writes it again.")
+    cur = _current_hook_env()
+    if rec.get("home") and not _same_path(rec["home"], cur["home"]):
+        return (f"Ratchet's per-user folder here is {cur['home']}, but the hooks for this project use "
+                f"{rec['home']}. The folders do not match, so Ratchet won't trust state, integrity records or "
+                "approvals under this one. Unset RATCHET_HOME (or set it back to the hooks' folder). If you moved "
+                "the folder on purpose, restart your agent CLI with the new RATCHET_HOME so its hooks record it.")
+    if rec.get("key_file") and not _same_path(rec["key_file"], cur["key_file"]):
+        return (f"The director key file here is {cur['key_file']}, but the hooks for this project use "
+                f"{rec['key_file']}. They do not match, so Ratchet won't use this director key. Unset "
+                "RATCHET_DIRECTOR_KEY_FILE (or set it to the same file the agent CLI uses).")
+    why = _hook_record_doubt(root) if doubt else None
+    if why:
+        return (f"Refused: {why}, so {_hook_env_path(root)} may be out of date (a failed write leaves the old "
+                "record, which may name a director that no longer runs commands here). Ratchet won't trust it, or "
+                "the per-user folder and director key file it names, so every command here is refused until that "
+                f"hook runs cleanly, director commands included; only {', '.join(RECOVERY_CMDS)} still run, to show "
+                "what is wrong. Run the doctor command to see the "
+                "failure, make sure .ratchet/ is writable, then send any message or run any command in your agent "
+                "CLI so the hook runs again.")
+    return None
+
+
+# Commands that only read, or only repair hooks: they still run when the hook record can't be trusted, so a user
+# locked out by it can see what is wrong (doctor, status, next, view) and reinstall the hooks (install-hooks).
+RECOVERY_CMDS = ("doctor", "status", "next", "view", "install-hooks")
+_HOOK_ENV_ADVISORY = False  # set by main for a recovery command: a hook-record problem is said, not fatal
+
+
+def require_hook_env(root: Path):
+    why = None if _IN_HOOK else hook_env_problem(root)
+    if why and not _HOOK_ENV_ADVISORY:
+        die(why)
 
 
 def _markers_path() -> Path:
@@ -1369,7 +1770,8 @@ def cmd_init(args):
     if existing:
         old_st = read_json(ctx.state_path(existing), None)
         if old_st and old_st.get("phase") not in ("done", "cancelled"):
-            if not (args.force and os.environ.get("RATCHET_HUMAN_OVERRIDE") == "1"):
+            if not (args.force and human_override("replace the run that is still active", ctx,
+                                                  f"init --force (replaced run {existing})")):
                 die(f"Run '{existing}' is still active (phase {old_st['phase']}). Ask the user whether to resume it "
                     f"(ratchet.py resume) or cancel it (ratchet.py cancel, after they confirm). "
                     "A run is never replaced silently.")
@@ -1772,6 +2174,8 @@ def _human_since(ctx: Ctx, since_iso: str | None):
             e = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(e, dict) or e.get("override"):
+            continue  # an override audit line is not something the user typed in the chat
         at = e.get("at", "")
         if since_iso < at <= _in_a_minute():  # a timestamp from the future is forged, not typed
             out.append(e)
@@ -1799,7 +2203,138 @@ def _director_key(required=True) -> bytes | None:
 
 
 def _is_director_session() -> bool:
+    """The bare environment check. Trusted as is only inside a hook (whose environment is the agent CLI's own);
+    director commands go through require_director_session, which also asks what the hooks recorded."""
     return os.environ.get("RATCHET_ROLE") == "director"
+
+
+# ---- who counts as the director ---------------------------------------------------------------------------
+# RATCHET_ROLE=director in the environment proves nothing on its own: a builder can write a script that sets it and
+# run that script with a clean-looking command the guard can't see into. The guard hook, which runs right before
+# every command any session runs and has that agent CLI's own launch-time environment, records the role of the
+# session that last ran a command in each project (.ratchet/hook-env.json, `guard_role`) and, for a director whose
+# folder holds no .ratchet/, that folder in the per-user folder (director-folders.json). Director commands then
+# need the hooks to agree.
+
+def _director_folders_path() -> Path:
+    return ratchet_home() / "director-folders.json"
+
+
+def record_director_folder(folder: Path) -> bool:
+    """Called by the guard of a director session whose folder has no .ratchet/: remember that folder. Returns False
+    when it could not be saved (run_hook then says so; the director commands refuse without the record)."""
+    try:
+        key = os.path.realpath(str(folder))
+        p = _director_folders_path()
+        data = read_json(p, {}) or {}
+        if not isinstance(data, dict):
+            return False
+        if key in data:
+            return True
+        data[key] = now()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(f"{p.name}.{os.getpid()}-{secrets.token_hex(4)}.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data))
+        os.replace(tmp, p)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _recorded_guard_role(root: Path | None) -> str | None:
+    """'director' / 'builder' as the guard last recorded for `root`, None when no guard has run a command there
+    (or there is no project), 'unreadable' when the record can't be read."""
+    if root is None:
+        return None
+    try:
+        rec = json.loads(_hook_env_path(root).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return "unreadable"
+    if not isinstance(rec, dict):
+        return "unreadable"
+    recs = _hook_env_records(root)  # the newest guard record at the moment of reading (record_hook_env)
+    if recs is None:
+        return "unreadable"
+    guards = [r for r in recs if r[1] == "guard"]
+    role = guards[-1][2] if guards else rec.get("guard_role")
+    return role if role in ("director", "builder") else (None if role is None else "unreadable")
+
+
+DIRECTOR_NO_HOOKS_NOTE = (
+    "RATCHET: note: Ratchet's hooks are not installed for any agent CLI here (and none has enforced anything here), "
+    "so nothing records which session is the director and RATCHET_ROLE=director is taken at its word. Nothing else "
+    "is enforced without hooks either; install them (the install-hooks command) so director commands need a "
+    "hook-recorded director session.")
+
+
+def director_session_problem(what: str) -> str | None:
+    """None when this process may act as the director; otherwise a plain reason. Fail closed: RATCHET_ROLE=director
+    counts only with a positive record from a director session's own guard hook. The one exception is when Ratchet's
+    hooks are not installed at all (for any agent CLI), because then nothing is recorded or enforced anyway
+    (require_director_session says so on stderr). Installed hooks with a missing record (none has run yet, or its
+    write failed) are refused."""
+    return _director_session_check(what)[0]
+
+
+def _director_session_check(what: str):
+    """(problem or None, note or None) for director_session_problem / require_director_session."""
+    if not _is_director_session():
+        return f"{what} must be run from the director's session (RATCHET_ROLE=director).", None
+    if _IN_HOOK:
+        return None, None
+    here = Path.cwd().resolve()
+    own = _ratchet_root_of(here)
+    for r in (own, find_root()):  # a failed record write leaves the OLD role in place: trust no record meanwhile
+        doubt = _hook_record_doubt(r) if r is not None and (r / RATCHET_DIR).is_dir() else None
+        if doubt:
+            return (f"{what} refused: {doubt} in {r}, so the role its hooks recorded may be out of date (a failed "
+                    "write leaves the old record, which may name a director that no longer runs commands there). "
+                    "Director commands are refused until that hook runs cleanly. Run the doctor command to see the "
+                    "failure, make sure .ratchet/ is writable, then send any message or run any command in the "
+                    "director's agent CLI so its hooks record the role again."), None
+    if own is not None:
+        own_role, where = _recorded_guard_role(own), own
+    else:
+        folders = read_json(_director_folders_path(), {}) or {}
+        own_role = "director" if isinstance(folders, dict) and os.path.realpath(str(here)) in folders else None
+        where = here
+    if own_role == "director":
+        return None, None
+    target = find_root()
+    if own_role is None:
+        own_role, where = _recorded_guard_role(target), target
+        if own_role is None:
+            if not hooks_in_use(here, own, target):
+                return None, DIRECTOR_NO_HOOKS_NOTE  # no hooks at all: nothing is recorded or enforced anyway
+            return (f"{what} refused: RATCHET_ROLE=director is set, and Ratchet's hooks are installed (or have run "
+                    "here), but no hook "
+                    f"has recorded a director session in {here} (or in {target}): the record is missing, either "
+                    "because the director's agent CLI has not run a command here since its hooks were installed, "
+                    "or because a hook could not save it. Ratchet does not take the variable at its word while "
+                    "hooks are installed. Restart the director's agent CLI (started with RATCHET_ROLE=director) "
+                    "so its hooks record the role, and run director commands from it in its own folder, reaching "
+                    "a lane with --root <lane>. If it keeps failing, check that .ratchet/ (or, for a folder with no "
+                    ".ratchet/, the per-user folder) is writable: the hook says so when it can't save the record."), None
+    if own_role == "unreadable":
+        return (f"{what} refused: {_hook_env_path(where)} can't be read, so Ratchet can't confirm this is the "
+                "director's session. Delete it; the next hook run (send any message in your agent CLI) writes it "
+                "again."), None
+    return (f"{what} refused: RATCHET_ROLE=director is set, but Ratchet's guard hook last ran a command in {where} "
+            "for a session that was not started as the director, so this is not treated as the director's session "
+            "(a builder setting the variable, for example in a script, gets nothing from it). Run director commands "
+            "from the director's own agent CLI, started with RATCHET_ROLE=director and with Ratchet's hooks "
+            "installed, in its own folder, and reach a lane with --root <lane>."), None
+
+
+def require_director_session(what: str):
+    why, note = _director_session_check(what)
+    if why:
+        die(why)
+    if note:
+        print(note, file=sys.stderr)
 
 
 def _approval_payload(ctx, st, action) -> str:
@@ -1944,8 +2479,8 @@ def _require_approval(ctx, st, action, token=None):
         die("This lane is director-enrolled: approvals need a director token "
             f"(director runs: ratchet.py --root {ctx.root} director-sign {action}). "
             "Chat messages do not count as approvals here.")
-    if os.environ.get("RATCHET_HUMAN_OVERRIDE") == "1":
-        return {"by": "human", "detail": "(RATCHET_HUMAN_OVERRIDE)"}
+    if human_override(f"approve this pause ({action})", ctx, action):
+        return {"by": "human", "detail": "(RATCHET_HUMAN_OVERRIDE, code typed back at the terminal)"}
     p = st.get("pending") or {}
     if action in ("approve-plan", "human-approve") and p.get("action") not in (None, "hooks-waive"):
         die(f"A different question is waiting for the user's answer: shall I {ASKABLE.get(p.get('action'), p.get('action'))}"
@@ -1996,8 +2531,7 @@ def _require_human(ctx, st, action="human-approve", token=None):
 
 
 def cmd_director_key(args):
-    if not _is_director_session():
-        die("director-key must be run from the director's session (RATCHET_ROLE=director).")
+    require_director_session("director-key")
     p = director_key_path()
     if p.exists() and not args.rotate:
         ok(f"Director key exists: {p}")
@@ -2009,8 +2543,7 @@ def cmd_director_key(args):
 
 
 def cmd_director_enroll(args):
-    if not _is_director_session():
-        die("director-enroll must be run from the director's session (RATCHET_ROLE=director).")
+    require_director_session("director-enroll")
     ctx = Ctx(find_root())
     ctx.ratchet.mkdir(exist_ok=True)
     key = _director_key()
@@ -2023,8 +2556,7 @@ def cmd_director_enroll(args):
 
 
 def cmd_director_sign(args):
-    if not _is_director_session():
-        die("director-sign must be run from the director's session (RATCHET_ROLE=director).")
+    require_director_session("director-sign")
     ctx = Ctx(find_root())
     st = ctx.state()
     want = {"approve-plan": ["awaiting_plan_approval"],
@@ -4151,7 +4683,8 @@ def cmd_choice(args):
         die("No reply from the user yet. End your turn and wait for them to pick an option.")
     entry = msgs[0]  # the first reply answers the question
     letter = choice_letter(entry.get("prompt", ""), p.get("options") or [])
-    if ctx.config().get("verify_transcripts", True) and os.environ.get("RATCHET_HUMAN_OVERRIDE") != "1":
+    if ctx.config().get("verify_transcripts", True) and not human_override(
+            "record the option the user picked", ctx, "choice (recorded without the transcript check)"):
         good, why = _transcript_ok(entry, p.get("asked_at"))
         if not good:
             die(f"Couldn't confirm that reply came from the user ({why}). Ask them to reply again in this chat.")
@@ -5265,8 +5798,63 @@ def _expand(cmd: str) -> str:
         cmd = re.sub(r"\$\{" + name + r"\}|\$" + name + r"(?![A-Za-z0-9_])", lambda _m: val, cmd)
     return cmd
 DIRECTOR_CALL_RE = re.compile(r"""ratchet\.py["']?\s+(?:--root\s+\S+\s+)?director-(sign|key|enroll)\b""")
-ROLE_SET_RE = re.compile(r"(^|[\s;&|(])(export\s+)?RATCHET_ROLE\s*=|env\s+[^;&|]*RATCHET_ROLE=")
-OVERRIDE_SET_RE = re.compile(r"(^|[\s;&|(])(export\s+)?RATCHET_HUMAN_OVERRIDE\s*=|env\s+[^;&|]*RATCHET_HUMAN_OVERRIDE=")
+# Variables a builder session may read but never set. Each is matched however it is set: VAR=, export/declare/
+# typeset/local/readonly/setenv/fish `set -x`, a dict or kwargs entry (python3 -c os.environ / env=...), putenv-style
+# calls, or indirectly (the name stored in another variable, or built from pieces, then used by eval, env -S,
+# printf -v, ${!v}, sourcing, or an os.environ write). A plain read ($VAR, printenv VAR, grep VAR docs) is fine.
+RESERVED_ENV = (
+    ("RATCHET_HUMAN_OVERRIDE", "RATCHET GUARD: RATCHET_HUMAN_OVERRIDE is for a person at their own terminal, not "
+                               "for agents."),
+    ("RATCHET_DIRECTOR_KEY_FILE", "RATCHET GUARD: the director key path (RATCHET_DIRECTOR_KEY_FILE) cannot be "
+                                  "redirected by a builder session."),
+    ("RATCHET_ROLE", "RATCHET GUARD: RATCHET_ROLE and the director commands are reserved for the director session."),
+    ("RATCHET_HOME", "RATCHET GUARD: Ratchet's per-user folder (RATCHET_HOME) is off-limits to builder sessions; it "
+                     "cannot be redirected from here."),
+)
+RESERVED_PIECES_MSG = ("RATCHET GUARD: this command builds one of Ratchet's reserved variable names "
+                       "(RATCHET_HUMAN_OVERRIDE, RATCHET_ROLE, RATCHET_HOME, RATCHET_DIRECTOR_KEY_FILE) from pieces "
+                       "and sets it indirectly. Builder sessions may read those variables but never set them.")
+ENV_INDIRECT_RE = re.compile(
+    r"\beval\b|\benv\b[^;&|\n]*\s(-[A-Za-z]*S|--split-string)|\b(export|declare|typeset|local|readonly|setenv)\b"
+    r"|\bset\s+-[A-Za-z]*x|\bprintf\s+-v\b|\$\{!|\bsource\s|(^|[;&|(]\s*)\.\s+\S"
+    r"|environ\s*\[[^\]]*\]\s*\|?=(?!=)|environ\s*\.\s*(update|setdefault|__setitem__)\b|environ\s*\|?=(?!=)"
+    r"|\b(putenv|setenv|Setenv|SetEnvironmentVariable)\s*\(|process\.env\s*\[[^\]]*\]\s*=(?!=)"
+    r"|Object\.assign\s*\(\s*process\.env|\bENV\s*\[[^\]]*\]\s*=(?!=)|\$ENV\{[^}]*\}\s*=(?!=)|--(set)?env\b")
+ENV_TOKEN_RE = re.compile(r"(?<![\w$])(?<!\$\{)(?<!\$\{!)(?<!\$\{#)RATCHET\w*", re.I)
+
+
+def _reserved_env_problem(cmd: str) -> str | None:
+    """The guard message when a shell command sets (directly or indirectly) a variable only a person or the
+    director may set; None otherwise. The one detector for every reserved variable (plain reads stay allowed).
+    Best-effort: a script written to a file first and run later is not seen here, which is why the engine also
+    distrusts these values on its own (terminal code, hook-recorded folder, key file and director role)."""
+    indirect = bool(ENV_INDIRECT_RE.search(cmd) or ENV_INDIRECT_RE.search(_expand(cmd)))
+    texts = [cmd] + ([_expand(cmd)] if _expand(cmd) != cmd else [])
+    for text in texts:
+        for seg in _segments(text):
+            prog, _sub = _program(seg)
+            if prog in READ_ONLY_PROGRAMS and "$(" not in seg and "`" not in seg:
+                continue  # grep/cat/... only read; mentioning a name there sets nothing
+            for m in ENV_TOKEN_RE.finditer(seg):
+                tok = m.group(0)
+                full = next(((n, msg) for n, msg in RESERVED_ENV if tok.upper() == n), None)
+                if full:
+                    name, msg = full
+                    after = seg[m.end():]
+                    before = seg[:m.start()]
+                    if re.match(r"""['"\]}]*\s*\+?=(?!=)|['"]\s*:""", after) or \
+                            re.search(r"""(?:^|[\s;&|(])[A-Za-z_]\w*=\s*['"]?$""", before) or \
+                            re.search(r"\b(export|declare|typeset|local|readonly|setenv)\b|\bset\s+-[A-Za-z]*x",
+                                      before) or \
+                            re.search(r"\b(putenv|setenv|Setenv|SetEnvironmentVariable|setdefault|update|"
+                                      r"__setitem__)\s*\(\s*['\"]?$", before) or indirect:
+                        return msg
+                elif tok.startswith("RATCHET") and indirect and \
+                        any(n.startswith(tok) and n != tok for n, _m in RESERVED_ENV):
+                    return RESERVED_PIECES_MSG
+    return None
+
+
 DANGEROUS_GIT_RE = re.compile(r"\bgit\s+(clean\b[^;&|\n]*\s-[a-zA-Z]*[xX]|stash\b[^;&|\n]*(\s--all\b|\s-a\b))")
 
 
@@ -5445,6 +6033,10 @@ def _run_phase(root: Path) -> str | None:
 def decide_guard(n: dict) -> tuple[bool, str]:
     cmd, cwd = n["command"], n["cwd"]
     if not _is_director_session():
+        if n["kind"] == "shell" and cmd:
+            why = _reserved_env_problem(cmd)
+            if why:
+                return True, why
         key_bits = [str(director_key_path()), str(ratchet_home()), "director.key", ".config/ratchet", ".config/rat"]
         scan = cmd + " " + " ".join(n["paths"]) + " " + json.dumps({k: v for k, v in n["input"].items()
                                                                      if k in ("path", "pattern", "glob", "file_path",
@@ -5453,13 +6045,11 @@ def decide_guard(n: dict) -> tuple[bool, str]:
         if any(b in scan for b in key_bits) or wide:
             return True, ("RATCHET GUARD: the director's key and Ratchet's per-user files are off-limits to builder "
                           "sessions. Wait for the director to approve this lane.")
-        if n["kind"] == "shell" and (DIRECTOR_CALL_RE.search(cmd) or ROLE_SET_RE.search(cmd)):
+        if n["kind"] == "shell" and DIRECTOR_CALL_RE.search(cmd):
             return True, "RATCHET GUARD: director commands and RATCHET_ROLE are reserved for the director session."
         if n["kind"] == "shell" and re.search(r"reviewer-status\b[^;&|\n]*--mark", cmd):
             return True, ("RATCHET GUARD: only the director (or the user, in their own terminal) can switch a "
                           "reviewer off. Reviewers that genuinely fail are marked unavailable automatically.")
-        if n["kind"] == "shell" and OVERRIDE_SET_RE.search(cmd):
-            return True, "RATCHET GUARD: RATCHET_HUMAN_OVERRIDE is for a person at their own terminal, not for agents."
     root = find_root(Path(cwd))
     marks = False
     if (root / RATCHET_DIR).is_dir():
@@ -5511,16 +6101,55 @@ def emit_hook(host: str, event: str, block: bool, message: str) -> int:
     return 0
 
 
+def _hook_record_failed(n: dict, host: str, event: str, detail: str) -> str:
+    """A hook could not save its hook-env record (or a director's folder record). Record it the way a hook crash is
+    recorded (a crash marker, or the unsaved-crash fallback, plus a hook-errors.log line), so the hook counts as
+    broken until a later run saves the record cleanly, and return the plain line the host shows."""
+    saved = False
+    root = _ratchet_root_of(n.get("cwd"))
+    if root is not None:
+        try:
+            saved = _record_hook_run(root, host, event, crashed=True) or _record_unsaved_crash(root, host, event)
+            with open(root / RATCHET_DIR / "hook-errors.log", "a") as f:
+                f.write(f"{now()} {host} {event}: HookRecordError: {detail}\n")
+        except Exception:
+            pass
+    line = (f"RATCHET: the {event} hook could not save which per-user folder, director key file and session role "
+            f"this agent CLI uses ({detail}). Until a hook saves it, Ratchet refuses director commands here and "
+            "won't trust a per-user folder it can't confirm. Make that file's folder writable; the next hook run "
+            "writes it again.")
+    if root is not None and not saved:
+        line += (f" Ratchet could not save this failure either (it cannot write to {RATCHET_DIR}/{HOOK_CRASHES}/), "
+                 "so run the doctor command.")
+    return line
+
+
 def run_hook(event: str, host_arg: str | None) -> int:
     data = _hook_input()
     host = detect_hook_host(data, host_arg)
     started = now()  # a clean run resolves only crashes recorded before it began
+    global _IN_HOOK
+    _IN_HOOK = True  # this process has the agent CLI's own environment: it is the one the engine compares against
     try:
         n = normalize_hook(data, host)
+        record_failed = None  # remembering the folder must never break the hook itself, nor fail silently
+        try:
+            env_root = _ratchet_root_of(n.get("cwd"))
+            if env_root is not None:
+                if not record_hook_env(env_root, host, event, started):
+                    record_failed = f"could not save {_hook_env_path(env_root)}"
+            elif event == "guard" and _hook_role() == "director" and n.get("cwd"):
+                if not record_director_folder(Path(str(n["cwd"]))):
+                    record_failed = f"could not save {_director_folders_path()}"
+        except Exception as e:
+            record_failed = f"{type(e).__name__}: {e}"
         block, msg = {"stop": decide_stop, "prompt": decide_prompt, "guard": decide_guard}[event](n)
+        if record_failed:  # the decision above still stands; the failure is recorded and said, never swallowed
+            note = _hook_record_failed(n, host, event, record_failed)
+            msg = f"{msg}\n{note}" if msg else note
         rc = emit_hook(host, event, block, msg)
         clean_root = _ratchet_root_of(n.get("cwd"))
-        if clean_root is not None:
+        if clean_root is not None and not record_failed:
             _record_hook_run(clean_root, host, event, crashed=False, started=started)  # a clean run resolves this hook's crash
         return rc
     except (Exception, SystemExit) as e:  # guard/prompt fail OPEN — never brick the host session
@@ -6240,6 +6869,24 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.root:
         os.environ["RATCHET_ROOT"] = str(Path(args.root).resolve())
+    global _HOOK_ENV_ADVISORY
+    _HOOK_ENV_ADVISORY = False
+    if args.cmd in RECOVERY_CMDS:  # reads or hook repair: run anyway and say plainly what is wrong
+        why = None if _IN_HOOK else hook_env_problem(find_root())
+        if why:
+            _HOOK_ENV_ADVISORY = True
+            why = why[len("Refused: "):] if why.startswith("Refused: ") else why
+            print(f"RATCHET: {args.cmd} still runs (it only reads, or only repairs hooks), but Ratchet can't trust "
+                  f"this project's hook record, so what it shows is not confirmed: {why}", file=sys.stderr)
+            args.fn(args)
+            # A read exits 1 when the record itself is missing, unreadable or names another folder (what it shows
+            # may come from a folder the hooks don't use). A record that only may be out of date (a hook failure
+            # is unresolved: status and doctor report it themselves) and the hook repair exit 0 after the note.
+            if args.cmd != "install-hooks" and hook_env_problem(find_root(), doubt=False):
+                sys.exit(1)
+            return
+    elif args.cmd not in ("hook", "hook-stop", "hook-prompt", "hook-guard"):
+        require_hook_env(find_root())  # a per-user folder or key file the hooks don't use is not trusted
     args.fn(args)
 
 
