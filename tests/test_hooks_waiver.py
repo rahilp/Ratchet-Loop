@@ -103,7 +103,8 @@ def project(name="p", approved=True) -> Path:
     r = rx(d, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout
     if approved:
-        say(d, "yes, build it")
+        rx(d, "ask", "approve-plan")  # CP5: an approval answers the question Ratchet printed
+        say(d, "yes, go ahead")
         r = rx(d, "approve-plan")
         assert r.returncode == 0, r.stderr + r.stdout
     clear_hb(d)
@@ -240,7 +241,7 @@ def main():
           (hk(d), sj(d).get("phase")))
 
     print("[CP2-T07] a yes already used for plan approval is not reused")
-    d = project("t07")  # project() approved the plan with "yes, build it"
+    d = project("t07")  # project() approved the plan with "yes, go ahead"
     ask(d)
     r = rx(d, "hooks-waive")
     check("[CP2-T07] refused with no newer message", refused(r) and not waived(d), r.stdout + r.stderr)
@@ -286,7 +287,8 @@ def main():
           and bool((n2.get("hooks") or {}).get("waived")), (n1.get("hooks"), n2.get("hooks")))
     check("[CP2-T11] next action is identical apart from hooks", strip(n1) == strip(n2) and bool(n1), (strip(n1), strip(n2)))
     d = project("t11b", approved=False)
-    say(d, "yes, build it")
+    rx(d, "ask", "approve-plan")
+    say(d, "yes, go ahead")
     r = rx(d, "approve-plan")
     check("[CP2-T11] approve-plan succeeds with hooks missing and no waiver",
           r.returncode == 0 and sj(d).get("phase") == "building" and not waived(d), r.stderr + r.stdout)
@@ -296,7 +298,8 @@ def main():
     check("[CP2-T12] project is awaiting plan approval", sj(d).get("phase") == "awaiting_plan_approval", sj(d).get("phase"))
     a, r = full_waive(d)
     check("[CP2-T12] hooks-waive works before plan approval", r.returncode == 0 and waived(d), r.stderr + r.stdout)
-    say(d, "yes, build it")
+    rx(d, "ask", "approve-plan")
+    say(d, "yes, go ahead")
     ap = rx(d, "approve-plan")
     check("[CP2-T12] approve-plan still works afterwards", ap.returncode == 0 and sj(d).get("phase") == "building",
           ap.stderr + ap.stdout)
@@ -312,7 +315,8 @@ def main():
     w = rx(d, "hooks-waive")
     ap = rx(d, "approve-plan")
     if refused(ap):  # pinned alternative: one further message is needed, but approve-plan must then work
-        say(d, "yes, build it")
+        rx(d, "ask", "approve-plan")
+        say(d, "yes, go ahead")
         ap = rx(d, "approve-plan")
     check("[CP2-T13] hooks-waive succeeds and approve-plan is never blocked",
           w.returncode == 0 and ap.returncode == 0 and sj(d).get("phase") == "building", (w.stderr, ap.stderr))
@@ -416,7 +420,8 @@ def main():
     check("[CP2-T19] the same yes still waives", w.returncode == 0 and waived(d), w.stderr + w.stdout)
     ap = rx(d, "approve-plan")
     check("[CP2-T19] and does not approve the plan afterwards either", refused(ap), (ap.stdout, ap.stderr))
-    say(d, "yes, build it")
+    rx(d, "ask", "approve-plan")
+    say(d, "yes, go ahead")
     ap = rx(d, "approve-plan")
     check("[CP2-T19] a separate yes approves the plan", ap.returncode == 0 and sj(d).get("phase") == "building",
           ap.stderr + ap.stdout)
@@ -545,7 +550,8 @@ def main():
     say(d, "yes, build it")
     check("[CP2-T30] the first reply after the hooks question answers it, so it doesn't approve the plan",
           refused(rx(d, "approve-plan")) and sj(d).get("phase") == "awaiting_plan_approval")
-    say(d, "yes, build it")
+    rx(d, "ask", "approve-plan")
+    say(d, "yes, go ahead")
     check("[CP2-T30] the next yes approves the plan", rx(d, "approve-plan").returncode == 0 and sj(d).get("phase") == "building")
     d = project("t30c")
     ask(d)
@@ -627,9 +633,10 @@ def main():
         r = rx(d, "approve-plan")
         check(f"[CP2-T32] {txt!r} as the first reply after the hooks question does not approve the plan",
               refused(r) and sj(d).get("phase") == "awaiting_plan_approval", (r.stdout, r.stderr))
-        say(d, txt)
+        rx(d, "ask", "approve-plan")  # CP5: the plan's own question, then a listed yes
+        say(d, "yes")
         r = rx(d, "approve-plan")
-        check(f"[CP2-T32] a second {txt!r} reaches approve-plan",
+        check(f"[CP2-T32] after {txt!r} answered the hooks question, a separate yes reaches approve-plan",
               r.returncode == 0 and sj(d).get("phase") == "building", (r.stdout, r.stderr))
     d = project("t32w", approved=False)
     ask(d)
@@ -660,8 +667,14 @@ def main():
     check("[CP2-T34] awaiting_since unchanged by the ask", aw0 and stj_read(d).get("awaiting_since") == aw0,
           (aw0, stj_read(d).get("awaiting_since")))
     r = rx(d, "approve-plan")
-    check("[CP2-T34] a plan-approving yes typed before the ask still approves", r.returncode == 0
-          and sj(d).get("phase") == "building", (r.stdout, r.stderr))
+    check("[CP2-T34] the hooks question does not turn the yes typed before it into a plan approval",
+          refused(r) and sj(d).get("phase") == "awaiting_plan_approval", (r.stdout, r.stderr))
+    rx(d, "ask", "withdraw")
+    rx(d, "ask", "approve-plan")
+    say(d, "yes, go ahead")
+    r = rx(d, "approve-plan")
+    check("[CP2-T34] after the hooks question, the plan is still approved the normal way (its own question, "
+          "then a listed yes)", r.returncode == 0 and sj(d).get("phase") == "building", (r.stdout, r.stderr))
     d = project("t34b")
     ask(d)
     check("[CP2-T34] no approval window is opened where none existed", stj_read(d).get("awaiting_since") is None,
@@ -672,10 +685,11 @@ def main():
     say(d, GO)   # a waiver-looking message typed BEFORE the ask, and nothing after
     ask(d)
     r = rx(d, "approve-plan")
-    # it is judged as the user's latest reply (not skipped as the hooks answer), and a hooks reply is not a plan yes
-    check("[CP2-T35] the earlier message is not treated as the hooks answer", refused(r)
-          and "not a clear yes" in r.stderr and "without hooks" in r.stderr
-          and sj(d).get("phase") == "awaiting_plan_approval", (r.stdout, r.stderr))
+    w = rx(d, "hooks-waive")
+    # CP5: no reply was typed after the hooks question, so nothing answers it, and a hooks reply is never a plan yes
+    check("[CP2-T35] the earlier message is not treated as the hooks answer", refused(r) and refused(w)
+          and "No human message recorded" in w.stderr and not waived(d)
+          and sj(d).get("phase") == "awaiting_plan_approval", (r.stdout, r.stderr, w.stderr))
     d = project("t32y", approved=False)
     ask(d)
     say(d, "yes with hooks")

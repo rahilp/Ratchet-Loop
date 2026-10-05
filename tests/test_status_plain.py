@@ -151,7 +151,8 @@ def plan_project(approve: bool) -> Path:
     r = rx(d, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout
     if approve:
-        say(d, "yes, build it")
+        rx(d, "ask", "approve-plan")  # CP5: an approval answers the question Ratchet printed
+        say(d, "yes, go ahead")
         r = rx(d, "approve-plan")
         assert r.returncode == 0, r.stderr + r.stdout
     clear_hb(d)

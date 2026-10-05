@@ -86,7 +86,8 @@ def building_lane(base: Path, slug: str, transcripts: Path, waive: bool) -> Path
     d = lane(base, slug)
     sh("config", "--set", "min_review_seconds=0", cwd=d)
     assert sh("plan-submit", cwd=d).returncode == 0
-    say(d, "yes, build it", transcripts)
+    sh("ask", "approve-plan", cwd=d)  # CP5: an approval answers the question Ratchet printed
+    say(d, "yes, go ahead", transcripts)
     r = sh("approve-plan", cwd=d)
     assert r.returncode == 0, r.stderr + r.stdout
     if waive:

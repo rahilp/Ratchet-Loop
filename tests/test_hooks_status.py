@@ -128,10 +128,11 @@ def project(env, approved=True):
         (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
         r = rx(d, env, "plan-submit")
         assert r.returncode == 0, r.stderr + r.stdout
-        tp.open("a").write(json.dumps({"type": "user", "message": {"role": "user", "content": "yes, build it"},
+        rx(d, env, "ask", "approve-plan")  # CP5: an approval answers the question Ratchet printed
+        tp.open("a").write(json.dumps({"type": "user", "message": {"role": "user", "content": "yes, go ahead"},
                                        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
         rx(d, env, "hook", "prompt", "--host", "claude",
-           stdin=json.dumps({"cwd": str(d), "prompt": "yes, build it", "session_id": "s-owner",
+           stdin=json.dumps({"cwd": str(d), "prompt": "yes, go ahead", "session_id": "s-owner",
                              "transcript_path": str(tp)}))
         r = rx(d, env, "approve-plan")
         assert r.returncode == 0, r.stderr + r.stdout

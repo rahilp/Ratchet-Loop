@@ -67,5 +67,7 @@
       "id": "claude",
       "preset": "claude"
     }
-  ]
+  ],
+  "test_timeout_sec": 3600,
+  "max_adversarial_rounds_run": 50
 }

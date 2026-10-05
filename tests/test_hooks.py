@@ -45,11 +45,12 @@ def setup_project() -> Path:
     (run / "tests" / "CP1.json").write_text('{"cases": []}')
     sh("plan-submit", cwd=d)
     import datetime as dt
+    sh("ask", "approve-plan", cwd=d)  # CP5: an approval answers the question Ratchet printed
     tp = d.parent / f"{d.name}-transcript.jsonl"   # what the agent CLI writes when the user types
-    tp.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": "approve"},
+    tp.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": "approved"},
                               "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
     sh("hook", "prompt", "--host", "claude", cwd=d,
-       stdin=json.dumps({"cwd": str(d), "prompt": "approve", "transcript_path": str(tp)}))
+       stdin=json.dumps({"cwd": str(d), "prompt": "approved", "transcript_path": str(tp)}))
     r = sh("approve-plan", cwd=d)
     assert r.returncode == 0, r.stderr
     return d

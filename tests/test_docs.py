@@ -706,7 +706,8 @@ def project(name):
         "tests": {"files": ["tests/test_cp1.py"], "command": "python3 tests/test_cp1.py"}}]}))
     (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
     rx(d, "plan-submit")
-    say(d, "yes, build it")
+    rx(d, "ask", "approve-plan")  # an approval answers the question Ratchet printed
+    say(d, "yes, go ahead")
     rx(d, "approve-plan")
     return d
 
@@ -2604,6 +2605,28 @@ SECTIONS = [("CP4", cp4_orchestrator_setup_and_plan_review), ("CP5", cp5_docs_li
             ("CP7", cp7_docs_lint), ("CP2", cp2_docs_lint)]
 # single-line restatement so CP5-T20's single-line SECTIONS probe pattern still matches and can replace it
 SECTIONS = [s for s in SECTIONS]
+
+
+# ---- CP5 adversarial round 12: a reply can go unrecorded, and the docs say so ----
+
+def cp5_adv12_unrecorded_reply_docs():
+    print("CP5 adv round 12: README and the orchestrator skill say a reply can go unrecorded and must be sent again")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    skill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text(encoding="utf-8")
+    sec = readme.split("### Saying yes, and saying no", 1)[-1].split("\n## ", 1)[0]
+    check("[CP5-X62] README's 'Saying yes, and saying no' says a reply can go unrecorded when Ratchet's own records "
+          "are damaged, that it then approves nothing, and that the user sends it again after the repair",
+          has(sec, r"unrecorded|not recorded|doesn't record", r"records?[^.]*damaged|damaged[^.]*records?",
+              r"approves nothing", r"send your reply again|send it again", r"accept-state"), sec[-800:])
+    check("[CP5-X62] README still says a reply sent while Ratchet is busy is recorded and need not be sent again",
+          has(sec, r"busy", r"still recorded", r"don't need to send it again"))
+    check("[CP5-X62] the orchestrator skill tells the agent what to do when the prompt hook did not record a reply: "
+          "never treat it as an answer, tell the user, ask again after the repair",
+          has(skill, r"Ratchet did not record this message", r"When a reply wasn't recorded",
+              r"not an answer", r"print the question again", r"send their reply again", r"accept-state"))
+
+
+SECTIONS.append(("CP5", cp5_adv12_unrecorded_reply_docs))
 
 
 def main():

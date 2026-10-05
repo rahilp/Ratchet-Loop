@@ -24,6 +24,7 @@ Python 3.8+ stdlib only.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
 import fnmatch
 import hashlib
@@ -38,6 +39,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import webbrowser
 from pathlib import Path
 
@@ -195,25 +197,35 @@ def find_root(start: Path | None = None) -> Path:
     return p
 
 
-def read_json(path: Path, default=None):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+def read_json(path: Path, default=None, record=None):
+    """Read a JSON file through _read_record, the one reader.
+    Without `record`: a file a person or an agent writes (config.json, a plan, a test plan, a host's settings). A
+    damaged one stops the command with a plain message naming it, because only its author can fix it.
+    With `record` (a sentence saying what Ratchet does instead): one of Ratchet's own records. A missing, unreadable,
+    invalid or non-object file reads as `default`, the sentence goes to stderr, and this never exits."""
+    data, why = _read_record(path, kind=dict if record else None, missing=default)
+    if why is None:
+        return data
+    if record:
+        _note_unreadable(path, why, record if isinstance(record, str) else "Ratchet treats it as holding nothing")
         return default
-    except json.JSONDecodeError as e:
-        die(f"{path} is not valid JSON: {e}")
+    if why.startswith(("JSONDecodeError", "UnicodeDecodeError")):
+        die(f"{path} is not valid JSON: {why.split(': ', 1)[-1]}")
+    die(f"{path} can't be read ({why}). Check that it is a file you can read, then run this command again.")
 
 
 def write_json(path: Path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    """Write a JSON file people may read (indented), through _write_record, the one atomic writer."""
+    _write_record(path, data, pretty=True)
 
 
 def slugify(text: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return (s[:48].rstrip("-")) or "feature"
+
+
+_SAFE_SLUG_RE = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]+$")  # a run folder name: no path separators, not . or ..
+_STATE_LOCK_HELD = False  # set by main() while this process holds the state lock for its whole command
 
 
 class Ctx:
@@ -240,8 +252,19 @@ class Ctx:
 
     # --- active run
     def active_slug(self):
-        a = read_json(self.ratchet / "active.json", {}) or {}
-        return a.get("slug")
+        """The active run's slug from active.json. A damaged active.json names the run this project registered in the
+        per-user folder (active-runs.json, written with it at init) when that run's folder is here; otherwise no run.
+        accept-state writes it again."""
+        p = self.ratchet / "active.json"
+        a, why = _read_record(p)
+        if why is None:
+            return a.get("slug")
+        slug = (_active_marker(self.root) or {}).get("slug")
+        if not (isinstance(slug, str) and _SAFE_SLUG_RE.match(slug) and (self.ratchet / "runs" / slug).is_dir()):
+            slug = None
+        _note_unreadable(p, why, f"Ratchet uses the active run recorded in its per-user folder, '{slug}'" if slug
+                         else "Ratchet finds no active run recorded for this project in its per-user folder either")
+        return slug
 
     def run_dir(self, slug=None) -> Path:
         slug = slug or self.active_slug()
@@ -253,11 +276,21 @@ class Ctx:
         return self.run_dir(slug) / "state.json"
 
     def state(self, slug=None):
+        """The run's state. Every command that changes a run holds the state lock from before this read to after its
+        last save (see main), so nothing else changes state.json in between. A chat the prompt hook recorded for a
+        run no chat owned yet becomes its owner here (the hook itself never writes state.json); a command holding
+        the lock saves that at once."""
         p = self.state_path(slug)
         verify_chain(p, "state.json")
-        st = read_json(p)
+        st, why = _read_record(p, missing=None)
+        if why is not None:
+            die(f"The run's state.json ({p}) can't be read ({why}), so nothing was done. Tell the user; restore it "
+                "from a backup or their git history, or, to start the feature over, they can run "
+                "`RATCHET_HUMAN_OVERRIDE=1 ratchet.py init --force \"<feature>\"` from their own terminal.")
         if st is None:
             die("state.json missing for active run")
+        if _bind_prompt_owner(self, st) and _STATE_LOCK_HELD:
+            self.save_state(st)
         return st
 
     def save_state(self, st):
@@ -266,7 +299,7 @@ class Ctx:
             st.pop("hooks_waived", None)
             st["hooks_waive_n"] = int(st.get("hooks_waive_n", 0)) + 1  # hooks are installed or fired: the old consent must not resurface later
             self.log(st, "hooks_waive_cleared", note="enforcement hooks are active")
-        write_json(self.state_path(st["slug"]), st)
+        _write_record(self.state_path(st["slug"]), st, pretty=True)
         record_chain(self.state_path(st["slug"]))
 
     def plan(self, slug=None):
@@ -279,8 +312,7 @@ class Ctx:
 
     def log(self, st, event: str, **data):
         st.setdefault("history", []).append({"at": now(), "event": event, **data})
-        if event in PROGRESS_EVENTS:
-            st["stop_blocks"] = 0  # the safety valve counts stops WITHOUT progress
+        # a PROGRESS_EVENTS entry also restarts the stop hook's count of stops without progress (_stop_blocks)
 
 
 # --------------------------------------------------------------------------- fingerprint
@@ -398,6 +430,16 @@ def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str, extra: dict | No
     return new[:7]
 
 
+def _head_commit_named(root: Path, msg: str) -> str | None:
+    """HEAD's short id when HEAD is a commit with exactly this message (a checkpoint commit already made by an
+    earlier run of `complete` that failed before it could save), else None."""
+    r = subprocess.run(["git", "log", "-1", "--format=%H%n%B", "HEAD"], cwd=root, capture_output=True)
+    if r.returncode != 0:
+        return None
+    sha, _, body = r.stdout.decode("utf-8", "surrogateescape").partition("\n")
+    return sha.strip()[:7] if sha.strip() and body.strip() == msg.strip() else None
+
+
 def changed_files(root: Path, fp_a: dict, fp_b: dict) -> list[str]:
     if fp_a["id"] == fp_b["id"]:
         return []
@@ -429,17 +471,414 @@ def _chain_path() -> Path:
     return ratchet_home() / "file-hashes.json"
 
 
-def record_chain(p: Path):
+_ABSENT = object()  # pass as _read_record's `missing` to tell a file that is not there from an empty one
+_FRESH = object()  # _read_record's default for `missing`: a new empty record ({}, or [] for lines)
+
+
+def _read_record(path: Path, kind=dict, missing=_FRESH, lines: bool = False, tail: int | None = None):
+    """The one reader of Ratchet's records (every file under .ratchet/ and in RATCHET_HOME that the hooks or the
+    engine read for state, approvals, crashes, notes, hashes, director folders, stop errors or active runs).
+    Returns (data, None), or (None, why) when the file can't be read, is not valid JSON, or is not a `kind` (a JSON
+    object by default; None accepts any JSON value). A file that does not exist yet returns (`missing`, None): a new
+    empty record unless the caller passes its own marker. With `lines`, a JSON-lines file: (the JSON objects on its
+    lines, None), skipping lines that are not one; `tail` reads only its last `tail` bytes.
+    It never exits or raises, so no hook or command can crash on a damaged record: each caller fails safe on its own
+    terms (a damaged record that grants trust grants nothing), and says so with _note_unreadable."""
     try:
-        cp = _chain_path()
-        data = read_json(cp, {}) or {}
+        if tail is None:
+            raw = path.read_bytes()
+        else:
+            with open(path, "rb") as f:
+                f.seek(max(0, os.fstat(f.fileno()).st_size - tail))
+                raw = f.read()
+    except FileNotFoundError:
+        return (([] if lines else {}) if missing is _FRESH else missing), None
+    except OSError as e:  # a folder or a link loop where the file goes, no permission, a parent that is a file
+        return None, f"{type(e).__name__}: {e}"
+    except Exception as e:  # never raise, whatever the file system does
+        return None, f"{type(e).__name__}: {e}"
+    if lines:
+        out = []
+        for line in raw.decode("utf-8", "replace").splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict):
+                out.append(e)
+        return out, None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError as e:  # invalid JSON, or bytes that are not UTF-8
+        return None, f"{type(e).__name__}: {e}"
+    except RecursionError:
+        return None, "RecursionError: nested too deeply"
+    if kind is not None and not isinstance(data, kind):
+        return None, "not a JSON object" if kind is dict else f"not a JSON {getattr(kind, '__name__', kind)}"
+    return data, None
+
+
+def _write_record(path: Path, data, pretty: bool = False):
+    """The one writer of Ratchet's records: replace the file in one rename, through a temp file of this process's
+    own (pid plus a random token), flushed to disk first, so two writers never share a temp file, a reader never
+    sees half a write, and a crash never leaves a half-written record. The temp file is removed on failure.
+    Raises OSError when it can't write; every caller handles that on its own terms."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}-{secrets.token_hex(4)}.tmp")
+    text = (json.dumps(data, indent=2, ensure_ascii=False) + "\n") if pretty else json.dumps(data)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _append_record(path: Path, text: str):
+    """The one appender for Ratchet's append-only records (human_log.jsonl, the run's .jsonl records, hook-errors.log,
+    hook-crashes-unsaved.log): whole lines, added at the end, never rewriting what is there. Raises OSError."""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text)
+
+
+_NOTED_UNREADABLE = set()
+
+
+def _note_unreadable(path: Path, why: str, outcome: str):
+    """Say plainly, on stderr, that a damaged record was set aside and what Ratchet did instead (once per file and
+    cause in a process)."""
+    try:
+        key = (str(path), why, outcome)
+        if key in _NOTED_UNREADABLE:
+            return
+        _NOTED_UNREADABLE.add(key)
+        print(f"ratchet: {path} could not be read ({why}); {outcome}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+class _BreakerLock:
+    """The lock protocol both of Ratchet's lock files share (_ChainLock and its per-user siblings, and _StateLock), so
+    they behave the same and a fix is made once. The lock file is created with O_CREAT|O_EXCL and holds this
+    process's own token. It is only ever removed (a stale one, or the holder releasing its own) while holding a second
+    O_CREAT|O_EXCL file, `<lock>.break`, and judged again under it, so two processes clearing one stale lock can't
+    remove each other's fresh lock, and a release never removes another process's lock. Only a regular file is ever
+    judged stale or removed (a folder or a link in its place is left alone). A breaker file older than BREAKER_STALE
+    seconds was left by a process that died while holding it (it is held for a few system calls) and is removed, so
+    a crash there can't disable the lock for good; only the very file judged stale is removed (_remove_stale_breaker),
+    and a holder checks that its breaker is still in place before it removes anything under it (_holds_breaker), so
+    two waiters behind one stale breaker can't both hold it. Subclasses say how old a lock must be to be stale (_stale_after)
+    and how long to pause between tries (_pause)."""
+
+    BREAKER_STALE = 30
+
+    def __init__(self, path: Path, token: str):
+        self.path = path
+        self.token = token
+        self.held = False
+        self._breaker_id = None  # (device, inode) of the breaker file this process created, while it holds it
+
+    @property
+    def breaker(self) -> Path:
+        return self.path.with_name(self.path.name + ".break")
+
+    def _stale_after(self) -> float:
+        raise NotImplementedError
+
+    def _pause(self):
+        time.sleep(0.005)
+
+    def _create(self, path: Path):
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(self.token)
+
+    def _is_stale(self, st) -> bool:
+        """Whether a lock file with this lstat() result was left by a command that stopped: a regular file older
+        than _stale_after() seconds."""
+        return stat.S_ISREG(st.st_mode) and time.time() - st.st_mtime > self._stale_after()
+
+    def _take_breaker(self, wait: float) -> bool:
+        """True once this process holds the breaker file; False when another process holds it for longer than
+        `wait`. Raises OSError when it can't be created at all (the caller decides what that means)."""
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                self._create(self.breaker)
+                try:  # the file this process created: what _holds_breaker checks later
+                    st = os.lstat(self.breaker)
+                except OSError:  # moved away at once by a waiter clearing a stale breaker: try again
+                    continue
+                self._breaker_id = (st.st_dev, st.st_ino)
+                return True
+            except FileExistsError:
+                try:  # held for a few system calls: one this old was left by a process that died holding it
+                    st = os.lstat(self.breaker)
+                    if stat.S_ISREG(st.st_mode) and time.time() - st.st_mtime > self.BREAKER_STALE:
+                        self._remove_stale_breaker(st)
+                        continue
+                except OSError:
+                    pass
+            if time.monotonic() >= deadline:
+                return False
+            self._pause()
+
+    def _remove_stale_breaker(self, st):
+        """Remove the breaker file judged stale (its lstat() result is `st`), and only that file. Another waiter may
+        have removed it and taken a fresh breaker since it was judged, so it is never unlinked by path: it is first
+        renamed to a name of this process's own, and only removed when the renamed file is the one judged (same
+        device, inode and modification time). Otherwise it is a fresh breaker another process holds, and it is put
+        back at once (a hard link that never replaces a newer breaker). Raises OSError when the rename fails (the
+        file is gone already: the caller tries to create the breaker again)."""
+        mine = self.breaker.with_name(f"{self.breaker.name}.{os.getpid()}-{secrets.token_hex(4)}.stale")
+        os.rename(self.breaker, mine)
+        try:
+            got = os.lstat(mine)
+            if (got.st_dev, got.st_ino, got.st_mtime_ns) != (st.st_dev, st.st_ino, st.st_mtime_ns):
+                try:  # a live breaker taken by mistake: give it back
+                    os.link(mine, self.breaker)
+                except OSError:
+                    pass
+        finally:
+            try:
+                os.unlink(mine)
+            except OSError:
+                pass
+
+    def _holds_breaker(self) -> bool:
+        """Whether the breaker file in place is still the one this process created (a waiter clearing a stale
+        breaker may have moved it away for a moment). Checked right before removing anything under it."""
+        try:
+            st = os.lstat(self.breaker)
+        except OSError:
+            return False
+        return self._breaker_id is not None and (st.st_dev, st.st_ino) == self._breaker_id
+
+    def _drop_breaker(self):
+        try:
+            if self._holds_breaker():  # never another process's breaker
+                os.unlink(self.breaker)
+        except OSError:
+            pass
+        self._breaker_id = None
+
+    def _clear_stale(self) -> bool:
+        """Remove the lock file if it is still stale when judged again while holding the breaker file. True when
+        the lock file is gone now (removed, or already released), so the caller can try to take it at once; False
+        when another process holds the breaker or the lock is live. Raises OSError for a file-system error."""
+        if not self._take_breaker(0):
+            return False  # another process is clearing or releasing the lock right now: try again shortly
+        try:
+            if not self._holds_breaker():
+                return False  # moved away by a waiter clearing a stale breaker: judge again later
+            if self._is_stale(os.lstat(self.path)):
+                os.unlink(self.path)
+                return True
+            return False  # a newer, live lock (or not a lock file): wait for it
+        except FileNotFoundError:
+            return True
+        finally:
+            self._drop_breaker()
+
+    def _release_own(self, wait: float):
+        """Remove the lock file if it still holds this process's token, under the breaker file. When the breaker
+        can't be had within `wait` seconds the lock is left in place (it goes stale and is cleared later): a lock
+        that might not be ours is never removed."""
+        try:
+            if not self._take_breaker(wait):
+                return
+        except OSError:
+            return
+        try:
+            if self._holds_breaker() and self.path.read_text(encoding="utf-8") == self.token:
+                os.unlink(self.path)
+        except OSError:
+            pass
+        finally:
+            self._drop_breaker()
+
+
+class _ChainLock(_BreakerLock):
+    """A short lock (milliseconds) around the hash record: its read-modify-write, an append to a recorded file
+    together with its new hash, and a check of a file against its hash. The prompt hook appends to human_log.jsonl
+    without the state lock (it never waits on a long command), so a reader must never see that file between the
+    append and its new hash, and two writers must never drop each other's hash. Best effort: when it can't be had
+    within a few seconds (an unwritable per-user folder, say) the caller goes on without it, as before.
+    The breaker protocol is _BreakerLock's; a lock older than STALE seconds was left by a process that died."""
+
+    STALE = 30
+
+    def __init__(self, wait: float = 5.0):
+        super().__init__(ratchet_home() / "file-hashes.lock", f"{os.getpid()} {secrets.token_hex(8)}")
+        self.wait = wait
+
+    def _stale_after(self) -> float:
+        return self.STALE
+
+    def __enter__(self):
+        deadline = time.monotonic() + self.wait
+        while True:
+            try:  # no per-user folder yet: there is no hash record to protect
+                self._create(self.path)
+                self.held = True
+                return self
+            except FileExistsError:
+                try:  # held for milliseconds: one older than half a minute was left by a process that died
+                    if self._is_stale(os.lstat(self.path)) and self._clear_stale():
+                        continue
+                except OSError:
+                    pass
+            except OSError:
+                return self
+            if time.monotonic() >= deadline:
+                return self
+            time.sleep(0.01)
+
+    def __exit__(self, *exc):
+        if self.held:
+            self.held = False
+            self._release_own(1.0)  # can't be had: leave the lock; it goes stale and is cleared later
+        return False
+
+
+def _record_lock_path(record: Path) -> Path:
+    """The lock file a shared record is protected by: named after the record, next to it (`active-runs.lock` for
+    active-runs.json, `enrolled.lock`, `hook-heartbeat.lock`, ...). The one place that name is built, so _RecordLock
+    and every busy message that names the lock stay in step."""
+    return record.with_name(record.stem + ".lock")
+
+
+class _RecordLock(_ChainLock):
+    """The short lock update_record holds by default around one shared record's read-modify-write: a lock file named
+    after the record, next to it (`active-runs.lock` for active-runs.json, `enrolled.lock`, `hook-heartbeat.lock`,
+    ...). Built like file-hashes.lock: the breaker protocol is _BreakerLock's, it is held for milliseconds, and one
+    older than STALE seconds was left by a process that died and is cleared."""
+
+    def __init__(self, record: Path, wait: float = 5.0):
+        super().__init__(wait)
+        self.path = _record_lock_path(record)
+
+
+KEEP = object()  # update_record: `fn` or `damaged` returns it to leave the record exactly as it is
+
+
+def update_record(path: Path, fn, lock=None, damaged=None, pretty: bool = False, need_lock: bool = True,
+                  wait: float = 5.0) -> str:
+    """The one read-modify-write of a shared record: a file more than one process can update at once (every record in
+    RATCHET_HOME, and in .ratchet/ the ones hooks or commands outside the state lock rewrite). Two unlocked writers
+    would each read the file, add their own entry and write the whole file back, and the later write would silently
+    drop the other's entry. So this holds a _BreakerLock-based lock for that file from the read to the write: it reads
+    with _read_record, applies `fn(data)` and writes the result with _write_record. The lock is a _RecordLock next to
+    the record, taken here, unless the caller passes `lock`: one it has already entered (its own lock file for this
+    record, or a wider step under the same lock), used as it is. The default lock is waited for at most `wait`
+    seconds.
+    `fn(data)` returns the new data, or KEEP to leave the file as it is.
+    `damaged` is the file's own rule for a record that can't be read: a sentence (it reads as empty through read_json,
+    which says so on stderr with that sentence, and is replaced), or a function of the reason returning the data to
+    start from (the file is then replaced) or KEEP. Default: it is left as it is, and stderr says so.
+    Returns "written", "kept" (fn kept it), "damaged" (left as it is) or "busy" (the lock could not be had in time:
+    nothing was read or written, unless need_lock is False, when it goes on without it, best effort as before).
+    Raises OSError when the folder or the write fails; every caller handles that on its own terms."""
+    with contextlib.ExitStack() as stack:
+        if lock is None:
+            path.parent.mkdir(parents=True, exist_ok=True)  # the lock file goes in this folder
+        lk = lock if lock is not None else stack.enter_context(_RecordLock(path, wait))
+        if not lk.held and need_lock:
+            return "busy"
+        if isinstance(damaged, str):
+            data = read_json(path, {}, record=damaged)
+        else:
+            data, why = _read_record(path)
+            if why is not None:
+                if damaged is None:
+                    _note_unreadable(path, why, "Ratchet left it as it is and did not write over it")
+                    return "damaged"
+                data = damaged(why)
+                if data is KEEP:
+                    return "damaged"
+        new = fn(data)
+        if new is KEEP:
+            return "kept"
+        _write_record(path, new, pretty=pretty)
+        return "written"
+
+
+_CHAIN_REBUILD = False  # set by accept-state (a person confirmed at their terminal): an unreadable record is rebuilt
+
+
+def _chain_record():
+    """(the hash record, None), or (None, why) when it can't be read or is not a JSON object."""
+    return _read_record(_chain_path())
+
+
+def _record_chain_now(p: Path, lock: _ChainLock):
+    """Record p's hash, under `lock` (the caller's _ChainLock, already entered; best effort as ever: when it could
+    not be had, the hash is still recorded). An unreadable hash record is never replaced here (a fresh record would
+    drop every other file's hash, and a file with no recorded hash is trusted): it is left as it is, so every check
+    against it keeps refusing, until accept-state, run by a person at their own terminal, rebuilds it. Never exits."""
+    cp = _chain_path()
+
+    def damaged(why):
+        if not _CHAIN_REBUILD:
+            _note_unreadable(cp, why, "the new hash was not recorded and the file was left as it is; every check "
+                             "against it refuses until the user runs accept-state")
+            return KEEP
+        _note_unreadable(cp, why, "accept-state replaces it with a new record")
+        return {}
+
+    def add(data):
         data[str(p.resolve())] = hashlib.sha256(p.read_bytes()).hexdigest()
-        cp.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cp.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data), encoding="utf-8")
-        os.replace(tmp, cp)
+        return data
+    try:
+        _ = update_record(cp, add, lock=lock, damaged=damaged, need_lock=False)  # need_lock=False: never "busy"
     except OSError:
         pass
+
+
+def record_chain(p: Path):
+    with _ChainLock() as lock:
+        _record_chain_now(p, lock)
+
+
+def append_recorded(p: Path, line: str):
+    """Append one line to a file Ratchet keeps a hash of and record its new hash, as one step for every reader."""
+    with _ChainLock() as lock:
+        _append_record(p, line)
+        _record_chain_now(p, lock)
+
+
+ACCEPT_STATE_CMD = "`RATCHET_HUMAN_OVERRIDE=1 ratchet.py accept-state`"
+
+
+def chain_problem(p: Path, label: str) -> str | None:
+    """Why `p` can't be trusted against Ratchet's record of file hashes (None when it can). Never exits, so a hook can
+    use it: a damaged record vouches for nothing (it is a problem, never permission), and so does a file that can't
+    be read."""
+    try:
+        with _ChainLock():
+            record, why = _chain_record()
+            known = (record or {}).get(str(p.resolve()))
+            same = why is None and (not known or not p.exists()
+                                    or hashlib.sha256(p.read_bytes()).hexdigest() == known)
+    except OSError as e:
+        return (f"{label} ({p}) can't be read ({type(e).__name__}: {e.strerror or e}), so Ratchet can't confirm it "
+                "was not changed outside ratchet.py, and won't trust it. Tell the user; check that it is a file "
+                "Ratchet can read.")
+    if why is not None:  # a damaged record vouches for nothing: refuse rather than trust the file
+        return (f"Ratchet's record of file hashes ({_chain_path()}) can't be read ({why}), so it can't confirm that "
+                f"{label} ({p}) was not changed outside ratchet.py, and won't trust it. Tell the user; only if they "
+                f"are sure the file is right, they can rebuild the record from their own terminal with "
+                f"{ACCEPT_STATE_CMD} (it asks them to type back a short code).")
+    if not same:
+        return (f"{label} was changed outside ratchet.py ({p}). Ratchet won't trust it. Tell the user; restore the "
+                "file, or, only if they are sure, they can accept it from their own terminal with "
+                f"{ACCEPT_STATE_CMD} (it asks them to type back a short code).")
+    return None
 
 
 def verify_chain(p: Path, label: str):
@@ -448,13 +887,9 @@ def verify_chain(p: Path, label: str):
             if cand.name == RATCHET_DIR:
                 require_hook_env(cand.parent)
                 break
-    known = (read_json(_chain_path(), {}) or {}).get(str(p.resolve()))
-    if not known or not p.exists():
-        return
-    if hashlib.sha256(p.read_bytes()).hexdigest() != known:
-        die(f"{label} was changed outside ratchet.py ({p}). Ratchet won't trust it. Tell the user; restore the file, "
-            "or, only if they are sure, they can accept it from their own terminal with "
-            "`RATCHET_HUMAN_OVERRIDE=1 ratchet.py accept-state` (it asks them to type back a short code).")
+    why = chain_problem(p, label)
+    if why:
+        die(why)
 
 
 # ---- the human override: a person at their own terminal ------------------------------------------------------
@@ -587,14 +1022,27 @@ def log_override(ctx, action: str):
     nothing is approved, accepted or replaced: a confirmed override is never used without its audit line."""
     log = ctx.ratchet / "human_log.jsonl"
     try:
-        with log.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"at": now(), "by": "human", "override": True, "action": action,
-                                "via": "RATCHET_HUMAN_OVERRIDE, code typed back at the terminal"}) + "\n")
+        append_recorded(log, json.dumps({"at": now(), "by": "human", "override": True, "action": action,
+                                         "via": "RATCHET_HUMAN_OVERRIDE, code typed back at the terminal"}) + "\n")
     except OSError as e:
         die(f"The override was confirmed, but Ratchet could not write its audit line to {log} "
             f"({type(e).__name__}: {e.strerror or e}), so nothing was approved or changed: an override is only used "
             "when it is recorded. Make that file (and .ratchet/) writable, then run the command again.")
-    record_chain(log)
+
+
+ACCEPT_STATE_PURPOSE = "accept the current state.json and human_log.jsonl as the new baseline"
+
+
+def _refuse_damaged_baseline(ctx):
+    """accept-state's refusal of a damaged state.json (it can't be a baseline): says how to get out and changes
+    nothing. Read-only, so main runs it before it asks the person for the code."""
+    sp = ctx.state_path()
+    _st, why = _read_record(sp, missing=None)
+    if why is not None:
+        die(f"The run's state.json ({sp}) can't be read ({why}), so it can't be accepted as the new baseline, and "
+            "nothing was changed. Restore it (from a backup or your git history) and run accept-state again; or, to "
+            "start the feature over, run `RATCHET_HUMAN_OVERRIDE=1 ratchet.py init --force \"<feature>\"` yourself "
+            "in a terminal window.")
 
 
 def cmd_accept_state(args):
@@ -602,8 +1050,23 @@ def cmd_accept_state(args):
         die("accept-state is for a person at their own terminal: run `RATCHET_HUMAN_OVERRIDE=1 ratchet.py "
             "accept-state` yourself in a terminal window and type back the code it shows.")
     ctx = Ctx(find_root())
-    human_override("accept the current state.json and human_log.jsonl as the new baseline", ctx, "accept-state")
-    for p in (ctx.state_path(), ctx.ratchet / "human_log.jsonl"):
+    sp = ctx.state_path()
+    _refuse_damaged_baseline(ctx)  # main already checked, before asking for the code; checked again under the lock
+    purpose = ACCEPT_STATE_PURPOSE
+    if not _OVERRIDE_CONFIRMED:  # main confirms first; this keeps any other caller from going on unconfirmed
+        _confirm_override(purpose)  # dies unless the person types the code back
+    global _CHAIN_REBUILD
+    _CHAIN_REBUILD = True  # the person confirmed: an unreadable hash record is rebuilt from these files, starting
+    # with the audit line's own write below (so it never says the record waits for the accept-state running now)
+    human_override(purpose, ctx, "accept-state")
+    _act, act_why = _read_record(ctx.ratchet / "active.json")
+    if act_why is not None and ctx.active_slug():  # named again from the per-user marker (Ctx.active_slug)
+        try:
+            _write_record(ctx.ratchet / "active.json", {"slug": ctx.active_slug()}, pretty=True)
+            print(f"RATCHET: {ctx.ratchet / 'active.json'} was damaged; it names run '{ctx.active_slug()}' again.")
+        except OSError:
+            pass
+    for p in (sp, ctx.ratchet / "human_log.jsonl"):
         if p.exists():
             record_chain(p)
     ok("Current state.json and human_log.jsonl accepted as the new baseline.")
@@ -687,13 +1150,12 @@ def _combined_hook_env(recs) -> dict | None:
     newer hook removed it): the caller lists again."""
     view = None
     for _us, _kind, _role, _name, path in reversed(recs):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
+        data, why = _read_record(path, missing=_ABSENT)
+        if data is _ABSENT:
             return None
-        except (OSError, ValueError):
+        if why is not None:
             continue  # not a record Ratchet wrote (records are renamed into place whole): skip it
-        if isinstance(data, dict) and data.get("home") and data.get("key_file"):
+        if data.get("home") and data.get("key_file"):
             view = {"home": data["home"], "key_file": data["key_file"], "at": data.get("at"), "host": data.get("host")}
             break
     if view is None:
@@ -724,17 +1186,10 @@ def record_hook_env(root: Path, host: str, event: str = "", started: str | None 
     kind = "guard" if event == "guard" else "env"
     role = _hook_role() if kind == "guard" else "-"
     tag = f"{os.getpid()}-{secrets.token_hex(4)}"
-    tmp = folder / f"{p.name}.{tag}.tmp"
     try:
         folder.mkdir(exist_ok=True)
-        with open(tmp, "x", encoding="utf-8") as f:
-            f.write(json.dumps(dict(cur, at=now(), host=host)))
-        os.replace(tmp, folder / f"{p.name}.{kind}.{us}.{role}.{tag}")
+        _write_record(folder / f"{p.name}.{kind}.{us}.{role}.{tag}", dict(cur, at=now(), host=host))
     except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
         return False
     for r_us, r_kind, _r, _n, path in _hook_env_records(root) or []:
         if r_us < us and (kind == "guard" or r_kind == "env"):  # a guard record supersedes every older record
@@ -749,24 +1204,13 @@ def record_hook_env(root: Path, host: str, event: str = "", started: str | None 
         view = _combined_hook_env(recs)
         if view is None:
             continue  # a record vanished while it was read: list again
-        try:
-            disk = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            disk = None
+        disk, _why = _read_record(p, missing=None)  # missing or damaged: rewritten below
         if isinstance(disk, dict) and all(disk.get(k) == view.get(k) for k in _HOOK_ENV_CORE):
             return True
-        vtmp = p.with_name(f"{p.name}.{os.getpid()}-{secrets.token_hex(4)}.tmp")
         try:
-            with open(vtmp, "w", encoding="utf-8") as f:
-                f.write(json.dumps({k: v for k, v in view.items() if v is not None}))
-            os.replace(vtmp, p)
+            _write_record(p, {k: v for k, v in view.items() if v is not None})
         except OSError:
             return False
-        finally:
-            try:
-                vtmp.unlink()
-            except OSError:
-                pass
     return False
 
 
@@ -825,9 +1269,8 @@ def hook_env_problem(root: Path, doubt: bool = True) -> str | None:
     state Ratchet can't read or save), the missing record is refused, never read as "anything goes". With `doubt`
     (the default), an existing record that agrees is refused too while such a failure stands (_hook_record_doubt):
     the failed write may have left it out of date."""
-    try:
-        rec = json.loads(_hook_env_path(root).read_text(encoding="utf-8"))
-    except FileNotFoundError:
+    rec, why = _read_record(_hook_env_path(root), kind=None, missing=_ABSENT)
+    if rec is _ABSENT:
         if not (root / RATCHET_DIR).is_dir() or not hooks_in_use(root):
             return None  # no Ratchet state here, or no hooks in use: nothing records (or enforces) anything
         if not _hook_record_may_have_failed(root):
@@ -839,7 +1282,7 @@ def hook_env_problem(root: Path, doubt: bool = True) -> str | None:
                 f"only {', '.join(RECOVERY_CMDS)} still run, to show what is wrong. "
                 "Make sure .ratchet/ is writable, then restart your agent CLI (or send it any message) so its hooks "
                 "write the record again.")
-    except (OSError, ValueError):
+    if why is not None:
         return (f"{_hook_env_path(root)} is unreadable, so Ratchet can't tell which per-user folder its hooks use. "
                 "Delete it; the next hook run (send any message in your agent CLI) writes it again.")
     if not isinstance(rec, dict) or not rec.get("home") or not rec.get("key_file"):
@@ -861,7 +1304,8 @@ def hook_env_problem(root: Path, doubt: bool = True) -> str | None:
                 "record, which may name a director that no longer runs commands here). Ratchet won't trust it, or "
                 "the per-user folder and director key file it names, so every command here is refused until that "
                 f"hook runs cleanly, director commands included; only {', '.join(RECOVERY_CMDS)} still run, to show "
-                "what is wrong. Run the doctor command to see the "
+                "what is wrong, and accept-state, the repair a person runs at their own terminal when Ratchet names "
+                "it. Run the doctor command to see the "
                 "failure, make sure .ratchet/ is writable, then send any message or run any command in your agent "
                 "CLI so the hook runs again.")
     return None
@@ -869,6 +1313,9 @@ def hook_env_problem(root: Path, doubt: bool = True) -> str | None:
 
 # Commands that only read, or only repair hooks: they still run when the hook record can't be trusted, so a user
 # locked out by it can see what is wrong (doctor, status, next, view) and reinstall the hooks (install-hooks).
+# accept-state (the repair Ratchet names for a file or hash record it won't trust) also runs while a hook failure is
+# unresolved, so a person is never locked out of it: it needs their code typed back at the terminal, and it is still
+# refused when the hook record is missing, damaged or names another per-user folder (see main).
 RECOVERY_CMDS = ("doctor", "status", "next", "view", "install-hooks")
 _HOOK_ENV_ADVISORY = False  # set by main for a recovery command: a hook-record problem is said, not fatal
 
@@ -883,20 +1330,62 @@ def _markers_path() -> Path:
     return ratchet_home() / "active-runs.json"
 
 
+def _restriction_record_damaged(p: Path, holds: str, repair: str):
+    """update_record's `damaged` rule for a per-user record `p` that holds a restriction for other projects or lanes
+    too (`holds`). Such a record is never replaced by a write that would keep only the writer's entry: that would
+    drop every other entry's restriction without a word. The damaged file is left as it is (KEEP) and the person is
+    told, on stderr, how to repair it (`repair`)."""
+    def keep(why):
+        _note_unreadable(p, why, f"it holds {holds}, so Ratchet left it as it is and did not write over it. To "
+                                 f"repair it: {repair}")
+        return KEEP
+    return keep
+
+
+def _active_runs_repair(p: Path) -> str:
+    return (f"restore it from a backup or fix the JSON by hand; or, if you accept that until then deleting a "
+            f"project's .ratchet/ folder is not noticed, move it aside (mv \"{p}\" \"{p}.damaged\"): each project's "
+            "entry is written again when its next run starts")
+
+
 def register_active(root: Path, slug: str | None):
-    """Remember active runs outside the repo, so deleting .ratchet/ is noticed instead of silently ending the loop."""
+    """Remember active runs outside the repo, so deleting .ratchet/ is noticed instead of silently ending the loop.
+    A damaged active-runs.json is never written over (it holds other projects' runs): see
+    _restriction_record_damaged. It is shared by every project on this machine, so it is only changed through
+    update_record, under its own lock: two runs starting or ending at once never drop each other's entry. When the
+    lock can't be had, nothing is written and stderr says so."""
     try:
         p = _markers_path()
-        data = read_json(p, {}) or {}
         key = str(root.resolve())
-        if slug:
-            data[key] = {"slug": slug, "since": now()}
-        else:
-            data.pop(key, None)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        write_json(p, data)
+
+        def change(data):
+            if slug:
+                data[key] = {"slug": slug, "since": now()}
+            else:
+                data.pop(key, None)
+            return data
+        done = update_record(p, change, pretty=True, damaged=_restriction_record_damaged(
+            p, "the active runs of other projects on this machine", _active_runs_repair(p)))
+        if done == "busy":
+            print(f"ratchet: the per-user record of active runs ({p}) was busy (its lock "
+                  f"{_record_lock_path(p)} could not be had), so "
+                  + ("this run was not registered there: deleting this project's .ratchet/ folder would not be "
+                     "noticed. Run `ratchet.py pause` and then `ratchet.py resume` to register it again."
+                     if slug else "this project's entry was not removed; the next run that starts here replaces it."),
+                  file=sys.stderr)
     except Exception:
         pass
+
+
+def _active_marker(root: Path) -> dict | None:
+    """This project's entry in the per-user active-runs.json ({"slug", "since"}), or None. The record does two
+    things: the stop hook uses it to notice a deleted Ratchet folder (decide_stop), and Ctx.active_slug uses it to
+    name the active run when active.json is damaged. A damaged file names no run for either (so it never picks a
+    run), and it is never written over until a person repairs it (register_active)."""
+    data = read_json(_markers_path(), {}, record="Ratchet treats it as naming no active run, and leaves it as it is "
+                     "until it is repaired: " + _active_runs_repair(_markers_path())) or {}
+    marker = data.get(str(root.resolve()))
+    return marker if isinstance(marker, dict) and marker.get("slug") else None
 
 
 # A bare "ok", "sure", "great" or thumbs-up is NOT a yes (it is often just an acknowledgement); those words are
@@ -944,7 +1433,9 @@ def choice_letter(text: str, options) -> str | None:
 
 
 def message_intent(text: str) -> str:
-    """approve | unclear. A reply only counts as an approval if it is nothing BUT an approval: it must contain a real
+    """approve | unclear. Used only to word the prompt hook's hint; it never decides an approval (an approval needs
+    the user's first reply after `ask <action>` to be a listed yes: is_listed_yes).
+    A reply only reads as an approval if it is nothing BUT an approval: it must contain a real
     approval phrase ("yes", "go ahead", "approved"...), and every other word must be a filler. No question, no hedge,
     no extra request ("yes, and also add X" or "ok cancel it" is not a yes). A bare "ok" / "sure" / thumbs-up is not
     a yes either."""
@@ -993,6 +1484,28 @@ def _norm_reply(text: str) -> str:
 def hooks_waive_intent(text: str) -> str:
     """Strict allow-list for the hooks question: approve only when the whole reply is a listed waiver phrase."""
     return "approve" if _norm_reply(text) in HOOKS_WAIVE_PHRASES else "unclear"
+
+
+# The ONLY replies that say yes to a question Ratchet asked (`ask <action>`): plan approval, a step or final review,
+# unblocking, cancel, set-review, approve-changes, claim and ui-respec. Case, commas, extra spaces and a trailing "."
+# or "!" are ignored; nothing else may be attached. Only the user's FIRST reply after the question counts.
+APPROVAL_REPLIES = ("yes", "yes, go ahead", "go ahead", "approved")
+
+
+def _norm_yes(text: str) -> str:
+    t = unicodedata.normalize("NFKC", text or "").casefold().strip()
+    t = re.sub(r"[.!]+$", "", t).replace(",", " ")
+    return " ".join(t.split())
+
+
+def is_listed_yes(text: str) -> bool:
+    return _norm_yes(text) in {_norm_yes(p) for p in APPROVAL_REPLIES}
+
+
+def listed_yes_text() -> str:
+    """The accepted replies, quoted, for the printed question and the refusals."""
+    q = [f'"{p}"' for p in APPROVAL_REPLIES]
+    return ", ".join(q[:-1]) + " or " + q[-1]
 
 
 CANCEL_HINT_RE = re.compile(r"\b(cancel|abandon|scrap|kill)\b[^.?!]*\b(run|build|feature|ratchet|loop|work|whole thing|everything)\b"
@@ -1206,12 +1719,18 @@ def next_action(ctx: Ctx, st=None) -> dict:
                    if c["gates"].get("behavior") and not test_plan(ctx, c["id"])]
         extra = (f" (test plans still missing for {', '.join(missing)} — spawn ratchet-test-planner, then run "
                  "ratchet.py plan-submit again)") if missing else ""
-        return {"phase": phase, "action": "Waiting for the user to approve the plan. When they reply, only a clear "
-                "approval counts — otherwise answer their question or make their change and ask again." + extra,
-                "stop_ok": not missing}
+        asked = (st.get("pending") or {}).get("action") == "approve-plan"
+        how = ("The approval question is printed: wait for the user's reply. Run ratchet.py approve-plan only if "
+               "their first reply after it is one of the listed yes replies; otherwise answer them or make their "
+               "change, then print the question again (ratchet.py ask approve-plan)." if asked else
+               "Waiting for the user to approve the plan. " + _after_next(PLAN_ASK_NEXT))
+        return {"phase": phase, "action": how + extra, "stop_ok": not missing}
     if phase in ("awaiting_checkpoint_review", "awaiting_final_review"):
-        return {"phase": phase, "action": "Waiting for the human to review. On approval run ratchet.py "
-                "human-approve; on feedback run ratchet.py feedback.", "stop_ok": True}
+        asked = (st.get("pending") or {}).get("action") == "human-approve"
+        how = ("The review question is printed: wait for the user's reply. Run ratchet.py human-approve only if "
+               "their first reply after it is one of the listed yes replies; if they ask for changes, run "
+               "ratchet.py feedback." if asked else "Waiting for the human to review. " + REVIEW_ASK_NEXT)
+        return {"phase": phase, "action": how, "stop_ok": True}
     if phase == "planning_feedback":
         return {"phase": phase, "action": "Spawn ratchet-checkpoint-planner in EXTEND mode with the human's feedback "
                 "(append new checkpoints, never edit completed ones), ratchet-test-planner for each new checkpoint, "
@@ -1561,17 +2080,72 @@ def _status_path(ctx):
     return ctx.ratchet / "provider-status.json"
 
 
+_STATUS_DAMAGED = "Ratchet treats every provider as not yet tested"
+
+
 def provider_status(ctx) -> dict:
-    return read_json(_status_path(ctx), {}) or {}
+    return read_json(_status_path(ctx), {}, record=_STATUS_DAMAGED) or {}
 
 
-def probe_provider(ctx, cfg, pv, bench=True) -> tuple[bool, str]:
-    """Send a tiny request through the provider exactly as a review would go, and record the result."""
+def _note_record_busy(p: Path, lost: str):
+    """Say on stderr that a shared record's lock could not be had, so `lost` was not saved. Only for a best-effort
+    caller that goes on regardless (e.g. probe_provider): a caller that then refuses outright uses
+    _die_record_busy instead, which says this once, accurately, in its own refusal; the two are never both printed
+    for the same busy write."""
+    print(f"ratchet: {p} was being updated by another Ratchet command (its lock {_record_lock_path(p)} "
+          f"could not be had), so {lost} was not saved.", file=sys.stderr)
+
+
+def _retry_command() -> str:
+    """The command this process was run as (this interpreter, this ratchet.py and every argument it was given, each
+    quoted for a POSIX shell), so a refusal can say exactly what to run again and running it as written works."""
+    import shlex
+    args = list(_ENGINE_ARGV) if _ENGINE_ARGV is not None else list(sys.argv[1:])
+    return shlex.join([sys.executable or "python3", str(Path(__file__).resolve()), *args])
+
+
+def _die_record_busy(p: Path, lost: str):
+    """The one refusal every update_record caller that must not claim its change was saved uses: names the record
+    and the lock update_record itself takes for it (_record_lock_path, so the two can't drift apart), says what
+    `lost`, and gives the user's own whole command to run again (_retry_command: every flag kept). Exits non-zero
+    through die(); never returns."""
+    die(f"{p} is being updated by another Ratchet command right now (its lock {_record_lock_path(p)} could not be "
+        f"had), so {lost}. Run the same command again in a moment: `{_retry_command()}`")
+
+
+def _update_provider_status(ctx, change, note: bool = True, lock=None) -> str:
+    """Change provider-status.json (`change(data)` edits it in place). More than one command can update it (a probe
+    run by `reviewers`, `providers --add`), so it is changed only through update_record, under its own lock (or
+    `lock`, that lock already held by the caller); a damaged one holds no result and is replaced. Returns
+    update_record's result. A caller that must not then claim the change was saved checks for "busy" itself and
+    refuses with _die_record_busy, passing note=False so this does not also print a stderr note for the same busy
+    write: `providers --add --no-check` does this, and a checked `providers --add` takes this lock itself first
+    (see _record_probe). A best-effort caller leaves note=True, so the stderr note below speaks for it."""
+    p = _status_path(ctx)
+
+    def fn(data):
+        change(data)
+        return data
+    res = update_record(p, fn, lock=lock, damaged=_STATUS_DAMAGED, pretty=True)
+    if res == "busy" and note:
+        _note_record_busy(p, "this provider check")
+    return res
+
+
+def probe_provider(ctx, cfg, pv, bench=True, note: bool = True, record: bool = True) -> tuple[bool, str, bool]:
+    """Send a tiny request through the provider exactly as a review would go, and record the result (_record_probe:
+    provider-status.json, then unavailable-reviewers.json).
+    Returns (good, detail, saved): `saved` is False when either of those writes could not be made because its lock
+    was busy (True when both were saved, or when nothing was sent because the provider has no command or isn't
+    installed, so there was nothing to record). Every recording caller is best effort and leaves note=True, so a
+    stderr line speaks for a busy write. A caller that must not claim anything was saved unless all of it was (a
+    checked `providers --add`) passes record=False (nothing is written, and `saved` is False once a request was
+    sent), then takes both records' locks itself and calls _record_probe."""
     cmd_t, use_stdin = provider_command(pv)
     if not cmd_t:
-        return False, "no command"
+        return False, "no command", True
     if not shutil.which(cmd_t[0]):
-        return False, f"'{cmd_t[0]}' is not installed or not on PATH"
+        return False, f"'{cmd_t[0]}' is not installed or not on PATH", True
     prompt = f"This is a connectivity check. Reply with exactly this and nothing else: {PROBE_TOKEN}"
     work = Path(tempfile.mkdtemp(prefix="ratchet-probe-"))
     out_file = work / "last-message.txt"
@@ -1597,18 +2171,36 @@ def probe_provider(ctx, cfg, pv, bench=True) -> tuple[bool, str]:
     except OSError as e:
         good, detail = False, str(e)[:200]
     shutil.rmtree(work, ignore_errors=True)
-    data = provider_status(ctx)
-    data[pv["id"]] = {"ok": good, "at": now(), "detail": detail}
-    write_json(_status_path(ctx), data)
+    if not record:
+        return good, detail, False
+    busy = _record_probe(ctx, pv, good, detail, bench=bench, note=note)
+    return good, detail, not busy
+
+
+def _record_probe(ctx, pv, good: bool, detail: str, bench: bool = True, note: bool = True, locks=None) -> list:
+    """Record a probe's result: provider-status.json, then unavailable-reviewers.json (bench every lens of a
+    failing provider when `bench`, else clear its benched entries). Returns the records whose write was busy, in
+    the order tried (empty when every write was saved). `locks` maps a record's path to its _RecordLock the caller
+    already holds: a caller that takes both first can't have one written and then find the other busy."""
+    locks = locks or {}
+    sp, up = _status_path(ctx), _unavailable_path(ctx)
+    busy = []
+    if _update_provider_status(ctx, lambda data: data.__setitem__(pv["id"], {"ok": good, "at": now(),
+                                                                          "detail": detail}),
+                               note=note, lock=locks.get(sp)) == "busy":
+        busy.append(sp)
     if not good and bench:
         for lens in LENSES:
-            mark_unavailable(ctx, f"{pv['id']}-{lens}", f"test request failed: {detail}")
+            if mark_unavailable(ctx, f"{pv['id']}-{lens}", f"test request failed: {detail}", note=note,
+                                lock=locks.get(up)) is None and up not in busy:
+                busy.append(up)
     else:
-        live = unavailable_reviewers(ctx)
-        for lens in LENSES:
-            live.pop(f"{pv['id']}-{lens}", None)
-        write_json(_unavailable_path(ctx), live)
-    return good, detail
+        def clear(live):
+            for lens in LENSES:
+                live.pop(f"{pv['id']}-{lens}", None)
+        if _update_unavailable(ctx, clear, note=note, lock=locks.get(up)) == "busy":
+            busy.append(up)
+    return busy
 
 
 def probe_due(ctx, cfg, pid) -> bool:
@@ -1662,14 +2254,31 @@ def cmd_providers(args):
             die(f"Can't tell which company's model '{args.add}' runs. Give --model (a model name from that tool) "
                 "or --company.")
         if args.no_check:
-            data = provider_status(ctx)
-            data.pop(pv["id"], None)  # an earlier result was about whatever had this id before
-            write_json(_status_path(ctx), data)
+            # an earlier result was about whatever had this id before
+            p = _status_path(ctx)
+            if _update_provider_status(ctx, lambda data: data.pop(pv["id"], None), note=False) == "busy":
+                _die_record_busy(p, f"{args.add}'s old status entry was not cleared and it was not added")
         else:
-            good, detail = probe_provider(ctx, cfg, pv, bench=False)
+            # A refused add changes nothing: a failed test request records nothing (an older provider with this id
+            # keeps its own status), and a passing one is recorded only once both records' locks are held, so a
+            # busy lock on either leaves provider-status.json, unavailable-reviewers.json and config.json as they were
+            good, detail = probe_provider(ctx, cfg, pv, record=False)[:2]
             if not good:
                 die(f"{args.add} didn't pass the test request ({detail}). Not added. Fix the command or model and "
                     "try again (or add --no-check to add it anyway).")
+            busy, locks = None, {}
+            with contextlib.ExitStack() as stack:
+                for rec in (_status_path(ctx), _unavailable_path(ctx)):
+                    lk = stack.enter_context(_RecordLock(rec))
+                    if not lk.held:
+                        busy = rec
+                        break
+                    locks[rec] = lk
+                if busy is None:
+                    left = _record_probe(ctx, pv, good, detail, bench=False, note=False, locks=locks)
+                    busy = left[0] if left else None
+            if busy is not None:
+                _die_record_busy(busy, f"nothing was changed and {args.add} was not added")
         plist = [x for x in plist if x["id"] != pv["id"]] + [pv]
         _write_providers(ctx, plist)
         ok(f"Added provider {args.add} ({provider_company(pv)}, {_plain_model(pv.get('model'))}). It can now review.")
@@ -1708,7 +2317,7 @@ def cmd_providers(args):
                 continue
             if pr["company"] and pr["company"] != host:
                 pv = {"id": name, "preset": name}
-                good, detail = probe_provider(ctx, cfg, pv)
+                good, detail, _saved = probe_provider(ctx, cfg, pv)
                 if good:
                     plist.append(pv)
                     _write_providers(ctx, plist)
@@ -1734,6 +2343,223 @@ def cmd_providers(args):
 
 
 # --------------------------------------------------------------------------- commands
+
+# Which chat is running an engine command. The guard hook sees the chat (session id) of every shell call. When the
+# command it is about to let run really invokes `ratchet.py init` or `ratchet.py ask` (parsed as shell words: the
+# ratchet.py call must be a command of its own, never text inside quotes, an echo, a commit message, a comment or a
+# heredoc), it notes that chat together with that call's exact arguments in the per-user folder (outside the repo,
+# where agents can't write). The engine accepts a note only when the arguments equal its own, it is under
+# ENGINE_NOTE_SECONDS old, and no other chat noted the same call; the note is then used up. `init` makes that chat
+# the run's owner (on a repo's first run there is no human log yet to go by), and an `ask` while no chat owns the run
+# makes the chat that asked the owner, so the user's reply in another chat can't answer the question or take the run.
+# Without a usable note the engine falls back to the human log / prompt-hook owner rule (see _bind_owner).
+ENGINE_NOTE_SECONDS = 60
+_ENGINE_ARGV: list | None = None  # this process's own arguments (set by main)
+_SHELL_OPS = set(";&|<>")
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _shell_words(cmd: str):
+    """Split a shell command into ("word", text) and ("op", text) tokens the way a POSIX shell would for plain
+    commands. None when it can't be read safely: unbalanced quotes, a heredoc or here-string, a command
+    substitution (`...` / $(...)), or bash's $'...' quoting, whose contents this simple reader doesn't follow."""
+    out, cur, i, n = [], None, 0, len(cmd)
+
+    def flush():
+        nonlocal cur
+        if cur is not None:
+            out.append(("word", cur))
+        cur = None
+
+    while i < n:
+        c = cmd[i]
+        if c in " \t\r":
+            flush()
+            i += 1
+        elif c == "\\":
+            if i + 1 < n and cmd[i + 1] != "\n":
+                cur = (cur or "") + cmd[i + 1]
+            i += 2
+        elif c == "'":
+            j = cmd.find("'", i + 1)
+            if j < 0:
+                return None
+            cur = (cur or "") + cmd[i + 1:j]
+            i = j + 1
+        elif c == '"':
+            j, buf = i + 1, ""
+            while j < n and cmd[j] != '"':
+                if cmd[j] == "\\" and j + 1 < n and cmd[j + 1] in '$`"\\\n':
+                    buf += "" if cmd[j + 1] == "\n" else cmd[j + 1]
+                    j += 2
+                    continue
+                if cmd[j] == "`" or cmd.startswith("$(", j):
+                    return None
+                buf += cmd[j]
+                j += 1
+            if j >= n:
+                return None
+            cur = (cur or "") + buf
+            i = j + 1
+        elif c == "`" or cmd.startswith("$(", i) or cmd.startswith("$'", i):
+            return None  # $'...' (bash ANSI-C quoting) ends at an unescaped quote only: never read inside it
+        elif c == "#" and cur is None:
+            while i < n and cmd[i] != "\n":
+                i += 1
+        elif c in "\n()":
+            flush()
+            out.append(("op", c))
+            i += 1
+        elif c in _SHELL_OPS:
+            if c in "<>" and cur is not None and cur.isdigit():
+                cur = None  # `2>&1`: the digits name a file descriptor, not an argument
+            flush()
+            j = i
+            while j < n and cmd[j] in _SHELL_OPS:
+                j += 1
+            op = cmd[i:j]
+            if "<<" in op:
+                return None
+            out.append(("op", op))
+            i = j
+        else:
+            cur = (cur or "") + c
+            i += 1
+    flush()
+    return out
+
+
+def _simple_commands(words) -> list:
+    """The word lists of each simple command in `_shell_words` output (split at operators; redirection targets
+    are left out)."""
+    cmds, cur, skip = [], [], False
+    for kind, text in words:
+        if kind == "op" and ("<" in text or ">" in text):
+            skip = True  # a redirection: the next word is its target, not an argument
+        elif kind == "op":
+            cmds.append(cur)
+            cur, skip = [], False
+        elif skip:
+            skip = False
+        else:
+            cur.append(text)
+    cmds.append(cur)
+    return cmds
+
+
+def _engine_invocations(cmd: str) -> list:
+    """The argument lists of every `ratchet.py ...` call `cmd` would actually run as a command of its own
+    (`python3 .../ratchet.py ...`, `.../ratchet.py ...` or `$RATCHET ...`). Text that only mentions ratchet.py (in
+    quotes, after echo or grep, in a comment or heredoc) is not a call. An argument the shell would still expand
+    ($VAR) makes the call unknowable, so it is left out."""
+    words = _shell_words(cmd or "")
+    if not words:
+        return []
+    found = []
+    for w in _simple_commands(words):
+        while w and _ASSIGNMENT_RE.match(w[0]):
+            w = w[1:]
+        if w and re.fullmatch(r"python[0-9.]*", Path(w[0]).name):
+            w = w[1:]
+            while w and w[0].startswith("-"):
+                w = w[1:]
+            if not (w and Path(w[0]).name == "ratchet.py"):
+                continue
+        elif not (w and (Path(w[0]).name == "ratchet.py" or w[0] in ("$RATCHET", "${RATCHET}"))):
+            continue
+        argv = w[1:]
+        if argv and not any("$" in a for a in argv):
+            found.append(argv)
+    return found
+
+
+def _engine_subcommand(argv) -> str | None:
+    a = list(argv)
+    while a and (a[0] == "--root" or a[0].startswith("--root=")):
+        a = a[2:] if a[0] == "--root" else a[1:]
+    return a[0] if a else None
+
+
+def _engine_notes_path() -> Path:
+    return ratchet_home() / "engine-call-sessions.json"
+
+
+class _EngineNotesLock(_RecordLock):
+    """A _RecordLock on engine-call-sessions.json, named the same way _record_lock_path names every other record's
+    lock. update_record takes this lock itself (via its own _RecordLock) when _note_engine_call / _noted_session call
+    it without a lock=; this class exists only so a lock on this one record can also be taken directly, the same way
+    _RecordLock(path) does for any other record."""
+
+    def __init__(self, wait: float = 2.0):
+        super().__init__(_engine_notes_path(), wait)
+
+
+def _note_fresh(note) -> bool:
+    fresh = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=ENGINE_NOTE_SECONDS)).isoformat(
+        timespec="microseconds")
+    return (isinstance(note, dict) and isinstance(note.get("argv"), list) and isinstance(note.get("session"), str)
+            and bool(note["session"]) and fresh < str(note.get("at", "")) <= _in_a_minute())
+
+
+def _note_engine_call(root: Path, cmd: str, session: str | None):
+    """Guard hook: for every `ratchet.py init` / `ratchet.py ask` call `cmd` really runs, note which chat is about
+    to run it here, with its exact arguments. Best effort; never blocks the call."""
+    if not session:
+        return
+    calls = [a for a in _engine_invocations(cmd) if _engine_subcommand(a) in ("init", "ask")]
+    if not calls:
+        return
+    try:
+        p = _engine_notes_path()
+
+        def add(notes):
+            for argv in calls:
+                key = f"{root.resolve()}|{_engine_subcommand(argv)}"
+                kept = [x for x in (notes.get(key) if isinstance(notes.get(key), list) else []) if _note_fresh(x)]
+                notes[key] = kept + [{"session": session, "argv": argv, "at": now()}]
+            return notes
+        # can't be had: note nothing (the owner rules without a note apply); damaged (a crash mid-write, say): no
+        # note in it counts, and this write replaces it
+        _ = update_record(p, add, wait=2.0,
+                          damaged="Ratchet treats it as holding no notes and replaces it with this call's note")
+    except Exception:
+        pass
+
+
+def _noted_session(root: Path, which: str) -> str | None:
+    """The chat the guard hook saw run exactly this `ratchet.py <which> ...` call (same arguments) in this project in
+    the last ENGINE_NOTE_SECONDS. A matching note is used up; stale or malformed notes are dropped. None when there
+    is no such note, or when more than one chat noted the same call (Ratchet can't tell which one this is)."""
+    mine = list(_ENGINE_ARGV) if _ENGINE_ARGV is not None else list(sys.argv[1:])
+    try:
+        p = _engine_notes_path()
+        key = f"{root.resolve()}|{which}"
+        match = []
+
+        def damaged(why):  # it names no chat; the guard hook's next note replaces it
+            _note_unreadable(p, why, "Ratchet uses no note for this call (the rules without a note apply); the next "
+                             "note the guard hook takes replaces the file")
+            return KEEP
+
+        def use(notes):
+            if key not in notes:
+                return KEEP
+            raw = notes.get(key)
+            live = [x for x in (raw if isinstance(raw, list) else []) if _note_fresh(x)]
+            match.extend(x for x in live if [str(a) for a in x["argv"]] == mine)
+            rest = [x for x in live if x not in match]
+            if rest:
+                notes[key] = rest
+            else:
+                notes.pop(key, None)
+            return notes
+        # can't be had: use no note and change nothing (the rules without a note)
+        _ = update_record(p, use, wait=2.0, damaged=damaged)
+    except Exception:
+        return None
+    sessions = {x["session"] for x in match}
+    return sessions.pop() if len(sessions) == 1 else None
+
 
 def cmd_init(args):
     root = find_root()
@@ -1768,7 +2594,10 @@ def cmd_init(args):
                 subprocess.run(["git", "rm", "--cached", "-q", "--", *runtime], cwd=root, capture_output=True)
     existing = ctx.active_slug()
     if existing:
-        old_st = read_json(ctx.state_path(existing), None)
+        old_st, why = _read_record(ctx.state_path(existing), missing=None)
+        if why is not None:  # a damaged run is still the active one: it is only replaced with --force, by a person
+            _note_unreadable(ctx.state_path(existing), why, "Ratchet treats that run as still active")
+            old_st = {"phase": "unknown: its state.json can't be read"}
         if old_st and old_st.get("phase") not in ("done", "cancelled"):
             if not (args.force and human_override("replace the run that is still active", ctx,
                                                   f"init --force (replaced run {existing})")):
@@ -1796,13 +2625,13 @@ def cmd_init(args):
         "slug": slug, "feature": args.feature, "phase": "planning", "created_at": now(),
         "human_review": args.human_review or ctx.config()["human_review"],
         "current": None, "checkpoints": {}, "plan_hash": None, "awaiting_since": None,
-        "stop_blocks": 0, "history": [], "branch": branch, "dirty_at_start": dirty[:50],
-        "owner_session": human[-1]["session"] if human else None,
+        "history": [], "branch": branch, "dirty_at_start": dirty[:50],
+        "owner_session": _noted_session(root, "init") or (human[-1]["session"] if human else None),
         "base_tree": fingerprint(root)["id"],
     }
-    write_json(rd / "state.json", st)
+    _write_record(rd / "state.json", st, pretty=True)
     record_chain(rd / "state.json")
-    write_json(ctx.ratchet / "active.json", {"slug": slug})
+    _write_record(ctx.ratchet / "active.json", {"slug": slug}, pretty=True)
     register_active(root, slug)
     ok(f"Initialised run '{slug}' at {rd.relative_to(root)}" + (f" on new branch {branch}" if branch else ""))
     if dirty:
@@ -1993,19 +2822,48 @@ def _unavailable_path(ctx):
     return ctx.ratchet / "unavailable-reviewers.json"
 
 
-def unavailable_reviewers(ctx) -> dict:
-    data = read_json(_unavailable_path(ctx), {}) or {}
+_UNAVAILABLE_DAMAGED = "Ratchet treats every reviewer as available"
+
+
+def _live_unavailable(data: dict) -> dict:
     t = now()
-    return {k: v for k, v in data.items() if v.get("until", "") > t}
+    return {k: v for k, v in data.items() if isinstance(v, dict) and str(v.get("until", "")) > t}
 
 
-def mark_unavailable(ctx, rid, reason, hours=None):
+def unavailable_reviewers(ctx) -> dict:
+    return _live_unavailable(read_json(_unavailable_path(ctx), {}, record=_UNAVAILABLE_DAMAGED) or {})
+
+
+def _update_unavailable(ctx, change, note: bool = True, lock=None) -> str:
+    """Change unavailable-reviewers.json (`change(live)` edits its unexpired entries in place; expired ones are
+    dropped). More than one command can update it (`reviewer-status`, a probe, a failed review), so it is changed
+    only through update_record, under its own lock (or `lock`, that lock already held by the caller); a damaged
+    one marks no reviewer and is replaced. Returns update_record's result. A caller that must not then claim the
+    change was saved checks for "busy" itself and refuses with _die_record_busy, passing note=False so this does not
+    also print a stderr note for the same busy write: reviewer-status --reset and --mark (through mark_unavailable)
+    do this, and a checked `providers --add` takes this lock itself first (see _record_probe). A best-effort caller
+    leaves note=True, so the stderr note below speaks for it."""
+    p = _unavailable_path(ctx)
+
+    def fn(data):
+        live = _live_unavailable(data)
+        change(live)
+        return live
+    res = update_record(p, fn, lock=lock, damaged=_UNAVAILABLE_DAMAGED, pretty=True)
+    if res == "busy" and note:
+        _note_record_busy(p, "this change to the unavailable reviewers")
+    return res
+
+
+def mark_unavailable(ctx, rid, reason, hours=None, note: bool = True, lock=None):
+    """Marks `rid` unavailable until `hours` from now (returns that time), unless unavailable-reviewers.json's lock
+    is busy, when nothing is saved and this returns None (reviewer_status's --mark checks for that and dies, with
+    note=False so _update_unavailable's own stderr note does not also print). `lock`: as _update_unavailable."""
     hours = hours if hours is not None else float(ctx.config().get("unavailable_ttl_hours", 6))
     until = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=hours)).isoformat(timespec="microseconds")
-    data = unavailable_reviewers(ctx)
-    data[rid] = {"reason": reason[:300], "since": now(), "until": until}
-    write_json(_unavailable_path(ctx), data)
-    return until
+    res = _update_unavailable(ctx, lambda live: live.__setitem__(rid, {"reason": reason[:300], "since": now(),
+                                                                       "until": until}), note=note, lock=lock)
+    return None if res == "busy" else until
 
 
 def reviewer_availability(ctx, cfg, rid, risk=None) -> tuple[bool, str]:
@@ -2133,6 +2991,24 @@ def _plan_hash(plan, ctx=None):
     return hashlib.sha1(json.dumps(body, sort_keys=True).encode()).hexdigest()[:12]
 
 
+PLAN_ASK_NEXT = ("NEXT: settle any other question or offer with the user first, in its own turn. Then show them the "
+                 "whole plan, run `ratchet.py ask approve-plan` and end that message with the question it prints, word "
+                 "for word, as the only question in it. End your turn. Only their first reply after that question "
+                 "counts, and only a listed yes approves; a yes from before the question does not count. Ratchet "
+                 "can't see your message, so a yes meant for another question in it would still count.")
+def _after_next(text: str) -> str:
+    """A `NEXT: ...` line as a sentence of its own (for next_action, which says what is waiting first)."""
+    body = text[len("NEXT: "):] if text.startswith("NEXT: ") else text
+    return body[:1].upper() + body[1:]
+
+
+REVIEW_ASK_NEXT = ("Settle any other question or offer first, in its own turn. Then run `ratchet.py ask human-approve` "
+                   "and end your message with the question it prints, word for word, as the only question in it, then "
+                   "end your turn. Only their first reply after that question counts: run `ratchet.py human-approve` "
+                   "only if it is one of the listed yes replies. If they ask for changes instead, run "
+                   "`ratchet.py feedback`.")
+
+
 def cmd_plan_submit(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -2146,6 +3022,8 @@ def cmd_plan_submit(args):
         die("Plan invalid:\n  - " + "\n  - ".join(errs))
     st["phase"] = "awaiting_plan_approval"
     st["awaiting_since"] = now()
+    if (st.get("pending") or {}).get("action") == "approve-plan":
+        st.pop("pending", None)  # a question about an earlier version of the plan no longer applies
     st["plan_hash"] = _plan_hash(plan, ctx)
     st["checkpoints"] = {cp["id"]: st["checkpoints"].get(cp["id"]) or new_cp_state(cp)
                          for cp in plan["checkpoints"]}
@@ -2155,6 +3033,7 @@ def cmd_plan_submit(args):
     link = viewer_link(ctx)
     ok(f"Plan valid ({len(plan['checkpoints'])} checkpoints).")
     print(f"VIEWER: {link['url']}" + ("" if link["live"] else "   (static; `ratchet.py view --serve` for a live link)"))
+    print(PLAN_ASK_NEXT)
     if args.open:
         webbrowser.open(link["url"]) if link["live"] else open_viewer(path)
 
@@ -2167,17 +3046,18 @@ def _human_since(ctx: Ctx, since_iso: str | None):
     log = ctx.ratchet / "human_log.jsonl"
     if not log.exists() or not since_iso:
         return []
-    verify_chain(log, "human_log.jsonl")
+    if _IN_HOOK:  # a hook never exits over it: a log Ratchet can't vouch for holds no message (it grants nothing)
+        if chain_problem(log, "human_log.jsonl"):
+            return []
+    else:
+        verify_chain(log, "human_log.jsonl")
     out = []
-    for line in log.read_text().splitlines():
-        try:
-            e = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(e, dict) or e.get("override"):
+    recs, _why = _read_record(log, lines=True)  # can't be read: no message (it grants nothing)
+    for e in recs or []:
+        if e.get("override"):
             continue  # an override audit line is not something the user typed in the chat
         at = e.get("at", "")
-        if since_iso < at <= _in_a_minute():  # a timestamp from the future is forged, not typed
+        if isinstance(at, str) and since_iso < at <= _in_a_minute():  # a timestamp from the future is forged
             out.append(e)
     return out
 
@@ -2199,7 +3079,13 @@ def _director_key(required=True) -> bytes | None:
         if required:
             die(f"No director key at {p}. The director creates it with: ratchet.py director-key")
         return None
-    return p.read_text().strip().encode()
+    try:
+        return p.read_bytes().strip()
+    except OSError as e:  # a folder where the key goes, say: no key (chat approvals stay refused for enrolled lanes)
+        if required:
+            die(f"The director key at {p} can't be read ({type(e).__name__}: {e.strerror or e}). The director "
+                "creates a new one with: ratchet.py director-key --rotate")
+        return None
 
 
 def _is_director_session() -> bool:
@@ -2226,18 +3112,20 @@ def record_director_folder(folder: Path) -> bool:
     try:
         key = os.path.realpath(str(folder))
         p = _director_folders_path()
-        data = read_json(p, {}) or {}
-        if not isinstance(data, dict):
-            return False
-        if key in data:
-            return True
-        data[key] = now()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(f"{p.name}.{os.getpid()}-{secrets.token_hex(4)}.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(data))
-        os.replace(tmp, p)
-        return True
+
+        def damaged(why):  # invalid JSON, or not a JSON object: it grants nothing; this write replaces it (other
+            # folders are recorded again the next time their director's guard runs there)
+            _note_unreadable(p, why, "Ratchet treats it as naming no director folder and replaces it now")
+            return {}
+
+        def add(data):
+            if key in data:
+                return KEEP
+            data[key] = now()
+            return data
+        # shared by every director session on this machine: under its own lock, so none drops another's folder; when
+        # the lock can't be had, nothing is saved and the hook reports it like any record it could not save
+        return update_record(p, add, damaged=damaged) in ("written", "kept")
     except (OSError, ValueError):
         return False
 
@@ -2247,13 +3135,10 @@ def _recorded_guard_role(root: Path | None) -> str | None:
     (or there is no project), 'unreadable' when the record can't be read."""
     if root is None:
         return None
-    try:
-        rec = json.loads(_hook_env_path(root).read_text(encoding="utf-8"))
-    except FileNotFoundError:
+    rec, why = _read_record(_hook_env_path(root), missing=None)
+    if rec is None and why is None:
         return None
-    except (OSError, ValueError):
-        return "unreadable"
-    if not isinstance(rec, dict):
+    if why is not None:  # damaged (or not a JSON object): it confirms no role
         return "unreadable"
     recs = _hook_env_records(root)  # the newest guard record at the moment of reading (record_hook_env)
     if recs is None:
@@ -2298,7 +3183,7 @@ def _director_session_check(what: str):
     if own is not None:
         own_role, where = _recorded_guard_role(own), own
     else:
-        folders = read_json(_director_folders_path(), {}) or {}
+        folders, _why = _read_record(_director_folders_path())  # damaged: it names no director folder
         own_role = "director" if isinstance(folders, dict) and os.path.realpath(str(here)) in folders else None
         where = here
     if own_role == "director":
@@ -2349,12 +3234,46 @@ def _sign(key: bytes, payload: str) -> str:
     return hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
 
 
+def _enrolled_path() -> Path:
+    return ratchet_home() / "enrolled.json"
+
+
+def _enrolled_repair(p: Path) -> str:
+    return (f"restore it from a backup or fix the JSON by hand; or move it aside (mv \"{p}\" \"{p}.damaged\") and "
+            "have the director run director-enroll again for every lane it drives")
+
+
 def _enrolled_outside(ctx) -> str | None:
-    return (read_json(ratchet_home() / "enrolled.json", {}) or {}).get(str(ctx.root.resolve()))
+    """When this lane was enrolled with a director, from the per-user enrolled.json (the backstop that keeps a lane
+    enrolled when its own director.json is removed). A damaged file holds a restriction Ratchet can no longer read,
+    so it keeps it: while a director key exists on this machine, every project without a director.json of its own
+    counts as possibly enrolled (chat replies approve nothing) until a person repairs the file; director-enroll
+    never writes over it. With no director key there is no director to approve anything, so it names no lane."""
+    p = _enrolled_path()
+    data, why = _read_record(p)
+    if why is None:
+        return data.get(str(ctx.root.resolve()))
+    try:
+        key_here = director_key_path().exists()
+    except OSError:  # can't tell: keep the restriction
+        key_here = True
+    if key_here:
+        _note_unreadable(p, why, "it holds which lanes a director enrolled, so Ratchet treats this project as "
+                         "enrolled (chat replies approve nothing; a director token still does) until it is "
+                         "repaired. To repair it: " + _enrolled_repair(p))
+        return "unreadable"
+    _note_unreadable(p, why, "no director key exists on this machine, so Ratchet treats it as naming no enrolled "
+                     "lane. To repair it: " + _enrolled_repair(p))
+    return None
 
 
 def approval_mode(ctx) -> str:
-    enr = read_json(ctx.ratchet / "director.json")
+    p = ctx.ratchet / "director.json"
+    enr, why = _read_record(p, missing=None)
+    if why is not None:  # it exists, so this lane was enrolled: a damaged enrollment keeps refusing chat approvals
+        _note_unreadable(p, why, "Ratchet still treats this lane as enrolled with a director (chat replies approve "
+                         "nothing); the director enrolls it again with director-enroll")
+        return "director"
     if not enr and _enrolled_outside(ctx):
         return "director"  # enrollment file deleted from the repo: still enrolled
     if enr:
@@ -2482,17 +3401,21 @@ def _require_approval(ctx, st, action, token=None):
     if human_override(f"approve this pause ({action})", ctx, action):
         return {"by": "human", "detail": "(RATCHET_HUMAN_OVERRIDE, code typed back at the terminal)"}
     p = st.get("pending") or {}
-    if action in ("approve-plan", "human-approve") and p.get("action") not in (None, "hooks-waive"):
-        die(f"A different question is waiting for the user's answer: shall I {ASKABLE.get(p.get('action'), p.get('action'))}"
-            f"{' -> ' + p['mode'] if p.get('mode') else ''}? Their reply answers THAT question, not this approval. "
-            f"If they said yes to it, run `ratchet.py {PENDING_COMMAND.get(p.get('action'), p.get('action'))}"
-            f"{' ' + p['mode'] if p.get('mode') else ''}`. If they said no or moved on, run `ratchet.py ask withdraw`, "
-            "then ask them plainly about this approval and wait for their reply.")
-    msgs = _human_since(ctx, st.get("awaiting_since"))
+    if action in ASKED_APPROVALS:
+        return _asked_reply(ctx, st, action, p)
+    # what is left: hooks-waive (its own exact list, first reply only) and feedback (any text). Either way only the
+    # run's own chat counts (the hooks question's chat for hooks-waive).
+    msgs = _replies(ctx, st, st.get("awaiting_since"), p if p.get("action") == action else None)
+    if action == "feedback":
+        # When the review question was asked at this pause, the reply that answered (or spent) it is the feedback,
+        # not whatever the user typed later.
+        q = p if p.get("action") == "human-approve" else (st.get("spent_question") or {})
+        if q.get("action") == "human-approve" and q.get("asked_at") and (
+                q is p or q["asked_at"] == st.get("awaiting_since")):
+            msgs = _replies(ctx, st, q["asked_at"], q)[:1]
     if p.get("action") == "hooks-waive" and action != "hooks-waive":
-        # the first reply after the hooks question answers THAT question; it is not an approval of anything else
         # the first reply after the hooks question is its answer, whatever it says ("Any other reply means no"),
-        # so it can never double as an approval of the plan or a checkpoint
+        # so it can never double as anything else
         after = [m for m in msgs if m.get("at", "") > p.get("asked_at", "")]
         if after:
             msgs = [m for m in msgs if m is not after[0]]
@@ -2501,18 +3424,13 @@ def _require_approval(ctx, st, action, token=None):
     if msgs:
         entry = msgs[-1]
         last = entry.get("prompt", "")
-        intent = hooks_waive_intent if action == "hooks-waive" else message_intent
-        if action != "feedback" and intent(last) != "approve":
-            if action == "hooks-waive":
-                st.pop("pending", None)  # spent: a later yes must not turn this no into consent
-                ctx.save_state(st)
-                die(f"The user's reply to the hooks question was not a clear yes: \"{last[:120]}\". Nothing was "
-                    "recorded. Only the exact reply \"" + HOOKS_WAIVE_REPLY + "\" (or a listed equivalent) counts. If they "
-                    "still want to skip hooks, run `ratchet.py ask hooks-waive` again and show them the question it "
-                    "prints word for word.")
-            die(f"The user's latest reply is not a clear yes: \"{last[:120]}\". Answer it or make the change they asked "
-                "for, then ask them plainly (e.g. \"Shall I go ahead? Reply yes to continue.\") and try again after "
-                "they reply.")
+        if action == "hooks-waive" and hooks_waive_intent(last) != "approve":
+            st.pop("pending", None)  # spent: a later yes must not turn this no into consent
+            ctx.save_state(st)
+            die(f"The user's reply to the hooks question was not a clear yes: \"{last[:120]}\". Nothing was "
+                "recorded. Only the exact reply \"" + HOOKS_WAIVE_REPLY + "\" (or a listed equivalent) counts. If they "
+                "still want to skip hooks, run `ratchet.py ask hooks-waive` again and show them the question it "
+                "prints word for word.")
         if ctx.config().get("verify_transcripts", True):
             good, why = _transcript_ok(entry, st.get("awaiting_since"))
             if not good:
@@ -2523,6 +3441,100 @@ def _require_approval(ctx, st, action, token=None):
         "for their reply; approval must come from them. If they have already replied, Ratchet's prompt hook is not "
         "running in this agent CLI, so their reply could not be recorded: run `ratchet.py doctor --json` and follow "
         "the hooks steps in the orchestrator skill.")
+
+
+# Approvals that answer a question Ratchet printed (`ratchet.py ask <action>`). The user's FIRST reply after that
+# question is the answer, and only a listed yes (APPROVAL_REPLIES) approves. hooks-waive has its own exact list,
+# feedback takes any text and a lettered choice takes a letter, so they are not in here.
+ASKED_APPROVALS = ("approve-plan", "human-approve", "cancel", "set-review", "approve-changes", "claim", "ui-respec")
+
+
+def _ask_cmd(action, mode=None, eng="ratchet.py") -> str:
+    return f"`{eng} ask {action}{' ' + mode if mode else ''}`"
+
+
+def _question_what(action, mode=None) -> str:
+    """The question `ask <action>` put to the user, in the words it used ("shall I <this>?")."""
+    if action == "set-review":
+        return f"change how often they review to: {REVIEW_MODE_WORDS.get(mode, mode)}"
+    return ASKABLE.get(action, action)
+
+
+def _question_session(st, p=None):
+    """The chat whose replies can answer a question: the one recorded when it was asked (for `claim`, the chat that
+    asked to take the run over), else the run's owner chat. None while no chat owns the run yet."""
+    return (p or {}).get("session") or st.get("owner_session")
+
+
+def _replies(ctx, st, since, p=None):
+    """Human messages after `since` typed in the question's own chat. A message from another chat never answers (or
+    spends) a question asked here, and so never moves the run to that chat: only `resume --claim` does that. There is
+    no fallback to every chat: while no chat is known, only a message that carries no chat id at all counts (from an
+    agent CLI that sends none, where Ratchet can't tell chats apart); a message from any identified chat makes that
+    chat the owner first (the prompt hook records it, and Ctx.state binds it under the command's lock), so it never
+    answers a question unbound."""
+    sess = _question_session(st, p)
+    return [m for m in _human_since(ctx, since) if m.get("session") == sess]
+
+
+def _spend_question(ctx, st, reply=""):
+    """The question got its one answer and it was not a yes: close it, so a later yes can't count. awaiting_since is
+    left at the question, so `feedback` can still record the change request in that same reply."""
+    p = st.pop("pending", None) or {}
+    st["spent_question"] = {"action": p.get("action"), "asked_at": p.get("asked_at"), "session": p.get("session")}
+    ctx.log(st, "question_not_approved", action=p.get("action"), reply=reply[:200])
+    ctx.save_state(st)
+
+
+def _asked_reply(ctx, st, action, p):
+    """The user's answer to the question `ask <action>` printed, or die. Only their first reply after it counts."""
+    want = p.get("action")
+    mode_txt = f" {p['mode']}" if p.get("mode") else ""
+    if want != action:
+        if want:
+            what = _question_what(want, p.get("mode"))
+            die(f"A different question is waiting for the user's answer: shall I {what}? Their reply answers THAT "
+                f"question, not this one. If they said yes to it, run `ratchet.py {PENDING_COMMAND.get(want, want)}"
+                f"{mode_txt}`. If they said no or moved on, run `ratchet.py ask withdraw`. Then print this question "
+                f"with {_ask_cmd(action)}, show it to them word for word, and wait for their reply.")
+        die(f"Ratchet has not asked the user this question yet, so no reply counts as their answer. Run "
+            f"{_ask_cmd(action)}, show them the question it prints word for word, and end your turn. Only their first "
+            "reply after the question counts; a yes from before it does not.")
+    asked = p.get("asked_at")
+    again = _ask_cmd(action, p.get("mode"))
+    if p.get("phase") and p["phase"] != st.get("phase"):
+        _spend_question(ctx, st)
+        die(f"That question was asked while the run was {PHASE_PLAIN.get(p['phase'], p['phase'])}; it is now "
+            f"{PHASE_PLAIN.get(st.get('phase'), st.get('phase'))}, so it no longer applies. Nothing was approved. If "
+            f"you still need their yes, print the question again ({again}).")
+    if p.get("overtook"):
+        _spend_question(ctx, st)
+        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'))}"
+            "?) was still waiting for the user's first reply, so their reply could be meant for either. Nothing was "
+            f"approved and the question is closed. Print it again on its own ({again}), with no other question or "
+            "offer in that message, and wait for their reply.")
+    msgs = _replies(ctx, st, asked, p)  # only the chat the question was asked in can answer it
+    if not msgs:
+        die("No human message recorded in this run's chat since the question was printed (a message typed in another "
+            "chat never answers it). End your turn and wait for the user's reply; approval must come from them. If "
+            "they have already replied, Ratchet's prompt hook is not running in this agent CLI, so their reply could "
+            "not be recorded: run `ratchet.py doctor --json` and follow the hooks steps in the orchestrator skill.")
+    entry = msgs[0]  # the first reply answers the question; later messages never do
+    reply = entry.get("prompt", "")
+    if not is_listed_yes(reply):
+        _spend_question(ctx, st, reply)
+        die(f"The user's first reply after the question was not one of the listed yes replies ({listed_yes_text()}): "
+            f"\"{reply[:120]}\". Nothing was approved, and the question is closed, so a later yes does not count. "
+            "Answer what they said or make the change they asked for. If you still need their yes, print the question "
+            f"again ({again}), show it to them word for word, and wait for their reply.")
+    if ctx.config().get("verify_transcripts", True):
+        good, why = _transcript_ok(entry, asked)
+        if not good:
+            _spend_question(ctx, st, reply)
+            die(f"Couldn't confirm that reply came from the user ({why}). Nothing was approved. Print the question "
+                f"again ({again}) and ask them to reply in this chat; if it keeps failing, `ratchet.py doctor` shows "
+                "whether the prompt hook is installed.")
+    return {"by": "human", "detail": reply[:200], "session": entry.get("session")}
 
 
 def _require_human(ctx, st, action="human-approve", token=None):
@@ -2545,13 +3557,28 @@ def cmd_director_key(args):
 def cmd_director_enroll(args):
     require_director_session("director-enroll")
     ctx = Ctx(find_root())
+    ep = _enrolled_path()
+    lane = str(ctx.root.resolve())
+    bad, signed = [], []
+
+    def damaged(why):  # it holds other lanes' enrollment: never replace it with this lane's alone
+        bad.append(why)
+        return KEEP
+
+    def add(outside):
+        signed.append(_sign(_director_key(), "enroll|" + lane))
+        outside[lane] = signed[0]
+        return outside
+    # shared by every lane on this machine: changed only under its own lock, so two lanes enrolled at once both stay
+    done = update_record(ep, add, damaged=damaged, pretty=True)
+    if bad:
+        die(f"Ratchet's record of enrolled lanes ({ep}) can't be read ({bad[0]}). It keeps every lane a director "
+            "enrolled in director mode even if that lane's .ratchet/director.json is removed, so Ratchet won't write "
+            f"over it, and nothing was changed. Tell the user; to repair it: {_enrolled_repair(ep)}.")
+    if done == "busy":
+        _die_record_busy(ep, "nothing was changed")
     ctx.ratchet.mkdir(exist_ok=True)
-    key = _director_key()
-    sig = _sign(key, "enroll|" + str(ctx.root.resolve()))
-    write_json(ctx.ratchet / "director.json", {"enrolled_at": now(), "sig": sig})
-    outside = read_json(ratchet_home() / "enrolled.json", {}) or {}
-    outside[str(ctx.root.resolve())] = sig
-    write_json(ratchet_home() / "enrolled.json", outside)
+    _write_record(ctx.ratchet / "director.json", {"enrolled_at": now(), "sig": signed[0]}, pretty=True)
     ok(f"Lane {ctx.root} enrolled: approvals now require a director token.")
 
 
@@ -2593,9 +3620,9 @@ def cmd_approve_plan(args):
     if missing:
         die(f"Test plans missing for {', '.join(missing)}. Spawn ratchet-test-planner first.")
     msg = _require_human(ctx, st, "approve-plan", getattr(args, "director_token", None))
-    st["approved"] = approval_snapshot(ctx, st)
-    if msg.get("session"):
-        st["owner_session"] = msg["session"]  # the session where the user said yes owns the build
+    if (st.get("pending") or {}).get("action") == "approve-plan":
+        st.pop("pending", None)  # answered
+    st["approved"] = approval_snapshot(ctx, st)  # the owner chat is unchanged: only `resume --claim` moves a run
     st["phase"] = "building"
     st["current"] = plan["checkpoints"][0]["id"]
     first = st["checkpoints"][st["current"]]
@@ -3007,8 +4034,10 @@ def cmd_ui_record(args):
         die(f"The UI check found differences in {args.cp}, and since then the capture spec (states/{args.cp}.json) "
             "or the review scope has changed. Differences are fixed in the app's code, not by changing what is "
             "compared. Put the spec and scope back as they were and re-run the capture. If the spec itself was "
-            f"wrong, run `ratchet.py ask ui-respec {args.cp}`, explain to the user what you want to change and "
-            f"why, and after their clear yes run `ratchet.py ui-respec {args.cp}`.")
+            f"wrong, explain to the user what you want to change and why, run `ratchet.py ask ui-respec {args.cp}`, "
+            "end your message with the question it prints, word for word, as the only question in it, and end your "
+            f"turn. Run `ratchet.py ui-respec {args.cp}` only if their first reply after it is one of the listed yes "
+            "replies.")
     g["attempts"] += 1
     verdict, blockers = _ui_verdict(review, cfg)
     dest = ctx.evidence(args.cp) / "ui" / f"round-{g['attempts']:02d}"
@@ -3708,6 +4737,8 @@ def _finish_guardrail(ctx, st, cp):
     user = read_json(ctx.config_path, {}) or {}
     checks = [c for c in (user.get("checks") or []) if isinstance(c, dict)]
     existing = [c for c in checks if norm_kind(c.get("kind")) == gr["kind"]]
+    if any(c.get("from") == f"{st['slug']}/{cp['id']}" for c in existing):
+        return  # an earlier run of `complete` for this step added it, then failed before it could save
     if existing and not gr.get("strengthen"):
         die(f"An automatic check for '{gr['kind']}' already exists; it is never replaced silently.")
     # a strengthen step replaces its own kind's check, after proving it still catches every past case
@@ -4282,7 +5313,12 @@ def cmd_complete(args):
         gfp = g.get("fingerprint") or {}
         if gfp.get("id") == fp["id"]:
             continue
-        changed = changed_files(ctx.root, gfp, fp)
+        # The fingerprint never reads Ratchet's folder from the working tree, only from HEAD: a difference there alone
+        # is a checkpoint commit (its shared .ratchet files) made by an earlier `complete` that failed before it
+        # could save, not a change to the reviewed code. The rerun then finds that commit instead of making another.
+        changed = [f for f in changed_files(ctx.root, gfp, fp) if f != RATCHET_DIR and not f.startswith(RATCHET_DIR + "/")]
+        if not changed:
+            continue
         if name == "behavior":
             problems.append(f"code changed since behavior passed ({len(changed)} files) → re-run ratchet.py behavior {args.cp}")
             stale.append(name)
@@ -4336,6 +5372,8 @@ def cmd_complete(args):
         if cp.get("spec_refs"):
             msg += "\nSpec: " + ", ".join(_as_list(cp["spec_refs"]))[:600]
         commit = _commit_reviewed(ctx.root, cps.get("base_tree"), fp, msg, extra=spec_files)
+        if not commit:  # nothing new to commit: a run of complete that failed after its commit left it at HEAD
+            commit = _head_commit_named(ctx.root, msg)
     cps.update(status="done", completed_at=now(), commit=commit)
     ctx.log(st, "checkpoint_complete", cp=args.cp, commit=commit)
     order = [c["id"] for c in ctx.plan()["checkpoints"]]
@@ -4392,6 +5430,8 @@ def cmd_human_approve(args):
             st.pop("choice_allow", None)
     else:
         msg = _require_human(ctx, st, "human-approve", getattr(args, "director_token", None))
+    if (st.get("pending") or {}).get("action") == "human-approve":
+        st.pop("pending", None)  # answered (or overtaken by the user's pick at a block)
     order = [c["id"] for c in (ctx.plan() or {"checkpoints": []})["checkpoints"]]
     if st["phase"] == "blocked":
         back = st.pop("blocked_from", None) or "building"
@@ -4448,6 +5488,8 @@ def cmd_feedback(args):
     if st["phase"] not in ("awaiting_checkpoint_review", "awaiting_final_review", "done"):
         die(f"feedback is for review points (phase {st['phase']})")
     msg = _require_human(ctx, st, "feedback", getattr(args, "director_token", None))
+    if (st.get("pending") or {}).get("action") == "human-approve":
+        st.pop("pending", None)  # their reply asked for changes, which answers the approval question
     for line in args.learning or []:
         _append_learning(ctx, line, source=f"human review of {st['slug']}")
     st["phase"] = "planning_feedback"
@@ -4547,15 +5589,16 @@ def cmd_resume(args):
     if st["phase"] == "paused":
         st["phase"] = st.pop("paused_from", "building")
         st["blocked_reason"] = None
-    st["stop_blocks"] = 0
     register_active(ctx.root, st["slug"])
-    ctx.log(st, "resumed")
+    ctx.log(st, "resumed")  # also restarts the stop hook's count of stops without progress
     ctx.save_state(st)
     ok(f"Resumed '{st['slug']}' in phase {st['phase']}" + (" — this chat now owns the run." if args.claim else "."))
     print(json.dumps(next_action(ctx, st), indent=2))
 
 
-ASKABLE = {"approve-changes": "accept the changes listed above as the new baseline",
+ASKABLE = {"approve-plan": "start building the plan as it is",
+           "human-approve": "mark this as approved and carry on",
+           "approve-changes": "accept the changes listed above as the new baseline",
            "cancel": "cancel this Ratchet run (commits already made are kept)",
            "set-review": "change how often you review",
            "claim": "continue this Ratchet run in THIS chat",
@@ -4563,15 +5606,17 @@ ASKABLE = {"approve-changes": "accept the changes listed above as the new baseli
            "ui-respec": "change what the UI check compares for this step (its capture steps or scope), as explained above",
            "choice": "go with one of the lettered options you listed"}
 # the command that carries out a "yes" to each question
-PENDING_COMMAND = {"approve-changes": "approve-changes", "cancel": "cancel", "set-review": "set-review",
+PENDING_COMMAND = {"approve-plan": "approve-plan", "human-approve": "human-approve", "approve-changes": "approve-changes", "cancel": "cancel", "set-review": "set-review",
                    "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec", "choice": "choice"}
 REVIEW_MODE_WORDS = {"end": "only at the end", "each": "after every step", "none": "never (fully autonomous)"}
 
 
 def cmd_ask(args):
-    """Record the question the agent is about to ask the user. Only a clear yes typed AFTER this counts."""
+    """Record (and print) the question the agent is about to ask the user. Only the user's FIRST reply after it
+    answers it, and only a listed yes approves (APPROVAL_REPLIES; hooks-waive and choice have their own replies)."""
     ctx = Ctx(find_root())
     st = ctx.state()
+    asker = _noted_session(ctx.root, "ask")  # the chat running this command, when the guard hook saw it
     if args.action == "withdraw":
         p = st.get("pending")
         if not p:
@@ -4588,6 +5633,7 @@ def cmd_ask(args):
         die("ask ui-respec needs the checkpoint id, e.g. `ratchet.py ask ui-respec CP2`")
     if args.action not in ("set-review", "ui-respec") and args.mode:
         die(f"ask {args.action} takes no extra value")
+    _bind_owner(ctx, st, args.action, asker)
     if args.action == "choice":
         return _ask_choice(ctx, st, args)
     detail = ""
@@ -4600,25 +5646,144 @@ def cmd_ask(args):
     if args.action == "set-review":
         detail = {"end": "I'll only check in with you at the end.", "each": "I'll check in after every step.",
                   "none": "I'll build every step without checking in; the checks still run."}[args.mode]
+    what = ASKABLE[args.action]
+    if args.action in ("approve-plan", "human-approve"):
+        what = _approval_question(ctx, st, args.action)
     old = st.get("pending") or {}
     if args.action == "hooks-waive" and old.get("action") not in (None, "hooks-waive"):
         die(f"A different question ({old.get('action')}) is still waiting for the user's answer. Get that answered "
             "first; a hooks question must not take over their reply.")
+    overtook = _overtake(ctx, st, args.action, args.mode, asker)
     asked = now()
-    st["pending"] = {"action": args.action, "mode": args.mode, "asked_at": asked, "prev_awaiting": st.get("awaiting_since")}
+    st["pending"] = {"action": args.action, "mode": args.mode, "asked_at": asked, "prev_awaiting": st.get("awaiting_since"),
+                     "session": _asking_session(ctx, st, args.action, asker), **overtook}
+    if args.action in ("approve-plan", "human-approve"):
+        st["pending"]["phase"] = st["phase"]  # the answer only counts at the pause it was asked at
     if args.action != "hooks-waive":  # a hooks question must not open (or reset) any approval window
         st["awaiting_since"] = asked
     ctx.log(st, "question_asked", action=args.action, mode=args.mode)
     ctx.save_state(st)
+    if overtook:
+        print(_not_asked_text(_ask_cmd(args.action, args.mode), overtook))
+        return
     if args.action == "hooks-waive":
         print(f"ASK THE USER: Shall I build without the Ratchet hooks? The checks would then only advise; nothing "
               f"enforces them. To agree, reply exactly \"{HOOKS_WAIVE_REPLY}\". Any other reply means no.")
         return
-    what = ASKABLE[args.action]
     if args.action == "set-review":
         what = f"change how often you review to: {REVIEW_MODE_WORDS[args.mode]}"
-    q = f"{detail} Shall I {what}? Reply yes to confirm."
+    q = (f"{detail} Shall I {what}? To say yes, reply with just one of these: {listed_yes_text()}. Only your first "
+         "reply counts, and any other reply approves nothing.")
     print(f"ASK THE USER: {q.strip()}")
+    print(ASK_ALONE)
+
+
+# Ratchet can't see what the agent shows the user, so it can't tell a yes to this question from a yes to another
+# question or offer in the same message. The agent keeps the message to this one question.
+ASK_ALONE = ("NEXT: end your message with that question, word for word, as the only question in it: settle any other "
+             "question or offer first, in an earlier turn. Then end your turn. Ratchet can't see what you showed, so "
+             "a yes meant for something else in the same message would still count.")
+
+
+def _asking_session(ctx, st, action, asker=None):
+    """The chat whose first reply will answer a question being asked now. A claim belongs to the chat that ran
+    `ask claim` (`asker`, noted by the guard hook for this exact call); every other question belongs to the run's
+    owner chat. None while no chat owns the run (see _bind_owner). Only a claim with no note (an agent CLI whose guard
+    hook doesn't run, or a call the guard couldn't read) falls back to the chat the user typed in last."""
+    if not st.get("owner_session"):
+        return None
+    if action != "claim":
+        return st["owner_session"]
+    return asker or _latest_session(ctx)
+
+
+def _bind_owner(ctx, st, action, asker):
+    """A question needs a chat to answer it. Before any chat owns the run, the chat that runs `ask` (noted by the
+    guard hook) becomes the owner, so only its replies answer the question and the run can't be taken by a reply in
+    another chat. With no note (an agent CLI whose guard hook doesn't run) the question waits unbound, and the first
+    chat the prompt hook records for the run owns it (decide_prompt)."""
+    if st.get("owner_session"):
+        return
+    if action == "claim":
+        die("No chat owns this Ratchet run yet, so there is nothing to take over and nothing was asked. Run "
+            "`ratchet.py resume` (without --claim) and carry on in this chat.")
+    if asker:
+        st["owner_session"] = asker
+        ctx.log(st, "owner_recorded", session=asker, via="ask")
+
+
+def _overtake(ctx, st, action, mode, asker=None) -> dict:
+    """A new question while a DIFFERENT one still waits for the user's first reply: the user may see both, and one
+    reply can't answer two questions. Plan and step approvals are refused until the waiting one is answered or
+    withdrawn. Any other question is recorded but marked as overtaking, so no reply approves it; the agent asks it
+    again on its own. Either way the replaced question is logged. Returns the marker to store on the new question."""
+    old = st.get("pending") or {}
+    oa = old.get("action")
+    if not oa:
+        return {}  # nothing waiting
+    first = _replies(ctx, st, old.get("asked_at"), old)[:1]
+    answered = bool(first)
+    new_sess = _asking_session(ctx, st, action, asker)
+    if not answered and old.get("session") and new_sess != old.get("session"):
+        # the waiting question belongs to another chat: a question asked here (even the same one) must not drop it
+        die(f"A question is waiting for the user's first reply in another chat (shall I {_question_what(oa, old.get('mode'))}?), "
+            "so nothing was asked here. Try again after it is answered there. If the user tells you that chat is "
+            "gone, run `ratchet.py ask withdraw` first (that drops its question; it is logged, and that chat has to "
+            "ask it again).")
+    if oa == action and (old.get("mode") or None) == (mode or None):
+        return {}  # the same question printed again in its own chat
+    if oa == "hooks-waive" and (not answered or hooks_waive_intent(first[0].get("prompt", "")) == "approve"):
+        # `hooks-waive` reads its answer from this question: replacing it before the reply, or after the user agreed,
+        # would hide that reply from it. A first reply that is not the waiver phrase is a no, so it can be replaced.
+        if answered:
+            die(f"The user agreed to build without the Ratchet hooks (their reply to the hooks question was "
+                f"\"{first[0].get('prompt', '')[:80]}\"), so nothing was asked. Run `ratchet.py hooks-waive` to record "
+                "it first, or `ratchet.py ask withdraw` if they have since changed their mind. Then ask this question "
+                "on its own.")
+        die("The hooks question (shall I build without the Ratchet hooks?) is still waiting for the user's reply, so "
+            "nothing was asked. Wait for their reply: if it is exactly \"" + HOOKS_WAIVE_REPLY + "\", run "
+            "`ratchet.py hooks-waive`. If you no longer need it, run `ratchet.py ask withdraw`. Then ask this question "
+            "on its own.")
+    if not answered and action in ("approve-plan", "human-approve"):
+        die(f"A different question is still waiting for the user's first reply: shall I "
+            f"{_question_what(oa, old.get('mode'))}? One reply can't answer two questions. Get that one answered "
+            f"(if they say yes, run `ratchet.py {PENDING_COMMAND.get(oa, oa)}{' ' + old['mode'] if old.get('mode') else ''}`"
+            ") or run `ratchet.py ask withdraw` if you no longer need it, then ask this question on its own.")
+    ctx.log(st, "question_overtaken", action=oa, mode=old.get("mode"), by=action, answered=answered)
+    if answered:
+        return {}  # the old question already had its one reply; this one starts clean
+    return {"overtook": oa, "overtook_mode": old.get("mode")}
+
+
+def _not_asked_text(again, overtook) -> str:
+    return (f"NOT ASKED: a different question (shall I {_question_what(overtook['overtook'], overtook.get('overtook_mode'))}"
+            "?) was still waiting for the user's first reply. It is now withdrawn, and this question is recorded as "
+            "overtaking it, so no reply approves it: if the user saw both, their reply could be meant for either. Do "
+            f"not show it. Run {again} again to ask it on its own, then show the user only that "
+            "question.")
+
+
+def _approval_question(ctx, st, action) -> str:
+    """The question `ask approve-plan` / `ask human-approve` puts to the user at this pause, or die when there is
+    nothing to approve here."""
+    if approval_mode(ctx) == "director":
+        die("This lane is director-enrolled: a chat reply can't approve anything here. The director signs this "
+            f"approval instead (director-sign {action}).")
+    phase = st["phase"]
+    if action == "approve-plan":
+        if phase != "awaiting_plan_approval":
+            die(f"There is no plan waiting for approval (the run is {PHASE_PLAIN.get(phase, phase)}).")
+        return "start building the plan shown above, as it is"
+    if phase == "awaiting_checkpoint_review":
+        titles = {c["id"]: c.get("title", c["id"]) for c in (ctx.plan() or {}).get("checkpoints", [])}
+        left = [c for c, s in (st.get("checkpoints") or {}).items() if s.get("status") != "done"]
+        t = titles.get(st.get("review_target"), "the last step")
+        return f"mark the step \"{t}\" as approved and " + ("go on to the next step" if left else "finish the run")
+    if phase == "awaiting_final_review":
+        return "mark the finished work as approved and close this run"
+    if phase == "blocked":
+        return "carry on past the problem explained above"
+    die(f"Nothing is waiting for the user's approval (the run is {PHASE_PLAIN.get(phase, phase)}).")
 
 
 def _ask_choice(ctx, st, args):
@@ -4653,12 +5818,17 @@ def _ask_choice(ctx, st, args):
         offered = st.setdefault("guardrails_offered", [])
         if kind not in offered:
             offered.append(kind)  # asked once; not offered again whatever the answer
+    overtook = _overtake(ctx, st, "choice", None)
     asked = now()
     st["pending"] = {"action": "choice", "mode": None, "options": opts, "locked": locked, "guardrail": guards,
-                     "asked_at": asked, "prev_awaiting": st.get("awaiting_since")}
+                     "asked_at": asked, "prev_awaiting": st.get("awaiting_since"),
+                     "session": _asking_session(ctx, st, "choice"), **overtook}
     st["awaiting_since"] = asked
     ctx.log(st, "question_asked", action="choice", options=opts, locked=locked)
     ctx.save_state(st)
+    if overtook:
+        print(_not_asked_text("the same `ratchet.py ask choice ...` command", overtook))
+        return
     lines = [f"ASK THE USER: give them options {', '.join(opts)} in your own words, with your recommendation, and ask "
              f"them to reply with just the letter."]
     for letter, paths in locked.items():
@@ -4678,7 +5848,14 @@ def cmd_choice(args):
     st = ctx.state()
     _require_pending(st, "choice")
     p = st["pending"]
-    msgs = _human_since(ctx, p.get("asked_at"))
+    if p.get("overtook"):
+        _clear_pending(st)
+        ctx.log(st, "choice_unclear", reply="(asked while another question was waiting)")
+        ctx.save_state(st)
+        die("These options were printed while another question was still waiting for the user's first reply, so their "
+            "reply could be meant for either. Nothing was recorded. Run `ratchet.py ask choice ...` again on its own "
+            "and wait for their pick.")
+    msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the options were put to can pick one
     if not msgs:
         die("No reply from the user yet. End your turn and wait for them to pick an option.")
     entry = msgs[0]  # the first reply answers the question
@@ -4727,7 +5904,7 @@ def _choice_covers(allow: dict, probs: list[str]) -> bool:
 def _require_pending(st, action, mode=None):
     p = st.get("pending") or {}
     if p.get("action") != action or (mode and p.get("mode") != mode):
-        die(f"First run `ratchet.py ask {action}{' ' + mode if mode else ''}`, show the user the question it prints, "
+        die(f"First run {_ask_cmd(action, mode)}, show the user the question it prints, "
             "and wait for their reply. Replies from before the question don't count.")
 
 
@@ -4931,7 +6108,7 @@ def cmd_reviewers(args):
             if not due:
                 break
             for pid in due:
-                good, detail = probe_provider(ctx, cfg, provider_by_id(cfg, pid))
+                good, detail, _saved = probe_provider(ctx, cfg, provider_by_id(cfg, pid))
                 print(f"  checked {pid}: {'working' if good else 'not usable now (' + detail + ')'}", file=sys.stderr)
             resolved = resolve_reviewers(ctx, cfg, cp)
         g["attempts"] += 1
@@ -5007,12 +6184,15 @@ def cmd_reviewer_status(args):
     ctx = Ctx(find_root())
     cfg = ctx.config()
     if args.reset:
-        data = unavailable_reviewers(ctx)
-        data.pop(args.reset, None)
-        write_json(_unavailable_path(ctx), data)
+        p = _unavailable_path(ctx)
+        if _update_unavailable(ctx, lambda live: live.pop(args.reset, None), note=False) == "busy":
+            _die_record_busy(p, f"{args.reset} was not reset")
         ok(f"{args.reset} will be tried again")
     if args.mark:
-        until = mark_unavailable(ctx, args.mark, args.reason or "marked unavailable")
+        until = mark_unavailable(ctx, args.mark, args.reason or "marked unavailable", note=False)
+        if until is None:
+            p = _unavailable_path(ctx)
+            _die_record_busy(p, f"{args.mark} was not marked unavailable")
         ok(f"{args.mark} skipped until {until[:16]}Z; the next provider, or the host's sub-agents, fill its slot")
     print(f"Host provider: {detect_host(cfg)}")
     for rid, spec in roster(cfg).items():
@@ -5257,7 +6437,7 @@ def _public_host(bind: str, override: str | None) -> str:
 
 
 def server_info(state_file: Path) -> dict | None:
-    info = read_json(state_file, None)
+    info = read_json(state_file, None, record="Ratchet treats it as naming no running server")
     if info and _pid_alive(info.get("pid")) and _port_open(info.get("port")):
         return info
     return None
@@ -5309,12 +6489,12 @@ def _start_server(kind, root: Path, state_file: Path, bind, port, token_mode, pu
     host = _public_host(bind, public_host)
     url = f"http://{host}:{port}/" + (f"?t={token}" if token else "")
     info = {"url": url, "pid": pid, "port": port, "bind": bind, "token": token, "started_at": now()}
-    write_json(state_file, info)
+    _write_record(state_file, info, pretty=True)
     return info, True
 
 
 def _stop_server(state_file: Path) -> bool:
-    info = read_json(state_file, None)
+    info = read_json(state_file, None, record="Ratchet treats it as naming no running server")
     if not info:
         return False
     try:
@@ -5622,62 +6802,180 @@ def normalize_hook(data: dict, host: str) -> dict:
             "transcript_path": data.get("transcript_path") or data.get("transcriptPath")}
 
 
+def _heartbeat_path(root: Path) -> Path:
+    return root / RATCHET_DIR / "hook-heartbeat.json"
+
+
 def _heartbeat(root: Path, event: str, host: str):
     """Record that a hook fired (liveness only). It never carries crash state: crash records live only in per-run
-    marker files and appended lines (see _record_hook_run), so a stale rewrite of this shared file by a concurrent
-    hook can at worst roll an entry back to an older time, which only makes a hook look less healthy.
+    marker files and appended lines (see _record_hook_run). Concurrent hooks rewrite this shared file only through
+    update_record, under its own lock, so none drops another's entry; a beat skipped because the lock could not be
+    had within a second only makes a hook look less healthy until its next run.
     The rewrite goes to a per-process temp file that then replaces the heartbeat in one rename, so a concurrent
     hook never reads a truncated, half-written heartbeat (that read would fail and crash the reading hook)."""
-    p = root / RATCHET_DIR / "hook-heartbeat.json"
-    tmp = p.with_name(f"{p.name}.{os.getpid()}-{secrets.token_hex(4)}.tmp")
-    try:
-        hb = read_json(p, {}) or {}
+    p = _heartbeat_path(root)
+
+    def beat(hb):
         hb[event] = {"at": now(), "host": host}
-        with open(tmp, "w") as f:  # every hook-state write uses open(), one name a test can fault
-            f.write(json.dumps(hb))
-        os.replace(tmp, p)
+        return hb
+    try:  # every hook rewrites it: under its own lock (a second at most: a hook never waits long), so a concurrent
+        # hook never drops this hook's entry; when the lock can't be had, this beat is skipped (liveness only)
+        _ = update_record(p, beat, wait=1.0,
+                          damaged="Ratchet treats it as recording no hook run and replaces it now")  # writes use open()
     except Exception:
         pass
-    finally:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
 
 
 ENGINE_PATH = str(Path(__file__).resolve())
+
+# The prompt and stop hooks keep their own append-only records in the run folder (never state.json, which only a
+# command holding the state lock writes): the engine reads them.
+PROMPT_CHATS_FILE = "prompt-chats.jsonl"  # a chat the user typed in while no chat owned the run: {"at", "session"}
+STOP_BLOCKS_FILE = "stop-blocks.jsonl"  # each stop the stop hook refused {"at", "phase"}, or a reset {"at", "reset"}
+
+
+def _jsonl(p: Path) -> list:
+    """The JSON objects on the lines of one of the run's .jsonl records ([] when it is missing or can't be read;
+    a line that is not one is skipped, so a damaged line grants nothing)."""
+    recs, _why = _read_record(p, lines=True)
+    return recs or []
+
+
+def _append_jsonl(p: Path, rec: dict) -> bool:
+    try:
+        _append_record(p, json.dumps(rec, ensure_ascii=False) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def _prompt_owner(ctx, st):
+    """(session, at, records read) for the first chat the prompt hook recorded for this run while no chat owned it,
+    after the records already used (`prompt_chats_seen`). Only a record matching a message in human_log.jsonl (same
+    time, same chat) counts. None when there is none."""
+    recs = _jsonl(ctx.run_dir(st["slug"]) / PROMPT_CHATS_FILE)
+    fresh = recs[int(st.get("prompt_chats_seen") or 0):]
+    if not fresh:
+        return None
+    typed = {(e.get("at"), e.get("session")) for e in _human_since(ctx, "0") if e.get("session")}
+    for r in fresh:
+        if isinstance(r.get("session"), str) and r["session"] and (r.get("at"), r["session"]) in typed:
+            return r["session"], r.get("at"), len(recs)
+    return None
+
+
+def _bind_prompt_owner(ctx, st) -> bool:
+    """Make the chat the prompt hook recorded (see _prompt_owner) the owner of a run no chat owns yet. Each record
+    is used once, so an owner set later is never replaced from an old record. True when the state changed."""
+    if st.get("owner_session") or st.get("phase") in ("done", "cancelled"):
+        return False
+    got = _prompt_owner(ctx, st)
+    if not got:
+        return False
+    st["owner_session"], typed_at, st["prompt_chats_seen"] = got
+    ctx.log(st, "owner_recorded", session=got[0], via="prompt", typed_at=typed_at)
+    return True
+
+
+def _last_human_at(ctx) -> str:
+    """When the user last typed a message (human_log.jsonl's last chat line; an override audit line is not one)."""
+    recs, _why = _read_record(ctx.ratchet / "human_log.jsonl", lines=True, tail=65536)
+    for e in reversed(recs or []):
+        if not e.get("override") and isinstance(e.get("at"), str):
+            return e["at"]
+    return ""
+
+
+def _stop_blocks(ctx, st) -> int:
+    """How many stops the stop hook refused since the run last made progress: a PROGRESS_EVENTS or `resumed` entry
+    in its history, a message the user typed, or a stop the hook allowed (a reset line)."""
+    since = max([e.get("at", "") for e in st.get("history", [])
+                 if e.get("event") in PROGRESS_EVENTS or e.get("event") == "resumed"] + [_last_human_at(ctx), ""])
+    n = 0
+    for r in _jsonl(ctx.run_dir(st["slug"]) / STOP_BLOCKS_FILE):
+        if str(r.get("at", "")) <= since:
+            continue
+        n = 0 if r.get("reset") else n + 1
+    return n
+
+
+def _settle_waiver(ctx):
+    """The enforcement hooks fired after the user chose to build without them: record the waiver's end in state.json
+    now (Ctx.save_state drops it and counts the clearing), so hooks that later go silent can't bring it back. One
+    try at the state lock, never a wait: if a command holds it, that command's own save clears the waiver."""
+    lock = _StateLock(ctx.root, wait=0, cmd="the stop hook")
+    if lock.acquire() or not lock.held:
+        return
+    try:
+        st = ctx.state()
+        if st.get("hooks_waived"):
+            ctx.save_state(st)
+    except (Exception, SystemExit):
+        pass  # the next command's save clears it instead; the stop decision goes on from what was read
+    finally:
+        lock.release()
 
 
 def decide_stop(n: dict) -> tuple[bool, str]:
     root = find_root(Path(n["cwd"]))
     ctx = Ctx(root)
-    marker = (read_json(_markers_path(), {}) or {}).get(str(root.resolve()))
+    marker = _active_marker(root)
     if not ctx.ratchet.is_dir() or not ctx.active_slug():
         if marker:  # .ratchet/ vanished under an active run: never let that end the loop silently
             return _stop_error(root, f"Ratchet run '{marker['slug']}' was active here but its .ratchet/ state is gone. "
                                      "Tell the user; restore it (e.g. from git history or backup) or ask them to cancel.")
         return False, ""
     _heartbeat(root, "stop", n["host"])
-    st = read_json(ctx.state_path(), None)
+    # Reading state.json needs no lock (it is replaced in one rename); this hook never waits on, or writes, the
+    # state a command holds: its count of refused stops is its own file (STOP_BLOCKS_FILE).
+    st, why = _read_record(ctx.state_path(), missing=None)
+    if why is not None:
+        # A damaged run state breaks this hook's check: logged to hook-errors.log like a crash (status, next and
+        # doctor show it, and the hook does not count as working until it runs cleanly), and the stop fails closed a
+        # few times. No crash marker: it is not this hook's own failure, so the commands that repair the run (accept-
+        # state, init --force) are never locked out behind it.
+        try:
+            _append_record(root / RATCHET_DIR / "hook-errors.log",
+                           f"{now()} {n['host']} stop: StateUnreadable: {ctx.state_path()}: {why}\n")
+        except OSError:
+            pass
+        return _stop_error(root, f"Ratchet could not read its run state ({ctx.state_path()}: {why}).")
     if not st:
         return _stop_error(root, "Ratchet's state.json for the active run is missing or unreadable.")
-    _reset_stop_errors(root)
-    if st.get("owner_session") and n.get("session") and n["session"] != st["owner_session"]:
+    owner = st.get("owner_session") or (_prompt_owner(ctx, st) or (None,))[0]
+    if owner and n.get("session") and n["session"] != owner:
+        _reset_stop_errors(root)
         return False, ""  # another session in the same repo: not bound by this run (the prompt hook tells it)
+    holder = _StateLock(root).live_holder()
+    if holder:  # a Ratchet command is changing the run right now: what it leaves is not known yet
+        return _stop_error(root, f"Ratchet is busy running {holder}, so this stop could not be checked. Wait for it "
+                                 "to finish.")
+    _reset_stop_errors(root)
+    if st.get("hooks_waived") and not _waiver_applies(root, ctx.config(), st):
+        _settle_waiver(ctx)
+    blocks_file = ctx.run_dir(st["slug"]) / STOP_BLOCKS_FILE
     na = next_action(ctx, st)
     if na.get("stop_ok"):
-        if st.get("stop_blocks"):
-            st["stop_blocks"] = 0
-            ctx.save_state(st)
+        if _stop_blocks(ctx, st):
+            _append_jsonl(blocks_file, {"at": now(), "reset": True})
         return False, ""
     cfg = ctx.config()
-    st["stop_blocks"] = int(st.get("stop_blocks", 0)) + 1
-    if st["stop_blocks"] > cfg["max_stop_blocks"]:
-        _set_blocked(st, f"The agent tried to stop {st['stop_blocks']} times without any gate progress — "
-                         "loop halted for the user to look at.")
-        ctx.save_state(st)
-        return False, f"RATCHET: safety valve — {st['blocked_reason']}"
-    ctx.save_state(st)
+    count = _stop_blocks(ctx, st) + 1
+    _append_jsonl(blocks_file, {"at": now(), "phase": st.get("phase")})
+    if count > cfg["max_stop_blocks"]:
+        reason = (f"The agent tried to stop {count} times without any gate progress — loop halted for the user to "
+                  "look at.")
+        lock = _StateLock(root, wait=0, cmd="the stop hook")  # one try: never waits behind a command
+        if not lock.acquire():
+            try:
+                st = ctx.state()
+                _set_blocked(st, reason)
+                ctx.save_state(st)
+            except (Exception, SystemExit):
+                pass  # state Ratchet won't trust (Ctx.state refused it): the stop is still let through, said below
+            finally:
+                lock.release()
+        return False, f"RATCHET: safety valve — {reason}"
     return True, ("RATCHET GATE: the work is not done, so you may not stop yet.\n"
                   f"Run: {st['slug']}  phase={na['phase']}"
                   + (f"  checkpoint={na.get('checkpoint')}  step={na.get('step')}" if na.get("checkpoint") else "")
@@ -5687,25 +6985,44 @@ def decide_stop(n: dict) -> tuple[bool, str]:
                   "stuck, run `ratchet.py pause --reason \"...\"` and tell the user why.")
 
 
+def _stop_errors_path() -> Path:
+    return ratchet_home() / "stop-errors.json"
+
+
 def _reset_stop_errors(root: Path):
-    p = ratchet_home() / "stop-errors.json"
-    data = read_json(p, {}) or {}
-    if data.pop(str(root.resolve()), None) is not None:
-        write_json(p, data)
+    """Forget this project's count of refused stops on unreadable state. A damaged per-user file holds no count and
+    is replaced now (it only lets a session stop sooner, after a few refusals, so it grants nothing)."""
+    p = _stop_errors_path()
+    key = str(root.resolve())
+    data, why = _read_record(p)  # a quick look first: nothing to forget, nothing to lock or write
+    if why is None and key not in data:
+        return
+
+    def forget(data):
+        return data if data.pop(key, None) is not None or bad else KEEP
+    bad = why is not None
+    try:  # shared by every project: under its own lock, so no other project's count is dropped
+        _ = update_record(p, forget, damaged="Ratchet treats it as holding no count and replaces it now", pretty=True)
+    except OSError:
+        pass
 
 
 def _stop_error(root: Path, why: str) -> tuple[bool, str]:
-    """Fail CLOSED for stop when state is unreadable — but only a few times, so a broken install can't trap a session."""
-    p = ratchet_home() / "stop-errors.json"
-    data = read_json(p, {}) or {}
+    """Fail CLOSED for stop when state is unreadable — but only a few times, so a broken install can't trap a session.
+    A damaged per-user count reads as no count (one more refusal at most) and is replaced."""
+    p = _stop_errors_path()
     key = str(root.resolve())
-    data[key] = int(data.get(key, 0)) + 1
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        write_json(p, data)
+    count = [1]  # when the count can't be read or saved, this is one refusal more (fail closed)
+
+    def bump(data):
+        n = data.get(key)
+        count[0] = data[key] = (n if isinstance(n, int) and not isinstance(n, bool) else 0) + 1
+        return data
+    try:  # shared by every project: under its own lock, so no other project's count is dropped
+        _ = update_record(p, bump, damaged="Ratchet treats it as holding no count and replaces it now", pretty=True)
     except Exception:
         pass
-    if data[key] > 5:
+    if count[0] > 5:
         return False, f"RATCHET: {why} (letting you stop after repeated failures — tell the user.)"
     return True, f"RATCHET: {why} You may not stop silently: explain this to the user first."
 
@@ -5717,40 +7034,88 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
     rdir = root / RATCHET_DIR
     if not rdir.is_dir():
         return False, ""
+    # This hook never takes the state lock and never writes state.json, so it never waits behind a long command
+    # (a test run) and can't undo what a command wrote. It only appends to its own records: the message to
+    # human_log.jsonl (with its hash, as one step), and, while no chat owns the run, this chat to PROMPT_CHATS_FILE;
+    # the next command reads them (Ctx.state). A user message also restarts the stop hook's count (_stop_blocks).
     _heartbeat(root, "prompt", n["host"])
     log = rdir / "human_log.jsonl"
-    verify_chain(log, "human_log.jsonl")
-    with log.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"at": now(), "prompt": n["prompt"][:2000], "session": n["session"], "host": n["host"],
-                            "transcript_path": n.get("transcript_path")}, ensure_ascii=False) + "\n")
-    record_chain(log)
+    problem = chain_problem(log, "human_log.jsonl")
+    if problem:  # never a crash: the message is not recorded, so it approves and answers nothing
+        return False, ("[ratchet] Ratchet did not record this message, so it approves nothing and answers no waiting "
+                       f"question. {problem}")
+    at = now()
+    append_recorded(log, json.dumps({"at": at, "prompt": n["prompt"][:2000], "session": n["session"],
+                                     "host": n["host"], "transcript_path": n.get("transcript_path")},
+                                    ensure_ascii=False) + "\n")
     ctx = Ctx(root)
     if ctx.active_slug():
-        st = read_json(ctx.state_path(), None)
+        st, why = _read_record(ctx.state_path(), missing=None)
+        if why is not None:  # never a crash: say what is wrong (every command refuses until the file is fixed)
+            return False, (f"[ratchet] Ratchet can't read the active run's state.json ({why}), so it can't say "
+                           "what this message means for the run, and its commands refuse until the file is fixed. "
+                           "Tell the user; restore the file from a backup or their git history, or, to start the "
+                           "feature over, they can run `RATCHET_HUMAN_OVERRIDE=1 ratchet.py init --force "
+                           "\"<feature>\"` from their own terminal.")
         if st and st.get("phase") not in ("done", "cancelled"):
-            st["stop_blocks"] = 0
-            ctx.save_state(st)
+            here = n.get("session")
+            if not st.get("owner_session"):
+                # no chat owned the run yet (the first run in a repo starts before the prompt hook can log anything):
+                # the first chat the user types in for this run owns it, and only `resume --claim` moves it later
+                st["owner_session"] = (_prompt_owner(ctx, st) or (None,))[0]
+                if here and not st["owner_session"]:
+                    _append_jsonl(ctx.run_dir(st["slug"]) / PROMPT_CHATS_FILE, {"at": at, "session": here})
+                    st["owner_session"] = here  # this copy only: the hints below treat it as the owner
             eng = f'python3 "{ENGINE_PATH}"'
-            if st.get("owner_session") and n.get("session") and n["session"] != st["owner_session"]:
+            p = st.get("pending") or {}
+            claim_here = p.get("action") == "claim" and here and p.get("session") == here
+            if st.get("owner_session") and here and here != st["owner_session"] and not claim_here:
                 return False, (f"[ratchet] This repo has an unfinished Ratchet run '{st['slug']}' (phase {st['phase']}) "
                                "started in another chat. If the user wants to continue it here, run "
-                               f"`{eng} ask claim`, ask them, and after a clear yes run `{eng} resume --claim`; "
-                               "otherwise leave it alone and do what they asked.")
-            p = st.get("pending") or {}
+                               f"{_ask_cmd('claim', eng=eng)}, end your message with the question it prints, word for "
+                               "word, as the only question in it, and end your turn; run "
+                               f"`{eng} resume --claim` only if their first reply after it is one of the listed yes "
+                               "replies. Otherwise leave the run alone and do what they asked.")
             if p.get("action") and p["action"] != "hooks-waive":
                 cmd = PENDING_COMMAND.get(p["action"], p["action"]) + (" " + p["mode"] if p.get("mode") else "")
-                what = (f"change how often they review to: {REVIEW_MODE_WORDS.get(p.get('mode'), p.get('mode'))}"
-                        if p["action"] == "set-review" else ASKABLE.get(p["action"], p["action"]))
+                what = _question_what(p["action"], p.get("mode"))
+                again = _ask_cmd(p["action"], p.get("mode"), eng=eng)
+                asked_in = _question_session(st, p)
+                if asked_in and here and here != asked_in:
+                    return False, (f"[ratchet] A Ratchet question (shall I {what}?) is waiting for a reply in another "
+                                   "chat. This message does not answer it and approves nothing; do what the user asked "
+                                   "here.")
+                if p.get("overtook"):
+                    return False, (f"[ratchet] Your waiting question (shall I {what}?) was printed while another one was "
+                                   "still waiting, so this reply approves nothing, whatever it says. Answer what they "
+                                   f"said; if you still need their answer, run {again} again and show them only that "
+                                   "question.")
                 if p["action"] == "choice":
                     letter = choice_letter(n["prompt"], p.get("options") or [])
                     return False, (f"[ratchet] This reply answers your lettered question ({', '.join(p.get('options') or [])}). "
                                    + (f"It reads as option {letter}. " if letter else "It is NOT a clear pick of one option. ")
                                    + f"Run `{eng} choice` to record it, then continue. It does NOT approve the plan or a "
                                    "checkpoint.")
-                verdict = ("It reads as a clear yes" if message_intent(n["prompt"]) == "approve"
-                           else "It is NOT a clear yes")
+                try:
+                    first = len(_replies(ctx, st, p.get("asked_at"), p)) <= 1
+                except (Exception, SystemExit):
+                    first = True
+                if not first:
+                    return False, (f"[ratchet] The user's first reply after your waiting question (shall I {what}?) "
+                                   "already answered it, so this later message is not their answer: it does NOT "
+                                   "approve the plan, a checkpoint or anything else. If you still need their yes, "
+                                   f"print the question again ({again}).")
+                verdict = ("It is one of the listed yes replies" if is_listed_yes(n["prompt"])
+                           else "It is NOT one of the listed yes replies, so it approves nothing")
+                if p["action"] in ("approve-plan", "human-approve"):
+                    return False, (f"[ratchet] This reply answers your waiting question: shall I {what}? {verdict}. "
+                                   f"Only if it is a listed yes, run `{eng} {cmd}`. Otherwise answer what they said or "
+                                   f"make their change"
+                                   + (f" (at a review, record change requests with `{eng} feedback`)"
+                                      if p["action"] == "human-approve" else "")
+                                   + f", and ask again later with {again}.")
                 return False, (f"[ratchet] This reply answers your waiting question: shall I {what}? {verdict}. "
-                               f"Only after a clear yes run `{eng} {cmd}`; otherwise run `{eng} ask withdraw` and do "
+                               f"Only after a listed yes run `{eng} {cmd}`; otherwise run `{eng} ask withdraw` and do "
                                "what they asked. This reply does NOT approve the plan, a checkpoint or anything else.")
             if st["phase"] == "building" and re.match(r"^\s*(stop|pause|hold on|wait|halt|cancel)\b", n["prompt"], re.I):
                 return False, (f"[ratchet] The user asked you to stop. Run `{eng} pause --reason \"user asked\"`, "
@@ -5758,13 +7123,21 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
             if st["phase"] in ("awaiting_plan_approval", "awaiting_checkpoint_review",
                                "awaiting_final_review", "blocked"):
                 if CANCEL_HINT_RE.search(n["prompt"]):
-                    hint = (f"This may be a request to cancel the run — run `{eng} ask cancel`, ask them, and cancel "
-                            "only after a clear yes.")
-                elif message_intent(n["prompt"]) == "approve":
-                    hint = "This reads as a clear approval — record it with the matching command."
+                    hint = (f"This may be a request to cancel the run — run {_ask_cmd('cancel', eng=eng)}, end your "
+                            "message with the question it prints, word for word, as the only question in it, and end "
+                            f"your turn; run `{eng} cancel` only if their first reply after it is one of the listed "
+                            "yes replies.")
                 else:
-                    hint = ("This is NOT a clear approval: answer it or make the requested change, then ask the user "
-                            "to confirm plainly.")
+                    ask = {"awaiting_plan_approval": "approve-plan"}.get(st["phase"], "human-approve")
+                    hint = ("Ratchet has not asked its approval question yet, so this reply approves nothing"
+                            + (" even though it reads like a yes. " if message_intent(n["prompt"]) == "approve"
+                               else ". Answer it or make the requested change. ")
+                            + "When you need their approval, "
+                            f"run {_ask_cmd(ask, eng=eng)}"
+                            + (" (or offer the lettered options from `next` with `ask choice`)"
+                               if st["phase"] == "blocked" else "")
+                            + ", end your message with the question it prints, word for word, as the only question "
+                            "in it, and end your turn; only their first reply after that question counts.")
                 return False, (f"[ratchet] Run '{st['slug']}' is waiting on the user (phase {st['phase']}). {hint} "
                                f"(Engine: {eng})")
     return False, ""
@@ -5964,6 +7337,47 @@ def _write_allowed(path: str, cwd: str) -> bool:
     return rel is None or bool(rel and ALLOWED_RATCHET_WRITES.match(rel))
 
 
+_WRAPPERS = {"sudo", "env", "command", "exec", "time", "nice", "nohup", "timeout", "xargs", "stdbuf"}
+_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+_HOOK_SUBCOMMANDS = ("hook", "hook-stop", "hook-prompt", "hook-guard")
+
+
+def _calls_own_hook(cmd: str, depth: int = 0) -> bool:
+    """True when `cmd` really runs `ratchet.py hook ...` (directly, through python, a wrapper such as env or
+    timeout, an unknown $PROGRAM, `bash -c` or eval). Text that only mentions a hook (a grep pattern, an echo, a
+    commit message, a comment) is not a call. A command the shell-word reader can't follow (a command substitution,
+    a heredoc, $'...') is blocked whenever it mentions a hook at all, so what can't be read fails safe."""
+    words = _shell_words(cmd)
+    if words is None:
+        return bool(SELF_HOOK_RE.search(cmd))
+    for w in _simple_commands(words):
+        while w and _ASSIGNMENT_RE.match(w[0]):
+            w = w[1:]
+        while w and Path(w[0]).name in _WRAPPERS:
+            w = w[1:]
+            while w and (w[0].startswith("-") or _ASSIGNMENT_RE.match(w[0]) or re.fullmatch(r"[0-9.]+[smhd]?", w[0])):
+                w = w[1:]
+        if not w:
+            continue
+        prog = Path(w[0]).name
+        if prog == "eval" or prog in _SHELLS:
+            code = [" ".join(w[1:])] if prog == "eval" else \
+                [w[i + 1] for i in range(1, len(w) - 1) if re.fullmatch(r"-[a-z]*c[a-z]*", w[i])]
+            if depth < 3 and any(_calls_own_hook(c, depth + 1) for c in code):
+                return True
+            continue
+        if re.fullmatch(r"python[0-9.]*|py", prog):
+            w = w[1:]
+            while w and w[0].startswith("-"):
+                w = w[1:]
+            if not w:
+                continue
+            prog = Path(w[0]).name
+        if (prog == "ratchet.py" or "$" in w[0]) and _engine_subcommand(w[1:]) in _HOOK_SUBCOMMANDS:
+            return True
+    return False
+
+
 def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
     raw = cmd
     if INTERPRETER_RE.search(raw):  # heredoc bodies fed to an interpreter are code, not data: check what they touch
@@ -5981,7 +7395,7 @@ def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
         return ("RATCHET GUARD: launching another agent session (claude -p, codex exec, gemini -p, copilot -p) from "
                 "the shell is blocked while Ratchet is active — it could impersonate the user. Use sub-agents, "
                 "external_review.py for adversarial reviews, or ui_review.py for UI reviews.")
-    if SELF_HOOK_RE.search(cmd):
+    if _calls_own_hook(cmd):
         return ("RATCHET GUARD: Ratchet's hooks are called by your agent CLI, not by you. Calling `ratchet.py hook` "
                 "yourself would forge a user message or a gate event.")
     if DANGEROUS_GIT_RE.search(cmd):
@@ -6025,7 +7439,8 @@ def _run_phase(root: Path) -> str | None:
         ctx = Ctx(root)
         if not (ctx.ratchet / "active.json").exists():
             return None
-        return (read_json(ctx.state_path(), {}) or {}).get("phase")
+        st, _why = _read_record(ctx.state_path())
+        return (st or {}).get("phase")
     except (Exception, SystemExit):
         return None
 
@@ -6062,6 +7477,7 @@ def decide_guard(n: dict) -> tuple[bool, str]:
         why = _guard_shell(cmd, cwd, who)
         if why:
             return True, why
+        _note_engine_call(root, cmd, n.get("session"))  # which chat runs `init` / `ask` here (see _noted_session)
     if who["enforce"] and not n.get("agent_type") and _run_phase(root) == "building" and _orchestrator_edit(n, root):
         return True, ORCH_EDIT_MSG
     if n["kind"] == "write":
@@ -6110,8 +7526,7 @@ def _hook_record_failed(n: dict, host: str, event: str, detail: str) -> str:
     if root is not None:
         try:
             saved = _record_hook_run(root, host, event, crashed=True) or _record_unsaved_crash(root, host, event)
-            with open(root / RATCHET_DIR / "hook-errors.log", "a") as f:
-                f.write(f"{now()} {host} {event}: HookRecordError: {detail}\n")
+            _append_record(root / RATCHET_DIR / "hook-errors.log", f"{now()} {host} {event}: HookRecordError: {detail}\n")
         except Exception:
             pass
     line = (f"RATCHET: the {event} hook could not save which per-user folder, director key file and session role "
@@ -6160,8 +7575,7 @@ def run_hook(event: str, host_arg: str | None) -> int:
                 saved = False
                 saved = (_record_hook_run(root, host, event, crashed=True)  # first: an unwritable log must not hide it
                          or _record_unsaved_crash(root, host, event))  # durable fallback: unresolved, whatever its age
-                with open(root / RATCHET_DIR / "hook-errors.log", "a") as f:
-                    f.write(f"{now()} {host} {event}: {type(e).__name__}: {e}\n")
+                _append_record(root / RATCHET_DIR / "hook-errors.log", f"{now()} {host} {event}: {type(e).__name__}: {e}\n")
         except Exception:
             pass
         if event == "stop" and root is not None and (root / RATCHET_DIR / "active.json").exists():
@@ -6332,15 +7746,17 @@ def cmd_doctor(args):
         print(f"  some hook crashes could not be saved in {RATCHET_DIR}/{HOOK_CRASHES}/ and were kept in "
               f"{RATCHET_DIR}/{HOOK_CRASHES_UNSAVED}; make that folder writable. Each clears on that hook's next "
               "clean run.")
+    for rp, repair in ((_markers_path(), _active_runs_repair), (_enrolled_path(), _enrolled_repair)):
+        _rd, rwhy = _read_record(rp)
+        if rwhy is not None:  # per-user records that hold restrictions: never written over (_restriction_record_damaged)
+            print(f"  {rp} can't be read ({rwhy}). It holds restrictions for other projects or lanes too, so Ratchet "
+                  f"won't write over it. To repair it: {repair(rp)}.")
 
 
 def _safe_config(root: Path) -> dict:
     """Config for read-only diagnostics: a corrupt config.json (read_json dies) counts as empty."""
-    try:
-        json.loads((root / RATCHET_DIR / "config.json").read_text())  # quiet pre-check: read_json die()s noisily
-    except FileNotFoundError:
-        pass
-    except (OSError, ValueError):
+    _cfg, why = _read_record(root / RATCHET_DIR / "config.json", kind=None)  # quiet pre-check: read_json die()s
+    if why is not None:
         return {}
     try:
         return Ctx(root).config()
@@ -6365,11 +7781,8 @@ def installed_hook_files(host: str, root: Path) -> list:
 
 def read_heartbeat(root: Path) -> dict:
     """Tolerant read: a corrupt or odd heartbeat file counts as empty."""
-    try:
-        hb = json.loads((root / RATCHET_DIR / "hook-heartbeat.json").read_text())
-    except (OSError, ValueError):
-        return {}
-    return hb if isinstance(hb, dict) else {}
+    hb, _why = _read_record(root / RATCHET_DIR / "hook-heartbeat.json")
+    return hb or {}
 
 
 def _parse_iso(v):
@@ -6477,8 +7890,7 @@ def _record_unsaved_crash(root: Path, host: str, event: str) -> bool:
     counts as unresolved after its log line ages out. Returns False when this fails too: run_hook then tells the
     host, and readers count every hook as broken while the crash store refuses writes (_crash_store_unwritable)."""
     try:
-        with open(root / RATCHET_DIR / HOOK_CRASHES_UNSAVED, "a") as f:
-            f.write(f"{now()} {_mark_host(host)} {event}\n")
+        _append_record(root / RATCHET_DIR / HOOK_CRASHES_UNSAVED, f"{now()} {_mark_host(host)} {event}\n")
         return True
     except Exception:
         return False
@@ -6712,6 +8124,213 @@ def hooks_warning(ctx, hs=None) -> str | None:
 
 # --------------------------------------------------------------------------- main
 
+# Every command that changes a run holds one exclusive lock file, state.lock in the Ratchet folder, for its WHOLE run:
+# from before its first read of state.json to after its last write, its test runs, checks, regression suite and
+# provider probes included. So two commands never interleave and none can overwrite what another wrote meanwhile (a
+# double submit, an approval made during a test run): the second one waits for a short command to finish
+# (STATE_LOCK_WAIT_SECONDS), then reads what it wrote; behind a long one (LONG_LOCKED_CMDS) it refuses after a moment
+# (STATE_LOCK_BUSY_WAIT_SECONDS) with "Ratchet is busy running <command>; try again when it finishes" and changes
+# nothing. The lock file names the command holding it. The hooks never wait on it and never write state.json.
+# A lock not refreshed for STATE_LOCK_STALE_SECONDS (more than the longest test run, test_timeout_sec, plus a margin)
+# is left over from a crashed command and is removed; a live command refreshes its lock while it runs.
+STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "red", "implemented", "behavior",
+                     "ui-record", "adv-record", "complete", "human-approve", "feedback", "plan-extend", "pause",
+                     "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
+                     "approve-changes", "guardrail", "reviewers", "repeats", "spec")
+LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers")  # tests, checks, a regression suite, provider probes
+# The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
+OVERRIDE_CMDS = ("approve-plan", "human-approve", "approve-changes", "cancel", "set-review", "resume", "hooks-waive",
+                 "ui-respec", "choice", "feedback", "accept-state", "init")
+STATE_LOCK_WAIT_SECONDS = 30
+STATE_LOCK_BUSY_WAIT_SECONDS = 2
+STATE_LOCK_STALE_MARGIN_SECONDS = 300
+STATE_LOCK_STALE_SECONDS = DEFAULT_CONFIG["test_timeout_sec"] + STATE_LOCK_STALE_MARGIN_SECONDS
+STATE_LOCK_REFRESH_SECONDS = 30
+
+
+def _changes_state(args) -> bool:
+    """Whether this command may change the run (and so runs under the state lock)."""
+    if args.cmd == "repeats":
+        return bool(getattr(args, "offered", None))
+    if args.cmd == "spec":
+        return getattr(args, "spec_cmd", None) in ("import", "keep")
+    return args.cmd in STATE_LOCKED_CMDS
+
+
+def _lock_stale_seconds(root: Path) -> float:
+    """A live command can hold the lock through a whole test run (test_timeout_sec): only a lock older than that,
+    plus a margin, is stale."""
+    cfg, _why = _read_record(root / RATCHET_DIR / "config.json")  # a damaged config: the default stale age
+    try:
+        t = float((cfg or {}).get("test_timeout_sec") or 0)
+    except (TypeError, ValueError):
+        t = 0
+    return max(STATE_LOCK_STALE_SECONDS, t + STATE_LOCK_STALE_MARGIN_SECONDS)
+
+
+def _lock_pause():
+    time.sleep(0.05)
+
+
+class _StateLock(_BreakerLock):
+    """O_CREAT|O_EXCL lock file, state.lock in the Ratchet folder (works the same on POSIX and Windows), around one
+    command. It holds the process id, a random token and the command's name. Every failure to take it (another
+    command holds it, the folder can't be written, something other than a lock file sits at that path) is retried
+    after a pause until the wait runs out, then refused with a plain message; behind a long command the wait is cut
+    short. The breaker protocol is _BreakerLock's, shared with the per-user locks: the lock file is only ever removed
+    (a stale one, or an owner releasing its own) while holding a second O_EXCL file, state.lock.break, so the file
+    judged stale is the file removed: two waiters can't both clear it, and none can remove a newer, live lock; a
+    breaker file left by a process that died is cleared after BREAKER_STALE seconds. With `refresh`, the holder
+    touches its lock while it runs, so a long, live command is never judged stale. With `create_dir` (init: the
+    first command of a project), the Ratchet folder is made first, so two first inits are serialised like every
+    other command instead of both running unlocked."""
+
+    def __init__(self, root: Path, wait: float | None = None, cmd: str | None = None, refresh: bool = False,
+                 create_dir: bool = False):
+        super().__init__(root / RATCHET_DIR / "state.lock",
+                         f"{os.getpid()} {secrets.token_hex(8)}" + (f" {cmd}" if cmd else ""))
+        self.root = root
+        self.create_dir = create_dir
+        self.wait = wait
+        self.refresh = refresh
+        self._beat = None
+        self.holder = None  # the command holding the lock at the last try (None: not known)
+
+    def _stale_after(self) -> float:
+        return _lock_stale_seconds(self.root)
+
+    def _pause(self):
+        _lock_pause()
+
+    def _cant(self, e: OSError) -> str:
+        return (f"Ratchet could not use its lock file {self.path} ({type(e).__name__}: {e.strerror or e}), so nothing "
+                f"was done. Check that {self.path.parent} is a folder you can write to, then run this command again.")
+
+    def _holder_cmd(self) -> str | None:
+        """The command named in the lock file (None for a lock that names none, or no regular lock file)."""
+        try:
+            if not stat.S_ISREG(os.lstat(self.path).st_mode):
+                return None
+            parts = self.path.read_text(encoding="utf-8", errors="replace").split()
+        except OSError:
+            return None
+        return " ".join(parts[2:]) if len(parts) > 2 else None
+
+    def live_holder(self) -> str | None:
+        """Who holds a live (not stale) lock right now, without waiting or changing anything; None when no command
+        does."""
+        try:
+            st = os.lstat(self.path)
+        except OSError:
+            return None
+        if not stat.S_ISREG(st.st_mode) or self._is_stale(st):
+            return None
+        return self._holder_cmd() or "another Ratchet command"
+
+    def _why_busy(self) -> str:
+        """Why the lock file exists. A stale lock is cleared first (under the breaker file); the caller retries."""
+        self.holder = self._holder_cmd()
+        stale_after = _lock_stale_seconds(self.root)
+        busy = (f"Ratchet is busy running {self.holder or 'another command'}; try again when it finishes. Nothing was "
+                f"done: another Ratchet command is still changing this run (lock file {self.path}). If no Ratchet "
+                f"command is running, the lock clears itself {int(stale_after // 60)} minutes after its command last "
+                f"refreshed it, or remove {self.path}.")
+        try:
+            st = os.lstat(self.path)
+        except FileNotFoundError:
+            return busy  # released just now: the next try takes it
+        except OSError as e:
+            return self._cant(e)
+        if not stat.S_ISREG(st.st_mode):
+            return (f"Ratchet's lock file {self.path} is not a file Ratchet made (a folder or a link sits there), so "
+                    "nothing was done. Remove it, then run this command again.")
+        if not self._is_stale(st):
+            return busy
+        try:  # judged again while holding the breaker file: nobody else can remove it meanwhile
+            self._clear_stale()
+        except OSError as e:
+            return self._cant(e)
+        return (f"A lock file left by a Ratchet command that stopped ({self.path}) could not be cleared, so nothing "
+                f"was done. If no other Ratchet command is running, remove {self.path} and {self.breaker} (if it "
+                "is there), then run this command again.")
+
+    def acquire(self) -> str | None:
+        """None once the lock is held (or there is no Ratchet folder, so no state to protect); otherwise, once the
+        wait runs out, the reason it could not be taken. Never raises for a file-system error."""
+        if self.create_dir:
+            try:
+                self.path.parent.mkdir(exist_ok=True)
+            except OSError as e:
+                return self._cant(e)
+        if not self.path.parent.is_dir():
+            return None  # no Ratchet folder: there is no state to protect (the command says so itself)
+        start = time.monotonic()
+        deadline = start + (STATE_LOCK_WAIT_SECONDS if self.wait is None else self.wait)
+        while True:
+            try:
+                self._create(self.path)
+                self.held = True
+                self._start_refresh()
+                return None
+            except FileExistsError:
+                why = self._why_busy()
+                if self.holder in LONG_LOCKED_CMDS:  # it may run for many minutes: refuse rather than wait it out
+                    deadline = min(deadline, start + STATE_LOCK_BUSY_WAIT_SECONDS)
+            except OSError as e:
+                why = self._cant(e)
+            if time.monotonic() >= deadline:
+                return why
+            _lock_pause()
+
+    def _start_refresh(self):
+        if not self.refresh:
+            return
+        import threading
+        done = threading.Event()
+
+        def beat():
+            while not done.wait(STATE_LOCK_REFRESH_SECONDS):
+                try:
+                    if self.path.read_text(encoding="utf-8") == self.token:
+                        os.utime(self.path, None)
+                except OSError:
+                    pass
+        threading.Thread(target=beat, daemon=True).start()
+        self._beat = done
+
+    def release(self):
+        """Remove the lock file if it is still this command's own, under the breaker file. When the breaker can't be
+        had within a few seconds the lock is left in place (it goes stale and is cleared later): a lock that might
+        not be ours is never removed."""
+        if self._beat is not None:
+            self._beat.set()
+            self._beat = None
+        if not self.held:
+            return
+        self.held = False
+        self._release_own(5)
+
+    def __enter__(self):
+        why = self.acquire()
+        if why:
+            die(why)
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+def _may_use_override(args) -> bool:
+    """Whether this command may ask for the RATCHET_HUMAN_OVERRIDE code (it reaches human_override): it is asked
+    before the state lock is taken."""
+    if os.environ.get("RATCHET_HUMAN_OVERRIDE") != "1" or args.cmd not in OVERRIDE_CMDS:
+        return False
+    if args.cmd == "init":  # only replacing a run that is still active asks for it
+        return bool(getattr(args, "force", False)) and bool(Ctx(find_root()).active_slug())
+    return not getattr(args, "director_token", None) and not (args.cmd == "resume" and not args.claim)
+
+
 def main(argv=None):
     try:  # quiet exit when output is piped into head/grep
         import signal
@@ -6753,8 +8372,9 @@ def main(argv=None):
     a = sp.add_parser("pause"); a.add_argument("--reason"); a.set_defaults(fn=cmd_pause)
     a = sp.add_parser("resume", help="resume a paused run; --claim moves the run to this chat (after `ask claim`)")
     a.add_argument("--claim", action="store_true"); a.set_defaults(fn=cmd_resume)
-    a = sp.add_parser("ask", help="record the question you're about to ask the user (needed before cancel, "
-                                  "set-review, approve-changes, hooks-waive, resume --claim, ui-respec)")
+    a = sp.add_parser("ask", help="record and print the question you're about to ask the user (needed before approve-plan, "
+                                  "human-approve, cancel, set-review, approve-changes, hooks-waive, resume --claim, "
+                                  "ui-respec)")
     a.add_argument("action", choices=list(ASKABLE) + ["withdraw"])
     a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec: the checkpoint id")
     a.add_argument("--options", help="choice: the option letters, e.g. A,B,C")
@@ -6867,6 +8487,8 @@ def main(argv=None):
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_doctor)
 
     args = p.parse_args(argv)
+    global _ENGINE_ARGV, _STATE_LOCK_HELD
+    _ENGINE_ARGV = list(sys.argv[1:] if argv is None else argv)
     if args.root:
         os.environ["RATCHET_ROOT"] = str(Path(args.root).resolve())
     global _HOOK_ENV_ADVISORY
@@ -6885,8 +8507,33 @@ def main(argv=None):
             if args.cmd != "install-hooks" and hook_env_problem(find_root(), doubt=False):
                 sys.exit(1)
             return
+    elif args.cmd == "accept-state":
+        # the repair Ratchet names: it runs even while a hook failure is unresolved (that doubt is what it repairs
+        # after, and a person types back the code), but never with a per-user folder the hooks don't use
+        why = None if _IN_HOOK else hook_env_problem(find_root(), doubt=False)
+        if why:
+            die(why)
+        if os.environ.get("RATCHET_HUMAN_OVERRIDE") == "1":  # a damaged state.json is refused before the code is asked
+            _refuse_damaged_baseline(Ctx(find_root()))
+        if not _IN_HOOK and _hook_record_doubt(find_root()):  # said in a few words (no times: the code comes next)
+            print("RATCHET: accept-state still runs, although a hook failure here is unresolved; the doctor command "
+                  "shows it, and the next clean run of that hook clears it.", file=sys.stderr)
+        _HOOK_ENV_ADVISORY = True
     elif args.cmd not in ("hook", "hook-stop", "hook-prompt", "hook-guard"):
         require_hook_env(find_root())  # a per-user folder or key file the hooks don't use is not trusted
+    if _changes_state(args):
+        if _may_use_override(args) and not _OVERRIDE_CONFIRMED:
+            # before the lock: a person may take a while to type the code, and nothing may wait on them meanwhile
+            _confirm_override(ACCEPT_STATE_PURPOSE if args.cmd == "accept-state"
+                              else f"use it for `ratchet.py {args.cmd}`")
+        # held for the whole command, its test runs included: nothing else changes the run meanwhile
+        with _StateLock(find_root(), cmd=args.cmd, refresh=True, create_dir=args.cmd == "init"):
+            _STATE_LOCK_HELD = True
+            try:
+                args.fn(args)
+            finally:
+                _STATE_LOCK_HELD = False
+        return
     args.fn(args)
 
 

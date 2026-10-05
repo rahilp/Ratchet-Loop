@@ -491,7 +491,8 @@ def openspec_run():
     write(d, {"openspec/changes/draft2/proposal.md": "# Someone else's draft\n", "openspec/staged.md": "staged\n"})
     g.git(d, "add", "openspec/staged.md")
     env = fake_openspec()
-    g.say(d, "yes, approved")
+    rx(d, "ask", "human-approve")  # CP5: an approval answers the question Ratchet printed
+    g.say(d, "approved")
     r = rx(d, "human-approve", env=env)
     check("the change is archived with OpenSpec's own CLI, in its own commit",
           r.returncode == 0 and "Archived OpenSpec change add-dark-mode" in r.stdout
@@ -514,7 +515,8 @@ def openspec_no_cli():
     g.approve_plan(d)
     build(d, "CP1")
     build(d, "CP2")
-    g.say(d, "yes, approved")
+    rx(d, "ask", "human-approve")  # CP5: an approval answers the question Ratchet printed
+    g.say(d, "approved")
     env = dict(g.ENV)
     env["PATH"] = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep)
                                   if not (Path(p) / "openspec").exists())
@@ -588,7 +590,8 @@ def finish_plain_run(d):
     assert rx(d, "adv-record", "CP1", "--reviews", *[g.write_review(d, rnd, rv["id"]) for rv in rnd["reviewers"]]).returncode == 0
     r = rx(d, "complete", "CP1")
     assert r.returncode == 0, r.stdout + r.stderr
-    g.say(d, "yes, approved")
+    rx(d, "ask", "human-approve")  # CP5: an approval answers the question Ratchet printed
+    g.say(d, "approved")
     return rx(d, "human-approve")
 
 
