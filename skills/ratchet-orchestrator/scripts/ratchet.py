@@ -528,7 +528,9 @@ def _write_record(path: Path, data, pretty: bool = False):
     tmp = path.with_name(f"{path.name}.{os.getpid()}-{secrets.token_hex(4)}.tmp")
     text = (json.dumps(data, indent=2, ensure_ascii=False) + "\n") if pretty else json.dumps(data)
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        # backslashreplace: a lone surrogate (from a reviewer's reply) is written as its own JSON escape, "\ud83d",
+        # which reads back as the same string; every other character encodes as UTF-8 unchanged
+        with open(tmp, "w", encoding="utf-8", errors="backslashreplace") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
@@ -1986,6 +1988,10 @@ def cmd_status_text(ctx: Ctx):
     note = exit_code_only_note(plan, st)
     if note:
         print(note)
+    for cid, c in (st.get("checkpoints") or {}).items():
+        for gate, what in (("ui", "UI review"), ("adversarial", "review")):
+            for line in ((c.get("gates") or {}).get(gate) or {}).get("unconfirmed") or []:
+                print(f"{cid} {what} {line}.")
     if st.get("phase") == "blocked":
         print(f"Why: \"{plain_reason(st.get('blocked_reason')) or 'no reason was recorded'}\"")
         print("What would you like to do?")
@@ -4387,6 +4393,22 @@ def _parse_review(raw: bytes, path) -> dict:
     return data
 
 
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def clean_review_text(v):
+    """A parsed review with every lone surrogate (a reviewer's cut-off emoji escape, "\\ud83d") replaced by U+FFFD,
+    in every string and key, so no later record, page or message fails to encode it. external_review.py cleans before
+    it signs; adv-record and ui-record clean after the signature is checked."""
+    if isinstance(v, str):
+        return _SURROGATE_RE.sub("\ufffd", v)
+    if isinstance(v, list):
+        return [clean_review_text(x) for x in v]
+    if isinstance(v, dict):
+        return {clean_review_text(k): clean_review_text(x) for k, x in v.items()}
+    return v
+
+
 def _write_review_evidence(dst: Path, raw: bytes, fst):
     """Copy the review into evidence from the bytes that were checked, keeping the original timestamps."""
     try:
@@ -4398,6 +4420,344 @@ def _write_review_evidence(dst: Path, raw: bytes, fst):
         os.utime(str(dst), ns=(fst.st_atime_ns, fst.st_mtime_ns))
     except OSError:
         pass
+
+
+# ---- review signing ----------------------------------------------------------------------------------------------
+# Every review round has its own secret, kept in Ratchet's per-user folder (never in the project, never printed) and
+# removed once the round is recorded. external_review.py and ui_review.py sign what they write with it (HMAC-SHA256
+# over the review's canonical JSON, the round's nonce or label, and the code fingerprint); adv-record and ui-record
+# refuse a review that is unsigned or whose signature does not match. A review by the host's own reviewer sub-agent
+# (ratchet-adversary, ratchet-visual-reviewer, ratchet-behavior-reviewer) is not signed: the guard hook records, in the
+# same per-user record, who wrote the file. On Claude Code it names the sub-agent, and a file it did not see that
+# sub-agent write with the Write tool is refused. On Codex, Gemini and Copilot, or with the hooks waived, the hook can't
+# say who wrote it, so any file in the round folder with the right nonce and code version counts and is marked "not
+# independently confirmed". The record is identified by the round itself (an adversarial round's own nonce; for a UI
+# round, the run's creation time, its round number and how many UI rounds this step has recorded), so a record left
+# by an abandoned run or an earlier round never speaks for a later one. This stops a different process on the same
+# machine that has no access to the per-user folder (the guard keeps agents out of it); it is not an operating system
+# boundary.
+
+UNCONFIRMED = "not independently confirmed"
+# Files the guard records the writer of: the REVIEW_OWNERS entries that name an owner sub-agent (an adversarial
+# round's reviews, and a UI round's two per-role reviews). Their patterns carry named groups (slug, cp, n, name).
+ADV_REVIEW_RE = re.compile(r"^runs/(?P<slug>[^/]+)/reviews/(?P<cp>[^/]+)/adv-round-(?P<n>\d+)/(?P<name>[^/]+\.json)$", re.I)
+UI_ROLES = ("visual", "behavior")
+
+
+def ui_round_number(st: dict, cp_id) -> int | None:
+    """The UI round a checkpoint is on (one more than its recorded UI rounds), or None when it has no UI gate."""
+    g = ((((st.get("checkpoints") or {}).get(cp_id) or {}).get("gates") or {}).get("ui")) or {}
+    if not g.get("required"):
+        return None
+    return int(g.get("attempts") or 0) + 1
+
+
+def _round_id(st: dict, cp_id: str, kind: str, n: int) -> str | None:
+    """What makes this round unique, or None when there is no such round in this run."""
+    cps = (st.get("checkpoints") or {}).get(cp_id) or {}
+    if kind == "adv":
+        rnd = cps.get("adv_round") or {}
+        if rnd.get("nonce") and int(rnd.get("round") or 0) == int(n):
+            return str(rnd["nonce"])
+        return None
+    g = (cps.get("gates") or {}).get("ui") or {}
+    if kind == "ui" and g.get("required") and st.get("created_at"):
+        return f"{st['created_at']}#{int(n)}#{int(g.get('rounds_recorded') or 0)}"
+    return None
+
+
+def review_key_file(root, st: dict, cp_id: str, kind: str, n: int) -> Path | None:
+    """Where this round's signing record lives under Ratchet's per-user folder (None when there is no such round)."""
+    rid = _round_id(st, cp_id, kind, n)
+    if rid is None:
+        return None
+    ident = "|".join([os.path.realpath(str(root)), str(st.get("slug")), cp_id, kind, str(int(n)), rid])
+    return ratchet_home() / "review-keys" / (hashlib.sha256(ident.encode()).hexdigest()[:32] + ".json")
+
+
+def open_review_key(ctx, cp_id: str, kind: str, n: int, st: dict | None = None) -> tuple[dict | None, str]:
+    """This round's signing record ({"secret", "writers"}), created when missing (a fresh secret and no writers).
+    (None, why) when it can't be: why is "busy" (another Ratchet command holds the record) or a plain reason."""
+    st = st if st is not None else ctx.state()
+    p = review_key_file(ctx.root, st, cp_id, kind, n)
+    if p is None:
+        return None, f"{cp_id} has no open {'adversarial' if kind == 'adv' else 'UI'} review round {n} in this run"
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(str(p.parent), 0o700)
+        res = update_record(p, lambda d: KEEP if d.get("secret") else {"secret": secrets.token_hex(32), "writers": {}},
+                            damaged=lambda _why: {})
+        if res == "busy":
+            return None, "busy"
+        os.chmod(str(p), 0o600)
+    except OSError as e:
+        return None, f"it could not be written ({e})"
+    key = review_key(ctx, cp_id, kind, n, st=st)
+    return (key, "") if key else (None, f"it could not be read back from {p}")
+
+
+def review_key_problem(why: str, retry: str) -> str:
+    """The plain message for a round secret that could not be created (open_review_key's reason)."""
+    if why == "busy":
+        return ("Another Ratchet command is using this round's review-signing record right now. Wait a moment, then "
+                f"{retry}.")
+    return (f"Could not create this round's review-signing secret under {ratchet_home() / 'review-keys'}: {why}. "
+            f"Make that folder writable, then {retry}.")
+
+
+def review_key(ctx, cp_id: str, kind: str, n: int, create: bool = False, st: dict | None = None) -> dict | None:
+    """This round's signing record, created when `create` and missing. None when there is none (or it can't be read
+    or written: a review then can't be signed, and is refused, which is the safe side)."""
+    if create:
+        return open_review_key(ctx, cp_id, kind, n, st)[0]
+    p = review_key_file(ctx.root, st if st is not None else ctx.state(), cp_id, kind, n)
+    if p is None:
+        return None
+    data, _why = _read_record(p, missing=None)
+    return data if isinstance(data, dict) and data.get("secret") else None
+
+
+def drop_review_key(p: Path | None):
+    """Remove a round's record (from review_key_file, taken before the state changes) once the round is recorded and
+    saved, or replaced, so its signatures and writer records can't be reused."""
+    if p is None:
+        return
+    for f in (p, _record_lock_path(p)):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def ui_round_label(cp_id: str, n: int) -> str:
+    return f"{cp_id}/ui/round-{int(n):02d}"
+
+
+def _review_mac(secret: str, review: dict, label: str) -> str:
+    body = {k: v for k, v in review.items() if k != "signature"}
+    # ASCII-escaped canonical JSON: a reviewer's lone surrogate ("\ud83d") can't make the encoding fail
+    payload = "\n".join([json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True), str(label),
+                         str(review.get("fingerprint"))])
+    return hmac.new(secret.encode(), payload.encode("utf-8", "surrogatepass"), hashlib.sha256).hexdigest()
+
+
+def sign_review(key: dict, review: dict, label: str, by: str) -> dict:
+    review.pop("signature", None)
+    review["signature"] = {"alg": "hmac-sha256", "by": by, "value": _review_mac(key["secret"], review, label)}
+    return review
+
+
+def signature_well_formed(sig) -> bool:
+    """A signature shaped like one sign_review makes. Anything else is an incidental field, not a signing attempt."""
+    return (isinstance(sig, dict) and sig.get("alg") == "hmac-sha256" and isinstance(sig.get("value"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", sig["value"]) is not None)
+
+
+def review_signed(key: dict | None, review: dict, label: str) -> bool:
+    sig = review.get("signature")
+    if not key or not signature_well_formed(sig):
+        return False
+    return hmac.compare_digest(sig["value"], _review_mac(key["secret"], review, label))
+
+
+def ui_manifest_label(cp_id: str, n: int) -> str:
+    return f"{ui_round_label(cp_id, n)}/manifest"
+
+
+def stamp_ui_manifest(ctx, st: dict, cp_id: str, n: int, key: dict, manifest: dict) -> str:
+    """`ui_review.py review` / `stage`, before writing the capture manifest for this UI round: give it a fresh stamp,
+    make that the round's current one (`manifest_stamp` in the round's record), and sign the manifest with the round's
+    secret. Per-role reviews written for an earlier stamp stop counting. '' on success, else why (as open_review_key)."""
+    p = review_key_file(ctx.root, st, cp_id, "ui", n)
+    if p is None:
+        return f"{cp_id} has no open UI review round {n} in this run"
+    stamp = secrets.token_hex(16)
+
+    def put(d):
+        if not d.get("secret"):
+            return KEEP
+        d["manifest_stamp"] = stamp
+        return d
+    try:
+        res = update_record(p, put)
+    except OSError as e:
+        return f"it could not be written ({e})"
+    if res != "written":
+        return "busy" if res == "busy" else f"its record could not be updated ({res})"
+    key["manifest_stamp"] = stamp
+    manifest.pop("signature", None)
+    manifest["stamp"] = stamp
+    sign_review(key, manifest, ui_manifest_label(cp_id, n), "ui_review.py")
+    return ""
+
+
+def ui_manifest_problem(key: dict | None, cp_id: str, n: int, man) -> str:
+    """Why a capture manifest given to `ui_review.py combine` does not count for this UI round ('' when it does)."""
+    if not isinstance(man, dict) or not review_signed(key, man, ui_manifest_label(cp_id, n)):
+        return (f"it was not written by `ui_review.py review` or `stage` for {cp_id}'s UI round {n}; a capture manifest "
+                "typed, copied or edited by hand, or one from another round, does not count. Run `ui_review.py review` "
+                "(or `stage`) on the capture manifest, then have the reviewers review again")
+    if man.get("stamp") != (key or {}).get("manifest_stamp"):
+        return ("`ui_review.py review` or `stage` has stamped a newer capture manifest for this round since this one; "
+                "use the manifest they wrote last, with reviews written after it")
+    return ""
+
+
+STALE_UI_INPUT = ("it was written for an earlier capture manifest (`ui_review.py review` or `stage` has stamped the "
+                  "manifest again since), so it may be a review of other code; have that reviewer review again")
+
+
+def _review_file_match(rel: str | None):
+    """(kind, match, owner sub-agent) for a review file whose writer the guard records (a REVIEW_OWNERS entry that
+    names an owner), or None."""
+    for rx, owners in REVIEW_OWNERS:
+        m = rx.match(rel or "")
+        if m and owners:
+            return ("adv" if rx is ADV_REVIEW_RE else "ui"), m, sorted(owners)[0]
+    return None
+
+
+def _note_writer_failure(root: Path, host: str, rel: str, detail: str):
+    """A review file's writer could not be recorded: logged where hook failures go (hook-errors.log), so the later
+    refusal and `doctor` can say why. Never raises (the hook fails open)."""
+    try:
+        _append_record(root / RATCHET_DIR / "hook-errors.log",
+                       f"{now()} {host} guard: ReviewWriterNotRecorded: {rel}: {detail}\n")
+    except Exception:
+        pass
+
+
+def _note_review_writer(n: dict):
+    """Guard hook: remember who wrote a review file into an open review round's folder (Claude Code names the
+    sub-agent; other CLIs don't, so their writes are recorded as not confirmed). Never breaks the hook; a write it
+    could not record is logged to hook-errors.log."""
+    host = n["host"]
+    actor = (n.get("agent_type") or "").split(":")[-1]
+    for p in n["paths"]:
+        rel = root = hit = None
+        try:
+            rel = _ratchet_rel(p, n["cwd"])
+            hit = _review_file_match(rel)
+            if not hit:
+                continue
+            kind, m, owner = hit
+            full = Path(os.path.normpath(os.path.join(n["cwd"], os.path.expanduser(p))))
+            root = find_root(full.parent)
+            st, _why = _read_record(root / RATCHET_DIR / "runs" / m.group("slug") / "state.json", missing=None)
+            kp = review_key_file(root, st, m.group("cp"), kind, int(m.group("n"))) if isinstance(st, dict) else None
+            if kp is None or not kp.exists():
+                continue  # no open round with a record: nothing could ever be confirmed against it
+            mine = _host_names_subagent(host) and actor == owner
+
+            def add(data, name=m.group("name"), mine=mine, kind=kind):
+                if not data.get("secret"):
+                    return KEEP
+                prev = (data.get("writers") or {}).get(name) or {}
+                w = {"host": host, "agent": actor or None, "at": now(),
+                     "confirmed": bool(mine and prev.get("confirmed", True))}
+                other = prev.get("other_writer") or (None if mine else (actor or "main session"))
+                if other:
+                    w["other_writer"] = other
+                if kind == "ui":  # the capture manifest it was written against: combine refuses an older one
+                    w["manifest_stamp"] = data.get("manifest_stamp")
+                data.setdefault("writers", {})[name] = w
+                return data
+            res = update_record(kp, add)
+            if res in ("busy", "damaged"):
+                _note_writer_failure(root, host, rel, f"its round's record was {res}")
+        except Exception as e:
+            if not hit:
+                continue  # not a review file: there was no writer to record
+            if root is None:
+                try:
+                    root = _ratchet_root_of(n.get("cwd"))
+                except Exception:
+                    root = None
+            if root is not None:
+                _note_writer_failure(Path(root), host, str(rel or p), f"{type(e).__name__}: {e}")
+
+
+def host_writer_origin(ctx, cfg, st: dict, key: dict | None, name: str, owner: str) -> tuple[str, str]:
+    """How an unsigned file written by a host reviewer sub-agent (`owner`) is known to be real: ('confirmed', ''),
+    ('unconfirmed', why) or ('refused', why)."""
+    w = ((key or {}).get("writers") or {}).get(name)
+    if w:
+        if w.get("confirmed"):
+            return "confirmed", ""
+        if _host_names_subagent(w.get("host") or ""):
+            other = w.get("other_writer") or w.get("agent")
+            who = "the main session (not a sub-agent)" if other in (None, "main session") else f"the {other} sub-agent"
+            return "refused", f"Ratchet's guard saw it written or edited by {who}, not only by a {owner} sub-agent"
+        return "unconfirmed", "this CLI's hook does not say which sub-agent wrote it"
+    if _waiver_applies(ctx.root, cfg, st):
+        return "unconfirmed", "Ratchet's hooks are waived for this run, so nothing recorded who wrote it"
+    if not _host_names_subagent(VENDOR_TO_HOST.get(detect_host(cfg), "unknown")):
+        return "unconfirmed", ("this CLI's hook did not record who wrote it; on this CLI any file in the round folder "
+                               "with the right nonce and code version counts")
+    return "refused", (f"Ratchet's guard did not see a {owner} sub-agent write it with the Write tool in this round "
+                       "(a file written through the shell, or by the main session, is not recorded)")
+
+
+def _writer_failure_note(root: Path, name: str) -> str:
+    hits = [e for e in read_hook_errors(root) if "ReviewWriterNotRecorded" in e["message"] and name in e["message"]]
+    return (" The guard could not record who wrote this file (see hook-errors.log in the project's Ratchet folder, "
+            "and `ratchet.py doctor`)." if hits else "")
+
+
+def check_review_origin(ctx, cfg, st: dict, cp_id: str, n: int, rp, rpath: Path, r: dict, rid: str,
+                        label: str) -> tuple[str, str]:
+    """How an adversarial review is known to be real: ('script-signed', ''), ('confirmed', '') for a host sub-agent
+    the guard named, or ('unconfirmed', why) where the guard could not name the writer (Codex, Gemini, Copilot, or
+    hooks waived). Dies when it is none of these."""
+    key = review_key(ctx, cp_id, "adv", n, st=st)
+    if signature_well_formed(r.get("signature")):
+        if key is None:
+            die(f"{rp} ({rid}) is signed, but this round's signing secret is gone, so no signature can be checked. Run "
+                f"`ratchet.py reviewers {cp_id}` and run its reviewers again.")
+        if review_signed(key, r, label):
+            return "script-signed", ""
+        die(f"{rp} ({rid}) has a signature that does not match this round: it was changed after it was signed, or it "
+            f"was signed for another round. An edited or copied review does not count; run the reviewer again "
+            f"(see `ratchet.py reviewers {cp_id}`).")
+    why = "it has no signature from external_review.py for this round"
+    if (_roster_spec(cfg, rid) or {}).get("kind") == "agent":
+        origin, why = host_writer_origin(ctx, cfg, st, key, rpath.name, "ratchet-adversary")
+        if origin != "refused":
+            return origin, why
+    die(f"{rp} ({rid}) is unsigned and does not count: {why}. Ratchet accepts a review signed by external_review.py "
+        "for this round, or one the host's ratchet-adversary sub-agent wrote with the Write tool (not through the "
+        "shell) while Ratchet's hooks run. A review typed, copied or edited by hand does not count. Launch the "
+        f"reviewer again as `ratchet.py reviewers {cp_id}` says.{_writer_failure_note(ctx.root, rpath.name)}")
+
+
+def ui_input_origin(ctx, cfg, st: dict, key: dict | None, cp_id: str, n: int, path: Path, r: dict) -> tuple[str, str]:
+    """How a per-role UI review given to `ui_review.py combine` is known to be real: ('script-signed', '') when
+    `ui_review.py review` signed it for this round, ('confirmed', '') or ('unconfirmed', why) for a host reviewer
+    sub-agent's file in this round's folder, or ('refused', why)."""
+    role = r.get("reviewer")
+    current = (key or {}).get("manifest_stamp")
+    if signature_well_formed(r.get("signature")):
+        if role in UI_ROLES and review_signed(key, r, f"{ui_round_label(cp_id, n)}/{role}"):
+            return ("script-signed", "") if r.get("manifest_stamp") == current else ("refused", STALE_UI_INPUT)
+        return "refused", ("its signature does not match this UI round: it was changed after ui_review.py signed it, or "
+                           "it was signed for another round")
+    folder = _review_round_dir(ctx, cp_id, "ui", n)
+    hit = None
+    try:
+        real = Path(os.path.realpath(str(path)))
+        if real.parent == Path(os.path.realpath(str(folder))):
+            hit = _review_file_match(real.relative_to(Path(os.path.realpath(str(ctx.ratchet)))).as_posix())
+    except (OSError, ValueError):
+        real = Path(str(path))
+    if not hit or hit[0] != "ui":
+        return "refused", (f"it is not signed by `ui_review.py review`, and it is not a reviewer's visual.json or "
+                           f"behavior.json in this round's folder ({folder})")
+    if role != real.stem.lower():
+        return "refused", f"its reviewer field says {role!r}, but {real.name} is the {real.stem.lower()} reviewer's file"
+    w = ((key or {}).get("writers") or {}).get(real.name)
+    if w and w.get("manifest_stamp") != current:
+        return "refused", STALE_UI_INPUT
+    return host_writer_origin(ctx, cfg, st, key, real.name, hit[2])
 
 
 def cmd_ui_record(args):
@@ -4425,6 +4785,16 @@ def cmd_ui_record(args):
     if review.get("fingerprint") != cur_fp:
         die("combined review is not stamped with the current code fingerprint (it was produced for other code, or by "
             "hand). Capture and review again with ui_review.py — it stamps the fingerprint itself.")
+    ui_key = review_key(ctx, args.cp, "ui", n, st=st)
+    if signature_well_formed(review.get("signature")) and ui_key is None:
+        die(f"{args.review} is signed, but UI round {n} has no signing secret (ui_review.py has not opened this round, "
+            "or its secret was removed), so the signature can't be checked and the review does not count; one signed "
+            "for another round never does. Run ui_review.py (`review`, or `stage` and `combine`) for this round.")
+    if not review_signed(ui_key, review, ui_round_label(args.cp, n)):
+        die(f"{args.review} is unsigned, or was changed after ui_review.py signed it for round {n}. Only a combined "
+            "review written by ui_review.py (`review`, or `combine`) for this round counts; a combined.json typed or "
+            "edited by hand does not.")
+    review = clean_review_text(review)  # its signature is checked: from here on it only feeds records and messages
     compared = review.get("compared") or {}
     if not compared.get("spec_sha256") or compared.get("scope") is None:
         die("The combined review doesn't say what was compared (capture spec and scope). Produce it with "
@@ -4441,7 +4811,14 @@ def cmd_ui_record(args):
             "end your message with the question it prints, word for word, as the only question in it, and end your "
             f"turn. Run `ratchet.py ui-respec {args.cp}` only if their first reply after it is one of the listed yes "
             "replies.")
+    key_file = review_key_file(ctx.root, st, args.cp, "ui", n)  # dropped only once this round is saved as recorded
     g["attempts"] += 1
+    g["rounds_recorded"] = int(g.get("rounds_recorded") or 0) + 1  # never reset: a later round never reuses a record
+    unconfirmed = [x for x in review.get("unconfirmed") or [] if isinstance(x, str)]  # signed with the review
+    if unconfirmed:
+        g["unconfirmed"] = unconfirmed
+    else:
+        g.pop("unconfirmed", None)
     verdict, blockers = _ui_verdict(review, cfg)
     dest = ctx.evidence(args.cp) / "ui" / f"round-{g['attempts']:02d}"
     dest.mkdir(parents=True, exist_ok=True)
@@ -4451,6 +4828,7 @@ def cmd_ui_record(args):
         g["status"] = "invalid"
         ctx.log(st, "ui_invalid", cp=args.cp, reason=review.get("invalid_reason"))
         ctx.save_state(st)
+        drop_review_key(key_file)  # this round is recorded and saved: its secret goes
         die(f"UI comparison INVALID ({review.get('invalid_reason', 'states did not match')}). "
             "Re-capture prototype and app in the SAME state and review again.", 2)
     if verdict == "FAIL":
@@ -4461,6 +4839,7 @@ def cmd_ui_record(args):
             _set_blocked(st, f"{args.cp}: UI gate failed {g['attempts']} rounds — needs a human decision.")
         ctx.log(st, "ui_failed", cp=args.cp, blockers=len(blockers))
         ctx.save_state(st)
+        drop_review_key(key_file)
         build_viewer(ctx)
         for b in blockers:
             print(f"  - [{b.get('severity')}] {b.get('location')}: {b.get('description')}")
@@ -4472,6 +4851,7 @@ def cmd_ui_record(args):
     cps["step"] = _earliest_open_step(cps)
     ctx.log(st, "ui_passed", cp=args.cp, round=g["attempts"])
     ctx.save_state(st)
+    drop_review_key(key_file)
     build_viewer(ctx)
     ok(f"Gate 2 (UI) PASSED for {args.cp}. Next step: {cps['step']}")
 
@@ -4527,6 +4907,8 @@ def cmd_adv_record(args):
                 f"round {rnd['round']} (see `ratchet.py reviewers {args.cp}`).")
         if r.get("checkpoint") not in (None, args.cp):
             die(f"{rp} is a review of {r.get('checkpoint')}, not {args.cp}.")
+        origin = check_review_origin(ctx, cfg, st, args.cp, rnd["round"], rp, rpath, r, rid, rnd["nonce"])
+        r = clean_review_text(r)  # its signature is checked: from here on it only feeds records and messages
         age = fst.st_mtime - _iso(rnd["opened_at"])
         if age < cfg.get("min_review_seconds", 20):
             die(f"{rp} ({rid}) was written {age:.0f}s after the round opened — too fast to be a real review. "
@@ -4538,25 +4920,36 @@ def cmd_adv_record(args):
             if not seen or (changed and not (seen & changed)):
                 die(f"{rp} ({rid}) approves without listing the changed files it reviewed (files_reviewed). "
                     f"Changed in this checkpoint: {', '.join(sorted(changed)[:8]) or '(none recorded)'}.")
-        reviews[rid] = (rpath, r, raw, fst)
+        reviews[rid] = (rpath, r, raw, fst, origin)
     missing = [i for i in required if i not in reviews]
     if missing:
         die(f"{args.cp} (risk={cp.get('risk', 'normal')}) needs reviews from {required}; missing {missing}. "
             f"Run `ratchet.py reviewers {args.cp}` to see how to launch each one.")
+    key_file = review_key_file(ctx.root, st, args.cp, "adv", rnd["round"])  # dropped once the round is saved
     rnd["recorded"] = now()
     dest = ctx.evidence(args.cp) / "adversarial" / f"round-{rnd['round']:02d}"
     dest.mkdir(parents=True, exist_ok=True)
     all_findings, verdicts = [], []
+    unconfirmed = []
     for rid in required:
-        rp, r, raw, fst = reviews[rid]
+        rp, r, raw, fst, (origin, why) = reviews[rid]
         spec = _roster_spec(cfg, rid) or {}
         findings = r.get("findings", []) or []
         all_findings += [dict(f, reviewer=rid) for f in findings]
+        how = {"script-signed": "signed by external_review.py",
+               "confirmed": "written by the ratchet-adversary sub-agent, confirmed by the guard hook"}.get(origin, UNCONFIRMED)
         verdicts.append({"reviewer": rid, "vendor": spec.get("vendor"), "claimed": r.get("verdict"),
-                         "findings": len(findings)})
+                         "findings": len(findings), "origin": how})
+        if origin == "unconfirmed":
+            verdicts[-1]["unconfirmed_because"] = why
+            unconfirmed.append(f"{rid}: {UNCONFIRMED} ({why})")
         if rp.parent != dest.resolve():
             _write_review_evidence(dest / f"{rid}.json", raw, fst)
     need = len(required)
+    if unconfirmed:
+        g["unconfirmed"] = unconfirmed
+    else:
+        g.pop("unconfirmed", None)
     record_kinds(st, args.cp, rnd["round"], all_findings, ctx.root, fp["id"], cp.get("risk", "normal"))
     covered = enforced_kinds(cfg)
     escaped = sorted({finding_kind(f) for f in all_findings if finding_kind(f) in covered
@@ -4593,6 +4986,7 @@ def cmd_adv_record(args):
                              f"{g['attempts']} rounds — needs a human/director decision.")
         ctx.log(st, "adversarial_changes_requested", cp=args.cp, findings=len(all_findings))
         ctx.save_state(st)
+        drop_review_key(key_file)  # this round is recorded and saved: its secret goes
         build_viewer(ctx)
         write_json(dest / "open-findings.json", all_findings)
         _announce_repeats(ctx, st)
@@ -4604,6 +4998,7 @@ def cmd_adv_record(args):
     cps["step"] = _earliest_open_step(cps)
     ctx.log(st, "adversarial_approved", cp=args.cp, round=g["attempts"])
     ctx.save_state(st)
+    drop_review_key(key_file)
     build_viewer(ctx)
     note = (f" {len(deferred)} minor finding(s) were recorded for later instead of blocking (`ratchet.py deferred`)."
             if deferred else "")
@@ -6520,6 +6915,7 @@ def cmd_reviewers(args):
         g["attempts"] += 1
         st["adv_rounds_total"] = int(st.get("adv_rounds_total", 0)) + 1
         prev = rnd["round"] if rnd else 0
+        old_key = review_key_file(ctx.root, st, args.cp, "adv", prev) if prev else None
         rnd = {"round": prev + 1, "nonce": secrets.token_hex(8), "fingerprint": fp, "opened_at": now(),
                "reviewers": [r["id"] for r in resolved],
                "substitutions": [{"used": r["id"], "instead_of": r["fallback_for"], "why": r["reasons"]}
@@ -6531,6 +6927,7 @@ def cmd_reviewers(args):
             ctx.log(st, "reviewer_fallback", cp=args.cp, detail="; ".join(
                 f"{x['used']} instead of {', '.join(x['instead_of'])}" for x in rnd["substitutions"]))
         ctx.save_state(st)
+        drop_review_key(old_key)  # the replaced round (now saved as replaced) stops counting
     else:
         # same round: if a listed reviewer has become unavailable (its CLI failed), give its slot to the next choice
         fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp)}
@@ -6544,6 +6941,9 @@ def cmd_reviewers(args):
             rnd["reviewers"] = [r["id"] for r in rnd["resolved"]]
             ctx.log(st, "reviewer_fallback", cp=args.cp, detail="re-resolved within round " + str(rnd["round"]))
             ctx.save_state(st)
+    _key, why = open_review_key(ctx, args.cp, "adv", rnd["round"], st)
+    if _key is None:
+        die(review_key_problem(why, f"run `ratchet.py reviewers {args.cp}` again"))
     out_dir = _review_round_dir(ctx, args.cp, "adv", rnd["round"])
     out_dir.mkdir(parents=True, exist_ok=True)
     fixes = ctx.run_dir() / "reviews" / args.cp / f"adv-round-{rnd['round'] - 1:02d}" / "fixes.md"
@@ -6614,7 +7014,7 @@ def status_json(ctx: Ctx) -> dict:
         s = st["checkpoints"].get(cp["id"]) or {}
         cps.append({"id": cp["id"], "title": cp["title"], "risk": cp.get("risk", "normal"),
                     "status": s.get("status", "unsubmitted"), "step": s.get("step"), "commit": s.get("commit"),
-                    "gates": {n: {k: g.get(k) for k in ("status", "attempts", "by") if g.get(k) is not None}
+                    "gates": {n: {k: g.get(k) for k in ("status", "attempts", "by", "unconfirmed") if g.get(k) is not None}
                               for n, g in (s.get("gates") or {}).items()}})
     na = next_action(ctx, st)
     hs = hooks_view(ctx, st)
@@ -6728,7 +7128,9 @@ def viewer_data(ctx: Ctx):
             own = all((_roster_spec(cfg, x["id"]) or {}).get("kind") == "agent" for x in rd.get("reviewers") or []) \
                 if rd.get("reviewers") else None
             rounds.append({"round": i, "who": who, "blocking": rd.get("findings", 0),
-                           "deferred": rd.get("deferred", 0), "own_company_only": own})
+                           "deferred": rd.get("deferred", 0), "own_company_only": own,
+                           "unconfirmed": [v["reviewer"] for v in rd.get("verdicts") or []
+                                           if v.get("origin") == UNCONFIRMED]})
         if rounds:
             reviews[cp["id"]] = {"rounds": rounds, "deferred_total": len(((st.get("checkpoints") or {}).get(cp["id"]) or {}).get("deferred") or [])}
     spec = None
@@ -7664,9 +8066,12 @@ def _ratchet_rel(path: str, cwd: str) -> str | None:
 # Review files that only their reviewer may write (checked where the host says which sub-agent is acting: Claude
 # Code puts agent_type on every tool call a sub-agent makes). An empty owner set means "only the script writes it".
 REVIEW_OWNERS = [
-    (re.compile(r"^runs/[^/]+/reviews/[^/]+/adv-round-\d+/[^/]+\.json$", re.I), {"ratchet-adversary"}),
-    (re.compile(r"^runs/[^/]+/reviews/[^/]+/round-\d+/visual\.json$", re.I), {"ratchet-visual-reviewer"}),
-    (re.compile(r"^runs/[^/]+/reviews/[^/]+/round-\d+/behavior\.json$", re.I), {"ratchet-behavior-reviewer"}),
+    (ADV_REVIEW_RE, {"ratchet-adversary"}),  # one pattern with the writer record (_note_review_writer)
+    # a UI round's per-role reviews (the guard also records their writer; named groups as in ADV_REVIEW_RE)
+    (re.compile(r"^runs/(?P<slug>[^/]+)/reviews/(?P<cp>[^/]+)/round-(?P<n>\d+)/(?P<name>visual\.json)$", re.I),
+     {"ratchet-visual-reviewer"}),
+    (re.compile(r"^runs/(?P<slug>[^/]+)/reviews/(?P<cp>[^/]+)/round-(?P<n>\d+)/(?P<name>behavior\.json)$", re.I),
+     {"ratchet-behavior-reviewer"}),
     (re.compile(r"^runs/[^/]+/reviews/[^/]+/round-\d+/combined\.json$", re.I), set()),
     (re.compile(r"^runs/[^/]+/reviews/[^/]+/capture[^/]*/manifest\.json$", re.I), set()),
 ]
@@ -7899,6 +8304,7 @@ def decide_guard(n: dict) -> tuple[bool, str]:
             return True, ("RATCHET GUARD: gate state, evidence, approvals and config under .ratchet/ are written by "
                           "ratchet.py only (you may write reviews/, states/, tests/, reference/, checkpoints.json, "
                           f"app-scout.json, standards.md, learnings.md). Blocked: {bad[0]}")
+        _note_review_writer(n)
     return False, ""
 
 

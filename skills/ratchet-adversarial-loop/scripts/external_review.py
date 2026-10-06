@@ -224,6 +224,10 @@ def main():
         print(f"prompt written: {prompt_file} ({len(prompt)} chars)")
         return
 
+    # This round's signing secret must exist before the reviewer runs, so a paid review is never thrown away unsigned.
+    if eng.review_key(ctx, a.cp, "adv", rnd["round"], st=st) is None:
+        sys.exit(f"This round's review-signing secret is missing. Run `ratchet.py reviewers {a.cp}` again, then "
+                 "re-run this reviewer.")
     cmd_t, use_stdin = eng.reviewer_command(cfg, a.reviewer)
     if not cmd_t:
         sys.exit(f"reviewer '{a.reviewer}' has no command: give its provider a 'preset' ({', '.join(eng.PRESETS)}) "
@@ -264,6 +268,7 @@ def main():
         (out.parent / f"{a.reviewer}.raw.txt").write_text(text + "\n--- stderr ---\n" + (r.stderr or ""))
         tail = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()[-1:] or [""]
         unavailable(f"exit {r.returncode}, no findings JSON ({tail[0][:160]})")
+    review = eng.clean_review_text(review)  # a cut-off emoji escape in the reply must not break signing or records
     # Stamp identity ourselves — never trust the model to echo these correctly.
     base = cps.get("base_tree")
     review["files_reviewed"] = (eng.changed_files(ctx.root, {"kind": "git-tree", "id": base}, {"kind": "git-tree", "id": fp})
@@ -272,6 +277,13 @@ def main():
                   checkpoint=a.cp, fingerprint=fp)
     review["findings"] = [f for f in review.get("findings") or [] if isinstance(f, dict)]
     review["verdict"] = "APPROVE" if not review["findings"] else "CHANGES_REQUESTED"
+    # Sign it with this round's secret (kept in Ratchet's per-user folder), so adv-record can tell it from a review
+    # typed or edited by hand. The secret itself is never printed or written into the project.
+    key = eng.review_key(ctx, a.cp, "adv", rnd["round"])
+    if key is None:
+        sys.exit(f"This round's review-signing secret is missing. Run `ratchet.py reviewers {a.cp}` again, then "
+                 "re-run this reviewer.")
+    eng.sign_review(key, review, rnd["nonce"], "external_review.py")
     out.write_text(json.dumps(review, indent=2))
     print(f"{a.reviewer}: {review['verdict']} ({len(review['findings'])} findings) → {out}")
 

@@ -723,6 +723,16 @@ def through_adversarial(d):
     rnd = json.loads(rx(d, "reviewers", "CP1", "--json").stdout)
     rid = rnd["reviewers"][0]["id"]
     p = Path(rnd["output_dir"]) / (rid + ".json")
+    # CP7: a hand-written review only counts once the guard hook has recorded, at write time, that a
+    # ratchet-adversary sub-agent is writing this exact file; confirm it through the real installed guard hook
+    # (the same one `records()` below exercises) before writing the content.
+    g = hook(d, "claude", "guard", {"session_id": OWNER, "transcript_path": "/tmp/t.jsonl", "cwd": str(d),
+                                    "permission_mode": "default", "hook_event_name": "PreToolUse",
+                                    "tool_name": "Write", "tool_input": {"file_path": str(p), "content": "{}"},
+                                    "tool_use_id": "toolu_review", "agent_type": "ratchet-adversary",
+                                    "agent_id": "a-ratchet-adversary"})
+    if not g["allowed"]:
+        raise SystemExit("guard refused the probe's own review write: %s" % g["reason"])
     p.write_text(json.dumps({"reviewer": rid, "checkpoint": "CP1", "fingerprint": rnd["fingerprint"],
                              "round_nonce": rnd["round_nonce"], "findings": [], "files_reviewed": ["src/f.py"]}))
     rx(d, "adv-record", "CP1", "--reviews", str(p))
@@ -818,9 +828,16 @@ def records(d):
                 new = not (d / rel).exists()
                 calls[(host, kind, rel, "write")] = write_payload(host, d, rel, new)
                 calls[(host, kind, rel, "shell")] = shell_payload(host, d, "echo forged > " + str(d / rel))
-        calls[(host, "control", "src/new_module.py", "write")] = write_payload(host, d, "src/new_module.py", True)
-        calls[(host, "control", "src/scratch.txt", "shell")] = shell_payload(
-            host, d, "echo forged > " + str(d / "src/scratch.txt"))
+        # The control: the same write and shell calls on a project file must be allowed. Mid-build, once Claude Code
+        # has named a sub-agent (the ratchet-adversary review write in through_adversarial), project files are
+        # changed by the implementer, and the orchestrator's own edits are rightly refused (ORCH_EDIT_MSG). So on a
+        # CLI that names sub-agents the control call is made the way the real flow makes it: by ratchet-implementer.
+        implementer = ({"agent_type": "ratchet-implementer", "agent_id": "a-ratchet-implementer"}
+                       if host == "claude" else {})
+        calls[(host, "control", "src/new_module.py", "write")] = dict(
+            write_payload(host, d, "src/new_module.py", True), **implementer)
+        calls[(host, "control", "src/scratch.txt", "shell")] = dict(shell_payload(
+            host, d, "echo forged > " + str(d / "src/scratch.txt")), **implementer)
     with concurrent.futures.ThreadPoolExecutor(8) as pool:
         res = dict(zip(calls, pool.map(lambda k: hook(d, k[0], "guard", calls[k]), calls)))
     out = {h: [] for h in eng.HOOK_HOSTS}

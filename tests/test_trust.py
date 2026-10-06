@@ -1133,6 +1133,17 @@ def cp3_write_review(path, rnd, rid, findings=None, **over):
     return str(path)
 
 
+def cp3_reviewer_writes(d, env, rnd, rid):
+    """A host review written the way the host's ratchet-adversary sub-agent writes it (CP7: on Claude Code a review
+    counts only when the guard saw that sub-agent write it), for helpers that need an accepted review to go on."""
+    path = Path(rnd["output_dir"]) / f"{rid}.json"
+    g = rx(d, env, "hook", "guard", "--host", "claude",
+           stdin=json.dumps({"cwd": str(d), "tool_name": "Write", "tool_input": {"file_path": str(path)},
+                             "agent_type": "ratchet-adversary", "agent_id": "a-ratchet-adversary"}))
+    assert g.returncode == 0, g.stderr + g.stdout
+    return cp3_write_review(path, rnd, rid)
+
+
 def cp3_fp(d, env):
     return json.loads(rx(d, env, "fingerprint").stdout)["id"]
 
@@ -1148,6 +1159,41 @@ def cp3_write_combined(path, fp, cp="CP1", compared=None, diffs=None):
             "compared": compared or {"spec_sha256": "s1", "scope": "all"}, "differences": diffs or []}
     Path(path).write_text(json.dumps(body))
     return str(path)
+
+
+def cp3_signed_combined(d, env, fp, cp="CP1", n=1, diffs=None, spec_sha256="s1"):
+    """A combined.json for round `n`, signed the way ui_review.py's `combine` step signs it (CP7: a hand-typed
+    combined review no longer counts). Used wherever a test needs an *accepted* combined review to reach the
+    behavior under test, not the signature check itself (that's CP7's own tests, in test_signing.py)."""
+    import test_signing as ts  # safe here: by the time this runs, either module is already fully imported
+    round_dir = cp3_ui_round_dir(d, n, cp)
+    # CP7 round 2: the capture manifest starts as capture.mjs writes it (checkpoint, spec hash, states; no
+    # fingerprint), and `stage` stamps it with the code version and scope and signs it for this round: combine
+    # refuses a manifest that ui_review.py did not sign.
+    manifest = Path(d) / ".ratchet/runs/f/reviews" / cp / "capture" / "manifest.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"checkpoint": cp, "spec_sha256": spec_sha256, "states": []}))
+    # CP7 round 1: combine only signs per-role reviews whose origin checks out, so the two files are written the
+    # way the host's reviewer sub-agents write them: `stage` opens the round, and the guard sees each one written.
+    st = subprocess.run([sys.executable, str(ts.UI_REVIEW), "stage", "--manifest", str(manifest), "--scope", "all"],
+                        cwd=d, capture_output=True, text=True, env=env)
+    assert st.returncode == 0, st.stderr + st.stdout
+    for tmp in json.loads(st.stdout).values():
+        shutil.rmtree(tmp, ignore_errors=True)
+    stamped = json.loads(manifest.read_text())
+    assert stamped.get("fingerprint") == fp and isinstance(stamped.get("signature"), dict), stamped
+    visual = round_dir / "visual.json"
+    behavior = round_dir / "behavior.json"
+    for path, agent in ((visual, "ratchet-visual-reviewer"), (behavior, "ratchet-behavior-reviewer")):
+        g = ts.guard(d, env, "Write", {"file_path": str(path)}, host="claude", agent=agent)
+        assert g.returncode == 0, g.stderr + g.stdout
+    visual.write_text(json.dumps({"reviewer": "visual", "verdict": "PASS" if not diffs else "FAIL",
+                                  "differences": diffs or []}))
+    behavior.write_text(json.dumps({"reviewer": "behavior", "verdict": "PASS", "differences": []}))
+    out = round_dir / "combined.json"
+    rp = ts.run_combine(d, env, [visual, behavior], out, cp, manifest)
+    assert rp.returncode == 0, rp.stderr + rp.stdout
+    return out
 
 
 def cp3_state(d):
@@ -1198,18 +1244,22 @@ def cp3_adv_folder_trust():
           and cp1["gates"]["adversarial"].get("status") != "passed"
           and not (cp1.get("adv_round") or {}).get("recorded"), (r.returncode, r.stderr, cp1))
 
-    # --- T03: a review written straight into the round's own folder still passes (regression) --------------------
-    env = make_env("claude")
+    # --- T03: a script-signed review written straight into the round's own folder still passes (regression) ------
+    # (CP7, user decision: reviews must be signed, so this regression now uses external_review.py against a fake CLI)
+    import test_signing as ts
+    env = ts.with_fake_provider(make_env("claude"), json.dumps({"findings": []}))
     d = cp3_project(env)
+    ts.use_codex_provider(d, env)
     cp3_pass_behavior(d, env)
     rnd = cp3_open_round(d, env)
     rid = cp3_R0(rnd)
-    good = cp3_write_review(Path(rnd["output_dir"]) / f"{rid}.json", rnd, rid)
-    r = rx(d, env, "adv-record", "CP1", "--reviews", good)
+    good = Path(rnd["output_dir"]) / f"{rid}.json"
+    rp = ts.run_external(d, env, rid, good)
+    r = rx(d, env, "adv-record", "CP1", "--reviews", str(good))
     cp1 = cp3_state(d)["checkpoints"]["CP1"]
-    check("[CP3-T03] a review written straight into the round's own folder still passes (regression)",
-          r.returncode == 0 and cp1["gates"]["adversarial"].get("status") == "passed",
-          (r.returncode, r.stderr, cp1["gates"]["adversarial"]))
+    check("[CP3-T03] a script-signed review written straight into the round's own folder still passes (regression)",
+          rp.returncode == 0 and r.returncode == 0 and cp1["gates"]["adversarial"].get("status") == "passed",
+          (rp.returncode, rp.stderr, r.returncode, r.stderr, cp1["gates"]["adversarial"]))
 
     # --- T04: a symlink inside the round's folder pointing outside it is refused ----------------------------------
     env = make_env("claude")
@@ -1268,10 +1318,10 @@ def cp3_ui_folder_trust():
     d = cp3_ui_project(env)
     cp3_pass_behavior(d, env)
     fp1 = cp3_fp(d, env)
-    round1 = cp3_ui_round_dir(d, 1)
-    compared = {"spec_sha256": "s1", "scope": "all"}
+    # CP7: round 1's combined review must be script-signed to be accepted at all (a hand-typed one would be
+    # refused as unsigned, never reaching the "fails and freezes" behavior this test is about).
     diffs = [{"severity": "minor", "location": "x", "description": "issue", "fixable_in_code": True}]
-    combined1 = cp3_write_combined(round1 / "combined.json", fp1, compared=compared, diffs=diffs)
+    combined1 = str(cp3_signed_combined(d, env, fp1, diffs=diffs))
     r1 = rx(d, env, "ui-record", "CP1", "--review", combined1)
     check("[CP3-T07] setup: round 1 fails and freezes the capture spec", r1.returncode == 2, (r1.returncode, r1.stderr))
     (d / "src/f.js").write_text("export const f = () => 1; // tweak\n")
@@ -1279,23 +1329,24 @@ def cp3_ui_folder_trust():
     check("[CP3-T07] setup: the code change produced a new fingerprint", fp2 != fp1, (fp1, fp2))
     body = json.loads(Path(combined1).read_text())
     body["fingerprint"], body["differences"] = fp2, []  # would otherwise PASS round 2 outright
-    Path(combined1).write_text(json.dumps(body))  # still physically in round-01/
+    Path(combined1).write_text(json.dumps(body))  # still physically in round-01/, and no longer validly signed
     r2 = rx(d, env, "ui-record", "CP1", "--review", combined1)
     cp1 = cp3_state(d)["checkpoints"]["CP1"]
     check("[CP3-T07] refused for not being inside round 2's own folder, even though the fingerprint now matches",
           r2.returncode != 0 and "reviews/CP1/round-02" in (r2.stderr + r2.stdout)
           and cp1["gates"]["ui"].get("status") != "passed", (r2.returncode, r2.stderr, cp1["gates"]["ui"]))
 
-    # --- T08: a combined review written into the round's own folder still passes (regression) ---------------------
+    # --- T08: a script-signed combined review written into the round's own folder still passes (regression) -------
+    # (CP7, user decision: reviews must be signed, so this regression now uses ui_review.py's combine step, with
+    # per-role files given real provenance the same way cp3_signed_combined builds them for every other test)
     env = make_env("claude")
     d = cp3_ui_project(env)
     cp3_pass_behavior(d, env)
     fp = cp3_fp(d, env)
-    round1 = cp3_ui_round_dir(d, 1)
-    good = cp3_write_combined(round1 / "combined.json", fp)
-    r = rx(d, env, "ui-record", "CP1", "--review", good)
+    good = cp3_signed_combined(d, env, fp)
+    r = rx(d, env, "ui-record", "CP1", "--review", str(good))
     cp1 = cp3_state(d)["checkpoints"]["CP1"]
-    check("[CP3-T08] a combined review written into the round's own folder still passes (regression)",
+    check("[CP3-T08] a script-signed combined review written into the round's own folder still passes (regression)",
           r.returncode == 0 and cp1["gates"]["ui"].get("status") == "passed", (r.returncode, r.stderr, cp1["gates"]["ui"]))
 
     # --- T09: a symlink inside the UI round's folder pointing outside it is refused --------------------------------
@@ -1431,9 +1482,16 @@ def cp3_adv_round1_location_first():
           and ui.get("status") != "passed" and ui.get("attempts", 0) == 0, (r.returncode, r.stderr, ui))
 
     # --- adv-record judges (and copies) the bytes it read after the check, even if the file is rewritten later -----
+    # CP7: `good` must be accepted outright (rc == 0, gate passed) for this to prove anything, so it is confirmed as
+    # a host sub-agent's write (the same mechanism test_signing.py's record_host_review drives end to end) before
+    # being written; the forged rewrite below stays hand-typed, since it must never be read back anyway.
+    import test_signing as ts
     m = engine()
     env, d, rnd, rid = cp3x_adv_ready()
-    good = Path(cp3_write_review(Path(rnd["output_dir"]) / f"{rid}.json", rnd, rid))
+    path = Path(rnd["output_dir"]) / f"{rid}.json"
+    gr = ts.guard(d, env, "Write", {"file_path": str(path)}, agent="ratchet-adversary")
+    assert gr.returncode == 0, (gr.returncode, gr.stdout, gr.stderr)
+    good = Path(cp3_write_review(path, rnd, rid))
     original = good.read_bytes()
     real_read = m._read_round_review
 
@@ -1451,9 +1509,11 @@ def cp3_adv_round1_location_first():
           ev.exists() and ev.read_bytes() == original, (ev.exists(), ev.read_bytes()[:200] if ev.exists() else None))
 
     # --- ui-record: same, the verdict and evidence come from the bytes read after the check ----------------------
+    # CP7: `good` must be accepted outright (rc == 0, gate passed), so it is signed the way ui_review.py's combine
+    # step signs it; the forged rewrite below stays hand-typed, since it must never be read back anyway.
     m = engine()
     env, d, fp = cp3x_ui_ready()
-    good = Path(cp3_write_combined(cp3_ui_round_dir(d, 1) / "combined.json", fp))
+    good = cp3_signed_combined(d, env, fp)
     original = good.read_bytes()
     real_read = m._read_round_review
 
@@ -1574,7 +1634,7 @@ def cp3_adv_round3_fstat_and_write_errors():
     # --- an OSError from os.fstat(dfd), the dir-fd identity check, becomes the "changed" message --------------------
     m = engine()
     env, d, fp = cp3x_ui_ready()
-    good = Path(cp3_write_combined(cp3_ui_round_dir(d, 1) / "combined.json", fp))
+    good = cp3_signed_combined(d, env, fp)  # CP7: must be accepted outright to exercise the later fstat/write step
     real_fstat = os.fstat
     state = {"calls": 0}
 
@@ -1597,7 +1657,7 @@ def cp3_adv_round3_fstat_and_write_errors():
     # --- an OSError from os.fstat(fd), the opened file's own fstat, becomes "Could not inspect" ----------------------
     m = engine()
     env, d, fp = cp3x_ui_ready()
-    good = Path(cp3_write_combined(cp3_ui_round_dir(d, 1) / "combined.json", fp))
+    good = cp3_signed_combined(d, env, fp)  # CP7: must be accepted outright to exercise the later fstat/write step
     state = {"calls": 0}
 
     def failing_fstat_file(fd):
@@ -1619,7 +1679,7 @@ def cp3_adv_round3_fstat_and_write_errors():
     # --- an OSError raised while writing the evidence copy (write_bytes) becomes a plain die message -----------------
     m = engine()
     env, d, fp = cp3x_ui_ready()
-    good = Path(cp3_write_combined(cp3_ui_round_dir(d, 1) / "combined.json", fp))
+    good = cp3_signed_combined(d, env, fp)  # CP7: must be accepted outright to exercise the later fstat/write step
     real_write_bytes = Path.write_bytes
     state = {"raised": False}
 
@@ -1760,7 +1820,7 @@ def cp4_awaiting_review(env):
     cp3_pass_behavior(d, env)
     rnd = cp3_open_round(d, env)
     rid = cp3_R0(rnd)
-    good = cp3_write_review(Path(rnd["output_dir"]) / f"{rid}.json", rnd, rid)
+    good = cp3_reviewer_writes(d, env, rnd, rid)
     r = rx(d, env, "adv-record", "CP1", "--reviews", good)
     assert r.returncode == 0, r.stderr + r.stdout
     r = rx(d, env, "complete", "CP1")
@@ -3036,7 +3096,7 @@ def cp5_awaiting_checkpoint_review(env):
     cp3_pass_behavior(d, env)
     rnd = cp3_open_round(d, env)
     rid = cp3_R0(rnd)
-    good = cp3_write_review(Path(rnd["output_dir"]) / f"{rid}.json", rnd, rid)
+    good = cp3_reviewer_writes(d, env, rnd, rid)
     r = rx(d, env, "adv-record", "CP1", "--reviews", good)
     assert r.returncode == 0, r.stderr + r.stdout
     r = rx(d, env, "complete", "CP1")
@@ -3310,7 +3370,7 @@ def cp5x_frozen_ui_project(env):
     cp3_pass_behavior(d, env)
     fp = cp3_fp(d, env)
     diffs = [{"severity": "minor", "location": "x", "description": "issue", "fixable_in_code": True}]
-    combined = cp3_write_combined(cp3_ui_round_dir(d, 1) / "combined.json", fp, diffs=diffs)
+    combined = str(cp3_signed_combined(d, env, fp, diffs=diffs))
     r = rx(d, env, "ui-record", "CP1", "--review", combined)
     assert r.returncode == 2, (r.returncode, r.stderr)
     assert cp3_state(d)["checkpoints"]["CP1"]["gates"]["ui"].get("frozen"), cp3_state(d)["checkpoints"]["CP1"]["gates"]["ui"]
@@ -3961,11 +4021,12 @@ def cp5_adv_round2_engine_hints():
     print("CP5 adv round 2: the engine's own hints say to show the printed question word for word")
 
     # --- X19: ui-record's frozen-spec refusal ----------------------------------------------------------------
+    # (CP7: the combined review must be script-signed with real provenance to reach the frozen-spec check at all;
+    # cp3_signed_combined's spec_sha256 override produces one that still mismatches round 1's frozen spec)
     env = make_env("claude")
     d = cp5x_frozen_ui_project(env)
     fp = cp3_fp(d, env)
-    combined = cp3_write_combined(cp3_ui_round_dir(d, 2) / "combined.json", fp,
-                                  compared={"spec_sha256": "s2", "scope": "all"})
+    combined = str(cp3_signed_combined(d, env, fp, n=2, spec_sha256="s2"))
     r = rx(d, env, "ui-record", "CP1", "--review", combined)
     check("[CP5-X19] ui-record's frozen-spec refusal names `ask ui-respec`, says to show the question word for word, "
           "and that only a listed yes as the first reply counts", r.returncode != 0 and "ask ui-respec CP1" in r.stderr
@@ -4686,7 +4747,7 @@ def cp5r7_at_complete(d, env):
     assert r.returncode == 0, r.stderr + r.stdout
     rnd = cp3_open_round(d, env)
     rid = cp3_R0(rnd)
-    good = cp3_write_review(Path(rnd["output_dir"]) / f"{rid}.json", rnd, rid)
+    good = cp3_reviewer_writes(d, env, rnd, rid)
     r = rx(d, env, "adv-record", "CP1", "--reviews", good)
     assert r.returncode == 0, r.stderr + r.stdout
 

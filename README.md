@@ -171,7 +171,7 @@ You don't need any of this to use Ratchet. It's here if you want to know why the
 |---|---|---|---|
 | 1 | **Tests** | Tests written *before* the code all run, and at least one fails on an assertion, then all pass | Ratchet runs the tests itself, checks none were deleted, and reads each planned test's own result, so a test that crashed, was skipped or never ran doesn't count (a step whose tests can't report results one by one is checked by exit code only, and `status` says so). A planned test that already passes before the code exists is not caught by this check. Planned tests are frozen after their first failing run: changing one needs your OK. This is a structural check, not a proof |
 | 2 | **Looks right** | The screen matches the design or the old screen, in the same state | Two separate reviewers compare screenshots and list every difference; any fixable difference blocks |
-| 3 | **Review** | Reviewers try to break the code and find nothing serious | Reviewers keep going until none of them has a blocking finding on the current code |
+| 3 | **Review** | Reviewers try to break the code and find nothing serious | Reviewers keep going until none of them has a blocking finding on the current code. A review counts only when the review script signed it for that round, or the host's own reviewer sub-agent wrote it (see below) |
 | 4 | **You** | You try it and say yes | Only a real message from you counts |
 
 Work with nothing to look at, like an API change or a refactor, skips gate 2. For rebuilding an old screen, gate 2 compares against the old screen instead of a new design.
@@ -241,6 +241,8 @@ The four CLIs do not all enforce the same things. Here is what each one actually
 | Copilot | Yes, Ratchet's state and evidence files are protected from hand-edits. | No, Ratchet has no way to know which sub-agent (reviewer) is at work, so it cannot confirm reviewer identity. | Yes, the stop hook stops the agent from ending its turn early. | Copilot's prompt hook drops its own message, so the agent never sees Ratchet's guidance, but the reply is still recorded in Ratchet's log. |
 
 Only Claude Code tells Ratchet which sub-agent is acting; none of the other three can do that today, so Ratchet cannot confirm reviewer identity on Codex, Gemini or Copilot the way it can on Claude Code.
+
+Review checks, on all four CLIs: a review from another provider counts only as a script-signed review. `external_review.py` (and `ui_review.py` for the screen reviews, which also signs the capture manifest the reviewers judged) signs what it writes with a secret made for that one round, kept in Ratchet's per-user folder, never printed, never in the project, and deleted once the round is recorded. A review from another provider that was typed, copied or edited by hand, or signed for another round or step, is refused as unsigned. A review by the host's own reviewer sub-agent is not signed, and how much Ratchet can check it depends on the CLI. Only Claude Code confirms which sub-agent wrote it: there the review counts only when Ratchet's guard hook saw that reviewer sub-agent write it with the Write tool, and a review written by the main session, through the shell, or by hand is refused as unsigned. On Codex, Gemini and Copilot, or when you waived the hooks, Ratchet cannot tell who wrote a host reviewer's file: any file in the round's folder with the right round nonce and code version counts, even one typed by hand, so the run never stalls, but `status` (and the viewer, for code reviews) marks it "not independently confirmed". Run outside a Ratchet run, `ui_review.py` still compares screens for an ad-hoc check, but its results are marked unsigned and never count for a gate. The secret protects against a different process on the same machine, not against the operating system: any program running as your own user can read Ratchet's per-user folder, and only the guard keeps the agent out of it.
 
 On all four, the guard also refuses commands that set Ratchet's reserved variables (`RATCHET_HUMAN_OVERRIDE`, `RATCHET_ROLE`, `RATCHET_HOME`, `RATCHET_DIRECTOR_KEY_FILE`), including indirect ways such as `declare`, `eval` or a `python3 -c` that writes `os.environ`. Ratchet itself also refuses a per-user folder or key file the hooks don't use, and the human override only works after a person types back a code shown in a real terminal. This is best-effort against an agent that can run anything: one that writes a script to a file and runs it later, or starts its own pseudo-terminal to read the code, can get further than the guard sees. Put plainly: these protections stop an agent from stumbling past a gate or taking an easy shortcut, but a script deliberately written to cheat, running as your own user, can still forge Ratchet's records, for example by calling Ratchet's own hook command directly with made-up input.
 
@@ -336,6 +338,7 @@ python3 tests/test_hooks_waiver.py
 python3 tests/test_install.py
 python3 tests/test_providers.py
 python3 tests/test_results.py
+python3 tests/test_signing.py
 python3 tests/test_specs.py
 python3 tests/test_status_plain.py
 python3 tests/test_trust.py

@@ -13,6 +13,10 @@ snapshots, the design file and the scope — never the project's code, instructi
   stage    Only stage the isolated folders (for host sub-agents).
   combine  Merge reviewer JSON files into combined.json.
 
+Inside an active Ratchet run, `review` and `stage` stamp and sign the capture manifest for the checkpoint's UI round,
+and everything written is signed for that round. Outside a run (no .ratchet folder, or no active run) they still work
+for an ad-hoc comparison, but nothing is signed: the files say "unsigned", and `ratchet.py ui-record` refuses them.
+
 Output: <out>/visual.json, <out>/behavior.json, <out>/combined.json
 Then:   ratchet.py ui-record CPn --review <out>/combined.json
 """
@@ -295,11 +299,12 @@ def _current_fingerprint():
 
 
 def combine(reviews: list[dict], checkpoint: str | None, manifest_fp: str | None = None,
-            compared: dict | None = None) -> dict:
+            compared: dict | None = None, check_fp: bool = True) -> dict:
     """Merge reviewer files. Every input must be a review of the CURRENT code: its own fingerprint (stamped by
-    `review` before the reviewers ran) or the capture manifest's fingerprint must equal the working tree's now."""
-    now_fp = _current_fingerprint()
-    for r in reviews:
+    `review` before the reviewers ran) or the capture manifest's fingerprint must equal the working tree's now.
+    `check_fp` is False only for an unsigned ad-hoc comparison outside a Ratchet run (no code version is tracked)."""
+    now_fp = _current_fingerprint() if check_fp else None
+    for r in reviews if check_fp else []:
         fp = r.get("fingerprint") or manifest_fp
         if not fp or (now_fp and fp != now_fp):
             raise SystemExit(f"Refusing to combine: the {r.get('reviewer', '?')} review is not of the current code "
@@ -319,16 +324,108 @@ def combine(reviews: list[dict], checkpoint: str | None, manifest_fp: str | None
             "summary": f"{len(fixable)} code-fixable difference(s) across {len(names)} reviewer(s)"}
 
 
+UNSIGNED = ("unsigned: written by ui_review.py outside a Ratchet run, for an ad-hoc comparison only; "
+            "`ratchet.py ui-record` does not accept it")
+
+
+def _active_run(eng):
+    """The active Ratchet run's Ctx, or None outside one (no .ratchet folder, or no active run)."""
+    try:
+        ctx = eng.Ctx(eng.find_root())
+        return ctx if ctx.ratchet.is_dir() and ctx.active_slug() else None
+    except SystemExit:
+        return None
+
+
+def _ui_round(eng, cp, how: str):
+    """(ctx, state, n): the Ratchet run and the UI round `cp` is on, or None outside an active Ratchet run (an ad-hoc,
+    unsigned comparison). Inside a run, exits with a plain message when there is no such round; `how` says where the
+    checkpoint comes from (a flag or the manifest)."""
+    ctx = _active_run(eng)
+    if ctx is None:
+        print(f"note: no active Ratchet run here, so nothing is signed ({UNSIGNED}).", file=sys.stderr)
+        return None
+    if not cp:
+        sys.exit(f"ui_review.py signs its reviews for one checkpoint's UI round, but no checkpoint was given ({how}).")
+    st = ctx.state()  # exits with its own message when its state can't be read
+    n = eng.ui_round_number(st, cp)
+    if n is None:
+        sys.exit(f"{cp} is not a step of the active Ratchet run with a UI gate, so there is no UI round to sign this "
+                 f"review for ({how}). Run ui_review.py from the project, for the step whose UI gate is open.")
+    return ctx, st, n
+
+
+def _ui_key(eng, ctx, st, cp, n) -> dict:
+    """This UI round's signing record, created when missing. Exits with a plain message when it can't be."""
+    key, why = eng.open_review_key(ctx, cp, "ui", n, st)
+    if key is None:
+        sys.exit(eng.review_key_problem(why, "run ui_review.py again"))
+    return key
+
+
+def _write_signed(out: Path, comb: dict, rnd=None):
+    """Write combined.json signed with the UI round's secret (kept in Ratchet's per-user folder), so ui-record can tell
+    it from a combined review typed or edited by hand. Exits without writing anything when it can't be signed.
+    `rnd` is (ctx, state, n, key) when the caller already opened the round. Outside an active Ratchet run it is
+    written unsigned, marked so."""
+    eng = _engine()
+    cp = comb.get("checkpoint")
+    if not rnd:
+        got = _ui_round(eng, cp, "the combined review names no checkpoint")
+        if got is None:
+            comb["unsigned"] = UNSIGNED
+            out.write_text(json.dumps(comb, indent=2))
+            return
+        ctx, st, n = got
+        rnd = (ctx, st, n, _ui_key(eng, ctx, st, cp, n))
+    ctx, st, n, key = rnd
+    eng.sign_review(key, comb, eng.ui_round_label(cp, n), "ui_review.py")
+    out.write_text(json.dumps(comb, indent=2))
+
+
+def _stamp_manifest(eng, rnd, cp, manifest: dict):
+    """Stamp and sign the capture manifest for this UI round (rnd = (ctx, state, n, key)); exits when it can't be."""
+    ctx, st, n, key = rnd
+    why = eng.stamp_ui_manifest(ctx, st, cp, n, key, manifest)
+    if why:
+        sys.exit(eng.review_key_problem(why, "run ui_review.py again"))
+
+
+def _open_stage_round(cp):
+    """`stage`: open this checkpoint's UI round record, so the guard can record which sub-agent writes visual.json and
+    behavior.json. (ctx, state, n, key), or None outside a Ratchet run or for a step with no UI gate (staging then
+    goes on, and the manifest is not signed)."""
+    eng = _engine()
+    ctx = _active_run(eng)
+    if ctx is None:
+        return None
+    st = ctx.state()
+    n = eng.ui_round_number(st, cp)
+    if n is None:
+        return None
+    return ctx, st, n, _ui_key(eng, ctx, st, cp, n)
+
+
 def cmd_review(a):
     manifest = json.loads(Path(a.manifest).read_text())
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     design = resolve_design(a.design)
     cases = Path(a.cases) if a.cases else None
+    eng = _engine()
+    cp = manifest.get("checkpoint")
+    got = _ui_round(eng, cp, "the capture manifest names no checkpoint")
+    rnd = None
+    if got:  # inside a run: the key is opened before any reviewer runs, so nothing paid for is thrown away unsigned
+        ctx, st, n = got
+        key = _ui_key(eng, ctx, st, cp, n)
+        rnd = (ctx, st, n, key)
     host, providers = role_providers(a)
-    fp_at_start = _current_fingerprint()
-    manifest["fingerprint"] = fp_at_start           # host sub-agents' files inherit this via `combine --manifest`
+    fp_at_start = _current_fingerprint() if rnd else None
     manifest["review_scope"] = a.scope              # what the reviewers were told to judge; ratchet.py checks it
+    if rnd:
+        manifest["fingerprint"] = fp_at_start       # host sub-agents' files inherit this via `combine --manifest`
+        _stamp_manifest(eng, rnd, cp, manifest)     # signed: combine trusts only the manifest this round last stamped
     Path(a.manifest).write_text(json.dumps(manifest, indent=2))
     staged = {role: stage(manifest, design, a.scope, cases if role == "behavior" else None, role)
               for role in ("visual", "behavior")}
@@ -339,6 +436,8 @@ def cmd_review(a):
             try:
                 r = RUNNERS[prov](staged[role], role, a.model if prov == "claude" else None, a.timeout)
                 r.update(reviewer=role, provider=prov, checkpoint=manifest.get("checkpoint"), fingerprint=fp_at_start)
+                if rnd:
+                    r["manifest_stamp"] = manifest["stamp"]  # combine refuses it once the manifest is stamped again
                 if tried:
                     r["fallback_for"] = tried
                 return role, r, tried
@@ -355,6 +454,10 @@ def cmd_review(a):
         if r is None:
             for_host[role] = staged[role]
             continue
+        if rnd:
+            eng.sign_review(key, r, f"{eng.ui_round_label(cp, n)}/{role}", "ui_review.py")  # `combine` checks it
+        else:
+            r["unsigned"] = UNSIGNED
         (out / f"{role}.json").write_text(json.dumps(r, indent=2))
         results.append(r)
         print(f"✓ {role} [{r['provider']}]: {r.get('verdict')} ({len(r.get('differences', []))} differences)")
@@ -363,16 +466,21 @@ def cmd_review(a):
         print(f"\nNo other provider available for: {', '.join(for_host)}. Spawn the host's own reviewer sub-agent(s) "
               "(ratchet-visual-reviewer / ratchet-behavior-reviewer), each told to work ONLY from its folder's INPUT.md "
               f"and to write {out}/<role>.json. Then run:\n  python3 {Path(__file__)} combine --inputs "
-              f"{out}/visual.json {out}/behavior.json --out {out}/combined.json --checkpoint {manifest.get('checkpoint')} "
-              f"--manifest {a.manifest}",
+              f"{out}/visual.json {out}/behavior.json --out {out}/combined.json"
+              + (f" --checkpoint {cp}" if cp else "") + f" --manifest {a.manifest}",
               file=sys.stderr)
         sys.exit(4)
     if not a.keep:
         for t in staged.values():
             shutil.rmtree(t, ignore_errors=True)
-    comb = combine(results, manifest.get("checkpoint"), fp_at_start, _compared(manifest))
-    (out / "combined.json").write_text(json.dumps(comb, indent=2))
-    print(f"combined: {out / 'combined.json'} → {comb['verdict']} ({comb['summary']})")
+    comb = combine(results, cp, fp_at_start, _compared(manifest), check_fp=bool(rnd))
+    if rnd:
+        _write_signed(out / "combined.json", comb, rnd)
+    else:
+        comb["unsigned"] = UNSIGNED
+        (out / "combined.json").write_text(json.dumps(comb, indent=2))
+    print(f"combined: {out / 'combined.json'} → {comb['verdict']} ({comb['summary']})"
+          + ("" if rnd else " [UNSIGNED: ad-hoc comparison, not for ratchet.py ui-record]"))
 
 
 def _compared(manifest: dict) -> dict:
@@ -384,6 +492,10 @@ def cmd_stage(a):
     """Stage isolated inputs for the host's own sub-agent reviewers."""
     manifest = json.loads(Path(a.manifest).read_text())
     manifest["review_scope"] = a.scope
+    rnd = _open_stage_round(manifest.get("checkpoint"))
+    if rnd:  # the reviewers' files are judged against this manifest, so it is stamped and signed like `review` does
+        manifest["fingerprint"] = _current_fingerprint()
+        _stamp_manifest(_engine(), rnd, manifest.get("checkpoint"), manifest)
     Path(a.manifest).write_text(json.dumps(manifest, indent=2))
     design = resolve_design(a.design)
     tv = stage(manifest, design, a.scope, None, "visual")
@@ -392,10 +504,75 @@ def cmd_stage(a):
 
 
 def cmd_combine(a):
-    reviews = [json.loads(Path(p).read_text()) for p in a.inputs]
-    man = json.loads(Path(a.manifest).read_text()) if a.manifest else {}
-    comb = combine(reviews, a.checkpoint, man.get("fingerprint"), _compared(man) if a.manifest else None)
-    Path(a.out).write_text(json.dumps(comb, indent=2))
+    """Merge per-role reviews and sign the result, but only reviews whose origin checks out: signed by `review` for
+    this round, or written into this round's folder by the host's own reviewer sub-agent (confirmed by the guard on
+    Claude Code; marked "not independently confirmed" where the CLI can't say who wrote it)."""
+    eng = _engine()
+    cp = a.checkpoint
+    got = _ui_round(eng, cp, "pass --checkpoint CPn")
+    if got is None:  # outside a Ratchet run: an ad-hoc comparison, merged as given and written unsigned
+        reviews = []
+        for p in a.inputs:
+            try:
+                r = json.loads(Path(p).read_text())
+            except (OSError, ValueError) as e:
+                sys.exit(f"Refusing to combine: {p} can't be read as a review ({e}).")
+            if not isinstance(r, dict):
+                sys.exit(f"Refusing to combine: {p} is not a review (a JSON object).")
+            reviews.append(r)
+        man = json.loads(Path(a.manifest).read_text()) if a.manifest else {}
+        comb = combine(reviews, cp, None, _compared(man) if a.manifest else None, check_fp=False)
+        comb["unsigned"] = UNSIGNED
+        Path(a.out).write_text(json.dumps(comb, indent=2))
+        print(f"combined → {comb['verdict']} ({comb['summary']}) [UNSIGNED: ad-hoc comparison, not for ratchet.py "
+              "ui-record]")
+        return
+    ctx, st, n = got
+    key = _ui_key(eng, ctx, st, cp, n)
+    settings = ctx.config()
+    reviews, unconfirmed, problems, roles = [], [], [], set()
+    for p in a.inputs:
+        try:
+            r = json.loads(Path(p).read_text())
+        except (OSError, ValueError) as e:
+            sys.exit(f"Refusing to combine: {p} can't be read as a review ({e}).")
+        if not isinstance(r, dict):
+            sys.exit(f"Refusing to combine: {p} is not a review (a JSON object).")
+        origin, why = eng.ui_input_origin(ctx, settings, st, key, cp, n, Path(p), r)
+        if origin == "refused":
+            problems.append(f"{p}: {why}")
+            continue
+        if r.get("reviewer") in roles:
+            problems.append(f"{p}: a second {r.get('reviewer')} review (each role counts once)")
+            continue
+        roles.add(r.get("reviewer"))
+        if origin == "unconfirmed":
+            unconfirmed.append(f"{r.get('reviewer')}: {eng.UNCONFIRMED} ({why})")
+        reviews.append(r)
+    if problems:
+        sys.exit("Refusing to combine: these reviews' origin can't be checked, so they don't count.\n  - "
+                 + "\n  - ".join(problems) + "\nA per-role review counts when `ui_review.py review` wrote and signed "
+                 "it for this round, or when the host's ratchet-visual-reviewer or ratchet-behavior-reviewer sub-agent "
+                 f"wrote it with the Write tool into {eng._review_round_dir(ctx, cp, 'ui', n)}/ after `ui_review.py "
+                 "review` (or `stage`) opened the round. A review typed, copied or edited by hand does not count.")
+    if not a.manifest:
+        sys.exit(f"Refusing to combine: pass --manifest with the capture manifest `ui_review.py review` (or `stage`) "
+                 f"last wrote for {cp}; it says which code version and scope the reviewers judged.")
+    base = Path(os.path.realpath(str(ctx.run_dir() / "reviews" / cp)))
+    if base not in Path(os.path.realpath(a.manifest)).parents:
+        sys.exit(f"Refusing to combine: the capture manifest must be the one written for {cp} under {base}/ "
+                 f"(by capture.mjs and ui_review.py), not {a.manifest}.")
+    try:
+        man = json.loads(Path(a.manifest).read_text())
+    except (OSError, ValueError) as e:
+        sys.exit(f"Refusing to combine: {a.manifest} can't be read as a capture manifest ({e}).")
+    why = eng.ui_manifest_problem(key, cp, n, man)
+    if why:
+        sys.exit(f"Refusing to combine: the capture manifest {a.manifest} does not count: {why}.")
+    comb = combine(reviews, cp, man.get("fingerprint"), _compared(man))
+    if unconfirmed:
+        comb["unconfirmed"] = unconfirmed
+    _write_signed(Path(a.out), comb, (ctx, st, n, key))
     print(f"combined → {comb['verdict']} ({comb['summary']})")
 
 

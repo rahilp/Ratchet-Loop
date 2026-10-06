@@ -34,7 +34,7 @@ From round 2 on: re-check that previous fixes actually hold, and withdraw a find
 Only when you genuinely can't find anything: `"findings": []`. Don't approve to be nice, and don't invent findings to look busy.
 
 ## Output
-Write JSON to the given path, and return only a 1-line summary:
+Write the JSON to the given path with the Write tool, not through the shell (Ratchet only counts a host reviewer's file that it saw the reviewer write with the Write tool), and return only a 1-line summary:
 ```json
 {"reviewer":"<your reviewer id>","lens":"<lens>","checkpoint":"CPn","fingerprint":"<id given to you>","round_nonce":"<nonce given to you>","files_reviewed":["every changed file you read in full"],
  "verdict":"APPROVE|CHANGES_REQUESTED",

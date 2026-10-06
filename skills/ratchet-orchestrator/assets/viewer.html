@@ -154,7 +154,8 @@ function reviewsBlock(r){
   if(!r || !r.rounds?.length) return "";
   const own = r.rounds.every(x=>x.own_company_only);
   const rows = r.rounds.map(x=>`<li data-testid="review-round">Round ${x.round}: ${esc(x.who.join("; "))} — ${
-    x.blocking?`${x.blocking} to fix`:"approved"}${x.deferred?`, ${x.deferred} minor noted for later`:""}</li>`).join("");
+    x.blocking?`${x.blocking} to fix`:"approved"}${x.deferred?`, ${x.deferred} minor noted for later`:""}${
+    x.unconfirmed?.length?` <span class="meta" data-testid="review-unconfirmed">(${esc(x.unconfirmed.join(", "))}: not independently confirmed)</span>`:""}</li>`).join("");
   return `<div><h4>Second opinion</h4>${own?`<div class="meta" data-testid="same-company-warning">Every review so far came from this agent's own company's models; no other provider was available.</div>`:""}<ul>${rows}</ul>${
     r.deferred_total?`<div class="meta">${r.deferred_total} minor finding(s) noted for later; you'll see them at the final review.</div>`:""}</div>`;
 }

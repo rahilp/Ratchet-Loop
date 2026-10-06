@@ -144,12 +144,47 @@ def ui_round_dir(d, cp="CP1", slug="f"):
 
 
 def write_review(d, rnd, rid, findings=None, **over):
+    """Writes an adversarial review into the round's own folder. CP7: a hand-written review only counts when the
+    guard hook has recorded, at write time, that a ratchet-adversary sub-agent is writing this exact file; so the
+    write is confirmed through the real guard hook (as test_signing.py's record_host_review does) before the
+    content is written."""
     p = Path(rnd["output_dir"]) / f"{rid}.json"
+    g = guard(d, "Write", {"file_path": str(p)}, agent="ratchet-adversary")
+    assert g.returncode == 0, g.stdout + g.stderr
     body = {"reviewer": rid, "checkpoint": rnd["checkpoint"], "fingerprint": rnd["fingerprint"],
             "round_nonce": rnd["round_nonce"], "findings": findings or [], "files_reviewed": ["src/f.js"]}
     body.update(over)
     p.write_text(json.dumps(body))
     return str(p)
+
+
+_COMBINE_HELPER = Path(tempfile.mkdtemp(prefix="ratchet-combine-helper-")) / "combine_and_sign.py"
+_COMBINE_HELPER.write_text(
+    "import json, sys\n"
+    "sys.path.insert(0, " + json.dumps(str((Path(__file__).resolve().parents[1]
+                                            / 'skills' / 'ratchet-ui-compare' / 'scripts'))) + ")\n"
+    "import ui_review as ur\n"
+    "data = json.load(open(sys.argv[1]))\n"
+    "comb = ur.combine(data['reviews'], data['checkpoint'], data.get('fingerprint'), data.get('compared'))\n"
+    "ur._write_signed(ur.Path(data['out']), comb)\n"
+)
+
+
+def write_combined(d, cp, compared, diffs, reviewers=("visual", "behavior"), out=None, fp=None):
+    """Writes a combined UI review into the round's own folder, signed the way ui_review.py's `combine` step signs
+    it (CP7: ui-record only accepts a script-signed combined review, never one written by hand). Calls `combine()`
+    and `_write_signed()` directly (not the CLI) so the test keeps full control of `compared` and `differences`,
+    including deliberately malformed shapes some of these checks exercise."""
+    path = out or (ui_round_dir(d, cp) / "combined.json")
+    reviews = [{"reviewer": r, "differences": diffs if i == 0 else []} for i, r in enumerate(reviewers)]
+    payload = {"reviews": reviews, "checkpoint": cp, "compared": compared,
+               "fingerprint": fp or json.loads(rx(d, "fingerprint").stdout)["id"], "out": str(path)}
+    pf = Path(tempfile.mkdtemp(prefix="ratchet-combine-in-")) / "in.json"
+    pf.write_text(json.dumps(payload))
+    r = subprocess.run([sys.executable, str(_COMBINE_HELPER), str(pf)], cwd=d, capture_output=True, text=True,
+                       env=ENV)
+    assert r.returncode == 0, r.stderr + r.stdout
+    return str(path)
 
 
 # ---- CP7 ----
@@ -625,25 +660,19 @@ def main():
     rx(d, "tests-written", "CP1"); rx(d, "red", "CP1")
     (d / "src/f.js").write_text("export const f = () => 1;\n")
     rx(d, "implemented", "CP1"); rx(d, "behavior", "CP1")
-    fp = json.loads(rx(d, "fingerprint").stdout)["id"]
     c = Path(tempfile.mkdtemp()) / "combined.json"
     c.write_text(json.dumps({"reviewers": ["visual", "behavior"], "differences": []}))
     check("a combined review without a fingerprint is refused", rx(d, "ui-record", "CP1", "--review", str(c)).returncode != 0)
-    c = ui_round_dir(d) / "combined.json"  # CP3: moved into this round's own folder, see ui_round_dir
-    c.write_text(json.dumps({"checkpoint": "CP1", "fingerprint": fp, "reviewers": ["visual", "behavior"],
-                             "compared": {"spec_sha256": "s1", "scope": "all"},
-                             "differences": [{"severity": "blocker", "location": "x", "description": "broken",
-                                              "fixable_in_code": False}]}))
-    check("a blocker can't exempt itself with fixable_in_code:false", rx(d, "ui-record", "CP1", "--review", str(c)).returncode == 2)
-    c.write_text(json.dumps({"checkpoint": "CP1", "fingerprint": fp, "reviewers": ["visual"], "differences": []}))
-    check("one reviewer is not enough", rx(d, "ui-record", "CP1", "--review", str(c)).returncode != 0)
+    c = write_combined(d, "CP1", {"spec_sha256": "s1", "scope": "all"},  # CP3+CP7: signed, into the round's own folder
+                       [{"severity": "blocker", "location": "x", "description": "broken", "fixable_in_code": False}])
+    check("a blocker can't exempt itself with fixable_in_code:false", rx(d, "ui-record", "CP1", "--review", c).returncode == 2)
+    c = write_combined(d, "CP1", {"spec_sha256": "s1", "scope": "all"}, [], reviewers=("visual",), out=Path(c))
+    check("one reviewer is not enough", rx(d, "ui-record", "CP1", "--review", c).returncode != 0)
 
     print("What the UI check compares is frozen after a FAIL (smoke-run finding)")
     def ui_round(d, compared, diffs):
-        c = ui_round_dir(d) / "combined.json"  # CP3: moved into this round's own folder, see ui_round_dir
-        c.write_text(json.dumps({"checkpoint": "CP1", "fingerprint": json.loads(rx(d, "fingerprint").stdout)["id"],
-                                 "reviewers": ["visual", "behavior"], "compared": compared, "differences": diffs}))
-        return rx(d, "ui-record", "CP1", "--review", str(c))
+        c = write_combined(d, "CP1", compared, diffs)  # CP3+CP7: signed, into the round's own folder
+        return rx(d, "ui-record", "CP1", "--review", c)
     spin = [{"severity": "minor", "location": "bill input", "description": "spinner arrows show", "fixable_in_code": True}]
     d = project("uifreeze", extra_cp={"gates": {"behavior": True, "ui": True, "adversarial": True},
                                       "ui_scope": "all", "ui_states": [{"name": "empty"}]})

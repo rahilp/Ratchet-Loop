@@ -79,8 +79,8 @@ def rx(d, *args, env=None):
     return g.rx(d, *args, env=env)
 
 
-def write_review(rnd, rid, findings=None):
-    return g.write_review(None, rnd, rid, findings=findings)
+def write_review(d, rnd, rid, findings=None):
+    return g.write_review(d, rnd, rid, findings=findings)
 
 
 def ids(rnd):
@@ -107,7 +107,7 @@ def severity_and_scope():
     g.to_adversarial(d)
     rnd = open_round(d)
     minor = [{"id": "M1", "severity": "minor", "file": "src/f.js", "line": 1, "description": "name could be clearer"}]
-    r = rx(d, "adv-record", "CP1", "--reviews", write_review(rnd, ids(rnd)[0], minor))
+    r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], minor))
     check("low risk: a minor finding alone doesn't block", r.returncode == 0 and "recorded for later" in r.stdout,
           r.stdout + r.stderr)
     r = rx(d, "deferred")
@@ -123,7 +123,7 @@ def severity_and_scope():
         g.to_adversarial(d)
         rnd = open_round(d)
         f = [{"id": "X1", "severity": sev, "file": "src/f.js", "description": "breaks"}]
-        r = rx(d, "adv-record", "CP1", "--reviews", write_review(rnd, ids(rnd)[0], f))
+        r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], f))
         check(f"low risk: {label} still blocks", r.returncode == 2, r.stdout + r.stderr)
 
     print("What blocks: normal risk, and later rounds scoped to what changed")
@@ -133,7 +133,7 @@ def severity_and_scope():
     rnd = open_round(d)
     check("normal risk asks two reviewers", len(ids(rnd)) == 2, ids(rnd))
     minor_f = [{"id": "M1", "severity": "minor", "file": "src/f.js", "description": "tiny"}]
-    paths = [write_review(rnd, ids(rnd)[0], minor_f), write_review(rnd, ids(rnd)[1])]
+    paths = [write_review(d, rnd, ids(rnd)[0], minor_f), write_review(d, rnd, ids(rnd)[1])]
     r = rx(d, "adv-record", "CP1", "--reviews", *paths)
     check("normal risk: a minor finding blocks in round 1", r.returncode == 2, r.stdout + r.stderr)
     (d / "src/f.js").write_text("export const f = () => 1; // fixed\n")
@@ -144,8 +144,8 @@ def severity_and_scope():
           (rnd.get("focus_files"), rnd.get("review_rules")))
     elsewhere = [{"id": "M2", "severity": "minor", "file": "src/a.js", "description": "old code nit"}]
     here = [{"id": "M3", "severity": "minor", "file": "./src/f.js", "description": "new code nit"}]
-    r = rx(d, "adv-record", "CP1", "--reviews", write_review(rnd, ids(rnd)[0], elsewhere),
-           write_review(rnd, ids(rnd)[1], here))
+    r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], elsewhere),
+           write_review(d, rnd, ids(rnd)[1], here))
     check("round 2: a minor finding in the changed code still blocks", r.returncode == 2, r.stdout + r.stderr)
     open_f = json.loads(next((d / ".ratchet/runs/f/evidence/CP1/adversarial").glob("round-02/open-findings.json")).read_text())
     check("… while a minor finding in untouched code is noted, not sent to the fixer",
@@ -154,8 +154,8 @@ def severity_and_scope():
     rx(d, "behavior", "CP1")
     rnd = open_round(d)
     major_elsewhere = [{"id": "B1", "severity": "major", "file": "src/a.js", "description": "real bug"}]
-    r = rx(d, "adv-record", "CP1", "--reviews", write_review(rnd, ids(rnd)[0], major_elsewhere),
-           write_review(rnd, ids(rnd)[1]))
+    r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], major_elsewhere),
+           write_review(d, rnd, ids(rnd)[1]))
     check("round 3: a major finding in untouched code still blocks", r.returncode == 2, r.stdout + r.stderr)
 
 
@@ -167,9 +167,9 @@ def review_holes():
     g.to_adversarial(d)
     rnd = open_round(d)
     nit = [{"id": "M1", "severity": "minor", "file": "src/f.js", "description": "unchecked input"}]
-    rx(d, "adv-record", "CP1", "--reviews", write_review(rnd, ids(rnd)[0], nit), write_review(rnd, ids(rnd)[1]))
+    rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], nit), write_review(d, rnd, ids(rnd)[1]))
     rnd = open_round(d)                                      # the fixer changed nothing
-    r = rx(d, "adv-record", "CP1", "--reviews", write_review(rnd, ids(rnd)[0], nit), write_review(rnd, ids(rnd)[1]))
+    r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], nit), write_review(d, rnd, ids(rnd)[1]))
     check("a minor finding the fixer ignored still blocks in round 2", r.returncode == 2, r.stdout + r.stderr)
     # path spellings of a changed file can't move a finding out of scope
     (d / "src/f.js").write_text("export const f = () => 1; // touched\n")
@@ -178,7 +178,7 @@ def review_holes():
                         ("bare name", "f.js"), ("no file", None)):
         rnd = open_round(d)
         f = [{"id": "M9", "severity": "minor", "description": "nit", **({"file": path} if path else {})}]
-        r = rx(d, "adv-record", "CP1", "--reviews", write_review(rnd, ids(rnd)[0], f), write_review(rnd, ids(rnd)[1]))
+        r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], f), write_review(d, rnd, ids(rnd)[1]))
         check(f"a minor finding in changed code given as {label} still blocks", r.returncode == 2, r.stdout + r.stderr)
 
     # a provider that runs its own command can't be slipped in after approval
