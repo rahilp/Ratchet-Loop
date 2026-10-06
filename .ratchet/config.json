@@ -69,5 +69,6 @@
     }
   ],
   "test_timeout_sec": 3600,
-  "max_adversarial_rounds_run": 60
+  "max_adversarial_rounds_run": 60,
+  "spec_keep": true
 }
