@@ -2,11 +2,11 @@
 """
 CP7 tests: review scripts sign the reviews they write.   python3 tests/test_signing.py
 
-Kept separate from tests/test_trust.py (already 15+ minutes) and tests/test_results.py (per-test report reading),
+Kept separate from the trust suites (tests/test_trust_cp*.py) and tests/test_results.py (per-test report reading),
 even though it reuses their low-level helpers (rx, git, js, make_env, now_dt, project building) by importing
-tests/test_trust.py as a module, the way tests/test_results.py already does.
+tests/trust_helpers.py as a module, the way tests/test_results.py already does.
 
-Every project here runs hermetically: a private HOME / RATCHET_HOME (tests/test_trust.py's make_env), agent-CLI
+Every project here runs hermetically: a private HOME / RATCHET_HOME (tests/trust_helpers.py's make_env), agent-CLI
 env vars scrubbed, and a private PATH holding only a handful of real tools plus, where a test needs an "other
 provider" reviewer, a FAKE shell script standing in for that CLI (tests/test_providers.py's fake_bin pattern). No
 real reviewer CLI is ever invoked; external_review.py and ui_review.py are the real scripts under test, run
@@ -28,7 +28,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
-import test_trust as tt  # noqa: E402  (rx, git, js, make_env, now_dt, engine, cp3_* project helpers)
+import trust_helpers as tt  # noqa: E402  (rx, git, js, make_env, now_dt, engine, cp3_* project helpers)
 
 EXT = ROOT / "skills" / "ratchet-adversarial-loop" / "scripts" / "external_review.py"
 UI_REVIEW = ROOT / "skills" / "ratchet-ui-compare" / "scripts" / "ui_review.py"

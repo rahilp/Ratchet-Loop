@@ -341,7 +341,16 @@ python3 tests/test_providers.py
 python3 tests/test_results.py
 python3 tests/test_signing.py
 python3 tests/test_specs.py
+python3 tests/test_split_check.py
 python3 tests/test_status_plain.py
-python3 tests/test_trust.py
+python3 tests/test_trust_cp1.py
+python3 tests/test_trust_cp3.py
+python3 tests/test_trust_cp4.py
+python3 tests/test_trust_cp5_a.py
+python3 tests/test_trust_cp5_b.py
+python3 tests/test_trust_cp5_c.py
+python3 tests/test_trust_cp5_d.py
+python3 tests/test_trust_cp5_e.py
+python3 tests/test_trust_cp5_regression.py
 python3 tests/test_viewer.py
 ```

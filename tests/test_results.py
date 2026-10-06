@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-CP6 tests, kept separate from tests/test_trust.py (already very slow): the test gate reads each planned test
+CP6 tests, kept separate from the slow trust suites (tests/test_trust_cp*.py): the test gate reads each planned test
 case's own result (JUnit XML or Ratchet's small JSON report) instead of trusting the process exit code alone, so a
 test that crashes, gets skipped, or silently drops out of the report cannot pass a checkpoint.
 
     python3 tests/test_results.py
 
-Reuses tests/test_trust.py's low-level helpers (rx, git, make_env, js, project plumbing) for building throwaway
+Reuses tests/trust_helpers.py's low-level helpers (rx, git, make_env, js, project plumbing) for building throwaway
 projects and driving the CP5 ask-then-yes approval flow, imported as a module so none of its own tests run here.
 Every project uses a tiny stdlib-only Python "fixture" script as its test command (no real test framework, no
 network, no sleeps): it reads FX_MODE (and FX_FORMAT) from the environment and writes the report Ratchet is
@@ -21,7 +21,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import test_trust as tt  # noqa: E402  (rx, git, make_env, js, now_dt, cp3_state, engine helpers)
+import trust_helpers as tt  # noqa: E402  (rx, git, make_env, js, now_dt, cp3_state, engine helpers)
 
 PASS = FAIL = 0
 
@@ -145,7 +145,7 @@ def write_fixture(d, ids):
 
 
 def cp6_project(env, report, cases, checks=None, command=None, report_reason=None):
-    """A throwaway one-checkpoint project (mirrors tests/test_trust.py's cp3_project/project), approved into
+    """A throwaway one-checkpoint project (mirrors tests/trust_helpers.py's cp3_project/project), approved into
     building, whose CP1 uses the stdlib-only fixture script as its test command.
 
     `report` is "json" / "junit" / "none" / None (the last two meaning "tests.report" is "none" with a reason, or

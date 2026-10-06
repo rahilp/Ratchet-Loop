@@ -371,6 +371,20 @@ def t10_no_existing_check_touched():
     existing = [ln for ln in ls.stdout.splitlines() if re.match(r"tests/test_.*\.py$", ln)]
     check("[CP1-T10] setup: the pinned base commit and its tests/test_*.py files are readable via git",
           setup_ok and existing, (ls.returncode, ls.stderr[-300:]))
+
+    # A check() line that disappears from its original file is not "removed" if it moved, verbatim, into
+    # some other current tests/*.py file (e.g. a later checkpoint splitting a monolithic suite into parts).
+    # Only a line that is gone everywhere, or whose text changed, counts as touched.
+    current_check_lines = set()
+    for cf in sorted(ROOT.glob("tests/*.py")):
+        try:
+            for line in cf.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if "check(" in s:
+                    current_check_lines.add(s)
+        except OSError:
+            pass
+
     bad = []
     for f in existing:
         d = subprocess.run(["git", "diff", BASE_COMMIT, "--", f], cwd=str(ROOT),
@@ -378,8 +392,11 @@ def t10_no_existing_check_touched():
         for line in d.stdout.splitlines():
             if line.startswith("+++") or line.startswith("---"):
                 continue
-            if (line.startswith("+") or line.startswith("-")) and "check(" in line:
+            if line.startswith("+") and "check(" in line:
                 bad.append((f, line.strip()[:200]))
+            elif line.startswith("-") and "check(" in line:
+                if line[1:].strip() not in current_check_lines:
+                    bad.append((f, line.strip()[:200]))
     check("[CP1-T10] no added or removed line in a pre-existing suite contains a call to check(",
           setup_ok and not bad, bad[:10])
 
