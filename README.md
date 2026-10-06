@@ -169,7 +169,7 @@ You don't need any of this to use Ratchet. It's here if you want to know why the
 
 | # | Gate | What has to be true | How it's enforced |
 |---|---|---|---|
-| 1 | **Tests** | Tests written *before* the code fail first, then pass | Ratchet runs the tests itself and checks none were deleted |
+| 1 | **Tests** | Tests written *before* the code all run, and at least one fails on an assertion, then all pass | Ratchet runs the tests itself, checks none were deleted, and reads each planned test's own result, so a test that crashed, was skipped or never ran doesn't count (a step whose tests can't report results one by one is checked by exit code only, and `status` says so). A planned test that already passes before the code exists is not caught by this check. Planned tests are frozen after their first failing run: changing one needs your OK. This is a structural check, not a proof |
 | 2 | **Looks right** | The screen matches the design or the old screen, in the same state | Two separate reviewers compare screenshots and list every difference; any fixable difference blocks |
 | 3 | **Review** | Reviewers try to break the code and find nothing serious | Reviewers keep going until none of them has a blocking finding on the current code |
 | 4 | **You** | You try it and say yes | Only a real message from you counts |
@@ -335,6 +335,7 @@ python3 tests/test_hooks_status.py
 python3 tests/test_hooks_waiver.py
 python3 tests/test_install.py
 python3 tests/test_providers.py
+python3 tests/test_results.py
 python3 tests/test_specs.py
 python3 tests/test_status_plain.py
 python3 tests/test_trust.py

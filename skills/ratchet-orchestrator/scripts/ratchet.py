@@ -24,6 +24,7 @@ Python 3.8+ stdlib only.
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import datetime as _dt
 import fnmatch
@@ -508,7 +509,7 @@ def _read_record(path: Path, kind=dict, missing=_FRESH, lines: bool = False, tai
                 out.append(e)
         return out, None
     try:
-        data = json.loads(raw.decode("utf-8"))
+        data = json.loads(raw.decode("utf-8-sig"))  # a leading byte-order mark is not damage
     except ValueError as e:  # invalid JSON, or bytes that are not UTF-8
         return None, f"{type(e).__name__}: {e}"
     except RecursionError:
@@ -1658,6 +1659,10 @@ def validate_plan(plan: dict) -> list[str]:
             t = cp.get("tests") or {}
             if not t.get("command"):
                 errs.append(f"{tag}: behavior gate on requires tests.command")
+            if "report" in t and t["report"] not in ("junit", "json", "none"):
+                errs.append(f"{tag}: tests.report must be junit, json or none")
+            if t.get("report") == "none" and not str(t.get("report_reason") or "").strip():
+                errs.append(f"{tag}: tests.report none requires tests.report_reason")
         for dep in cp.get("depends_on", []) or []:
             if dep not in seen:
                 errs.append(f"{tag}: depends_on {dep} must refer to an EARLIER checkpoint")
@@ -1936,6 +1941,27 @@ def plain_hook_errors(root: Path, host: str) -> list:
     return lines
 
 
+def exit_code_only_line(cp):
+    """A plain line when a step's tests are checked by exit code only: its plan says it writes no per-test report
+    (`tests.report` none), or the plan does not say (no `report` key, e.g. a plan from before reports existed)."""
+    t = (cp or {}).get("tests") or {}
+    if not ((cp or {}).get("gates") or {}).get("behavior") or t.get("report") in ("junit", "json"):
+        return None
+    if t.get("report") == "none":
+        return (f"{cp['id']} has no per-test report, so its tests are checked by exit code only. "
+                f"Reason: {t.get('report_reason')}")
+    return (f"{cp['id']}'s plan does not say how its tests report each result, so they are checked by exit code "
+            "only.")
+
+
+def exit_code_only_note(plan, st):
+    """exit_code_only_line for the step being built now, or None."""
+    if st.get("phase") != "building":
+        return None
+    return exit_code_only_line(next((c for c in (plan or {}).get("checkpoints") or []
+                                     if c.get("id") == st.get("current")), None))
+
+
 def cmd_status_text(ctx: Ctx):
     st = ctx.state()
     plan = ctx.plan() or {"checkpoints": []}
@@ -1957,6 +1983,9 @@ def cmd_status_text(ctx: Ctx):
     if st.get("phase") == "building" and any(g.get("status") in ("stale", "invalid")
                                              for g in (cur.get("gates") or {}).values()):
         print("The code changed since the checks last passed, so they must be re-run.")
+    note = exit_code_only_note(plan, st)
+    if note:
+        print(note)
     if st.get("phase") == "blocked":
         print(f"Why: \"{plain_reason(st.get('blocked_reason')) or 'no reason was recorded'}\"")
         print("What would you like to do?")
@@ -2053,6 +2082,9 @@ def cmd_plan_summary(args):
         print(f"   UI review: {'yes' if (cp.get('gates') or {}).get('ui') else 'no'}")
         print(f"   Risk: {risk}" + ("" if bar == "all" else f" (only {' and '.join(bar)} findings block; minor ones are noted for later)"))
         print(f"   Reviewed by: {'; '.join(who)}")
+        ecl = exit_code_only_line(cp)
+        if ecl:
+            print(f"   Tests: {ecl}")
         sl = _step_spec_line(cp)
         if sl:
             print(f"   From the spec: {sl}")
@@ -3657,16 +3689,38 @@ def _planned_cases(ctx, cp_id):
 
 
 def _coverage(ctx, cp):
-    """Every planned (non-browser) case ID must appear in at least one test file."""
+    """Every planned (non-browser) case ID must appear in at least one test file (in a non-Python file, the id in
+    any usual spelling on a test's opening line, such as Go's TestCP1_T01, counts too)."""
     files = (cp.get("tests") or {}).get("files") or []
-    blob = ""
-    for f in files:
-        for p in ctx.root.glob(f) if any(ch in f for ch in "*?[") else [ctx.root / f]:
-            if p.is_file():
-                blob += p.read_text(errors="ignore")
+    texts = [(p, p.read_text(errors="ignore")) for p in _test_paths(ctx, cp)]
+    blob = "".join(t for _, t in texts)
     missing = [c["id"] for c in _planned_cases(ctx, cp["id"])
-               if not re.search(r"(?<![A-Za-z0-9-])" + re.escape(c["id"]) + r"(?![0-9])", blob)]
+               if not re.search(r"(?<![A-Za-z0-9-])" + re.escape(c["id"]) + r"(?![0-9])", blob)
+               and not _declared(texts, c["id"])]
     return files, missing, bool(blob)
+
+
+def _declared(texts, cid) -> bool:
+    """True when a non-Python test file has `cid` on a line that opens a test (see _test_decls)."""
+    return any(_test_decls(t.splitlines(), _case_id_re(cid)) for p, t in texts if p.suffix != ".py")
+
+
+def _undeclared(ctx, cp) -> str | None:
+    """Why a planned test can't be told apart by name: a planned case id that, outside Python files, appears only in
+    comments, so no test's opening line holds it (None when every id is placed)."""
+    texts = [(p, p.read_text(errors="ignore")) for p in _test_paths(ctx, cp)]
+    py = "".join(t for p, t in texts if p.suffix == ".py")
+    bad = [c["id"] for c in _planned_cases(ctx, cp["id"])
+           if not re.search(r"(?<![A-Za-z0-9-])" + re.escape(c["id"]) + r"(?![0-9])", py)
+           and not _declared(texts, c["id"])]
+    if not bad:
+        return None
+    cid = bad[0]
+    return (f"Planned case {', '.join(bad)} appears in the test files only inside a comment (in a test's body or "
+            f"above it). Outside Python, a planned case id must be on the line that opens its test: in the test's "
+            f"name, such as it('[{cid}] ...', () => {{ or func Test{cid.replace('-', '_')}(t *testing.T) {{, or on "
+            f"an annotation directly above it, such as @DisplayName(\"[{cid}] ...\"), so the test's own result "
+            f"carries it. Have ratchet-test-writer move the id into the test's name.")
 
 
 def cmd_tests_written(args):
@@ -3696,17 +3750,32 @@ def cmd_tests_written(args):
     if missing:
         die(f"Planned cases not present in the test files: {', '.join(missing)}. "
             f"Each test must include its case ID (e.g. '[{args.cp}-T01] ...').")
+    why = _undeclared(ctx, cp)
+    if why:
+        die(why)
     cps["step"] = "red"
     ctx.log(st, "tests_written", cp=args.cp, files=files)
     ctx.save_state(st)
     ok(f"{args.cp}: all {len(_planned_cases(ctx, args.cp))} planned cases are present. Next: ratchet.py red {args.cp}")
 
 
-def _run_cmd(ctx, command, log_path, timeout):
+def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None):
+    """Run a test or check command. With `report`, the command gets that path in RATCHET_TEST_REPORT, and any file
+    already there is deleted first, so a report left by an earlier run can never count for this one."""
+    env = dict(os.environ, CI="1", FORCE_COLOR="0")
+    env.pop("RATCHET_TEST_REPORT", None)
+    if report is not None:
+        try:
+            report.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            die(f"Could not delete the old test report at {report.relative_to(ctx.root)} ({e}); remove it and re-run.")
+        env["RATCHET_TEST_REPORT"] = str(report)
     t0 = _dt.datetime.now()
     try:
         r = subprocess.run(command, shell=True, cwd=ctx.root, capture_output=True, text=True,
-                           timeout=timeout, env=dict(os.environ, CI="1", FORCE_COLOR="0"))
+                           timeout=timeout, env=env)
         code, out = r.returncode, (r.stdout or "") + "\n" + (r.stderr or "")
     except subprocess.TimeoutExpired as e:
         code, out = 124, f"TIMEOUT after {timeout}s\n{e.stdout or ''}{e.stderr or ''}"
@@ -3714,6 +3783,85 @@ def _run_cmd(ctx, command, log_path, timeout):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(f"$ {command}\n# exit={code} duration={dur:.1f}s at {now()}\n\n{out}")
     return code, out, dur
+
+
+def _report_path(ctx, cp):
+    """Where the test command must write its per-test results, or None when the approved plan has none for this
+    step (tests.report "none", or a plan from before reports existed): then the exit code alone decides."""
+    fmt = (cp.get("tests") or {}).get("report")
+    if fmt not in ("junit", "json"):
+        return None
+    return ctx.evidence(cp["id"]) / ("test-report.xml" if fmt == "junit" else "test-report.json")
+
+
+def _read_test_report(ctx, path: Path):
+    """The per-test results in a JUnit XML or Ratchet JSON report (told apart by content): ([(name, status)], None),
+    or (None, why). status is passed, failed (a check failed), error (a crash) or skipped. Never raises."""
+    rel = path.relative_to(ctx.root)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None, f"no test report was written at {rel}"
+    except Exception as e:
+        return None, f"the test report at {rel} could not be read ({type(e).__name__}: {e})"
+    if raw.startswith(b"\xef\xbb\xbf"):  # a UTF-8 byte-order mark, as some .NET loggers write
+        raw = raw[3:]
+    try:
+        if raw.lstrip().startswith(b"<"):
+            import xml.etree.ElementTree as ET
+            out = []
+            for tc in ET.fromstring(raw).iter("testcase"):
+                kids = {k.tag for k in tc}
+                status = ("error" if "error" in kids else "failed" if "failure" in kids
+                          else "skipped" if "skipped" in kids else "passed")
+                props = [pr.get("value") or "" for pr in tc.iter("property")]
+                out.append((" ".join([tc.get("classname") or "", tc.get("name") or ""] + props).strip(), status))
+            return out, None
+        data, why = _read_record(path, kind=dict)  # the one JSON reader; it never raises
+        cases = data.get("cases") if why is None else None
+        if isinstance(cases, list) and all(isinstance(c, dict) and isinstance(c.get("id"), str) and c.get("status")
+                                           in ("passed", "failed", "error", "skipped") for c in cases):
+            return [(c["id"], c["status"]) for c in cases], None
+        why = why or "it needs cases: [{id, status}] with status passed, failed, error or skipped"
+    except Exception as e:  # invalid XML or JSON, bytes that are not UTF-8, nesting too deep
+        why = f"{type(e).__name__}: {e}"
+    return None, f"the test report at {rel} is malformed ({why})"
+
+
+def _case_id_re(case_id: str):
+    """Finds a case id in a reported test name in any usual spelling: CP1-T01, CP1_T01, cp1_t01 or CP1T01 (pytest,
+    Go and Java names can't hold '-'), with no digit run on either side (so CP1-T01 never matches CP11-T01 or
+    CP1-T011)."""
+    head, _, tail = case_id.rpartition("-")
+    body = re.escape(head) + "[-_]?" + re.escape(tail) if head else re.escape(case_id)
+    return re.compile(r"(?<![0-9])" + body + r"(?![0-9])", re.I)
+
+
+def _case_problems(ctx, cp, cases, red: bool):
+    """(what stops the planned cases from counting, whether any of them failed a check). Every planned case must
+    have run (its id in a comment proves nothing), no two of its results may have the same name, none may crash or be
+    skipped, and after the build every one must pass."""
+    out, failed = [], False
+    for c in _planned_cases(ctx, cp["id"]):
+        pat = _case_id_re(c["id"])
+        got = sorted({s for name, s in cases if pat.search(name)})
+        named = [name for name, _ in cases if pat.search(name)]
+        twice = next((n for n in named if named.count(n) > 1), None)
+        failed = failed or "failed" in got
+        if twice is not None:
+            out.append(f"planned case {c['id']} ran more than once (two results are named '{twice}'; give each "
+                       f"test its own result name — a test.each/it.each title needs a placeholder such as %s, and "
+                       f"a JSON report needs a distinct id per result — or, if a second test stands in for the "
+                       f"planned one, give it its own case id and name)")
+        elif not got:
+            out.append(f"{c['id']} did not run (it has no result in the test report)")
+        elif "error" in got:
+            out.append(f"{c['id']} crashed with an error, which does not count as a failed check")
+        elif "skipped" in got:  # red refuses a skipped planned case, so at behavior a skip is always new
+            out.append(f"{c['id']} was skipped" + ("" if red else " (it was not skipped at the red run)"))
+        elif not red and got != ["passed"]:
+            out.append(f"{c['id']} did not pass")
+    return out, failed
 
 
 def _tail(text, n=60):
@@ -3727,15 +3875,34 @@ def cmd_red(args):
     cps = _cur(ctx, st, args.cp)
     _expect_step(cps, ["red"], args.cp)
     cp = cp_by_id(ctx.plan(), args.cp)
+    _, missing, _ = _coverage(ctx, cp)
+    if missing:
+        die(f"Planned cases not present in the test files: {', '.join(missing)}. Each test must include its case ID "
+            f"(e.g. '[{args.cp}-T01] ...'); have ratchet-test-writer put the missing tests back and re-run red.")
+    why = _undeclared(ctx, cp)
+    if why:
+        die(why)
     cfg = ctx.config()
-    code, out, _ = _run_cmd(ctx, cp["tests"]["command"], ctx.evidence(args.cp) / "red.log", cfg["test_timeout_sec"])
+    rpath = _report_path(ctx, cp)
+    code, out, _ = _run_cmd(ctx, cp["tests"]["command"], ctx.evidence(args.cp) / "red.log", cfg["test_timeout_sec"],
+                            rpath)
     cps["red"] = {"exit": code, "at": now()}
-    if code == 0 and not args.allow_green_first:
+    green = code == 0
+    if rpath:
+        cases, why = _read_test_report(ctx, rpath)
+        bad, failed = ([why], False) if why else _case_problems(ctx, cp, cases, red=True)
+        if bad:
+            ctx.save_state(st)
+            die(f"{args.cp}: the red run does not count: " + "; ".join(bad) + ". The test command must write each "
+                "planned case's result to the file named in RATCHET_TEST_REPORT; have ratchet-test-writer fix the "
+                "tests and re-run.")
+        green = not failed  # the report, not the exit code, says whether a planned case failed a check
+    if green and not args.allow_green_first:
         ctx.save_state(st)
         die(f"{args.cp}: tests PASSED before implementation — they don't prove anything yet. "
             f"Have ratchet-test-writer strengthen them, or if this checkpoint only preserves existing "
             f"behaviour re-run with --allow-green-first --reason '...'.")
-    if code == 0:
+    if green:
         if not args.reason:
             die("--allow-green-first needs --reason")
         if not cp.get("green_first_ok"):
@@ -3775,18 +3942,248 @@ def _additive(old: str, new: str) -> bool:
     return all(any(line == n for n in it) for line in [l.rstrip() for l in old.splitlines() if l.strip()])
 
 
+_PY_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+_FROZEN_WHY = ("A planned test can't change after its first run: an edit that skips it or ends it early would let "
+               "it pass without checking anything (if it really must change, ask the user: "
+               "`ratchet.py ask approve-changes`)")
+
+
+def _py_scope_items(body):
+    """(name, node) for each definition in one Python scope: defs, classes and assignments, including those inside
+    if, try, with and for blocks, but not those inside a nested function or class."""
+    for s in body:
+        if isinstance(s, _PY_DEFS):
+            yield s.name, s
+        elif isinstance(s, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for t in (s.targets if isinstance(s, ast.Assign) else [s.target]):
+                for n in ast.walk(t):
+                    if isinstance(n, ast.Name):
+                        yield n.id, s
+        else:
+            for f in ("body", "orelse", "finalbody", "handlers", "cases"):
+                sub = getattr(s, f, None)
+                if isinstance(sub, list):
+                    yield from _py_scope_items(sub)
+
+
+def _py_defs(body, path=()):
+    """(path, node) for every def and class, nested ones too. A path is ((name, nth of that name in its scope), ...)."""
+    seen = {}
+    for name, n in _py_scope_items(body):
+        if isinstance(n, _PY_DEFS):
+            k = seen[name] = seen.get(name, -1) + 1
+            yield path + ((name, k),), n
+            yield from _py_defs(n.body, path + ((name, k),))
+
+
+def _py_lookup(tree, path):
+    """The defs along `path` in `tree`, outermost first, or None when one of them is missing."""
+    body, nodes = tree.body, []
+    for name, k in path:
+        defs = [n for nm, n in _py_scope_items(body) if nm == name and isinstance(n, _PY_DEFS)]
+        if k >= len(defs):
+            return None
+        nodes.append(defs[k])
+        body = defs[k].body
+    return nodes
+
+
+def _py_start(n) -> int:
+    return min([n.lineno] + [d.lineno for d in n.decorator_list])
+
+
+def _py_frozen(old: str, new: str, ids) -> list[str] | None:
+    """The structural freeze for a Python test file (None when the red snapshot is not Python). Each planned case
+    id belongs to the innermost def or class around it (or right after its comment line); that definition, with its
+    decorators and its enclosing classes' decorators, must be unchanged (compared as ast.dump) and no later
+    definition in its scope may reuse its name. An id found in no def or class at all (only in a header comment,
+    say) makes the file's top-level code the test:
+    each old top-level statement must still be there, unchanged and in order, and no old def or class name may be
+    defined again. New tests and helpers may be added anywhere else."""
+    try:
+        t_old = ast.parse(old)
+    except (SyntaxError, ValueError):
+        return None
+    try:
+        t_new = ast.parse(new)
+    except (SyntaxError, ValueError) as e:
+        return [f"it no longer parses as Python ({type(e).__name__}), so its planned tests can't be checked"]
+    lines = old.splitlines()
+    defs = list(_py_defs(t_old.body))
+    starts = {_py_start(n): (p, n) for p, n in defs}
+    units, module_ids = {}, []
+    for cid in ids:
+        pat, placed, loose = _case_id_re(cid), False, False
+        for no, line in enumerate(lines, 1):
+            if not pat.search(line):
+                continue
+            inside = [(p, n) for p, n in defs if _py_start(n) <= no <= (n.end_lineno or n.lineno)]
+            if not inside and line.lstrip().startswith("#"):
+                k = no + 1
+                while k <= len(lines) and lines[k - 1].lstrip().startswith("#"):
+                    k += 1
+                inside = [starts[k]] if k in starts else []
+            if inside:
+                p, _n = max(inside, key=lambda pn: len(pn[0]))
+                units.setdefault(p, cid)
+                placed = True
+            else:
+                loose = True
+        if loose and not placed:  # only an id found in no def or class makes the top-level code the test
+            module_ids.append(cid)
+    out = []
+
+    def count(tree, nodes, name):
+        body = nodes[-2].body if nodes and len(nodes) > 1 else tree.body
+        return sum(1 for nm, _ in _py_scope_items(body) if nm == name)
+
+    for p, cid in units.items():
+        what = f"{'.'.join(x for x, _ in p)} ({cid})"
+        olds, news = _py_lookup(t_old, p), _py_lookup(t_new, p)
+        if news is None:
+            out.append(f"planned test {what} is gone since the red run")
+        elif any(count(t_new, news[:j + 1], p[j][0]) > count(t_old, olds[:j + 1], p[j][0]) for j in range(len(p))):
+            out.append(f"planned test {what} is defined again since the red run (the later definition replaces it)")
+        elif ast.dump(news[-1]) != ast.dump(olds[-1]) or [ast.dump(d) for a in news[:-1] for d in a.decorator_list] \
+                != [ast.dump(d) for a in olds[:-1] for d in a.decorator_list]:
+            out.append(f"planned test {what} changed since the red run")
+    if module_ids:
+        what = f"{', '.join(module_ids)} (named outside any function, so the file's existing top-level code is the test)"
+        cur = iter([ast.dump(s) for s in t_new.body])
+        changed = next((s for s in t_old.body if not any(ast.dump(s) == c for c in cur)), None)
+        top = {nm for nm, n in _py_scope_items(t_old.body) if isinstance(n, _PY_DEFS)}
+        again = sorted(nm for nm in top if count(t_new, None, nm) > count(t_old, None, nm))
+        if changed is not None:
+            out.append(f"planned test {what} changed since the red run (at red line {changed.lineno})")
+        elif again:
+            out.append(f"planned test {what} has {again[0]} defined again since the red run")
+    return out
+
+
+_COMMENT = ("//", "#", "/*", "*", "--")
+
+
+def _in_comment(line: str, pos: int) -> bool:
+    """True when position `pos` of `line` is inside a comment: the line is a comment line, or a //, /*, # or --
+    (the last two after a space or at the start) comes before `pos` outside any quoted string. A Rust attribute
+    (#[...]) is not a comment."""
+    if line.strip().startswith(_COMMENT) and not line.strip().startswith("#["):
+        return True
+    q, k = None, 0
+    while k < pos:
+        c = line[k]
+        if q:
+            if c == "\\":
+                k += 1
+            elif c == q:
+                q = None
+        elif c in "\"'`":
+            q = c
+        elif line.startswith(("//", "/*"), k) or (c == "#" and not line.startswith("#[", k)
+                                                   or line.startswith("--", k)) and (k == 0 or line[k - 1].isspace()):
+            return True
+        k += 1
+    return False
+
+
+def _test_decls(lines, pat):
+    """The indexes of each line, in a non-Python test file, that holds the case id outside any comment: either the
+    test's own opening line (its name, as in it('[CP1-T01] ...', or Go's func TestCP1_T01) or an annotation directly
+    above it (such as @DisplayName("[CP1-T01] ...")). A line holding the id only inside a comment is never counted."""
+    out = []
+    for i, line in enumerate(lines):
+        m = pat.search(line)
+        if m and not _in_comment(line, m.start()):
+            out.append(i)
+    return out
+
+
+def _planned_name(line: str, pat):
+    """The name of the test a line declares with a case id: the quoted name holding the id, or the identifier holding
+    it, such as a Go TestCP1T01 (None when it has neither)."""
+    q = next((q.group(0) for q in re.finditer(r"([\"'`])(?:\\.|(?!\1).)*\1", line) if pat.search(q.group(0))), None)
+    if q is not None:
+        return q
+    m = pat.search(line)
+    if not m:
+        return None
+    a, b = m.start(), m.end()
+    while a and (line[a - 1].isalnum() or line[a - 1] in "_$"):
+        a -= 1
+    while b < len(line) and (line[b].isalnum() or line[b] in "_$"):
+        b += 1
+    return line[a:b] if re.fullmatch(r"[A-Za-z_$][\w$]*", line[a:b]) else None
+
+
+def _text_frozen(old: str, new: str, ids) -> list[str]:
+    """The structural freeze for a test file in any other language that holds planned case ids: the file as it was at
+    the red run must be an exact prefix of the file now, so new tests and helpers may only be added at its end. An
+    added part may not declare a planned test's name again (in a language where a later definition replaces an
+    earlier one, it would stand in for the planned test). No language syntax is parsed."""
+    pats = [(cid, _case_id_re(cid)) for cid in ids]
+    lines = old.splitlines()
+    names, decl_lines = [], set()
+    for cid, pat in pats:
+        decl = _test_decls(lines, pat) or [i for i, l in enumerate(lines) if pat.search(l)]
+        decl_lines.update(decl)
+        for i in decl:
+            names.append((cid, _planned_name(lines[i], pat)))
+    if not names:
+        return []
+    tail = new[len(old):]
+    if not new.startswith(old) or (old and not old.endswith("\n") and tail and tail[0] not in "\r\n"):
+        cur = new.splitlines()
+        at = next((k for k, l in enumerate(lines) if k >= len(cur) or cur[k] != l), len(lines) - 1)
+        listed = ", ".join(f"{n} ({cid})" if n else cid for cid, n in names)
+        if decl_lines and at < min(decl_lines):
+            # The first change sits above any planned test's own line: an ordinary insertion (a new import, a new
+            # helper), not an edit to a planned test. Say so plainly instead of pointing at approve-changes.
+            return [f"content above the end of the file changed since the red run (first change at red line "
+                    f"{at + 1}; this file holds planned tests: {listed}). Move the added lines to the end of the "
+                    f"file, or put a test that needs a new import in a new test file"]
+        return [f"content above the end of the file changed since the red run (first change at red line {at + 1}; "
+                f"this file holds planned tests: {listed}). Outside Python, a test file that holds planned tests "
+                f"may only have lines added at its end. {_FROZEN_WHY}"]
+    for cid, n in names:
+        if not n:
+            continue
+        rx_ = (re.compile(r"[\"'`]" + re.escape(n[1:-1]) + r"[\"'`]") if n[0] in "\"'`" else
+               re.compile(r"(?<![\w$])" + re.escape(n) + r"(?![\w$])"))
+        if rx_.search(tail):
+            return [f"planned test {n} ({cid}) is declared again in lines added since the red run (a later "
+                    f"definition with the same name could replace it; give a new test its own case id and name)"]
+    return []
+
+
+def _frozen_test_problems(rel: str, old: str, new: str, ids) -> list[str]:
+    """Why a test file's planned tests no longer match the red run (empty when they all still do)."""
+    got = _py_frozen(old, new, ids) if rel.endswith(".py") else None
+    return _text_frozen(old, new, ids) if got is None else got
+
+
 def weakened_tests(ctx, st) -> list[str]:
     cur = st.get("current")
     cps = (st.get("checkpoints") or {}).get(cur) or {}
     if not cps.get("red_tests"):
         return []
-    out = []
+    out, ids = [], [c["id"] for c in _planned_cases(ctx, cur)]
     d = ctx.run_dir() / "evidence" / cur / "red-tests"
     for rel in cps["red_tests"]:
         old_p, new_p = d / rel.replace("/", "__"), ctx.root / rel
         if not old_p.exists():
             continue
-        if not new_p.exists() or not _additive(old_p.read_text(errors="replace"), new_p.read_text(errors="replace")):
+        old = old_p.read_text(errors="replace")
+        new = new_p.read_text(errors="replace") if new_p.exists() else None
+        if new is None:
+            out.append(f"test file {rel} (lines changed or removed since the red run)")
+            continue
+        frozen = _frozen_test_problems(rel, old, new, ids)
+        if frozen:
+            # Non-Python messages (_text_frozen) already carry whatever guidance applies (the approve-changes
+            # note only when a planned test itself is at risk); only Python messages (_py_frozen) need it added.
+            out.append(f"test file {rel}: {frozen[0]}. {_FROZEN_WHY}" if rel.endswith(".py")
+                        else f"test file {rel}: {frozen[0]}")
+        elif not _additive(old, new):
             out.append(f"test file {rel} (lines changed or removed since the red run)")
     return out
 
@@ -3821,10 +4218,15 @@ def cmd_behavior(args):
         die(f"Behavior gate FAILED: planned cases were removed from tests: {', '.join(missing)}. "
             "Tests may not be deleted or weakened to pass the gate.")
     log = ctx.evidence(args.cp) / f"behavior-{g['attempts']:02d}.log"
-    code, out, dur = _run_cmd(ctx, cp["tests"]["command"], log, cfg["test_timeout_sec"])
+    rpath = _report_path(ctx, cp)
+    code, out, dur = _run_cmd(ctx, cp["tests"]["command"], log, cfg["test_timeout_sec"], rpath)
+    bad = []
+    if rpath:
+        cases, why = _read_test_report(ctx, rpath)
+        bad = [why] if why else _case_problems(ctx, cp, cases, red=False)[0]
     failed_check = None
-    fp_tests = fingerprint(ctx.root)["id"] if code == 0 and cfg.get("checks") else None
-    if code == 0:
+    fp_tests = fingerprint(ctx.root)["id"] if code == 0 and not bad and cfg.get("checks") else None
+    if code == 0 and not bad:
         for chk in cfg.get("checks") or []:
             if not isinstance(chk, dict) or not chk.get("command"):
                 continue
@@ -3851,7 +4253,7 @@ def cmd_behavior(args):
         die(f"Behavior gate FAILED for {args.cp}: the automatic check '{failed_check.get('kind')}' "
             f"({failed_check.get('command')}) failed. Log: {log.relative_to(ctx.root)}. Give it to ratchet-implementer; "
             "the check stays as it is.", 2)
-    if code != 0:
+    if code != 0 or bad:
         g["status"] = "failed"
         g["last"] = {"exit": code, "log": str(log.relative_to(ctx.root)), "at": now()}
         if g["attempts"] >= cfg["max_behavior_attempts"]:
@@ -3860,7 +4262,8 @@ def cmd_behavior(args):
         ctx.save_state(st)
         build_viewer(ctx)
         print(_tail(out))
-        die(f"Behavior gate FAILED for {args.cp} (exit {code}). Log: {log.relative_to(ctx.root)}. "
+        die(f"Behavior gate FAILED for {args.cp} (exit {code}" + ("; " + "; ".join(bad) if bad else "") +
+            f"). Log: {log.relative_to(ctx.root)}. "
             "Give the failure to ratchet-implementer (do NOT edit the tests to make them pass) and re-run.", 2)
     g.update(status="passed", fingerprint=fp, passed_at=now(),
              last={"exit": 0, "log": str(log.relative_to(ctx.root)), "at": now(), "duration": dur})
@@ -6066,6 +6469,9 @@ def cmd_next(args):
         na["warning"] = hw
     na["hooks"] = hs
     na["hook_errors"] = hook_errors_view(ctx.root, hs.get("host", "unknown"))
+    note = exit_code_only_note(ctx.plan(), ctx.state())
+    if note:
+        na["test_check"] = note
     print(json.dumps(na, indent=2))
 
 

@@ -69,7 +69,7 @@ Hooks (installed with the plugin, or by `install.sh --host <cli>` / `$RATCHET in
 | `ratchet-design-system` | Writes/updates `DESIGN.md` (uses the `ratchet-design-md` skill) |
 | `ratchet-variant-writer` | High-risk guardrail steps only: writes disguised bad variants and look-alike good code for a mistake, without seeing the check |
 | `ratchet-prototyper` | Single-file clickable HTML prototype with switchable states (uses the `ratchet-prototype` skill) |
-| `ratchet-test-writer` | Writes the planned tests. They must fail first |
+| `ratchet-test-writer` | Writes the planned tests. Every one must run before the build, and at least one must fail on an assertion |
 | `ratchet-implementer` | Writes the code for ONE checkpoint, or fixes behavior/UI failures |
 | `ratchet-test-runner` | Runs `$RATCHET behavior CPn` and returns a concise diagnosis |
 | `ratchet-visual-reviewer` / `ratchet-behavior-reviewer` | Isolated UI gate reviewers (normally launched by `ui_review.py`, used as sub-agents only as a fallback) |
@@ -120,7 +120,7 @@ Loop until `$RATCHET next` reports a review phase. Always do what `next` says. I
 
 **Step 1: Tests (the behavior gate's standard).**
 Spawn `ratchet-test-writer` for `CPn` with `tests/CPn.json` and the checkpoint entry. For a large test plan, split the cases across 2–3 writers in parallel, each owning different test files listed in `tests.files`. Then:
-`$RATCHET tests-written CPn`, which checks every planned `code` case id appears in the tests, and `$RATCHET red CPn`, which requires the tests to FAIL now.
+`$RATCHET tests-written CPn`, which checks every planned `code` case id appears in the tests (outside Python, on the line that opens its test, in its name or an annotation directly above it; an id only in a comment is refused), and `$RATCHET red CPn`, which requires the tests to FAIL now. When the plan sets `tests.report` (junit or json), `red` and `behavior` read each case's own result from the file the command writes to `RATCHET_TEST_REPORT`: every planned case must run, a crash or a skip does not count, at `red` at least one planned case must fail on an assertion (a planned case that already passes at red is not caught by this check), and at `behavior` every one must pass. A missing or malformed report fails the run. With `tests.report: none`, or a plan with no `report` key (for example one approved before this field existed), the exit code alone decides, and `plan-summary`, `status` and `next` say so (with the reason for `none`). After its first failing run each planned test is frozen: its body can't change and no later test may reuse its name (checked with `ast` for Python; any other test file holding planned case ids is append-only: its red content must stay an exact prefix, and an added line may not declare a planned test's name again); new tests and helpers may still be added (outside Python, only at the end of the file), and with a report two results with the same name for one planned case fail the run, and changing a planned test needs the user's OK through `approve-changes`. This is a structural check, not a proof: a deliberate edit that gets past it is an accepted limit.
 - If red fails because the tests already pass, re-spawn the test-writer: "tests pass without the feature; make them actually exercise it." Use `--allow-green-first --reason` only for pure refactors that preserve behavior.
 
 **Step 2: Implement.**
