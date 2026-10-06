@@ -13,6 +13,17 @@ import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# Temp folders come from tests/_tmp.py, like every other suite, so they (and the background probes tied to them) are
+# removed however this script ends, and probe children inherit a TMPDIR the helper owns. CP5-T20 holds this lint's
+# imports to the stdlib, and "_tmp" is in that allow-list because _tmp.py itself imports only the stdlib, which
+# tests/test_cleanup.py checks ([CP1-X03]). Bytecode writes are turned off only to keep a run inside a private repo
+# copy (CP5-T20) from leaving a __pycache__ behind in that copy, not to hide the import.
+sys.path.insert(0, str(ROOT / "tests"))
+_DONT_WRITE_BYTECODE, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+try:
+    import _tmp
+finally:
+    sys.dont_write_bytecode = _DONT_WRITE_BYTECODE
 PASS = FAIL = 0
 
 
@@ -286,7 +297,6 @@ def cp2_docs_lint():
 import json as cp2_json
 import os as cp2_os
 import subprocess as cp2_subprocess
-import tempfile as cp2_tempfile
 
 CP2_ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
 CP2_CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "gemini": "Gemini", "copilot": "Copilot"}
@@ -373,7 +383,7 @@ def cp2_probe(engine=CP2_ENGINE):
     """{"data": HOST_ENFORCEMENT, "hosts": HOOK_HOSTS, "events": [...], "measured": {host: facts}} from the engine."""
     env = {k: v for k, v in cp2_os.environ.items() if k != "RATCHET_ROOT"}
     env["PYTHONDONTWRITEBYTECODE"] = "1"  # loading the engine must not write __pycache__ into the repo
-    with cp2_tempfile.TemporaryDirectory() as cwd:
+    with _tmp.mkdtemp() as cwd:
         r = cp2_subprocess.run([sys.executable, "-c", CP2_PROBE, str(engine)], capture_output=True, text=True,
                                timeout=120, cwd=cwd, env=env)
     if r.returncode != 0:
@@ -480,7 +490,7 @@ def cp2_single_source_checks(sect):
     # unchanged) is caught as Codex, Gemini and Copilot doing something the data and README deny.
     src = CP2_ENGINE.read_text(encoding="utf-8")
     real = 'return bool(HOST_ENFORCEMENT.get(host, {}).get("identity"))'
-    with cp2_tempfile.TemporaryDirectory() as tmp:
+    with _tmp.mkdtemp() as tmp:
         for sib in CP2_ENGINE.parent.glob("*.py"):
             (Path(tmp) / sib.name).write_text(sib.read_text(encoding="utf-8"), encoding="utf-8")
         (Path(tmp) / CP2_ENGINE.name).write_text(src.replace(real, "return True", 1), encoding="utf-8")
@@ -552,7 +562,7 @@ print(json.dumps({"data": eng.HOST_ENFORCEMENT, "hosts": list(eng.HOOK_HOSTS),
 def cp2_real_probe(engine=CP2_ENGINE):
     env = {k: v for k, v in cp2_os.environ.items() if k != "RATCHET_ROOT"}
     env["PYTHONDONTWRITEBYTECODE"] = "1"  # loading the engine must not write __pycache__ into the repo
-    with cp2_tempfile.TemporaryDirectory() as cwd:
+    with _tmp.mkdtemp() as cwd:
         r = cp2_subprocess.run([sys.executable, "-c", CP2_REAL_PROBE, str(engine),
                                 cp2_json.dumps(CP2_REAL_GUARD_PAYLOADS), CP2_REVIEW_REL],
                                capture_output=True, text=True, timeout=120, cwd=cwd, env=env)
@@ -606,7 +616,7 @@ def cp2_real_payload_checks():
              ('"claude": {"records": True, "identity": True,', '"claude": {"records": True, "identity": False,',
               "claude")]
     for old, new, host in flips:
-        with cp2_tempfile.TemporaryDirectory() as tmp:
+        with _tmp.mkdtemp() as tmp:
             mutant = cp2_real_probe(cp2_engine_variant(tmp, old, new))
         bad = cp2_identity_problems(mutant)
         check(f"[CP2-X13] teeth: an engine whose HOST_ENFORCEMENT flips {host}.identity fails the real-payload check",
@@ -899,13 +909,14 @@ def cp2_r4_start(engine=CP2_ENGINE, parts=("records", "stop", "replies", "identi
                         "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID", "GEMINI_CLI",
                         "COPILOT_CLI")}
     env["PYTHONDONTWRITEBYTECODE"] = "1"  # loading the engine must not write __pycache__ into the repo
-    home = cp2_tempfile.TemporaryDirectory(prefix="ratchet-cp2r4-home-")
-    cwd = cp2_tempfile.TemporaryDirectory()
+    home = _tmp.mkdtemp(prefix="ratchet-cp2r4-home-")
+    cwd = _tmp.mkdtemp()
     env["RATCHET_HOME"] = home.name  # per-user files (hashes, active-run markers) stay in a throwaway folder
     proc = cp2_subprocess.Popen([sys.executable, "-c", CP2_R4_PROBE, str(engine), ",".join(parts),
                                  cp2_json.dumps(CP2_REAL_GUARD_PAYLOADS), CP2_REVIEW_REL],
                                 stdout=cp2_subprocess.PIPE, stderr=cp2_subprocess.PIPE, text=True, cwd=cwd.name,
                                 env=env)
+    home.track(proc)  # stopped and its folders removed even if this lint crashes before cp2_r4_finish
     return proc, (home, cwd)
 
 
@@ -963,7 +974,7 @@ def cp2_r4_facts(probe):
 
 def cp2_hook_entry_checks(sect):
     # The real engine and the teeth mutants (cp2_r4_mutants, below) are probed side by side to keep the run short.
-    copies = [cp2_tempfile.TemporaryDirectory() for _ in cp2_r4_mutants()]
+    copies = [_tmp.mkdtemp() for _ in cp2_r4_mutants()]
     jobs, done, errors = [], [], []
     try:
         jobs.append(cp2_r4_start())
@@ -1161,7 +1172,7 @@ def cp2_r5_measure(engine=CP2_ENGINE):
     measured by actually crashing the stop hook and the guard hook, not by reading the docs or the code."""
     env = {k: v for k, v in cp2_os.environ.items() if k != "RATCHET_ROOT"}
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    with cp2_tempfile.TemporaryDirectory() as cwd:
+    with _tmp.mkdtemp() as cwd:
         r = cp2_subprocess.run([sys.executable, "-c", CP2_R5_PROBE, str(engine)], capture_output=True, text=True,
                                timeout=120, cwd=cwd, env=env)
     if r.returncode != 0:
@@ -1854,7 +1865,7 @@ def cp5_frontmatter_problems(docs):
 
 
 def stdlib_only(path):
-    ok = {"re", "sys", "traceback", "pathlib", "ast", "os", "subprocess", "tempfile", "json", "shutil", "textwrap", "hashlib", "time"}
+    ok = {"re", "sys", "traceback", "pathlib", "ast", "os", "subprocess", "tempfile", "json", "shutil", "textwrap", "hashlib", "time", "_tmp"}
     bad = []
     for n in ast.walk(ast.parse(Path(path).read_text(encoding="utf-8"))):
         mods = [a.name for a in n.names] if isinstance(n, ast.Import) else [n.module or ""] if isinstance(n, ast.ImportFrom) else []
@@ -1875,7 +1886,7 @@ def private_repo_copy(dest):
 
 
 def tree_snapshot_detects_ratchet():
-    with tempfile.TemporaryDirectory() as tmp:
+    with _tmp.mkdtemp() as tmp:
         c = private_repo_copy(Path(tmp) / "r")
         b = tree_snapshot(c)
         (c / ".ratchet").mkdir()
@@ -2049,7 +2060,7 @@ def cp5_docs_lint():
     # T15 / T16
     hits = [h for n, t in docs for h in user_cmd_hits(n, t)]
     check("[CP5-T15] no skill or agent tells the user to run a command", not hits, hits[:6])
-    with tempfile.TemporaryDirectory() as td:
+    with _tmp.mkdtemp() as td:
         tf = Path(td) / "SKILL.md"
         tf.write_text(orch + "\nRun `ratchet.py status` in your terminal.\n", encoding="utf-8")
         planted = user_cmd_hits(str(tf), tf.read_text(encoding="utf-8"))
@@ -2129,10 +2140,10 @@ def cp5_docs_lint():
         return
     me = Path(__file__).resolve()
     env = dict(os.environ, RATCHET_DOCS_NESTED="1")
-    with tempfile.TemporaryDirectory() as tmp:
+    with _tmp.mkdtemp() as tmp:
         copy = private_repo_copy(Path(tmp) / "repo")
         before = tree_snapshot(copy)
-        with tempfile.TemporaryDirectory() as cwd:
+        with _tmp.mkdtemp() as cwd:
             r = subprocess.run([sys.executable, str(copy / "tests" / "test_docs.py")], capture_output=True, text=True,
                                timeout=600, cwd=cwd, env=env)
         after = tree_snapshot(copy)
@@ -2148,7 +2159,7 @@ def cp5_docs_lint():
     for label, val in (("fail", "False"), ("pass", "True")):
         code = src.replace("ROOT = Path(__file__).resolve().parents[1]", f"ROOT = Path({str(ROOT)!r})")
         code = re.sub(r"(?m)^SECTIONS = \[.*\]$", f"SECTIONS = [('X', lambda: check('forced', {val}))]", code)
-        with tempfile.TemporaryDirectory() as cwd:
+        with _tmp.mkdtemp() as cwd:
             f = Path(cwd) / "t.py"
             f.write_text(code, encoding="utf-8")
             forced[label] = subprocess.run([sys.executable, str(f)], capture_output=True, text=True, timeout=120, cwd=cwd, env=env).returncode

@@ -10,11 +10,11 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
+import _tmp
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
-HOME = Path(tempfile.mkdtemp(prefix="ratchet-home-"))
+HOME = Path(_tmp.mkdtemp(prefix="ratchet-home-"))
 ENV = {k: v for k, v in os.environ.items() if k not in ("RATCHET_ROLE", "RATCHET_HUMAN_OVERRIDE", "RATCHET_ROOT")}
 ENV["RATCHET_HOME"] = str(HOME)
 ENV["RATCHET_HOST_PROVIDER"] = "anthropic"  # deterministic, whichever agent CLI runs the tests
@@ -32,7 +32,7 @@ def rx(d, *args, env=None):
                           env=env or ENV)
 
 
-TRANSCRIPTS = Path(tempfile.mkdtemp(prefix="ratchet-transcripts-"))
+TRANSCRIPTS = Path(_tmp.mkdtemp(prefix="ratchet-transcripts-"))
 
 
 def say(d, text, session="s-owner"):
@@ -67,7 +67,7 @@ def git(d, *a):
 
 
 def project(name="p", cps=1, extra_cp=None, config=None) -> Path:
-    d = Path(tempfile.mkdtemp(prefix=f"ratchet-{name}-"))
+    d = Path(_tmp.mkdtemp(prefix=f"ratchet-{name}-"))
     for c in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
         git(d, *c)
     (d / "src").mkdir()
@@ -158,7 +158,7 @@ def write_review(d, rnd, rid, findings=None, **over):
     return str(p)
 
 
-_COMBINE_HELPER = Path(tempfile.mkdtemp(prefix="ratchet-combine-helper-")) / "combine_and_sign.py"
+_COMBINE_HELPER = Path(_tmp.mkdtemp(prefix="ratchet-combine-helper-")) / "combine_and_sign.py"
 _COMBINE_HELPER.write_text(
     "import json, sys\n"
     "sys.path.insert(0, " + json.dumps(str((Path(__file__).resolve().parents[1]
@@ -179,7 +179,7 @@ def write_combined(d, cp, compared, diffs, reviewers=("visual", "behavior"), out
     reviews = [{"reviewer": r, "differences": diffs if i == 0 else []} for i, r in enumerate(reviewers)]
     payload = {"reviews": reviews, "checkpoint": cp, "compared": compared,
                "fingerprint": fp or json.loads(rx(d, "fingerprint").stdout)["id"], "out": str(path)}
-    pf = Path(tempfile.mkdtemp(prefix="ratchet-combine-in-")) / "in.json"
+    pf = Path(_tmp.mkdtemp(prefix="ratchet-combine-in-")) / "in.json"
     pf.write_text(json.dumps(payload))
     r = subprocess.run([sys.executable, str(_COMBINE_HELPER), str(pf)], cwd=d, capture_output=True, text=True,
                        env=ENV)
@@ -195,7 +195,7 @@ PNG = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000001
 def cp7_host_project(name, **kw):
     """A project whose host is forced to claude and whose PATH has no other agent CLI (codex/gemini/copilot/claude)."""
     import shutil
-    b = Path(tempfile.mkdtemp(prefix="ratchet-bin-"))
+    b = Path(_tmp.mkdtemp(prefix="ratchet-bin-"))
     for n in ("python3", "git", "node", "sh", "env"):
         p = shutil.which(n)
         if p:
@@ -231,7 +231,7 @@ def cp7_reviewers(d, env, cp="CP1"):
 
 
 def cp7_ui_project(design_cfg=None, design_files=None, extra_files=None):
-    d = Path(tempfile.mkdtemp(prefix="ratchet-ui7-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-ui7-"))
     for c in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
         git(d, *c)
     (d / "src").mkdir()
@@ -374,7 +374,7 @@ def cp7_gates():
     check("[CP7-T17] while the allowed design file is still staged (isolation check is not vacuous)", marker in blob, r.stderr)
 
     # C1..C3 (adversarial round 1): design staging is confined and collision-safe
-    outside = Path(tempfile.mkdtemp(prefix="ratchet-outside-"))
+    outside = Path(_tmp.mkdtemp(prefix="ratchet-outside-"))
     (outside / "secret.md").write_text("CP7_OUTSIDE_SECRET_MARKER\n")
     d = cp7_ui_project("docs/ui-design.md", {"docs/ui-design.md": "x\n"})
     for label, val in (("absolute path outside the project", str(outside / "secret.md")), ("`..` escape", "../" + outside.name + "/secret.md")):
@@ -564,7 +564,7 @@ def main():
     approve_plan(d)
     to_adversarial(d)
     fp = json.loads(rx(d, "fingerprint").stdout)["id"]
-    fake = Path(tempfile.mkdtemp()) / "fake.json"   # outside the repo, so it doesn't change the fingerprint
+    fake = Path(_tmp.mkdtemp()) / "fake.json"   # outside the repo, so it doesn't change the fingerprint
     fake.write_text(json.dumps({"reviewer": "host-both", "fingerprint": fp, "findings": []}))
     check("a review with no open round is refused", rx(d, "adv-record", "CP1", "--reviews", str(fake)).returncode != 0)
     rnd = open_round(d)
@@ -660,7 +660,7 @@ def main():
     rx(d, "tests-written", "CP1"); rx(d, "red", "CP1")
     (d / "src/f.js").write_text("export const f = () => 1;\n")
     rx(d, "implemented", "CP1"); rx(d, "behavior", "CP1")
-    c = Path(tempfile.mkdtemp()) / "combined.json"
+    c = Path(_tmp.mkdtemp()) / "combined.json"
     c.write_text(json.dumps({"reviewers": ["visual", "behavior"], "differences": []}))
     check("a combined review without a fingerprint is refused", rx(d, "ui-record", "CP1", "--review", str(c)).returncode != 0)
     c = write_combined(d, "CP1", {"spec_sha256": "s1", "scope": "all"},  # CP3+CP7: signed, into the round's own folder
@@ -1025,7 +1025,7 @@ def main():
     print("UI combine can't launder old reviews")
     d = project("combine")
     approve_plan(d)
-    out = Path(tempfile.mkdtemp())
+    out = Path(_tmp.mkdtemp())
     (out / "visual.json").write_text(json.dumps({"reviewer": "visual", "fingerprint": "0" * 40, "verdict": "PASS", "differences": []}))
     (out / "behavior.json").write_text(json.dumps({"reviewer": "behavior", "verdict": "PASS", "differences": []}))
     ui = ENGINE.parents[2] / "ratchet-ui-compare" / "scripts" / "ui_review.py"
@@ -1044,7 +1044,7 @@ def main():
     check("… and the stop hook now binds the other chat", stop(d, "s-other").returncode == 2 and stop(d, "s-owner").returncode == 0)
 
     print("Unblocking during planning, and the stop-error counter")
-    d = Path(tempfile.mkdtemp(prefix="ratchet-planblock-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-planblock-"))
     for c in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
         git(d, *c)
     (d / "a.js").write_text("x"); git(d, "add", "-A"); git(d, "commit", "-qm", "i")

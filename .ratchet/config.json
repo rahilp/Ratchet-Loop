@@ -13,7 +13,7 @@
       "codex"
     ]
   },
-  "regression_command": "for t in tests/test_*.py; do python3 \"$t\" > /tmp/rt-$(basename $t).log 2>&1 || { echo \"FAIL $t\"; tail -20 /tmp/rt-$(basename $t).log; exit 1; }; done",
+  "regression_command": "ls tests/test_*.py | xargs -P 6 -I{} sh -c 'python3 \"$1\" > /tmp/rt-$(basename \"$1\").log 2>&1 || { echo \"FAIL $1\"; tail -20 /tmp/rt-$(basename \"$1\").log; exit 1; }' _ {}",
   "commit_per_checkpoint": true,
   "design_md": "DESIGN.md",
   "standards": [

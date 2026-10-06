@@ -10,7 +10,7 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
+import _tmp
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
@@ -29,7 +29,7 @@ def check(name, cond, detail=""):
 
 
 def make_env(host=None):
-    home = Path(tempfile.mkdtemp(prefix="ratchet-hs-home-"))
+    home = Path(_tmp.mkdtemp(prefix="ratchet-hs-home-"))
     env = {k: v for k, v in os.environ.items() if k not in SCRUB}
     env.update(HOME=str(home), RATCHET_HOME=str(home / "rh"), CODEX_HOME=str(home / "codexhome"),
                COPILOT_HOME=str(home / "copilothome"))
@@ -98,7 +98,7 @@ def clear_hb(d):
 
 
 def project(env, approved=True):
-    d = Path(tempfile.mkdtemp(prefix="ratchet-hs-p-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-hs-p-"))
     for c in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
         git(d, *c)
     (d / "src").mkdir()

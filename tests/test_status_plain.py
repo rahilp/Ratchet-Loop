@@ -21,7 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
+import _tmp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,7 +29,7 @@ ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
 SCRUB = ("RATCHET_ROLE", "RATCHET_HUMAN_OVERRIDE", "RATCHET_ROOT", "RATCHET_HOST_PROVIDER", "CLAUDECODE",
          "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED",
          "GEMINI_CLI", "COPILOT_CLI", "GITHUB_COPILOT_CLI", "CODEX_HOME", "COPILOT_HOME", "RATCHET_HOOKS_WAIVE")
-HOME = Path(tempfile.mkdtemp(prefix="ratchet-sp-home-"))
+HOME = Path(_tmp.mkdtemp(prefix="ratchet-sp-home-"))
 
 
 def path_without_agent_clis() -> str:
@@ -50,7 +50,7 @@ def path_without_agent_clis() -> str:
             folders.append(folder)  # most folders hold no agent CLI and are kept as they are
             continue
         # a folder that holds one (a mise or npm bin, say) is replaced by a copy of its other tools
-        shadow = Path(tempfile.mkdtemp(prefix="ratchet-sp-bin-"))
+        shadow = Path(_tmp.mkdtemp(prefix="ratchet-sp-bin-"))
         for name in names:
             src = Path(folder) / name
             if not is_agent(name) and src.is_file():
@@ -65,7 +65,7 @@ def path_without_agent_clis() -> str:
 ENV = {k: v for k, v in os.environ.items() if k not in SCRUB}
 ENV.update(HOME=str(HOME), RATCHET_HOME=str(HOME / "rh"), CODEX_HOME=str(HOME / "codexhome"),
            COPILOT_HOME=str(HOME / "copilothome"), RATCHET_HOST_PROVIDER="anthropic", PATH=path_without_agent_clis())
-TRANSCRIPTS = Path(tempfile.mkdtemp(prefix="ratchet-sp-transcripts-"))
+TRANSCRIPTS = Path(_tmp.mkdtemp(prefix="ratchet-sp-transcripts-"))
 PASS = FAIL = 0
 GO = "yes, go ahead without hooks"
 JARGON = re.compile(r"\b(fingerprint|lens|slot|nonce|adversarial|director|approve-changes|gate|stop_blocks|round cap)\b", re.I)
@@ -117,7 +117,7 @@ def clear_hb(d):
 
 
 def new_git_dir(prefix) -> Path:
-    d = Path(tempfile.mkdtemp(prefix=prefix))
+    d = Path(_tmp.mkdtemp(prefix=prefix))
     KEEP.append(d)
     for c in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
         git(d, *c)
@@ -160,7 +160,7 @@ def plan_project(approve: bool) -> Path:
 
 
 def clone(src: Path) -> Path:
-    dst = Path(tempfile.mkdtemp(prefix="ratchet-sp-c-"))
+    dst = Path(_tmp.mkdtemp(prefix="ratchet-sp-c-"))
     KEEP.append(dst)
     shutil.rmtree(dst)
     shutil.copytree(src, dst, symlinks=True)

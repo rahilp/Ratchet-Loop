@@ -13,18 +13,18 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
+import _tmp
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
 SCRUB = ("RATCHET_ROLE", "RATCHET_HUMAN_OVERRIDE", "RATCHET_ROOT", "RATCHET_HOST_PROVIDER", "CLAUDECODE",
          "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED",
          "GEMINI_CLI", "COPILOT_CLI", "GITHUB_COPILOT_CLI", "CODEX_HOME", "COPILOT_HOME", "RATCHET_HOOKS_WAIVE")
-HOME = Path(tempfile.mkdtemp(prefix="ratchet-hw-home-"))
+HOME = Path(_tmp.mkdtemp(prefix="ratchet-hw-home-"))
 ENV = {k: v for k, v in os.environ.items() if k not in SCRUB}
 ENV.update(HOME=str(HOME), RATCHET_HOME=str(HOME / "rh"), CODEX_HOME=str(HOME / "codexhome"),
            COPILOT_HOME=str(HOME / "copilothome"), RATCHET_HOST_PROVIDER="anthropic")
-TRANSCRIPTS = Path(tempfile.mkdtemp(prefix="ratchet-hw-transcripts-"))
+TRANSCRIPTS = Path(_tmp.mkdtemp(prefix="ratchet-hw-transcripts-"))
 PASS = FAIL = 0
 
 GO = "yes, go ahead without hooks"
@@ -81,7 +81,7 @@ def fire_stop(d, session="s-owner"):
 
 
 def project(name="p", approved=True) -> Path:
-    d = Path(tempfile.mkdtemp(prefix=f"ratchet-hw-{name}-"))
+    d = Path(_tmp.mkdtemp(prefix=f"ratchet-hw-{name}-"))
     for c in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
         git(d, *c)
     (d / "src").mkdir()

@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import _tmp
 import time
 import traceback
 from pathlib import Path
@@ -54,7 +55,7 @@ def check(name, cond, detail=""):
 
 
 def _safe_path():
-    b = Path(tempfile.mkdtemp(prefix="ratchet-trust-bin-"))
+    b = Path(_tmp.mkdtemp(prefix="ratchet-trust-bin-"))
     for n in _SAFE_TOOLS:
         p = shutil.which(n)
         if p:
@@ -73,7 +74,7 @@ def scrub(env):
 
 
 def make_env(host="claude"):
-    home = Path(tempfile.mkdtemp(prefix="ratchet-trust-home-"))
+    home = Path(_tmp.mkdtemp(prefix="ratchet-trust-home-"))
     env = scrub(os.environ)
     env.update(HOME=str(home), RATCHET_HOME=str(home / "rh"), RATCHET_HOST_PROVIDER=VENDOR[host], PATH=SAFE_PATH)
     return env
@@ -160,7 +161,7 @@ def install(d, env, host="claude", scope="project"):
 def project(env, approved=True):
     """A throwaway git project, approved into the building phase (CP1 the only checkpoint), hooks installed and
     firing for host claude - mirrors tests/test_hooks_status.py's project()."""
-    d = Path(tempfile.mkdtemp(prefix="ratchet-trust-p-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-trust-p-"))
     git(d, "init", "-q")
     git(d, "config", "user.email", "t@t")
     git(d, "config", "user.name", "t")
@@ -550,7 +551,7 @@ def cp1_adv_round2_fixes():
     root = Path(d)
     for h in ("claude", "codex"):
         m._record_hook_run(root, h, "prompt", True)
-    bar = Path(tempfile.mkdtemp(prefix="ratchet-trust-bar-"))
+    bar = Path(_tmp.mkdtemp(prefix="ratchet-trust-bar-"))
     go = bar / "go"
     jobs = [(h, ev, True) for h in ("claude", "codex", "gemini", "copilot") for ev in ("guard", "stop")]
     jobs += [("claude", "prompt", False), ("codex", "prompt", False)]
@@ -972,7 +973,7 @@ def cp1_adv_round5_fixes():
     folder.mkdir(parents=True, exist_ok=True)
     for h in ("claude", "codex"):
         m._record_hook_run(root, h, "stop", True)  # resolved below by concurrent clean stop runs
-    bar = Path(tempfile.mkdtemp(prefix="ratchet-trust-bar5-"))
+    bar = Path(_tmp.mkdtemp(prefix="ratchet-trust-bar5-"))
     go = bar / "go"
     hosts = ("claude", "codex", "gemini", "copilot")
     jobs = [("guard", h, crash_payload(d), folder) for h in hosts]  # marker refused: the unsaved log takes it
@@ -1049,7 +1050,7 @@ def cp1_adv_round6_heartbeat_atomic():
 def cp3_project(env, extra_cp=None):
     """A throwaway git project with one checkpoint, approved into building (mirrors tests/test_gates.py's project(),
     adapted to this file's env-carrying rx())."""
-    d = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp3-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp3-"))
     git(d, "init", "-q")
     git(d, "config", "user.email", "t@t")
     git(d, "config", "user.name", "t")
@@ -1209,7 +1210,7 @@ def cp3_adv_folder_trust():
     cp3_pass_behavior(d, env)
     rnd = cp3_open_round(d, env)
     rid = cp3_R0(rnd)
-    outside = Path(tempfile.mkdtemp(prefix="ratchet-trust-outside-"))
+    outside = Path(_tmp.mkdtemp(prefix="ratchet-trust-outside-"))
     bad = cp3_write_review(outside / f"{rid}.json", rnd, rid)
     r = rx(d, env, "adv-record", "CP1", "--reviews", bad)
     cp1 = cp3_state(d)["checkpoints"]["CP1"]
@@ -1268,7 +1269,7 @@ def cp3_adv_folder_trust():
     rnd = cp3_open_round(d, env)
     rid = cp3_R0(rnd)
     out_dir = Path(rnd["output_dir"])
-    real = Path(tempfile.mkdtemp(prefix="ratchet-trust-sym-")) / "real.json"
+    real = Path(_tmp.mkdtemp(prefix="ratchet-trust-sym-")) / "real.json"
     cp3_write_review(real, rnd, rid)
     link = out_dir / f"{rid}.json"
     link.symlink_to(real)
@@ -1285,7 +1286,7 @@ def cp3_adv_folder_trust():
     rnd = cp3_open_round(d, env)
     rid = cp3_R0(rnd)
     out_dir = Path(rnd["output_dir"])
-    real_dir = Path(tempfile.mkdtemp(prefix="ratchet-trust-dotdot-"))
+    real_dir = Path(_tmp.mkdtemp(prefix="ratchet-trust-dotdot-"))
     cp3_write_review(real_dir / f"{rid}.json", rnd, rid)
     rel = os.path.relpath(real_dir, start=out_dir)
     sneaky = os.path.join(str(out_dir), rel, f"{rid}.json")
@@ -1305,7 +1306,7 @@ def cp3_ui_folder_trust():
     d = cp3_ui_project(env)
     cp3_pass_behavior(d, env)
     fp = cp3_fp(d, env)
-    outside = Path(tempfile.mkdtemp(prefix="ratchet-trust-outside-"))
+    outside = Path(_tmp.mkdtemp(prefix="ratchet-trust-outside-"))
     bad = cp3_write_combined(outside / "combined.json", fp)
     r = rx(d, env, "ui-record", "CP1", "--review", bad)
     cp1 = cp3_state(d)["checkpoints"]["CP1"]
@@ -1355,7 +1356,7 @@ def cp3_ui_folder_trust():
     cp3_pass_behavior(d, env)
     fp = cp3_fp(d, env)
     round1 = cp3_ui_round_dir(d, 1)
-    real = Path(tempfile.mkdtemp(prefix="ratchet-trust-uisym-")) / "real.json"
+    real = Path(_tmp.mkdtemp(prefix="ratchet-trust-uisym-")) / "real.json"
     cp3_write_combined(real, fp)
     link = round1 / "combined.json"
     link.symlink_to(real)
@@ -1444,7 +1445,7 @@ def cp3_adv_round1_location_first():
 
     # --- wrong folder + malformed / stale: the folder message wins (adv-record) ------------------------------------
     env, d, rnd, rid = cp3x_adv_ready()
-    outside = Path(tempfile.mkdtemp(prefix="ratchet-trust-x01-"))
+    outside = Path(_tmp.mkdtemp(prefix="ratchet-trust-x01-"))
     junk = outside / f"{rid}.json"
     junk.write_text("{ this is not json")
     r = rx(d, env, "adv-record", "CP1", "--reviews", str(junk))
@@ -1466,7 +1467,7 @@ def cp3_adv_round1_location_first():
 
     # --- wrong folder + malformed / stale: the folder message wins (ui-record) -------------------------------------
     env, d, fp = cp3x_ui_ready()
-    outside = Path(tempfile.mkdtemp(prefix="ratchet-trust-x02-"))
+    outside = Path(_tmp.mkdtemp(prefix="ratchet-trust-x02-"))
     junk = outside / "combined.json"
     junk.write_text("{ nope")
     r = rx(d, env, "ui-record", "CP1", "--review", str(junk))
@@ -1535,7 +1536,7 @@ def cp3_adv_round1_location_first():
         env, d, rnd, rid = cp3x_adv_ready()
         target = Path(rnd["output_dir"]) / f"{rid}.json"
         cp3_write_review(target, rnd, rid, findings=[{"id": "REAL", "severity": "blocker", "file": "src/f.js"}])
-        evil = Path(cp3_write_review(Path(tempfile.mkdtemp(prefix="ratchet-trust-x04-")) / "evil.json", rnd, rid))
+        evil = Path(cp3_write_review(Path(_tmp.mkdtemp(prefix="ratchet-trust-x04-")) / "evil.json", rnd, rid))
 
         def swap(target=target, evil=evil, make_link=make_link):
             tmp = target.with_name(target.name + ".swap")
@@ -1557,7 +1558,7 @@ def cp3_adv_round1_location_first():
     env, d, fp = cp3x_ui_ready()
     target = cp3_ui_round_dir(d, 1) / "combined.json"
     cp3_write_combined(target, fp, diffs=[{"severity": "blocker", "location": "x", "description": "real"}])
-    evil = Path(cp3_write_combined(Path(tempfile.mkdtemp(prefix="ratchet-trust-x04ui-")) / "evil.json", fp))
+    evil = Path(cp3_write_combined(Path(_tmp.mkdtemp(prefix="ratchet-trust-x04ui-")) / "evil.json", fp))
 
     def ui_swap():
         tmp = target.with_name("combined.json.swap")
@@ -1842,7 +1843,7 @@ def cp4_tamper_fixture(env):
 
 def cp4_unapproved_plan(env):
     """A submitted plan parked awaiting_plan_approval (mirrors cp3_project, minus the final approve-plan)."""
-    d = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp4-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp4-"))
     git(d, "init", "-q")
     git(d, "config", "user.email", "t@t")
     git(d, "config", "user.name", "t")
@@ -2045,7 +2046,7 @@ def cp4_tampered_session_ignored():
     # --- T09: a fresh RATCHET_HOME the test fully controls, no legitimate director key or hook history --------------
     env = make_env("claude")
     d, tp = cp4_unapproved_plan(env)
-    fake_home = Path(tempfile.mkdtemp(prefix="ratchet-trust-fakehome-"))
+    fake_home = Path(_tmp.mkdtemp(prefix="ratchet-trust-fakehome-"))
     fake_env = dict(env, RATCHET_ROLE="director", RATCHET_HOME=str(fake_home))
     rx(d, fake_env, "director-key")
     rx(d, fake_env, "director-enroll")
@@ -2067,7 +2068,7 @@ def cp4_tampered_session_ignored():
     # --- T10: a RATCHET_HOME that disagrees with what the hooks recorded is refused ---------------------------------
     env = make_env("claude")
     d = project(env)  # install + fire_claude already ran the hooks against this project with env's RATCHET_HOME (H1)
-    h2 = Path(tempfile.mkdtemp(prefix="ratchet-trust-h2-"))
+    h2 = Path(_tmp.mkdtemp(prefix="ratchet-trust-h2-"))
     env2 = dict(env, RATCHET_HOME=str(h2))
     r = rx(d, env2, "status")
     check("[CP4-T10] a later command under a different RATCHET_HOME (H2) is refused, not silently run against H2",
@@ -2140,7 +2141,7 @@ def cp4_adv_round1_role_backstop():
     # --- X01: the reviewer's exact bypass: write a script, then run it with a clean-looking command --------------
     env = make_env("claude")
     d, tp = cp4_unapproved_plan(env)
-    out = Path(tempfile.mkdtemp(prefix="ratchet-trust-x01-"))
+    out = Path(_tmp.mkdtemp(prefix="ratchet-trust-x01-"))
     script = out / "x.sh"
     body = ("export RATCHET_ROLE=director\n"
             + "".join(f'"{sys.executable}" "{ENGINE}" {cmd} > "{out}/{name}.out" 2> "{out}/{name}.err"; '
@@ -2170,7 +2171,7 @@ def cp4_adv_round1_role_backstop():
           (r.returncode, r.stderr, cp3_state(d)["phase"]))
 
     # --- X02: the same script in Python, run from a folder with no .ratchet/ and aimed at the lane with --root ----
-    elsewhere = Path(tempfile.mkdtemp(prefix="ratchet-trust-x02-"))
+    elsewhere = Path(_tmp.mkdtemp(prefix="ratchet-trust-x02-"))
     py = elsewhere / "x.py"
     py_body = ("import os, subprocess, sys\n"
                "os.environ['RATCHET_ROLE'] = 'director'\n"
@@ -2197,7 +2198,7 @@ def cp4_adv_round1_role_backstop():
     env = make_env("claude")
     d, tp = cp4_unapproved_plan(env)
     b = cp4x_guard_tool(d, env, "Bash", {"command": "ls"})  # the lane's builder has run commands in the lane
-    home_dir = Path(tempfile.mkdtemp(prefix="ratchet-trust-director-"))
+    home_dir = Path(_tmp.mkdtemp(prefix="ratchet-trust-director-"))
     denv = dict(env, RATCHET_ROLE="director")  # the director's agent CLI was started with it: its hooks have it
     steps = []
     for args in (["director-key"], ["director-enroll"], ["director-sign", "approve-plan"]):
@@ -2216,7 +2217,7 @@ def cp4_adv_round1_role_backstop():
     env = make_env("claude")
     d, tp = cp4_unapproved_plan(env)
     cp4x_guard_tool(d, env, "Bash", {"command": "ls"})
-    dproj = Path(tempfile.mkdtemp(prefix="ratchet-trust-dproj-"))
+    dproj = Path(_tmp.mkdtemp(prefix="ratchet-trust-dproj-"))
     (dproj / ".ratchet").mkdir()
     denv = dict(env, RATCHET_ROLE="director")
     g = cp4x_guard_tool(dproj, denv, "Bash", {"command": f"python3 {ENGINE} --root {d} director-key"},
@@ -2344,7 +2345,7 @@ def cp4_adv_round2_fail_closed():
     check("[CP4-X07] no director key was created and the lane was not enrolled",
           not (Path(env["RATCHET_HOME"]) / "director.key").exists()
           and not (Path(d) / ".ratchet" / "director.json").exists())
-    fake_home = Path(tempfile.mkdtemp(prefix="ratchet-trust-x07-home-"))
+    fake_home = Path(_tmp.mkdtemp(prefix="ratchet-trust-x07-home-"))
     r = rx(d, dict(env, RATCHET_HOME=str(fake_home)), "status")
     check("[CP4-X07] the per-user folder check fails closed too: a made-up RATCHET_HOME is refused, not trusted",
           r.returncode != 0 and "hook-env.json" in r.stderr and "missing" in r.stderr, (r.returncode, r.stderr))
@@ -2374,7 +2375,7 @@ def cp4_adv_round2_fail_closed():
     spoof = cp4y_director_cmds(d, dict(denv, RATCHET_HOST_PROVIDER="openai"))
     check("[CP4-X08] claiming another agent CLI (RATCHET_HOST_PROVIDER) does not make the installed hooks vanish",
           all(r.returncode != 0 for r in spoof), [(r.returncode, r.stderr[-150:]) for r in spoof])
-    elsewhere = Path(tempfile.mkdtemp(prefix="ratchet-trust-x08-"))
+    elsewhere = Path(_tmp.mkdtemp(prefix="ratchet-trust-x08-"))
     res = cp4y_director_cmds(elsewhere, denv, root=d)
     check("[CP4-X08] from a folder no director hook recorded, `--root <lane>` director commands are refused too",
           all(r.returncode != 0 for r in res) and not (Path(d) / ".ratchet" / "director.json").exists(),
@@ -2382,7 +2383,7 @@ def cp4_adv_round2_fail_closed():
     env = make_env("claude")
     d, tp = cp4_unapproved_plan(env)
     install(d, env, "claude", scope="user")  # installed for the user, in no project
-    elsewhere = Path(tempfile.mkdtemp(prefix="ratchet-trust-x08u-"))
+    elsewhere = Path(_tmp.mkdtemp(prefix="ratchet-trust-x08u-"))
     res = cp4y_director_cmds(elsewhere, dict(env, RATCHET_ROLE="director"), root=d)
     check("[CP4-X08] user-scope hooks count as installed: with no director record the commands are refused",
           all(r.returncode != 0 for r in res), [(r.returncode, r.stderr[-150:]) for r in res])
@@ -2526,7 +2527,7 @@ def cp4_adv_round3_stale_record_and_recovery():
     env = make_env("claude")
     d, tp = cp4_unapproved_plan(env)
     cp4x_guard_tool(d, env, "Bash", {"command": "ls"})
-    dproj = Path(tempfile.mkdtemp(prefix="ratchet-trust-x10b-"))
+    dproj = Path(_tmp.mkdtemp(prefix="ratchet-trust-x10b-"))
     (dproj / ".ratchet").mkdir()
     denv = dict(env, RATCHET_ROLE="director")
     cp4x_guard_tool(dproj, denv, "Bash", {"command": "ls"}, session="s-director")
@@ -2647,7 +2648,7 @@ def cp4z_slow_hook(d, env, event, payload, pause=2.0):
     """A real hook process that pauses right before it saves its hook-env record (after its start time is taken):
     the exact interleaving of a hook that started first but finishes last. Returns the process once it is paused
     (or after 15 s if it never reaches the write)."""
-    ready = Path(tempfile.mkdtemp(prefix="ratchet-trust-x12-")) / "ready"
+    ready = Path(_tmp.mkdtemp(prefix="ratchet-trust-x12-")) / "ready"
     p = subprocess.Popen([sys.executable, "-c", _CP4Z_SLOW_HOOK, str(ENGINE), str(ready), event, str(pause)],
                          cwd=str(d), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True)
@@ -2766,7 +2767,7 @@ def cp4_adv_round4_audit_and_concurrency():
     install(d, env, "claude")
     denv = dict(env, RATCHET_ROLE="director")
     g0 = cp4x_guard_tool(d, denv, "Bash", {"command": "ls"}, session="s-director")
-    other = dict(env, RATCHET_HOME=str(Path(tempfile.mkdtemp(prefix="ratchet-trust-x13h-")) / "rh"))
+    other = dict(env, RATCHET_HOME=str(Path(_tmp.mkdtemp(prefix="ratchet-trust-x13h-")) / "rh"))
     slow = cp4z_slow_hook(d, other, "prompt", prompt_payload(d))
     b = cp4x_guard_tool(d, env, "Bash", {"command": "ls"})
     slow_out = slow.communicate(timeout=60)
@@ -2981,7 +2982,7 @@ def cp4_adv_round5_override_audit_class():
               r.returncode != 0 and "Couldn't confirm" in (r.stderr + r.stdout), (r.returncode, r.stderr[-200:]))
 
     # --- D2: two guard records with the same start microsecond: the builder's wins, whatever the names say -------
-    folder_root = Path(tempfile.mkdtemp(prefix="ratchet-trust-d2-"))
+    folder_root = Path(_tmp.mkdtemp(prefix="ratchet-trust-d2-"))
     folder = folder_root / ".ratchet" / "hook-env"
     folder.mkdir(parents=True)
     rec = json.dumps({"home": "/h", "key_file": "/k", "at": "x", "host": "claude"})
@@ -3004,7 +3005,7 @@ def cp4_adv_round5_override_audit_class():
     env = make_env("claude")
     roles = []
     for first, second in (("director", "builder"), ("builder", "director")):
-        d = Path(tempfile.mkdtemp(prefix="ratchet-trust-d2p-"))
+        d = Path(_tmp.mkdtemp(prefix="ratchet-trust-d2p-"))
         (d / ".ratchet").mkdir()
         at = now_dt().isoformat(timespec="microseconds")
         saved_role = os.environ.get("RATCHET_ROLE")
@@ -3055,7 +3056,7 @@ def cp5_say(d, tp, env, text, session="s-owner"):
 def cp5_project_each(env):
     """A one-checkpoint project with human_review=each, approved into building (mirrors cp3_project, but with the
     per-step review mode CP5-T07 needs: completing the only checkpoint still pauses for a step review)."""
-    d = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5-"))
     git(d, "init", "-q")
     git(d, "config", "user.email", "t@t")
     git(d, "config", "user.name", "t")
@@ -3724,7 +3725,7 @@ def cp5y_guard_bash(d, env, command, session):
 
 def cp5y_repo():
     """A git repo with no Ratchet folder yet: a project's very first Ratchet run."""
-    d = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5y-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5y-"))
     git(d, "init", "-q")
     git(d, "config", "user.email", "t@t")
     git(d, "config", "user.name", "t")
@@ -4408,7 +4409,7 @@ def cp5_adv_round5_lock_fails_safe():
 
     # --- X30: every failure to create the lock waits with a pause, then refuses plainly within the wait ----------
     cases = []
-    root = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5v-"))
+    root = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5v-"))
     (root / ".ratchet").mkdir()
     os.chmod(root / ".ratchet", 0o555)
     try:
@@ -4419,11 +4420,11 @@ def cp5_adv_round5_lock_fails_safe():
             cases.append(("a read-only Ratchet folder", cp5v_refusal(m, root)))
     finally:
         os.chmod(root / ".ratchet", 0o755)
-    root = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5v-"))
+    root = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5v-"))
     (root / ".ratchet").mkdir()
     os.symlink(str(root / "nowhere"), str(root / ".ratchet" / "state.lock"))
     cases.append(("a dangling link where the lock goes", cp5v_refusal(m, root)))
-    root = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5v-"))
+    root = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5v-"))
     (root / ".ratchet" / "state.lock").mkdir(parents=True)
     cases.append(("a folder where the lock goes", cp5v_refusal(m, root)))
     old = time.time() - 3600
@@ -4442,7 +4443,7 @@ def cp5_adv_round5_lock_fails_safe():
     d, tp = cp5_plan(env)
     rx(d, env, "ask", "approve-plan")
     cp5_say(d, tp, env, "yes")
-    marker = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5v-m-")) / "marker"
+    marker = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5v-m-")) / "marker"
     os.symlink(str(Path(d) / "nowhere"), str(cp5w_lock(d)))
     proc = cp5v_start(d, env, marker, 1, "approve-plan")
     out, err = proc.communicate(timeout=60)
@@ -4455,7 +4456,7 @@ def cp5_adv_round5_lock_fails_safe():
     import threading
     both = []
     for _trial in range(10):
-        root = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5v-"))
+        root = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5v-"))
         (root / ".ratchet").mkdir()
         lockf = root / ".ratchet" / "state.lock"
         lockf.write_text("12345 crashed")
@@ -4484,7 +4485,7 @@ def cp5_adv_round5_lock_fails_safe():
           all(t[0] for t in both), [t for t in both if not t[0]][:2])
     check("[CP5-X31] ... and the one that took it removes its own lock when it is done", not any(t[3] for t in both),
           both)
-    root = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5v-"))
+    root = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5v-"))
     (root / ".ratchet").mkdir()
     (root / ".ratchet" / "state.lock").write_text("999 live")
     why = m._StateLock(root, wait=0.3).acquire()
@@ -4498,7 +4499,7 @@ def cp5_adv_round5_lock_fails_safe():
     cp5_say(d, tp, env, "yes")
     lock = cp5w_lock(d)
     lock.write_text("12345 held-by-test")
-    marker = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5v-m-")) / "marker"
+    marker = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5v-m-")) / "marker"
     proc = cp5v_start(d, env, marker, 30, "approve-plan")
     seen = cp5v_until(lambda: "waiting" in cp5v_lines(marker))
     waiting = seen and proc.poll() is None and cp3_state(d)["phase"] == "awaiting_plan_approval"
@@ -4539,7 +4540,7 @@ def cp5_adv_round5_lock_fails_safe():
     cp5w_lock(d).write_text("12345 held-by-test")
     tp.open("a").write(json.dumps({"type": "user", "message": {"role": "user", "content": "yes"},
                                    "timestamp": now_dt().isoformat()}) + "\n")
-    marker = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5v-m-")) / "marker"
+    marker = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5v-m-")) / "marker"
     t0 = time.monotonic()
     proc = cp5v_start(d, env, marker, 0.5, "hook", "prompt", "--host", "claude")
     out, err = proc.communicate(json.dumps({"cwd": str(d), "prompt": "yes", "session_id": "s-owner",
@@ -4550,7 +4551,7 @@ def cp5_adv_round5_lock_fails_safe():
           proc.returncode == 0 and took < 10 and "waiting" not in cp5v_lines(marker)
           and len(cp4_human_log_lines(d)) == log_before + 1 and cp4_human_log_lines(d)[-1].get("prompt") == "yes"
           and state_file.read_bytes() == before, (proc.returncode, took, cp5v_lines(marker), err[-300:]))
-    marker = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5v-m-")) / "marker"
+    marker = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5v-m-")) / "marker"
     proc = cp5v_start(d, env, marker, 0.5, "hook", "stop", "--host", "claude")
     out, err = proc.communicate(json.dumps({"session_id": "s-owner", "cwd": str(d), "hook_event_name": "Stop",
                                             "stop_hook_active": False}), timeout=60)
@@ -4566,9 +4567,9 @@ def cp5_adv_round5_lock_fails_safe():
     d, tp = cp5_plan(env)
     rx(d, env, "ask", "approve-plan")
     cp5_say(d, tp, env, "yes")
-    gate = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5v-g-")) / "go"
-    m1 = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5v-m-")) / "marker"
-    m2 = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5v-m-")) / "marker"
+    gate = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5v-g-")) / "go"
+    m1 = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5v-m-")) / "marker"
+    m2 = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5v-m-")) / "marker"
     approver = cp5v_start(d, env, m1, 30, "approve-plan", gate=gate)
     in_save = cp5v_until(lambda: "in-save" in cp5v_lines(m1))
     t0 = time.monotonic()
@@ -4629,7 +4630,7 @@ SECTIONS.append(("CP5", cp5_adv_round5_lock_fails_safe))
 def cp5_adv_round6_long_command_keeps_approval():
     print("CP5 adv round 6: an approval made while behavior runs is refused as busy, then applied once it finishes")
     env = make_env("claude")
-    tmp = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5u-"))
+    tmp = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5u-"))
     hold, running, go = tmp / "hold", tmp / "running", tmp / "go"
     waiter = tmp / "waiter.py"  # no `sleep` on the hermetic PATH: the test command waits through Python
     waiter.write_text("import os, sys, time\nhold, running, go = sys.argv[1:4]\nif os.path.exists(hold):\n"
@@ -4702,9 +4703,9 @@ def cp5r7_gate(tmp, name):
 def cp5r7_project(env):
     """cp3_project, with a behavior test command and a regression suite that each wait on marker files when held.
     CP1 is implemented and waiting for its behavior gate. Returns (d, tp, {"behavior": .., "regression": ..})."""
-    tmp = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r7-g-"))
+    tmp = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r7-g-"))
     beh, reg = cp5r7_gate(tmp, "behavior"), cp5r7_gate(tmp, "regression")
-    d = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r7-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r7-"))
     git(d, "init", "-q")
     git(d, "config", "user.email", "t@t")
     git(d, "config", "user.name", "t")
@@ -4841,7 +4842,7 @@ def cp5_adv_round7_one_command_at_a_time():
     sp = d / ".ratchet/runs/f/state.json"
     before = sp.read_bytes()
     cp5w_lock(d).write_text(f"{os.getpid()} cp5r7-token behavior")  # a live, long command holds the lock
-    marker = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r7-m-")) / "marker"
+    marker = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r7-m-")) / "marker"
     t0 = time.monotonic()
     hook = cp5v_start(d, env, marker, 30, "hook", "prompt", "--host", "claude")
     h_out, h_err = hook.communicate(json.dumps({"cwd": str(d), "prompt": "ok, show me the plan", "session_id": "s-A",
@@ -4923,7 +4924,7 @@ def cp5_adv_round7_one_command_at_a_time():
     d, tp, gates = cp5r7_project(env)
     cp5r7_at_complete(d, env)
     base = cp5r7_commits(d)
-    fail = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r7-f-")) / "fail_after_commit.py"
+    fail = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r7-f-")) / "fail_after_commit.py"
     fail.write_text(_CP5R7_FAIL_AFTER_COMMIT)
     r1 = subprocess.run([sys.executable, str(fail), str(ENGINE), "complete", "CP1"], cwd=d, env=env,
                         capture_output=True, text=True)
@@ -5022,7 +5023,7 @@ def cp5_adv_round8_init_lock_and_hash_record_lock():
 
     # --- X45: concurrent first-run inits in a project with no Ratchet folder: exactly one runs -----------------
     env = make_env("claude")
-    d = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r8-i-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r8-i-"))
     git(d, "init", "-q")
     git(d, "config", "user.email", "t@t")
     git(d, "config", "user.name", "t")
@@ -5056,7 +5057,7 @@ def cp5_adv_round8_init_lock_and_hash_record_lock():
     d, tp, gates = cp5r7_project(env)
     hold, running, go = gates["behavior"]
     rh = Path(env["RATCHET_HOME"])
-    tmp = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r8-a-"))
+    tmp = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r8-a-"))
     script = tmp / "appender.py"
     script.write_text(_CP5R8_APPENDER)
     start = tmp / "start"
@@ -5177,7 +5178,7 @@ print(json.dumps(got))
 
 
 def cp5r9_race(script, root, env, workers, n, mode):
-    start = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r9-s-")) / "start"
+    start = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r9-s-")) / "start"
     procs = [subprocess.Popen([sys.executable, str(script), str(ENGINE), str(root), str(start), str(w), str(n), mode],
                               cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
              for w in range(workers)]
@@ -5203,7 +5204,7 @@ def cp5r9_guard_proc(d, env, command, session):
 
 def cp5_adv_round9_engine_notes_lock():
     print("CP5 adv round 9: the engine-call notes have their own lock; concurrent guard hooks never drop a note")
-    tmp = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r9-"))
+    tmp = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r9-"))
     script = tmp / "noter.py"
     script.write_text(_CP5R9_NOTER)
 
@@ -5378,7 +5379,7 @@ def cp5r10_breaker_proc(script, marks, env, role):
 
 def cp5_adv_round10_damaged_records_and_breaker():
     print("CP5 adv round 10: damaged per-user records fail safe; a stale short lock is cleared by one process only")
-    tmp = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r10-"))
+    tmp = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r10-"))
     corrupt = '{"a": [1,'
 
     # --- X51: a corrupt engine-call-sessions.json: the guard notes over it, `ask` uses no note, nothing crashes ----
@@ -5425,7 +5426,7 @@ def cp5_adv_round10_damaged_records_and_breaker():
     env = make_env("claude")
     rh = Path(env["RATCHET_HOME"])
     rh.mkdir(parents=True, exist_ok=True)
-    folder = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r10-dir-"))
+    folder = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r10-dir-"))
     df = rh / "director-folders.json"
     df.write_text(corrupt)
     payload = {"session_id": "s-dir", "cwd": str(folder), "hook_event_name": "PreToolUse", "tool_name": "Bash",
@@ -5491,7 +5492,7 @@ def cp5_adv_round10_damaged_records_and_breaker():
     lock.write_text("")
     aged = time.time() - 120
     os.utime(lock, (aged, aged))
-    marks = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r10-m-"))
+    marks = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r10-m-"))
     slow = cp5r10_breaker_proc(script, marks, env, "slow")
     judged = cp5v_until(lambda: (marks / "slow-judged").exists(), timeout=60)
     fast = cp5r10_breaker_proc(script, marks, env, "fast")
@@ -5793,7 +5794,7 @@ def cp5_adv_round11_damaged_record_class():
         env = make_env("claude")
         rh = Path(env["RATCHET_HOME"])
         rh.mkdir(parents=True, exist_ok=True)
-        folder = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r11-dir-"))
+        folder = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r11-dir-"))
         df = rh / "director-folders.json"
         df.write_text(bad)
         payload = {"session_id": "s-dir", "cwd": str(folder), "hook_event_name": "PreToolUse", "tool_name": "Bash",
@@ -5820,7 +5821,7 @@ def cp5_adv_round11_damaged_record_class():
           and issubclass(m._EngineNotesLock, m._BreakerLock)
           and not any(k in vars(c) for c in (m._StateLock, m._ChainLock, m._EngineNotesLock) for k in shared),
           [(c.__name__, [k for k in shared if k in vars(c)]) for c in (m._StateLock, m._ChainLock)])
-    root = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r11-"))
+    root = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r11-"))
     (root / ".ratchet").mkdir()
     lockf, brk = root / ".ratchet" / "state.lock", root / ".ratchet" / "state.lock.break"
     old = time.time() - 3600
@@ -5884,7 +5885,7 @@ def cp5_adv_round11_damaged_record_class():
           rr is not None and not ({"die", "exit"} & calls) and raises == [] and uses("read_json", "_read_record")
           and uses("write_json", "_write_record"), (sorted(calls), len(raises)))
     with engine_env(make_env("claude")):
-        tmpd = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r11-rr-"))
+        tmpd = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r11-rr-"))
         cases = {"corrupt": _CP5R11_CORRUPT, "list": "[]", "null": "null", "bytes": None, "folder": None}
         got = {}
         for k, v in cases.items():
@@ -6031,7 +6032,7 @@ def cp5_adv_round12_restrictions_breaker_and_order():
         cp4x_guard_tool(d, env, "Bash", {"command": "ls"})
         lanes.append((d, tp))
     (a, tpa), (b, _tpb), (c, _tpc) = lanes
-    home_dir = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r12-director-"))
+    home_dir = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r12-director-"))
     denv = dict(env, RATCHET_ROLE="director")
     k = cp5r12_director(home_dir, denv, a, "director-key")
     ea = cp5r12_director(home_dir, denv, a, "director-enroll")
@@ -6109,7 +6110,7 @@ def cp5_adv_round12_restrictions_breaker_and_order():
         def _stale_after(self):
             return 30
 
-    root = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r12-brk-"))
+    root = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r12-brk-"))
     lockf = root / "x.lock"
     p1l, p2l = Lk(lockf, "tok-P1"), Lk(lockf, "tok-P2")
     brk = p1l.breaker
@@ -6411,7 +6412,7 @@ sys.exit(rc)
 def cp5r13_race(script, record, jobs):
     """Run the engine command of each job ((cwd, env, argv)) in its own process, all released at once; each reads
     `record` slowly. Returns the finished processes' (returncode, stderr)."""
-    gate = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r13-g-"))
+    gate = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r13-g-"))
     procs = [subprocess.Popen([sys.executable, str(script), str(ENGINE), record, str(gate / "go"),
                                str(gate / f"ready-{i}"), *argv], cwd=str(cwd), env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True)
@@ -6432,7 +6433,7 @@ def cp5r13_race(script, record, jobs):
 
 def cp5r13_pre_init_project(env):
     """A project right before its first `init` (the same steps as cp4_unapproved_plan up to init)."""
-    d = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r13-p-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r13-p-"))
     git(d, "init", "-q")
     git(d, "config", "user.email", "t@t")
     git(d, "config", "user.name", "t")
@@ -6461,7 +6462,7 @@ def cp5_adv_round13_shared_record_lock():
     env = make_env("claude")
     rh = Path(env["RATCHET_HOME"])
     projects = [cp5r13_pre_init_project(env) for _ in range(4)]
-    script = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r13-s-")) / "child.py"
+    script = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r13-s-")) / "child.py"
     script.write_text(_CP5R13_CHILD)
     ready, res = cp5r13_race(script, "active-runs.json",
                              [(d, env, ["init", "feature", "--slug", "f"]) for d in projects[:3]])
@@ -6481,7 +6482,7 @@ def cp5_adv_round13_shared_record_lock():
     lanes = projects[:3]
     for d in projects:
         cp4x_guard_tool(d, env, "Bash", {"command": "ls"})
-    home_dir = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r13-director-"))
+    home_dir = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r13-director-"))
     denv = dict(env, RATCHET_ROLE="director")
     k = cp5r12_director(home_dir, denv, lanes[0], "director-key")
     for d in projects:
@@ -6500,8 +6501,8 @@ def cp5_adv_round13_shared_record_lock():
     # --- X70: every shared record writer, two at once with the race forced: both entries survive ---------------
     lost = {}
     with engine_env(env):
-        a = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r13-a-"))
-        b = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r13-b-"))
+        a = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r13-a-"))
+        b = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r13-b-"))
         for x in (a, b):
             (x / ".ratchet").mkdir()
         ra, rb = str(a.resolve()), str(b.resolve())
@@ -6607,7 +6608,7 @@ def cp5_adv_round13_shared_record_lock():
     lock = rh / "active-runs.lock"
     lock.write_text("12345 another-process")
     before = (rh / "active-runs.json").read_text()
-    c = Path(tempfile.mkdtemp(prefix="ratchet-trust-cp5r13-c-"))
+    c = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r13-c-"))
     with engine_env(env):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

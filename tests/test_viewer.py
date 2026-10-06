@@ -9,7 +9,7 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
+import _tmp
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -27,7 +27,7 @@ for _k in ("RATCHET_ROLE", "RATCHET_HUMAN_OVERRIDE", "RATCHET_ROOT", "RATCHET_HO
            "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED",
            "GEMINI_CLI", "COPILOT_CLI", "GITHUB_COPILOT_CLI", "CODEX_HOME", "COPILOT_HOME", "RATCHET_HOOKS_WAIVE"):
     os.environ.pop(_k, None)
-_HOME = Path(tempfile.mkdtemp(prefix="ratchet-viewer-userhome-"))
+_HOME = Path(_tmp.mkdtemp(prefix="ratchet-viewer-userhome-"))
 os.environ.update(HOME=str(_HOME), CODEX_HOME=str(_HOME / "codexhome"), COPILOT_HOME=str(_HOME / "copilothome"))
 
 
@@ -103,7 +103,7 @@ def plain_viewer_checks(base: Path):
     src = TEMPLATE.read_text(encoding="utf-8")
     tr = base / "transcripts"
     tr.mkdir()
-    env_home = tempfile.mkdtemp(prefix="ratchet-viewer-home-")
+    env_home = _tmp.mkdtemp(prefix="ratchet-viewer-home-")
     os.environ["RATCHET_HOME"] = env_home
     os.environ["RATCHET_HOST_PROVIDER"] = "anthropic"
     plain = building_lane(base, "plain", tr, waive=False)
@@ -167,7 +167,7 @@ def plain_viewer_checks(base: Path):
 
 def patched_python(code: str) -> dict:
     """An environment whose Python runs `code` at start-up (via sitecustomize), to simulate a slow machine."""
-    d = Path(tempfile.mkdtemp(prefix="ratchet-viewer-site-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-viewer-site-"))
     (d / "sitecustomize.py").write_text(code)
     return dict(os.environ, PYTHONPATH=str(d))
 
@@ -177,9 +177,18 @@ def servers_for(root: Path) -> list:
             if "ratchet.py" in l and "--foreground" in l and str(root) in l]
 
 
+def server_base(prefix: str) -> Path:
+    """A throwaway folder for lanes; any viewer or dashboard server still running under it is stopped when the
+    folder is removed, so a crash partway through a check never leaves a server behind."""
+    t = _tmp.mkdtemp(prefix=prefix)
+    t.on_cleanup(lambda: [subprocess.run(["kill", line.split()[0]], capture_output=True)
+                          for line in servers_for(Path(t))])
+    return Path(t)
+
+
 def slow_start_checks():
     print("Slow machines")
-    base = Path(tempfile.mkdtemp(prefix="ratchet-viewer-slow-"))
+    base = server_base("ratchet-viewer-slow-")
     c, d = lane(base, "gamma"), lane(base, "delta")
     # A machine whose reverse DNS is slow: resolving 0.0.0.0 can take 5s or more, longer than the start-up wait.
     slow_dns = patched_python("import socket, time\n_real = socket.getfqdn\n"
@@ -212,7 +221,7 @@ def slow_start_checks():
 
 def main():
     slow_start_checks()
-    base = Path(tempfile.mkdtemp(prefix="ratchet-viewer-"))
+    base = server_base("ratchet-viewer-")
     a, b = lane(base, "alpha"), lane(base, "beta")
     try:
         print("Link before any server")

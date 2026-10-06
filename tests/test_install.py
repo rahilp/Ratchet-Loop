@@ -9,7 +9,7 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
+import _tmp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,7 +61,7 @@ def real_home_marks():
 
 def main():
     before = real_home_marks()
-    with tempfile.TemporaryDirectory() as tmp:
+    with _tmp.mkdtemp() as tmp:
         e = Env(tmp)
         r = e.run("--host", "all")
         out = r.stdout + r.stderr
@@ -110,13 +110,13 @@ def main():
         all_out = out
 
     # T11
-    with tempfile.TemporaryDirectory() as tmp:
+    with _tmp.mkdtemp() as tmp:
         e = Env(tmp)
         rc = e.run("--host", "claude")
         claude_out = rc.stdout
         ok = rc.returncode == 0 and (e.home / ".claude/skills/ratchet-orchestrator/SKILL.md").exists() and e.files(e.rh) == []
         check("[CP6-T11] --host claude installs into HOME/.claude only and leaves RATCHET_HOME empty", ok, (rc.returncode, e.files(e.rh)[:3]))
-    with tempfile.TemporaryDirectory() as tmp:
+    with _tmp.mkdtemp() as tmp:
         e = Env(tmp)
         rx = e.run("--host", "codex")
         codex_out = rx.stdout
@@ -126,7 +126,7 @@ def main():
     # T16
     def names_folder(o, rh):
         return f"{rh}/skills" in o and re.search(r"link", o, re.I) is not None
-    with tempfile.TemporaryDirectory() as tmp:
+    with _tmp.mkdtemp() as tmp:
         e = Env(tmp)
         ra = e.run("--host", "all")
         rc2 = e.run("--host", "codex")
@@ -137,7 +137,7 @@ def main():
               not re.search(r"link|point your|symlink", claude_out, re.I) and str(e.rh) not in claude_out, claude_out[-250:])
 
     # T25: auto-detected host, and skills linked into the CLI's own skills folder
-    with tempfile.TemporaryDirectory() as tmp:
+    with _tmp.mkdtemp() as tmp:
         e = Env(tmp)
         r = e.run(extra_env={"CODEX_THREAD_ID": "t1"})
         link = e.home / ".codex/skills/ratchet-orchestrator"
@@ -150,7 +150,7 @@ def main():
         r2 = e.run(extra_env={"CODEX_THREAD_ID": "t1"})
         check("[CP6-T25] re-running keeps a single working link per skill",
               r2.returncode == 0 and link.is_symlink() and (link / "SKILL.md").exists(), r2.stderr[-200:])
-    with tempfile.TemporaryDirectory() as tmp:
+    with _tmp.mkdtemp() as tmp:
         e = Env(tmp)
         r = e.run()
         check("[CP6-T25] no --host and no CLI detected falls back to Claude Code and says so",
@@ -160,7 +160,7 @@ def main():
               "Set up Ratchet and continue" in r.stdout, r.stdout[-200:])
 
     # T13
-    with tempfile.TemporaryDirectory() as tmp:
+    with _tmp.mkdtemp() as tmp:
         e = Env(tmp)
         rp = e.run("--host", "all", "--project")
         check("[CP6-T13] --host all --project exits 0 and puts the Claude copy in the project's .claude, not in HOME/.claude",
@@ -168,7 +168,7 @@ def main():
               (rp.returncode, (rp.stdout + rp.stderr)[-200:]))
 
     # T13 detail, T18-T21
-    with tempfile.TemporaryDirectory() as tmp:
+    with _tmp.mkdtemp() as tmp:
         e = Env(tmp)
         rp = e.run("--host", "all", "--project")
         proj = {"claude": ".claude/settings.json", "codex": ".codex/hooks.json", "gemini": ".gemini/settings.json", "copilot": ".github/hooks/ratchet.json"}
@@ -179,7 +179,7 @@ def main():
         check("[CP6-T19] --project keeps the shared non-Claude skills copy in RATCHET_HOME and none in the project",
               (e.rh / "skills/ratchet-orchestrator/SKILL.md").exists() and not (e.cwd / ".ratchet-loop").exists(), e.files(e.cwd)[:5])
     for host, rel in (("gemini", ".gemini/settings.json"), ("copilot", ".copilot/hooks/ratchet.json")):
-        with tempfile.TemporaryDirectory() as tmp:
+        with _tmp.mkdtemp() as tmp:
             e = Env(tmp)
             r1 = e.run("--host", host)
             f = e.home / rel
@@ -188,7 +188,7 @@ def main():
                   r1.returncode == 0 and (e.rh / "skills/ratchet-orchestrator/SKILL.md").exists() and f.exists()
                   and entry_counts(f, host) == {"stop": 1, "prompt": 1, "guard": 1} and not others and not (e.home / ".claude").exists(),
                   (r1.returncode, (r1.stdout + r1.stderr)[-200:], others))
-        with tempfile.TemporaryDirectory() as tmp:
+        with _tmp.mkdtemp() as tmp:
             e = Env(tmp)
             rq = e.run("--host", host, "--project")
             pf = e.cwd / (".github/hooks/ratchet.json" if host == "copilot" else rel)
@@ -198,7 +198,7 @@ def main():
                   (rq.returncode, (rq.stdout + rq.stderr)[-200:]))
 
     # T14
-    with tempfile.TemporaryDirectory() as tmp:
+    with _tmp.mkdtemp() as tmp:
         e = Env(tmp)
         rb = e.run("--host", "nonsense")
         after_bad = e.files(e.home) + e.files(e.rh)

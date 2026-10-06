@@ -15,7 +15,7 @@ expected to pass it in RATCHET_TEST_REPORT.
 import json
 import re
 import sys
-import tempfile
+import _tmp
 import traceback
 from pathlib import Path
 
@@ -150,7 +150,7 @@ def cp6_project(env, report, cases, checks=None, command=None, report_reason=Non
 
     `report` is "json" / "junit" / "none" / None (the last two meaning "tests.report" is "none" with a reason, or
     the key is left out entirely, i.e. a plan from before this change)."""
-    d = Path(tempfile.mkdtemp(prefix="ratchet-cp6-p-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-cp6-p-"))
     git(d, "init", "-q")
     git(d, "config", "user.email", "t@t")
     git(d, "config", "user.name", "t")
@@ -505,7 +505,7 @@ OPENSPEC_MIN = {
 def cp6_t15_spec_status_not_proven_on_false_exit0():
     print("CP6: spec status does not call a scenario proven on a false exit-0 pass")
     env = make_env("claude")
-    d = Path(tempfile.mkdtemp(prefix="ratchet-cp6-spec-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-cp6-spec-"))
     git(d, "init", "-q")
     git(d, "config", "user.email", "t@t")
     git(d, "config", "user.name", "t")
@@ -576,7 +576,7 @@ SECTIONS.append(("CP6", cp6_t15_spec_status_not_proven_on_false_exit0))
 
 def _x_planning_project(env):
     """Like cp6_project, but stops before plan-submit so a test can see plan-submit refuse a plan."""
-    d = Path(tempfile.mkdtemp(prefix="ratchet-cp6-x-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-cp6-x-"))
     git(d, "init", "-q")
     git(d, "config", "user.email", "t@t")
     git(d, "config", "user.name", "t")

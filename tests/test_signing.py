@@ -21,7 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
+import _tmp
 import traceback
 from pathlib import Path
 
@@ -91,7 +91,7 @@ printf '%s\n' "$reply"
 
 
 def fake_bin(name, reply_json):
-    b = Path(tempfile.mkdtemp(prefix="ratchet-sign-fakebin-"))
+    b = Path(_tmp.mkdtemp(prefix="ratchet-sign-fakebin-"))
     for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
         p = shutil.which(n)
         if p:
@@ -138,7 +138,7 @@ def guard(d, env, tool, tool_input, host="claude", agent=None, cwd=None):
 # ---- two-checkpoint project (T05: a round's secret can't cross checkpoints) -------------------------------------
 
 def project2(env):
-    d = Path(tempfile.mkdtemp(prefix="ratchet-sign-p2-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-sign-p2-"))
     git(d, "init", "-q")
     git(d, "config", "user.email", "t@t")
     git(d, "config", "user.name", "t")
@@ -688,7 +688,7 @@ def say_x(d, env, text):
 
 def raw_fake_bin(name, body):
     """A fake CLI whose whole script body is given (no reply escaping), on a PATH holding only a few real tools."""
-    b = Path(tempfile.mkdtemp(prefix="ratchet-sign-rawbin-"))
+    b = Path(_tmp.mkdtemp(prefix="ratchet-sign-rawbin-"))
     for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
         p = shutil.which(n)
         if p:
@@ -825,7 +825,7 @@ def x04_combine_refuses_unproven_inputs():
     round1 = cp3_ui_round_dir(d, 1)
     manifest = ui_manifest(d, fp)
     out = round1 / "combined.json"
-    tmp = Path(tempfile.mkdtemp(prefix="ratchet-sign-x04-"))
+    tmp = Path(_tmp.mkdtemp(prefix="ratchet-sign-x04-"))
     ra = run_combine(d, env, [write_role(tmp / "visual.json", "visual"), write_role(tmp / "behavior.json", "behavior")],
                      out, "CP1", manifest)
     check("[CP7-X04] hand-typed inputs outside the round folder are refused and nothing is written",
@@ -840,7 +840,7 @@ def x04_combine_refuses_unproven_inputs():
     rc = run_combine(d, env, [v, b], out, "CP1", manifest)
     check("[CP7-X04] a per-role file the guard saw the main session write is refused, saying so",
           rc.returncode != 0 and not out.exists() and "main session" in rc.stderr, (rc.returncode, rc.stderr))
-    other = Path(tempfile.mkdtemp(prefix="ratchet-sign-x04m-")) / "manifest.json"
+    other = Path(_tmp.mkdtemp(prefix="ratchet-sign-x04m-")) / "manifest.json"
     other.write_text(manifest.read_text())
     for p, agent in ((b, "ratchet-behavior-reviewer"),):
         assert guard(d, env, "Write", {"file_path": str(p)}, agent=agent).returncode == 0
@@ -922,7 +922,7 @@ def x07_review_signs_role_files():
     rc = run_combine(d, env, [round1 / "visual.json", round1 / "behavior.json"], out, "CP1", manifest)
     check("[CP7-X07] combine accepts the script-signed role files", rc.returncode == 0, rc.stderr)
     edited = dict(roles.get("visual") or {}, provider="codeX")
-    ep = Path(tempfile.mkdtemp(prefix="ratchet-sign-x07-")) / "visual.json"
+    ep = Path(_tmp.mkdtemp(prefix="ratchet-sign-x07-")) / "visual.json"
     ep.write_text(json.dumps(edited))
     re_ = run_combine(d, env, [ep, round1 / "behavior.json"], round1 / "combined-edited.json", "CP1", manifest)
     check("[CP7-X07] a one-character edit to a signed role file is refused by combine",
@@ -1288,7 +1288,7 @@ def x19_rereview_invalidates_old_role_files():
     r21 = cp3_ui_round_dir(d2, 1)
     m2 = ui_manifest(d2)
     assert run_review(d2, env2, m2, r21).returncode == 0
-    keep = Path(tempfile.mkdtemp(prefix="ratchet-sign-x19-"))
+    keep = Path(_tmp.mkdtemp(prefix="ratchet-sign-x19-"))
     for role in ("visual", "behavior"):
         shutil.copy(r21 / f"{role}.json", keep / f"{role}.json")
     assert run_review(d2, env2, m2, r21).returncode == 0
@@ -1302,7 +1302,7 @@ def x20_standalone_review_outside_a_run():
     print("CP7-X20: outside a Ratchet run, ui_review.py still compares, and marks the result unsigned")
     b = raw_fake_bin("codex", FAKE_UI_CODEX)
     env = dict(make_env("claude"), PATH=str(b))
-    d = Path(tempfile.mkdtemp(prefix="ratchet-sign-x20-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-sign-x20-"))
     git(d, "init", "-q")
     m = d / "shots" / "manifest.json"
     m.parent.mkdir()

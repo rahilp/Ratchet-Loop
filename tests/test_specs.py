@@ -11,7 +11,7 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
+import _tmp
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -181,7 +181,7 @@ As a visitor, I want to sign up, so that I have an account.
 
 
 def tmp(name, files) -> Path:
-    d = Path(tempfile.mkdtemp(prefix=f"ratchet-spec-{name}-"))
+    d = Path(_tmp.mkdtemp(prefix=f"ratchet-spec-{name}-"))
     write(d, files)
     return d
 
@@ -189,7 +189,7 @@ def tmp(name, files) -> Path:
 # ------------------------------------------------------------------------------------------------ project helpers
 
 def project(name, files) -> Path:
-    d = Path(tempfile.mkdtemp(prefix=f"ratchet-spec-{name}-"))
+    d = Path(_tmp.mkdtemp(prefix=f"ratchet-spec-{name}-"))
     for c in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
         g.git(d, *c)
     write(d, dict(files, **{"src/a.js": "export const a = 1;\n"}))
@@ -251,7 +251,7 @@ def build(d, cp):
 
 
 def fake_openspec() -> dict:
-    b = Path(tempfile.mkdtemp(prefix="ratchet-bin-"))
+    b = Path(_tmp.mkdtemp(prefix="ratchet-bin-"))
     (b / "openspec").write_text('#!/bin/sh\n[ "$1" = archive ] || exit 2\nmkdir -p openspec/changes/archive && '
                                 'mv "openspec/changes/$2" "openspec/changes/archive/2026-10-03-$2" && '
                                 'echo "Change \'$2\' archived as 2026-10-03-$2."\n')
@@ -363,7 +363,7 @@ def parsers():
 
 def review_fixes():
     print("Real-world spec files")
-    d = Path(tempfile.mkdtemp(prefix="ratchet-spec-rw-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-spec-rw-"))
     tm = d / "tasks.md"
     tm.write_bytes(b"## 1. Setup\r\n- [ ] 1. Make the store\r\n* [ ] Name caf\xe9 (not UTF-8)\r\n  - [ ] 1.1 nested\r\n")
     ts = ss.parse_tasks_md(tm, "c", "openspec")

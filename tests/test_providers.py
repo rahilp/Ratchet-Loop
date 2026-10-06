@@ -15,7 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
+import _tmp
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -55,7 +55,7 @@ printf '%s\n' "$reply"
 
 
 def fake_bin(*names, failing=()):
-    b = Path(tempfile.mkdtemp(prefix="ratchet-fakebin-"))
+    b = Path(_tmp.mkdtemp(prefix="ratchet-fakebin-"))
     for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
         p = shutil.which(n)
         if p:
@@ -186,7 +186,7 @@ def review_holes():
     env = env_with(b)
     d = g.project("trust", extra_cp={"risk": "high"})
     g.approve_plan(d)
-    stamp = Path(tempfile.mkdtemp()) / "stamp.sh"
+    stamp = Path(_tmp.mkdtemp()) / "stamp.sh"
     stamp.write_text("#!/bin/sh\necho RATCHET-PROBE-OK\necho '{\"findings\": []}'\n")
     stamp.chmod(0o755)
     r = rx(d, "providers", "--add", "rubber", "--command", json.dumps([str(stamp)]), "--company", "acme", env=env)

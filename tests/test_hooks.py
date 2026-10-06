@@ -16,7 +16,7 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
+import _tmp
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
@@ -29,7 +29,7 @@ def sh(*args, cwd, stdin=None, env=None):
 
 
 def setup_project() -> Path:
-    d = Path(tempfile.mkdtemp(prefix="ratchet-hooks-"))
+    d = Path(_tmp.mkdtemp(prefix="ratchet-hooks-"))
     for c in (["git", "init", "-q"], ["git", "config", "user.email", "t@t"], ["git", "config", "user.name", "t"]):
         subprocess.run(c, cwd=d, check=True)
     (d / "a.js").write_text("x")

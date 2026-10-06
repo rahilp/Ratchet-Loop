@@ -326,9 +326,10 @@ The person's override: if you ever need to approve or accept something yourself,
 
 ### Running the tests
 
-Each test file is a standalone script; none needs a framework.
+Each test file is a standalone script; none needs a framework. Every suite makes its temp folders through `tests/_tmp.py`, which removes them, and stops any background server the suite started, when the suite ends, whether it passes, fails a check or crashes. The one exception is `tests/test_cleanup.py`, which tests that helper and so makes and removes its own throwaway folders without it.
 
 ```
+python3 tests/test_cleanup.py
 python3 tests/test_docs.py
 python3 tests/test_gates.py
 python3 tests/test_guardrails.py

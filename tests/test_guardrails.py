@@ -13,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_gates as g  # noqa: E402
+import _tmp  # noqa: E402
 
 PASS = FAIL = 0
 
@@ -373,13 +374,13 @@ def main():
           r.returncode != 0 and "misses the disguised bad variant" in r.stderr and "v2.js" in r.stderr, r.stderr)
 
     print("Rebuilding past code safely, and only from findings that were acted on")
-    import importlib.util as iu2, os as _os, subprocess as sp, tempfile as tf_
+    import importlib.util as iu2, os as _os, subprocess as sp
     spec = iu2.spec_from_file_location("eng_h", g.ENGINE)
     m = iu2.module_from_spec(spec)
     spec.loader.exec_module(m)
     _os.environ["RATCHET_HOST_PROVIDER"] = "anthropic"
     _os.environ["RATCHET_HOME"] = g.ENV["RATCHET_HOME"]
-    repo = Path(tf_.mkdtemp(prefix="ratchet-mat-"))
+    repo = Path(_tmp.mkdtemp(prefix="ratchet-mat-"))
     sp.run(["git", "init", "-q"], cwd=repo)
     (repo / "f.js").write_text("one\n")
     (repo / "abs").symlink_to("/etc/passwd")
@@ -387,6 +388,8 @@ def main():
     ctx = m.Ctx(repo)
     t1 = m.fingerprint(repo)["id"]
     out = m._materialize(ctx, t1, [])
+    if out is not None:
+        _tmp.adopt(out)  # the caller owns the rebuilt copy; remove it when this suite ends
     check("past code with links pointing outside is rebuilt without them (no crash, nothing written outside)",
           out is not None and (out / "f.js").exists() and not (out / "abs").exists() and not (out / "up").exists(), out)
     (repo / "g.js").write_text("other\n")
