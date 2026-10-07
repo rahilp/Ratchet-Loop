@@ -326,7 +326,15 @@ The person's override: if you ever need to approve or accept something yourself,
 
 ### Running the tests
 
-Each test file is a standalone script; none needs a framework. Every suite makes its temp folders through `tests/_tmp.py`, which removes them, and stops any background server the suite started, when the suite ends, whether it passes, fails a check or crashes. The one exception is `tests/test_cleanup.py`, which tests that helper and so makes and removes its own throwaway folders without it.
+For the full regression run, use one command. It runs every `tests/test_*.py` suite at the same time and finishes in a few minutes instead of running them one after another:
+
+```
+python3 tests/run_all.py
+```
+
+It runs half as many suites at a time as the machine has CPU cores, at least 2, because each suite starts processes of its own and one suite per core was slower (`--workers N` changes that), and stops a suite that runs longer than 15 minutes (`--timeout SECONDS`). Each suite gets its own empty temp folder, and a suite that leaves anything in it is reported as failed even when its own checks passed. When a suite ends, run_all.py also stops every process it started that is still running, including one it detached into its own session, by a tag (`RATCHET_RUN_ALL_TAG`) each suite's processes inherit; on a system without `/proc` it can only stop the suite's process group, and its summary says so. The slowest suites start first: run_all.py remembers how long each suite took last time in a small file in your user cache folder (`~/.cache/ratchet-loop/`, never in the repository) and, for a suite it has not timed yet, guesses from the file's size. At the end it shows the last lines of output of every failed suite, a table of every suite and its time, slowest first, and a `N passed, M failed` line counting suites. It exits non-zero when any suite failed or none were found.
+
+Each test file is a standalone script; none needs a framework, so you can also run one suite on its own. Every suite makes its temp folders through `tests/_tmp.py`, which removes them, and stops any background server the suite started, when the suite ends, whether it passes, fails a check or crashes. The one exception is `tests/test_cleanup.py`, which tests that helper and so makes and removes its own throwaway folders without it. `tests/test_runner.py` tests run_all.py itself against tiny made-up suites and never runs the real ones.
 
 ```
 python3 tests/test_cleanup.py
@@ -339,6 +347,7 @@ python3 tests/test_hooks_waiver.py
 python3 tests/test_install.py
 python3 tests/test_providers.py
 python3 tests/test_results.py
+python3 tests/test_runner.py
 python3 tests/test_signing.py
 python3 tests/test_specs.py
 python3 tests/test_split_check.py
