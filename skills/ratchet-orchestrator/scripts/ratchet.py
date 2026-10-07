@@ -157,6 +157,10 @@ DEFAULT_CONFIG = {
 
 PROGRESS_EVENTS = {"tests_written", "red", "implemented", "behavior_passed", "ui_passed", "adversarial_approved",
                    "checkpoint_complete", "plan_submitted", "plan_approved", "plan_extended", "reviewers_launched"}
+# A wait (`ratchet.py wait`) also ends when the run is paused, resumed or claimed, or cancelled.
+WAIT_ENDING_EVENTS = {"paused", "resumed", "cancelled"}
+WAIT_DEFAULT_MINUTES = 30
+WAIT_MAX_MINUTES = 120
 
 FINGERPRINT_EXCLUDES = {
     ".git", RATCHET_DIR, "node_modules", ".next", ".nuxt", "dist", "build", "out",
@@ -313,7 +317,10 @@ class Ctx:
 
     def log(self, st, event: str, **data):
         st.setdefault("history", []).append({"at": now(), "event": event, **data})
-        # a PROGRESS_EVENTS entry also restarts the stop hook's count of stops without progress (_stop_blocks)
+        # a PROGRESS_EVENTS entry also restarts the stop hook's count of stops without progress (_stop_blocks), and
+        # ends a wait set with `ratchet.py wait` (the agent carries on from the progress instead)
+        if (event in PROGRESS_EVENTS or event in WAIT_ENDING_EVENTS) and st.pop("wait", None) is not None:
+            st["history"].append({"at": now(), "event": "wait_cleared", "by": event})
 
 
 # --------------------------------------------------------------------------- fingerprint
@@ -835,7 +842,9 @@ def _record_chain_now(p: Path, lock: _ChainLock):
         return {}
 
     def add(data):
-        data[str(p.resolve())] = hashlib.sha256(p.read_bytes()).hexdigest()
+        raw = p.read_bytes()
+        key = str(p.resolve())
+        data[key] = hashlib.sha256(raw).hexdigest()
         return data
     try:
         _ = update_record(cp, add, lock=lock, damaged=damaged, need_lock=False)  # need_lock=False: never "busy"
@@ -1988,6 +1997,9 @@ def cmd_status_text(ctx: Ctx):
     note = exit_code_only_note(plan, st)
     if note:
         print(note)
+    w = live_wait(st)
+    if w:
+        print(f"Waiting on: {w['reason']} (until {w['until'][:16].replace('T', ' ')} UTC).")
     for cid, c in (st.get("checkpoints") or {}).items():
         for gate, what in (("ui", "UI review"), ("adversarial", "review")):
             for line in ((c.get("gates") or {}).get(gate) or {}).get("unconfirmed") or []:
@@ -2540,11 +2552,11 @@ def _note_fresh(note) -> bool:
 
 
 def _note_engine_call(root: Path, cmd: str, session: str | None):
-    """Guard hook: for every `ratchet.py init` / `ratchet.py ask` call `cmd` really runs, note which chat is about
+    """Guard hook: for every `ratchet.py init` / `ask` / `wait` call `cmd` really runs, note which chat is about
     to run it here, with its exact arguments. Best effort; never blocks the call."""
     if not session:
         return
-    calls = [a for a in _engine_invocations(cmd) if _engine_subcommand(a) in ("init", "ask")]
+    calls = [a for a in _engine_invocations(cmd) if _engine_subcommand(a) in ("init", "ask", "wait")]
     if not calls:
         return
     try:
@@ -6358,6 +6370,77 @@ def cmd_pause(args):
     ok("Paused. The Stop hook now lets the agent stop. Resume with ratchet.py resume.")
 
 
+def live_wait(st) -> dict | None:
+    """The run's wait (`ratchet.py wait`) while it still applies, else None. It applies only while the run is being
+    built or planned (not paused, blocked, done or cancelled), to the chat that set it while that chat still owns the
+    run, before its `until` time, and until any gate progress is logged after it was set. A record that does not have
+    this shape (missing fields, a set time in the future, a window longer than WAIT_MAX_MINUTES) does not apply."""
+    w = st.get("wait")
+    if not isinstance(w, dict) or st.get("phase") in ("blocked", "paused", "done", "cancelled"):
+        return None
+    reason, set_at, until, sess = w.get("reason"), w.get("set_at"), w.get("until"), w.get("session")
+    if not all(isinstance(v, str) and v for v in (reason, set_at, until, sess)) or sess != st.get("owner_session"):
+        return None
+    t_set, t_until, t_now = _iso(set_at), _iso(until), time.time()
+    if not t_set or not t_until or t_set > t_now + 60 or t_until <= t_now or t_until - t_set > WAIT_MAX_MINUTES * 60 + 60:
+        return None
+    ends = PROGRESS_EVENTS | WAIT_ENDING_EVENTS
+    if any(e.get("event") in ends and _iso(e.get("at", "")) > t_set for e in st.get("history") or []
+           if isinstance(e, dict)):
+        return None
+    return {"reason": reason, "set_at": set_at, "until": until, "session": sess}
+
+
+def cmd_wait(args):
+    """The owner chat says it is waiting on background work (reviewers, sub-agents), so the stop hook lets it end its
+    turn until `until` without counting a blocked stop. Any gate progress ends the wait early."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    if st["phase"] in ("blocked", "paused", "done", "cancelled"):
+        die(f"Nothing to wait for: run '{st['slug']}' is {st['phase']}, so the stop hook already lets you stop.")
+    reason = " ".join(str(args.reason or "").split())[:300]
+    if not reason:
+        die('Say what you are waiting on, e.g. `ratchet.py wait --for "the codex review of CP2" --minutes 20`.')
+    # The chat running this command is one Ratchet saw itself, never a value the caller supplies: the chat the guard
+    # hook noted for this exact call, else (a host whose guard hook can't see the call) the chat the user typed in
+    # last, as `ask claim` does. `--session` is only a cross-check: `owner_session` is plain text any local process
+    # can read, so a bare --session proves nothing.
+    noted = _noted_session(ctx.root, "wait")
+    who = noted or _latest_session(ctx)
+    owner = st.get("owner_session")
+    if not owner:
+        die("No chat owns this Ratchet run yet, so Ratchet can't tell whose turn may end. Nothing was recorded; "
+            "carry on with `ratchet.py next`.")
+    if not who:
+        die("Ratchet could not tell which chat ran this command (its guard hook did not see the call, and it has "
+            "recorded no message from the user), so nothing was recorded. --session alone is not proof of which chat "
+            "this is. Keep working on `ratchet.py next`.")
+    if args.session and args.session != who:
+        die("The chat named by --session is not the one Ratchet sees running this command ("
+            + ("the chat its guard hook noted for this call" if noted else
+               "its guard hook did not see the call, so that is the chat the user typed in last")
+            + "). --session alone is not proof of which chat this is. Nothing was recorded.")
+    if who != owner:
+        die(f"Only the chat that owns run '{st['slug']}' may wait on background work; this one does not, and its "
+            "stops are not held by this run anyway. Nothing was recorded.")
+    try:
+        minutes = float(WAIT_DEFAULT_MINUTES if args.minutes is None else args.minutes)
+    except (TypeError, ValueError):
+        die("--minutes must be a number of minutes, e.g. --minutes 20.")
+    if minutes != minutes:  # NaN
+        minutes = WAIT_DEFAULT_MINUTES
+    minutes = int(round(min(max(minutes, 1), WAIT_MAX_MINUTES)))
+    t0 = _dt.datetime.now(_dt.timezone.utc)
+    until = (t0 + _dt.timedelta(minutes=minutes)).isoformat(timespec="microseconds")
+    st["wait"] = {"reason": reason, "set_at": t0.isoformat(timespec="microseconds"), "until": until,
+                  "session": who, "minutes": minutes}
+    ctx.log(st, "wait_set", reason=reason, until=until, minutes=minutes)
+    ctx.save_state(st)
+    ok(f"Waiting on: {reason}. Until {until[:16].replace('T', ' ')} UTC ({minutes} min) the stop hook lets this chat "
+       "end its turn, and those stops do not count as blocked stops. Any gate progress ends the wait early. When the "
+       "background work reports back, carry on with `ratchet.py next`.")
+
+
 CONSUMING_EVENTS = {"plan_approved", "approved", "unblocked", "changes_approved", "review_mode_changed",
                     "cancelled", "human_feedback", "resumed"}
 
@@ -6857,7 +6940,9 @@ def cmd_hooks_waive(args):
 
 def cmd_next(args):
     ctx = Ctx(find_root())
-    na = next_action(ctx)
+    st = ctx.state()
+    na = next_action(ctx, st)
+    na["wait"] = live_wait(st)  # what the owner chat said it is waiting on (`ratchet.py wait`), until when
     hs = hooks_view(ctx)
     hw = hooks_warning(ctx, hs)
     if hw and na.get("phase") not in ("planning",):
@@ -7027,6 +7112,7 @@ def status_json(ctx: Ctx) -> dict:
             "waiting_on": waiting_on, "blocked_reason": st.get("blocked_reason"),
             "blocked_reason_plain": plain_reason(st.get("blocked_reason")),
             "awaiting_since": st.get("awaiting_since"), "approval_mode": approval_mode(ctx),
+            "wait": live_wait(st),
             "adv_rounds_used": st.get("adv_rounds_total", 0),
             "unavailable_reviewers": unavailable_reviewers(ctx), "host_provider": detect_host(ctx.config()),
             "hooks_warning": hw, "hook_heartbeat": read_heartbeat(ctx.root),
@@ -7767,6 +7853,11 @@ def decide_stop(n: dict) -> tuple[bool, str]:
         if _stop_blocks(ctx, st):
             _append_jsonl(blocks_file, {"at": now(), "reset": True})
         return False, ""
+    w = live_wait(st)
+    if w:  # the owner chat said it is waiting on background work (`ratchet.py wait`): this stop is not counted
+        return False, (f"RATCHET: waiting on {w['reason']} until {w['until'][:16].replace('T', ' ')} UTC, so this "
+                       "stop is allowed and not counted. When the background work reports back, carry on with "
+                       "`ratchet.py next`.")
     cfg = ctx.config()
     count = _stop_blocks(ctx, st) + 1
     _append_jsonl(blocks_file, {"at": now(), "phase": st.get("phase")})
@@ -7835,6 +7926,45 @@ def _stop_error(root: Path, why: str) -> tuple[bool, str]:
     return True, f"RATCHET: {why} You may not stop silently: explain this to the user first."
 
 
+# Turns an agent CLI sends through the prompt hook on its own, not typed by the user: a background sub-agent's
+# hand-back, a background task's notice. A prompt where one of these exact markers STARTS any line of it is never
+# recorded as the user's message, so it answers no waiting question and approves nothing. Before a line is checked,
+# any leading whitespace (Unicode and zero-width included) and any leading HOST_TURN_WRAPPER_TAGS (opening or
+# closing, repeated in any mix) are set aside on that line alone. A marker only mentioned mid-line changes nothing.
+# A real reply with a marker at the start of one of its lines is dropped too (the safe side): the user sends it
+# again. Every line of the text is checked, in one linear pass, so no amount of ordinary preamble text ahead of the
+# marker line changes the answer: there is no fixed line count, block count or blank-line cap to tune or bypass.
+HOST_TURN_MARKERS = ("Another Claude session sent a message:",   # Claude Code: a background sub-agent's hand-back
+                     "[SYSTEM NOTIFICATION - NOT USER INPUT]",    # a host notice about background work
+                     "<task-notification>")                       # Claude Code: a background task finished
+HOST_TURN_WRAPPER_TAGS = ("system-reminder",)
+_HOST_TURN_SPACE = "[\\s\\u180e\\u200b\\u200c\\u200d\\u2060\\ufeff]"  # \s is Unicode-aware; plus the zero-width ones
+_HOST_TURN_TAGS = "|".join(map(re.escape, HOST_TURN_WRAPPER_TAGS))
+HOST_TURN_PAD_RE = re.compile(r"\A(?:%s|</?(?:%s)\b[^>]*>)+" % (_HOST_TURN_SPACE, _HOST_TURN_TAGS), re.I)
+_HOST_TURN_EOL_RE = re.compile("\r\n|[\n\r\v\f\x1c\x1d\x1e\x85  ]")  # the breaks str.splitlines uses
+
+
+def host_generated_turn(prompt) -> bool:
+    """Is this prompt one the agent CLI generated itself: does a HOST_TURN_MARKERS entry start any line of it, once
+    that line's own leading whitespace and leading wrapper tags are set aside? One linear pass over the text, line
+    by line; no fixed line count, block count or blank-line cap, so no amount of preamble text ahead of the marker
+    line changes the answer."""
+    text = prompt if isinstance(prompt, str) else ""
+    pos = 0
+    while True:
+        m = _HOST_TURN_EOL_RE.search(text, pos)
+        end = m.start() if m else len(text)
+        line = text[pos:end]
+        pad = HOST_TURN_PAD_RE.match(line)
+        if pad:
+            line = line[pad.end():]
+        if line.startswith(HOST_TURN_MARKERS):
+            return True
+        if not m:
+            return False
+        pos = m.end()
+
+
 def decide_prompt(n: dict) -> tuple[bool, str]:
     if os.environ.get("RATCHET_NESTED_REVIEW") == "1":
         return False, ""
@@ -7842,6 +7972,12 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
     rdir = root / RATCHET_DIR
     if not rdir.is_dir():
         return False, ""
+    if host_generated_turn(n.get("prompt")):  # nothing is recorded: not the user's message, not a chat they typed in
+        _heartbeat(root, "prompt", n["host"])
+        return False, ("[ratchet] This turn was sent by the agent CLI itself (a background sub-agent's hand-back or "
+                       "a task notice), not typed by the user, so Ratchet did not record it: it answers no waiting "
+                       "question and approves nothing. Carry on; if it was really the user's reply, ask them to send "
+                       "it again.")
     # This hook never takes the state lock and never writes state.json, so it never waits behind a long command
     # (a test run) and can't undo what a command wrote. It only appends to its own records: the message to
     # human_log.jsonl (with its hash, as one step), and, while no chat owns the run, this chat to PROMPT_CHATS_FILE;
@@ -8288,7 +8424,7 @@ def decide_guard(n: dict) -> tuple[bool, str]:
         why = _guard_shell(cmd, cwd, who)
         if why:
             return True, why
-        _note_engine_call(root, cmd, n.get("session"))  # which chat runs `init` / `ask` here (see _noted_session)
+        _note_engine_call(root, cmd, n.get("session"))  # which chat runs `init` / `ask` / `wait` here (_noted_session)
     if who["enforce"] and not n.get("agent_type") and _run_phase(root) == "building" and _orchestrator_edit(n, root):
         return True, ORCH_EDIT_MSG
     if n["kind"] == "write":
@@ -8948,7 +9084,7 @@ def hooks_warning(ctx, hs=None) -> str | None:
 STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "red", "implemented", "behavior",
                      "ui-record", "adv-record", "complete", "human-approve", "feedback", "plan-extend", "pause",
                      "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
-                     "approve-changes", "guardrail", "reviewers", "repeats", "spec")
+                     "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait")
 LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers")  # tests, checks, a regression suite, provider probes
 # The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
 OVERRIDE_CMDS = ("approve-plan", "human-approve", "approve-changes", "cancel", "set-review", "resume", "hooks-waive",
@@ -9182,6 +9318,11 @@ def main(argv=None):
     sp.add_parser("plan-extend").set_defaults(fn=cmd_plan_extend)
     a = sp.add_parser("learn"); a.add_argument("text"); a.add_argument("--source"); a.set_defaults(fn=cmd_learn)
     a = sp.add_parser("pause"); a.add_argument("--reason"); a.set_defaults(fn=cmd_pause)
+    a = sp.add_parser("wait", help="end your turn while background reviewers or sub-agents run, without a blocked stop")
+    a.add_argument("--for", dest="reason", required=True, help="what you are waiting on")
+    a.add_argument("--minutes", type=float, help=f"how long (1 to {WAIT_MAX_MINUTES}; default {WAIT_DEFAULT_MINUTES})")
+    a.add_argument("--session", help="optional cross-check: this chat's id; refused unless it is the chat Ratchet sees running the call (never proof on its own)")
+    a.set_defaults(fn=cmd_wait)
     a = sp.add_parser("resume", help="resume a paused run; --claim moves the run to this chat (after `ask claim`)")
     a.add_argument("--claim", action="store_true"); a.set_defaults(fn=cmd_resume)
     a = sp.add_parser("ask", help="record and print the question you're about to ask the user (needed before approve-plan, "

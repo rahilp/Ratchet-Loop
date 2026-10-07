@@ -31,14 +31,24 @@ then gives that slot to the next alternative, ending with the host's own sub-age
 Placeholders in "command": {prompt_file} {prompt} {out_file} {root} {model}. With "stdin": true the prompt
 is piped on stdin. Flags differ between CLI versions — give a provider its own "command" if a preset
 doesn't match the version you have installed.
+
+A CLI that takes the prompt only as a command-line argument ({prompt}: the copilot, cursor and opencode presets)
+can't be given a prompt larger than the system allows for one argument (on Linux 128 KiB; a big diff gets there).
+Such a reviewer is not started: it is marked unavailable with a plain reason and the script exits 3, like any other
+failure. To review large changes with that CLI, give its provider a "command" that reads {prompt_file} or stdin.
+
+The prompt and the CLI's reply are kept in a temp folder (ratchet-<reviewer>-...) while the review runs; it is
+removed when the review ends, pass or fail. With --dry-run it is kept, so the prompt can be read.
 """
 from __future__ import annotations
 
 import argparse
+import errno
 import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -53,6 +63,8 @@ AGENT_DIRS = [PLUGIN_ROOT / "agents", Path.home() / ".claude" / "agents"]
 
 MAX_DIFF = 180_000
 MAX_DOC = 40_000
+ARGV_MARGIN = 8_192  # bytes kept free under the system's limits, so a command near the edge is refused, not crashed
+WINDOWS_MAX_COMMAND_LINE = 32_767  # characters, the whole command line (CreateProcess)
 
 
 def load_engine():
@@ -149,6 +161,39 @@ An empty findings list means you approve. Every finding needs a cited rule or a 
 """
 
 
+def argv_problem(cmd: list[str], env: dict) -> str | None:
+    """Why `cmd` is too large to start (one argument, or the arguments and environment together, over what the
+    system accepts), in plain words; None when it fits. Checked before starting, so the CLI is never half-started."""
+    if os.name == "nt":
+        chars = sum(len(c) + 3 for c in cmd)  # quotes and a space around each argument
+        if chars > WINDOWS_MAX_COMMAND_LINE - ARGV_MARGIN:
+            return f"its command line would be about {chars:,} characters, over Windows' limit of {WINDOWS_MAX_COMMAND_LINE:,}"
+        return None
+    sizes = [len(c.encode("utf-8", "surrogateescape")) + 1 for c in cmd]
+    if sys.platform.startswith("linux"):
+        try:
+            page = os.sysconf("SC_PAGE_SIZE")
+        except (AttributeError, ValueError, OSError):
+            page = 4096
+        one_arg = 32 * (page if isinstance(page, int) and page > 0 else 4096)  # Linux's MAX_ARG_STRLEN
+        if max(sizes) > one_arg - ARGV_MARGIN:
+            return (f"one argument (the prompt) would be {max(sizes):,} bytes, over the system's limit of "
+                    f"{one_arg:,} bytes for a single argument")
+    try:
+        total_max = os.sysconf("SC_ARG_MAX")
+    except (AttributeError, ValueError, OSError):
+        total_max = 262_144
+    if not isinstance(total_max, int) or total_max <= 0:
+        total_max = 262_144
+    env_bytes = sum(len(k.encode("utf-8", "surrogateescape")) + len(str(v).encode("utf-8", "surrogateescape")) + 2
+                    for k, v in env.items())
+    total = sum(sizes) + env_bytes + 8 * (len(cmd) + len(env) + 2)
+    if total > total_max - ARGV_MARGIN:
+        return (f"its arguments and environment would be {total:,} bytes, over the system's limit of "
+                f"{total_max:,} bytes")
+    return None
+
+
 def parse_findings(text: str) -> dict | None:
     """Take the LAST top-level JSON object in the text that has a 'findings' key."""
     text = re.sub(r"```(?:json)?", "", text)
@@ -223,7 +268,13 @@ def main():
     if a.dry_run:
         print(f"prompt written: {prompt_file} ({len(prompt)} chars)")
         return
+    try:
+        _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, prompt_file, out_file)
+    finally:  # the prompt and the CLI's reply are not kept: the review (or its .raw.txt) is the record
+        shutil.rmtree(work, ignore_errors=True)
 
+
+def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, prompt_file, out_file):
     # This round's signing secret must exist before the reviewer runs, so a paid review is never thrown away unsigned.
     if eng.review_key(ctx, a.cp, "adv", rnd["round"], st=st) is None:
         sys.exit(f"This round's review-signing secret is missing. Run `ratchet.py reviewers {a.cp}` again, then "
@@ -246,22 +297,33 @@ def main():
         for r in same:
             until = eng.mark_unavailable(ctx, r, reason if r == a.reviewer else f"{binary} failed: {reason}")
         print(f"{a.reviewer} UNAVAILABLE: {reason}\n"
-              f"Marked unavailable until {until[:16]}Z. Run `ratchet.py reviewers {a.cp}` — its slot now "
+              f"Marked unavailable until {(until or 'later')[:16]}Z. Run `ratchet.py reviewers {a.cp}`: its slot now "
               "goes to the next provider, or to the host's own sub-agents.", file=sys.stderr)
         sys.exit(3)
 
+    env = dict(os.environ, RATCHET_NESTED_REVIEW="1")
+    too_big = argv_problem(cmd, env)
+    if too_big:  # never started: a CLI that takes the prompt as an argument can't be handed one this large
+        unavailable(f"the review prompt ({len(prompt):,} characters) is too large to pass to '{cmd[0]}' as a "
+                    f"command-line argument: {too_big}. Give this provider a 'command' that reads {{prompt_file}} "
+                    "or stdin to review changes this large")
     shown = " ".join(c if len(c) < 80 else c[:40] + "…" for c in cmd)
     print(f"running {a.reviewer}: {shown}", file=sys.stderr)
     try:
         # run from an empty folder, flagged as nested: the reviewer needs nothing but the prompt, can't touch the
         # project, and its CLI's own hooks must not log this prompt as if the user had typed it
         r = subprocess.run(cmd, cwd=work, input=prompt if use_stdin else None, capture_output=True, text=True,
-                           stdin=None if use_stdin else subprocess.DEVNULL,
-                           timeout=a.timeout, env=dict(os.environ, RATCHET_NESTED_REVIEW="1"))
+                           stdin=None if use_stdin else subprocess.DEVNULL, timeout=a.timeout, env=env)
     except FileNotFoundError:
         unavailable(f"'{cmd[0]}' is not installed or not on PATH")
     except subprocess.TimeoutExpired:
         unavailable(f"timed out after {a.timeout}s")
+    except OSError as e:  # the system refused to start it (E2BIG: the arguments were too large after all, ...)
+        if e.errno == errno.E2BIG:
+            unavailable(f"the review prompt ({len(prompt):,} characters) is too large to pass to '{cmd[0]}' as a "
+                        "command-line argument. Give this provider a 'command' that reads {prompt_file} or stdin "
+                        "to review changes this large")
+        unavailable(f"'{cmd[0]}' could not be started: {e.strerror or e}")
     text = (out_file.read_text() if out_file.exists() else "") + "\n" + (r.stdout or "")
     review = parse_findings(text)
     if review is None:
@@ -284,7 +346,12 @@ def main():
         sys.exit(f"This round's review-signing secret is missing. Run `ratchet.py reviewers {a.cp}` again, then "
                  "re-run this reviewer.")
     eng.sign_review(key, review, rnd["nonce"], "external_review.py")
-    out.write_text(json.dumps(review, indent=2))
+    tmp = out.parent / f".{out.name}.{os.getpid()}.tmp"  # written whole, then put in place: never half-written
+    try:
+        tmp.write_text(json.dumps(review, indent=2))
+        os.replace(tmp, out)
+    finally:
+        tmp.unlink(missing_ok=True)
     print(f"{a.reviewer}: {review['verdict']} ({len(review['findings'])} findings) → {out}")
 
 
