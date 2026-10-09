@@ -85,10 +85,36 @@ DESIGN.md              # design system (path configurable)
 
 ## 3. checkpoints.json
 
+Every plan carries a top-level `objective`: who the result is for, what they want, what done means to them, and
+what is deliberately out of scope. `plan-submit` refuses a plan with no `objective`, or with any of its four
+parts empty, naming the missing part. `plan-summary` prints it first, before the list of steps, so the human
+sees it at the moment they approve the plan. `plan-extend` (feedback) keeps the approved plan's objective; a
+feedback plan that drops or empties it is refused. A plan drafted from a spec (section 11) gets a draft objective
+built from the spec's own words (an OpenSpec proposal's "Why" paragraph, a Spec Kit user story, a BMAD
+"As a … I want … so that …" line); the planner refines it like the rest of the draft. `users` is always taken
+from an "As a … I want …" narrative the spec itself states (OpenSpec, Spec Kit or BMAD alike), never from a
+story's title; when no item in the spec states its audience, the draft leaves `users` as a literal
+`FILL IN: ...` placeholder instead of inventing one, and `plan-submit` refuses any objective part that still
+starts with `FILL IN:`, naming the part, so the planner or user must fill it in before the plan is approved.
+A run whose plan was approved before this field existed keeps working with no objective at all — nothing about
+it is required retroactively.
+
 ```json
 {
   "feature": "Managers can approve or reject leave requests",
   "slug": "leave-approvals",
+  "objective": {
+    "users": "Managers who need to approve or reject their team's leave requests",
+    "goal": "Let a manager clear their team's leave requests without leaving the app or asking HR",
+    "done_means": [
+      "A manager can approve or reject a request with a reason, from the Approvals page",
+      "The employee sees the decision and the reason"
+    ],
+    "out_of_scope": [
+      "Approving requests on someone else's team",
+      "Changing a decision after it was made"
+    ]
+  },
   "reference": { "type": "prototype", "paths": [".ratchet/runs/leave-approvals/reference/prototype.html"] },
   "assumptions": ["Only direct managers can approve"],
   "checkpoints": [
@@ -122,6 +148,10 @@ DESIGN.md              # design system (path configurable)
 ```
 
 Rules enforced by `ratchet.py plan-submit`:
+- top-level `objective`: `users`, `goal`, `done_means` (non-empty list) and `out_of_scope` (non-empty list) must
+  all be present and non-empty; a plan missing any part is refused, naming the missing part
+- no objective part may still start with `FILL IN:` (the draft's placeholder for an audience or part it could
+  not fill in from the spec); a plan with one is refused, naming the part
 - ids are `CP1…CPn`, in build order; `depends_on` may only point backwards
 - `title` ≤ 8 words; `summary` one plain-language sentence
 - `done_when` non-empty, written so a non-engineer can check it

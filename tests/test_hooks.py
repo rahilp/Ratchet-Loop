@@ -38,7 +38,7 @@ def setup_project() -> Path:
     sh("init", "hooks test", "--slug", "hk", cwd=d)
     run = d / ".ratchet" / "runs" / "hk"
     (run / "app-scout.json").write_text("{}")
-    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "checkpoints": [{
+    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN, "checkpoints": [{
         "id": "CP1", "title": "A", "summary": "s", "done_when": ["a"],
         "gates": {"behavior": True, "ui": False, "adversarial": True},
         "tests": {"files": ["t.test.js"], "command": "true"}}]}))

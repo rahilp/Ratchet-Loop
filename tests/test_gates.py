@@ -82,7 +82,7 @@ def project(name="p", cps=1, extra_cp=None, config=None) -> Path:
     rx(d, "config", "--set", "min_review_seconds=0", "providers=[]", *(config or []))
     run = d / ".ratchet/runs/f"
     (run / "app-scout.json").write_text("{}")
-    plan = {"feature": "x", "checkpoints": []}
+    plan = {"feature": "x", "objective": _tmp.OBJECTIVE_MIN, "checkpoints": []}
     for i in range(1, cps + 1):
         cp = {"id": f"CP{i}", "title": f"Step {i}", "summary": "s", "done_when": ["works"],
               "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",

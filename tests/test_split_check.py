@@ -38,6 +38,16 @@ BASE_COMMIT = "a24a31d26ae2ac4a598fc3e0c05a336f6304454e"
 # changed body. The other cases here compare only check(...) call text / id prefixes, which CP1 did not
 # touch, so they stay pinned to BASE_COMMIT.
 CP1_COMMIT = "f624da15927cd62059a7710ca0b989c934befe82"
+# The commit where CP2's split landed. Only T02's helper-*body* comparison reads the new side from this commit
+# (trust_helpers.py and the split files, for the one check that diffs a definition's body verbatim): reading
+# that comparison live meant a later, legitimate edit to a shared fixture (e.g. a later run's CP1 adding a
+# required plan objective to tests/trust_helpers.py or test_trust_cp5_c.py) read as a "changed body" and failed
+# this historical structural proof, even though nothing about the split regressed. Every other check here
+# (T01's check-call preservation, T03/T04's grouping, T05's import smoke test, T06/T07's import-repoint
+# precondition and full-suite run, T08's README mapping, T09's openspec mapping) reads the *current* working
+# tree for the new side, so deleting a migrated check or breaking today's README/spec/import mapping still
+# fails here and now, not just at the moment of the split.
+CP2_COMMIT = "5f394c1d2197a96f5754a8f14a75ee3f83206ceb"
 OLD_FILE = "tests/test_trust.py"
 README = ROOT / "README.md"
 SPEC = ROOT / "openspec/specs/close-ratchet-s-trust-holes-reviews-only-count-f/spec.md"
@@ -87,11 +97,51 @@ def cp1_pinned_source() -> str:
     return r.stdout
 
 
+def show_at(commit: str, relpath: str) -> str:
+    """A file's content as of `commit`, read with `git show` instead of the working tree."""
+    r = subprocess.run(["git", "show", f"{commit}:{relpath}"], cwd=str(ROOT),
+                        capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(f"git show failed: {r.returncode} {r.stderr[-300:]}")
+    return r.stdout
+
+
+def exists_at(commit: str, relpath: str) -> bool:
+    """Whether `relpath` existed as a blob at `commit`, checked with `git cat-file -e`."""
+    r = subprocess.run(["git", "cat-file", "-e", f"{commit}:{relpath}"], cwd=str(ROOT),
+                        capture_output=True, text=True, timeout=30)
+    return r.returncode == 0
+
+
 def split_files() -> list:
     """The new files the split is expected to produce: tests/trust_helpers.py and any tests/test_trust_cp*.py
     (CP5 may be divided into as many parts as the build settles on, e.g. test_trust_cp5_a.py / _b.py)."""
     files = sorted(ROOT.glob("tests/test_trust_cp*.py"))
     return files
+
+
+def split_files_pinned() -> list:
+    """The relative paths (as strings) of the new test_trust_cp*.py files as they existed right after CP2's
+    split (CP2_COMMIT). Used only by T02's helper-body comparison, so a later legitimate edit to a split
+    file's body does not make that one historical body-diff fail."""
+    r = subprocess.run(["git", "ls-tree", "-r", "--name-only", CP2_COMMIT, "--", "tests/"], cwd=str(ROOT),
+                        capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(f"git ls-tree failed: {r.returncode} {r.stderr[-300:]}")
+    names = [n for n in r.stdout.splitlines() if n]
+    return sorted(n for n in names if re.fullmatch(r"tests/test_trust_cp.*\.py", n))
+
+
+def split_files_current() -> list:
+    """The relative paths (as strings) of the new test_trust_cp*.py files in the *current* working tree. Every
+    check here except T02 uses this (not split_files_pinned()), so deleting a migrated check or breaking
+    today's README/spec/import mapping is caught today, not just as of the CP2 split commit."""
+    return sorted(str(p.relative_to(ROOT)) for p in split_files())
+
+
+def read_current(relpath: str) -> str:
+    """A file's content read live from the working tree -- the current-tree counterpart to show_at()."""
+    return (ROOT / relpath).read_text()
 
 
 def helper_file_path():
@@ -123,14 +173,21 @@ def t01_every_check_call_moves_once():
     check("[CP2-T01] setup: the pinned original contains at least one check(...) call",
           sum(pinned_calls.values()) > 0, sum(pinned_calls.values()))
 
-    files = split_files()
+    relpaths = split_files_current()
     per_file = {}
-    for f in files:
+    for relpath in relpaths:
+        fname = Path(relpath).name
         try:
-            per_file[f] = Counter(collect_check_call_texts(f.read_text(encoding="utf-8"), f.name))
+            src = read_current(relpath)
+        except OSError as e:
+            per_file[fname] = Counter()
+            check(f"[CP2-T01] {fname} is readable at the CP2 split commit", False, str(e))
+            continue
+        try:
+            per_file[fname] = Counter(collect_check_call_texts(src, fname))
         except SyntaxError as e:
-            per_file[f] = Counter()
-            check(f"[CP2-T01] {f.name} parses as valid Python", False, str(e))
+            per_file[fname] = Counter()
+            check(f"[CP2-T01] {fname} parses as valid Python", False, str(e))
 
     combined = Counter()
     for c in per_file.values():
@@ -139,9 +196,9 @@ def t01_every_check_call_moves_once():
     missing = pinned_calls - combined
     extra = combined - pinned_calls
     owners = {}
-    for f, c in per_file.items():
+    for fname, c in per_file.items():
         for text in c:
-            owners.setdefault(text, set()).add(f.name)
+            owners.setdefault(text, set()).add(fname)
     split_across = {t: fs for t, fs in owners.items() if len(fs) > 1 and pinned_calls.get(t, 0) <= 1}
 
     check("[CP2-T01] no check(...) call from the pinned original is missing from the new files",
@@ -179,6 +236,16 @@ def top_level_defs(tree):
 # neither name is ever defined in tests/trust_helpers.py (verified by hand against the current split).
 PER_FILE_SCAFFOLD_NAMES = {"SECTIONS", "main"}
 
+# T02 runs two different checks against two different sources, on purpose:
+#  (a) LIVE: does every pinned top-level definition still land, exactly once, in one of TODAY's files
+#      (tests/trust_helpers.py or a test_trust_cp*.py split file, read from the working tree)? This is what
+#      gives the test teeth against today's code: removing a shared helper or duplicating it into two split
+#      files right now fails here, not just against a commit that can never change again.
+#  (b) PINNED: is each definition's *body* still byte-for-byte what landed at CP2_COMMIT? Helper bodies may
+#      legitimately evolve later (e.g. run 3's CP1 adding a plan-objective fixture), so only the body
+#      comparison stays pinned to the CP2 split commit; a legitimate later edit must not fail this historical
+#      diff.
+
 
 def t02_shared_helpers_move_once():
     print("CP2-T02: every top-level definition from the old file lands, unchanged, in exactly one new file")
@@ -194,42 +261,79 @@ def t02_shared_helpers_move_once():
     check("[CP2-T02] setup: at least one top-level definition (function, class or assignment) was found in "
           "the pinned original", len(pinned_defs) > 0, sorted(pinned_defs))
 
-    helper_path = helper_file_path()
-    check("[CP2-T02] tests/trust_helpers.py exists", helper_path is not None)
-    if helper_path is None:
+    helper_existed = exists_at(CP2_COMMIT, "tests/trust_helpers.py")
+    check("[CP2-T02] tests/trust_helpers.py exists", helper_existed)
+    if not helper_existed:
         return
 
-    candidates = [helper_path] + split_files()
+    # (a) LIVE: read today's working tree, not a commit, so a helper removed or duplicated today is caught
+    # today. tests/trust_helpers.py is read live too (HELPERS_FILE already requires it to exist for the rest
+    # of the suite to import); imports from trust_helpers.py in a cp*_ file are not re-definitions, since
+    # top_level_defs() only looks at module-level FunctionDef/ClassDef/Assign nodes, never Import nodes.
+    live_candidates = ["tests/trust_helpers.py"] + split_files_current()
+    live_defs = {}
+    for relpath in live_candidates:
+        fname = Path(relpath).name
+        try:
+            src = read_current(relpath)
+        except OSError as e:
+            check(f"[CP2-T02] (live) setup: {fname} is readable", False, str(e))
+            continue
+        try:
+            live_defs[fname] = top_level_defs(ast.parse(src, filename=fname))
+        except SyntaxError as e:
+            live_defs[fname] = {}
+            check(f"[CP2-T02] (live) {fname} parses as valid Python", False, str(e))
+
+    live_missing = []
+    live_duplicated = []
+    for defname in pinned_defs:
+        owners = [fname for fname, defs in live_defs.items() if defname in defs]
+        if not owners:
+            live_missing.append(defname)
+        elif len(owners) > 1:
+            live_duplicated.append((defname, sorted(owners)))
+
+    check("[CP2-T02] (live) every pinned top-level definition appears in one of TODAY's new files "
+          "(trust_helpers.py or a test_trust_cp*.py split file, read from the working tree); none are "
+          "missing entirely", not live_missing, live_missing[:10])
+    check("[CP2-T02] (live) no pinned top-level definition is redefined (copied, not imported) in more than "
+          "one of TODAY's new files -- a name another file needs must be imported from trust_helpers",
+          not live_duplicated, live_duplicated[:10])
+
+    # (b) PINNED: body-identity comparison against the CP2 split commit (see comment above the function).
+    candidates = ["tests/trust_helpers.py"] + split_files_pinned()
     file_src = {}
     file_defs = {}
-    for f in candidates:
+    for relpath in candidates:
+        fname = Path(relpath).name
         try:
-            src = f.read_text(encoding="utf-8")
-        except OSError as e:
-            check(f"[CP2-T02] setup: {f.name} is readable", False, str(e))
+            src = show_at(CP2_COMMIT, relpath)
+        except RuntimeError as e:
+            check(f"[CP2-T02] setup: {fname} is readable", False, str(e))
             continue
-        file_src[f] = src
+        file_src[fname] = src
         try:
-            file_defs[f] = top_level_defs(ast.parse(src, filename=f.name))
+            file_defs[fname] = top_level_defs(ast.parse(src, filename=fname))
         except SyntaxError as e:
-            file_defs[f] = {}
-            check(f"[CP2-T02] {f.name} parses as valid Python", False, str(e))
+            file_defs[fname] = {}
+            check(f"[CP2-T02] {fname} parses as valid Python", False, str(e))
 
     missing = []
     duplicated = []
     changed = []
-    for name, node in pinned_defs.items():
+    for defname, node in pinned_defs.items():
         pinned_seg = ast.get_source_segment(pinned, node)
-        owners = [f for f, defs in file_defs.items() if name in defs]
+        owners = [fname for fname, defs in file_defs.items() if defname in defs]
         if not owners:
-            missing.append(name)
+            missing.append(defname)
         elif len(owners) > 1:
-            duplicated.append((name, sorted(o.name for o in owners)))
+            duplicated.append((defname, sorted(owners)))
         else:
-            f = owners[0]
-            f_seg = ast.get_source_segment(file_src[f], file_defs[f][name])
+            fname = owners[0]
+            f_seg = ast.get_source_segment(file_src[fname], file_defs[fname][defname])
             if f_seg != pinned_seg:
-                changed.append((name, f.name))
+                changed.append((defname, fname))
 
     check("[CP2-T02] every pinned top-level definition appears in one of the new files (trust_helpers.py or "
           "a test_trust_cp*.py split file); none are missing entirely",
@@ -245,8 +349,8 @@ def t02_shared_helpers_move_once():
 # ---- CP2-T03: the old monolith is gone, not just duplicated ----------------------------------------------
 
 
-def cp_prefixes_in_file(path: Path):
-    ids = re.findall(r"\[CP(\d+)-[TX]\d+\]", path.read_text(encoding="utf-8"))
+def cp_prefixes_in_text(text: str):
+    ids = re.findall(r"\[CP(\d+)-[TX]\d+\]", text)
     return {f"CP{n}" for n in ids}
 
 
@@ -265,8 +369,17 @@ def t03_old_monolith_gone():
     check("[CP2-T03] setup: the pinned original covers more than one CP id prefix (so a whole-file copy is "
           "detectable)", len(full_prefix_set) > 1, sorted(full_prefix_set))
 
-    files = split_files()
-    whole_copies = [f.name for f in files if cp_prefixes_in_file(f) == full_prefix_set]
+    relpaths = split_files_current()
+    whole_copies = []
+    for relpath in relpaths:
+        fname = Path(relpath).name
+        try:
+            text = read_current(relpath)
+        except OSError as e:
+            check(f"[CP2-T03] {fname} is readable at the CP2 split commit", False, str(e))
+            continue
+        if cp_prefixes_in_text(text) == full_prefix_set:
+            whole_copies.append(fname)
     check("[CP2-T03] no single new file contains every CP id prefix from the old file (nothing just renamed it)",
           not whole_copies, whole_copies)
 
@@ -276,15 +389,26 @@ def t03_old_monolith_gone():
 
 def t04_one_group_per_file_and_cp5_split():
     print("CP2-T04: each new file owns one checkpoint's section, and CP5 is divided across at least two files")
-    files = split_files()
-    check("[CP2-T04] setup: at least one new split file exists", bool(files), [str(f) for f in files])
-    if not files:
+    relpaths = split_files_current()
+    check("[CP2-T04] setup: at least one new split file exists", bool(relpaths),
+          [str(ROOT / r) for r in relpaths])
+    if not relpaths:
         return
-    mixed = [(f.name, sorted(cp_prefixes_in_file(f))) for f in files if len(cp_prefixes_in_file(f)) > 1]
+    prefixes_by_file = {}
+    for relpath in relpaths:
+        fname = Path(relpath).name
+        try:
+            text = read_current(relpath)
+        except OSError as e:
+            check(f"[CP2-T04] {fname} is readable at the CP2 split commit", False, str(e))
+            continue
+        prefixes_by_file[fname] = cp_prefixes_in_text(text)
+
+    mixed = [(fname, sorted(p)) for fname, p in prefixes_by_file.items() if len(p) > 1]
     check("[CP2-T04] no new file mixes check()s from two different CP groups",
           not mixed, mixed)
 
-    cp5_files = [f.name for f in files if cp_prefixes_in_file(f) == {"CP5"}]
+    cp5_files = [fname for fname, p in prefixes_by_file.items() if p == {"CP5"}]
     check("[CP2-T04] CP5 (the largest pinned section) is divided across at least two files",
           len(cp5_files) >= 2, cp5_files)
 
@@ -318,8 +442,8 @@ def t05_every_split_file_imports_cleanly():
 # ---- CP2-T06/T07: the two dependent suites still pass after their import is repointed -------------------------
 
 
-def _repointed_to_helper(path: Path):
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=path.name)
+def _repointed_to_helper(source: str, filename: str):
+    tree = ast.parse(source, filename=filename)
     imports_test_trust = False
     imports_helper = False
     for node in ast.walk(tree):
@@ -340,9 +464,14 @@ def _repointed_to_helper(path: Path):
 
 def _run_full_suite_and_check(case_id: str, rel_path: str):
     path = ROOT / rel_path
-    ok_import = _repointed_to_helper(path)
+    try:
+        pinned_text = read_current(rel_path)
+    except OSError as e:
+        check(f"[{case_id}] {rel_path} is readable at the CP2 split commit", False, str(e))
+        return
+    ok_import = _repointed_to_helper(pinned_text, rel_path)
     check(f"[{case_id}] {rel_path}'s `import test_trust as tt` line is repointed at the new shared helper "
-          "module (trust_helpers)", ok_import, path.read_text(encoding="utf-8").splitlines()[:5])
+          "module (trust_helpers)", ok_import, pinned_text.splitlines()[:5])
     if not ok_import:
         # Short-circuit: do not pay for a multi-minute full run until the structural precondition holds.
         return
@@ -369,13 +498,18 @@ def t07_test_signing_still_passes():
 
 def t08_readme_names_new_files():
     print("CP2-T08: README's test list names the new files, not the retired one")
-    readme = README.read_text(encoding="utf-8")
+    try:
+        readme = read_current(str(README.relative_to(ROOT)))
+    except OSError as e:
+        check("[CP2-T08] setup: README.md is readable at the CP2 split commit", False, str(e))
+        return
     check("[CP2-T08] README.md no longer lists `python3 tests/test_trust.py` as a runnable suite",
           "python3 tests/test_trust.py" not in readme, "")
-    files = split_files()
-    missing = [f.name for f in files if f.name not in readme]
+    relpaths = split_files_current()
+    fnames = [Path(r).name for r in relpaths]
+    missing = [n for n in fnames if n not in readme]
     check("[CP2-T08] README.md's test list names every new split file",
-          bool(files) and not missing, missing or "no split files found yet")
+          bool(fnames) and not missing, missing or "no split files found yet")
 
 
 # ---- CP2-T09: the openspec record points each moved test id at its new file ------------------------------------
@@ -383,10 +517,12 @@ def t08_readme_names_new_files():
 
 def t09_openspec_points_at_new_files():
     print("CP2-T09: the openspec record points each moved test id at its new file")
-    check("[CP2-T09] setup: the openspec spec.md file is readable", SPEC.exists(), str(SPEC))
-    if not SPEC.exists():
+    try:
+        spec = read_current(str(SPEC.relative_to(ROOT)))
+    except OSError as e:
+        check("[CP2-T09] setup: the openspec spec.md file is readable", False, str(e))
         return
-    spec = SPEC.read_text(encoding="utf-8")
+    check("[CP2-T09] setup: the openspec spec.md file is readable", True, "")
     annotations = re.findall(r"<!-- proven by test (CP\d+-[TX]\d+) in ([^,]+), commit [^\s]+ -->", spec)
     check("[CP2-T09] setup: the spec has at least one 'proven by test ... in tests/test_trust.py' annotation to "
           "re-point", bool(annotations), len(annotations))

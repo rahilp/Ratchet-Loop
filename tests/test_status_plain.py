@@ -138,7 +138,7 @@ def plan_project(approve: bool) -> Path:
     rx(d, "config", "--set", "min_review_seconds=0")
     run = d / ".ratchet/runs/f"
     (run / "app-scout.json").write_text("{}")
-    plan = {"feature": "Accounts", "checkpoints": []}
+    plan = {"feature": "Accounts", "objective": _tmp.OBJECTIVE_MIN, "checkpoints": []}
     for i in range(6):
         cp = {"id": f"CP{i + 1}", "title": TITLES[i], "summary": "s", "done_when": [DONE_WHEN[i], "second line"],
               "gates": {"behavior": True, "ui": UI[i], "adversarial": True}, "risk": RISKS[i],

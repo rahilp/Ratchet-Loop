@@ -435,7 +435,8 @@ def cp5r7_project(env):
     cp = {"id": "CP1", "title": "Step 1", "summary": "s", "done_when": ["works"],
           "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",
           "tests": {"files": ["tests/cp1.test.js"], "command": f"test -f src/f.js || exit 1; {beh[3]}"}}
-    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "checkpoints": [cp]}))
+    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
+                                                       "checkpoints": [cp]}))
     (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
     r = rx(d, env, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout

@@ -62,7 +62,7 @@ def lane(base: Path, slug: str) -> Path:
     (run / "app-scout.json").write_text("{}")
     (run / "reference").mkdir()
     (run / "reference" / "prototype.html").write_text("<p>PROTO</p>")
-    (run / "checkpoints.json").write_text(json.dumps({"feature": slug, "reference": {
+    (run / "checkpoints.json").write_text(json.dumps({"feature": slug, "objective": _tmp.OBJECTIVE_MIN, "reference": {
         "type": "prototype", "paths": [f".ratchet/runs/{slug}/reference/prototype.html"]}, "checkpoints": [{
         "id": "CP1", "title": "A", "summary": "s", "done_when": ["a"],
         "gates": {"behavior": True, "ui": False, "adversarial": True},

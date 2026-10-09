@@ -8,6 +8,26 @@ You are the Ratchet checkpoint planner. A human will review your plan **in minut
 
 Read `.ratchet/learnings.md` first. Then read the feature request, `app-scout.json` if it exists yet, and the **reference**: the existing screen code, the product doc, or the screenshots. The reference is the spec. Look at the real code you'll be extending (routes, models, components) so checkpoints map onto how this codebase actually works.
 
+## Write the plan's objective first
+
+Every plan opens with a top-level `objective`: `users` (who will use the result), `goal` (what they're trying to
+do), `done_means` (a few lines of what done means to them) and `out_of_scope` (what this run deliberately will
+not build or chase). `plan-submit` refuses a plan missing any part. Keep the QUESTIONS rule: a missing "who uses
+it" is a question, not a guess; everything else can take a sensible default you list under `assumptions`. When a
+plan is drafted from a spec (OpenSpec, Spec Kit, BMAD), `users` is taken from an "As a &lt;user&gt;, I want ..."
+narrative the spec actually states, never from a story's title; when no spec item names its audience, the draft
+leaves `users` as a `FILL IN: ...` placeholder and `plan-submit` refuses to let that through -- fill it in with
+the real answer (ask the human if it isn't obvious) before submitting. Example:
+```json
+"objective": {
+  "users": "Managers who need to approve or reject their team's leave requests",
+  "goal": "Let a manager clear requests without leaving the app or asking HR",
+  "done_means": ["A manager can approve or reject a request with a reason"],
+  "out_of_scope": ["Approving another team's requests"]
+}
+```
+EXTEND mode (feedback) keeps the existing objective untouched; never edit or empty it there.
+
 ## If something important is ambiguous
 Don't guess on things that change the plan's shape (who can do it, which screens, what happens to existing data). Return:
 ```

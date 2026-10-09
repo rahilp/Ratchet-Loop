@@ -182,7 +182,8 @@ def project(env, approved=True):
         cp = {"id": "CP1", "title": "Step 1", "summary": "s", "done_when": ["works"],
               "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",
               "tests": {"files": ["tests/cp1.test.js"], "command": "node --test tests/cp1.test.js"}}
-        (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "checkpoints": [cp]}))
+        (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
+                                                           "checkpoints": [cp]}))
         (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
         r = rx(d, env, "plan-submit")
         assert r.returncode == 0, r.stderr + r.stdout
@@ -273,7 +274,8 @@ def cp3_project(env, extra_cp=None):
           "tests": {"files": ["tests/cp1.test.js"], "command": "test -f src/f.js"}}
     if extra_cp:
         cp.update(extra_cp)
-    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "checkpoints": [cp]}))
+    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
+                                                           "checkpoints": [cp]}))
     (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
     r = rx(d, env, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout
@@ -524,7 +526,8 @@ def cp4_unapproved_plan(env):
     cp = {"id": "CP1", "title": "Step 1", "summary": "s", "done_when": ["works"],
           "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",
           "tests": {"files": ["tests/cp1.test.js"], "command": "test -f src/f.js"}}
-    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "checkpoints": [cp]}))
+    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
+                                                           "checkpoints": [cp]}))
     (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
     r = rx(d, env, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout
@@ -585,7 +588,8 @@ def cp5_project_each(env):
     cp = {"id": "CP1", "title": "Step 1", "summary": "s", "done_when": ["works"],
           "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",
           "tests": {"files": ["tests/cp1.test.js"], "command": "test -f src/f.js"}}
-    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "checkpoints": [cp]}))
+    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
+                                                           "checkpoints": [cp]}))
     (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
     r = rx(d, env, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout
@@ -670,7 +674,8 @@ def cp5y_submit_plan(d, env):
     cp = {"id": "CP1", "title": "Step 1", "summary": "s", "done_when": ["works"],
           "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",
           "tests": {"files": ["tests/cp1.test.js"], "command": "test -f src/f.js"}}
-    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "checkpoints": [cp]}))
+    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
+                                                           "checkpoints": [cp]}))
     (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
     r = rx(d, env, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout

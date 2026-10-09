@@ -216,11 +216,16 @@ def save_plan(d, plan):
 
 
 def refine(d):
-    """What the planner does with the draft: test files and commands, low risk (one reviewer, fast tests)."""
+    """What the planner does with the draft: test files and commands, low risk (one reviewer, fast tests), and
+    filling in any objective part the spec draft left as its FILL IN placeholder (the spec named no 'As a ...
+    I want ...' audience) -- the same thing plan-submit otherwise refuses."""
     plan = plan_of(d)
     for i, cp in enumerate(plan["checkpoints"], 1):
         cp["tests"] = {"files": [f"tests/cp{i}.test.js"], "command": f"node --test tests/cp{i}.test.js"}
         cp["risk"] = "low"
+    obj = plan.get("objective") or {}
+    if str(obj.get("users") or "").startswith(ss.FILL_IN_PREFIX):
+        obj["users"] = "The people who use this feature"
     save_plan(d, plan)
     return plan
 

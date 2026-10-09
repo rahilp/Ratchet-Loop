@@ -186,7 +186,8 @@ def cp6_project(env, report, cases, checks=None, command=None, report_reason=Non
     # report is None: no "report" key at all, modelling a plan approved before this change.
     cp = {"id": "CP1", "title": "Step 1", "summary": "s", "done_when": ["works"],
           "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low", "tests": tests}
-    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "checkpoints": [cp]}))
+    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
+                                                       "checkpoints": [cp]}))
     (run / "tests" / "CP1.json").write_text(json.dumps({"cases": cases}))
     r = rx(d, env, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout
@@ -540,6 +541,7 @@ def cp6_t15_spec_status_not_proven_on_false_exit0():
     case_id = cases[0]["id"]
     write_fixture(d, [case_id])
     cp["tests"] = {"files": [FIXTURE_REL], "command": f"python3 {FIXTURE_REL}", "report": "json"}
+    plan["objective"] = _tmp.OBJECTIVE_MIN
     (run / "app-scout.json").write_text("{}")
     (run / "checkpoints.json").write_text(json.dumps(plan))
     r = rx(d, env, "plan-submit")
@@ -603,7 +605,8 @@ def _x_planning_project(env):
 def _x_submit(env, d, run, tests):
     cp = {"id": "CP1", "title": "Step 1", "summary": "s", "done_when": ["works"],
           "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low", "tests": tests}
-    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "checkpoints": [cp]}))
+    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
+                                                       "checkpoints": [cp]}))
     return rx(d, env, "plan-submit")
 
 

@@ -35,6 +35,16 @@ import tempfile
 import threading
 from pathlib import Path
 
+# CP1: every plan needs a top-level 'objective' (who it is for, what they want, what done means, what is out
+# of scope). Test fixtures that write checkpoints.json directly (not through the real planner) use this minimal
+# one, shared here so every suite's setup data stays in one place.
+OBJECTIVE_MIN = {
+    "users": "the people who use this test project",
+    "goal": "get the checkpoint under test built",
+    "done_means": ["the checkpoint's own done_when criteria are met"],
+    "out_of_scope": ["anything not listed in the checkpoint's plan"],
+}
+
 _LOCK = threading.RLock()
 _LIVE: list = []          # TmpDir objects not cleaned up yet, oldest first
 _PROCS: list = []         # processes tracked without a folder (see track())

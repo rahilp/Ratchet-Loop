@@ -1567,6 +1567,7 @@ def approval_snapshot(ctx, st) -> dict:
     plan = ctx.plan() or {"checkpoints": []}
     cfg = ctx.config()
     return {"plan": _plan_hash(plan, ctx),
+            "objective": plan.get("objective"),
             "cps": {c["id"]: _sha(c) for c in plan["checkpoints"]},
             "tests": {c["id"]: _sha(test_plan(ctx, c["id"])) for c in plan["checkpoints"]},
             "rules": {k: _sha(cfg.get(k)) for k in RULE_KEYS},
@@ -1626,6 +1627,54 @@ def verify_integrity(ctx, st):
 
 
 # --------------------------------------------------------------------------- plan validation
+
+OBJECTIVE_EXAMPLE = ('{"users": "who will use the result", "goal": "what they are trying to do", '
+                      '"done_means": ["what done means to them, one line per point"], '
+                      '"out_of_scope": ["what this run deliberately will not build or chase"]}')
+
+
+def objective_problems(plan) -> list[str]:
+    """What is missing from the plan's top-level 'objective' (who it is for, what they want, what done means,
+    what is out of scope). Checked at plan-submit, not in validate_plan (shared with plan-extend, which instead
+    refuses a feedback plan that drops an objective the approved plan had)."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    if not isinstance(obj, dict) or not obj:
+        return [f"objective: missing. Every plan needs one, e.g. {OBJECTIVE_EXAMPLE}"]
+    errs = []
+    if not str(obj.get("users") or "").strip():
+        errs.append("objective.users: missing or empty (who will use the result)")
+    if not str(obj.get("goal") or "").strip():
+        errs.append("objective.goal: missing or empty (what they are trying to do)")
+    dm = obj.get("done_means")
+    if not isinstance(dm, list) or not any(str(x or "").strip() for x in dm):
+        errs.append("objective.done_means: missing or empty (what done means to them, as a non-empty list)")
+    oos = obj.get("out_of_scope")
+    if not isinstance(oos, list) or not any(str(x or "").strip() for x in oos):
+        errs.append("objective.out_of_scope: missing or empty (what this run deliberately will not build or "
+                    "chase, as a non-empty list)")
+    errs += _objective_fill_ins(obj)
+    return errs
+
+
+def _objective_fill_ins(obj: dict) -> list[str]:
+    """Every objective part that still starts with the spec draft's placeholder (specsrc.FILL_IN_PREFIX,
+    e.g. 'FILL IN: who will use this?') instead of a real answer, named so the planner or user must fill it in
+    before the plan can be submitted. A draft never guesses an audience from a story's title or invents one;
+    this is what catches it if one slips through unfilled."""
+    out = []
+    for key in ("users", "goal"):
+        v = str(obj.get(key) or "")
+        if v.startswith(specsrc.FILL_IN_PREFIX):
+            out.append(f"objective.{key}: still the draft placeholder ({v!r}) — fill it in before submitting")
+    for key in ("done_means", "out_of_scope"):
+        v = obj.get(key)
+        if not isinstance(v, list):
+            continue  # objective_problems already reports the invalid shape
+        for i, x in enumerate(v):
+            if str(x or "").startswith(specsrc.FILL_IN_PREFIX):
+                out.append(f"objective.{key}[{i}]: still the draft placeholder ({x!r}) — fill it in before submitting")
+    return out
+
 
 REQUIRED_CP_FIELDS = ["id", "title", "summary", "done_when", "gates"]
 
@@ -2087,6 +2136,16 @@ def cmd_plan_summary(args):
         die("There is no plan yet. Finish planning first, then ask again.")
     cfg = ctx.config()
     print(f"Plan: {plan.get('feature') or st.get('feature')} ({len(plan['checkpoints'])} steps)")
+    obj = plan.get("objective")
+    if isinstance(obj, dict) and obj:
+        print(f"\nWho it's for: {obj.get('users', '')}")
+        print(f"What they want: {obj.get('goal', '')}")
+        print("Done means:")
+        for line in obj.get("done_means") or []:
+            print(f"  - {line}")
+        print("Out of scope:")
+        for line in obj.get("out_of_scope") or []:
+            print(f"  - {line}")
     for line in spec_summary_lines(ctx, plan):
         print(line)
     all_host = True
@@ -3067,7 +3126,7 @@ def cmd_plan_submit(args):
     plan = ctx.plan()
     if plan is None:
         die("checkpoints.json not found in the run folder")
-    errs = validate_plan(plan) + spec_plan_problems(ctx, plan)
+    errs = validate_plan(plan) + objective_problems(plan) + spec_plan_problems(ctx, plan)
     if errs:
         die("Plan invalid:\n  - " + "\n  - ".join(errs))
     st["phase"] = "awaiting_plan_approval"
@@ -6319,6 +6378,9 @@ def cmd_plan_extend(args):
     errs = validate_plan(plan)
     if errs:
         die("Plan invalid:\n  - " + "\n  - ".join(errs))
+    had_objective = (st.get("approved") or {}).get("objective")
+    if had_objective and not objective_problems({"objective": had_objective}) and objective_problems(plan):
+        die("Feedback cannot drop the objective the approved plan had (" + "; ".join(objective_problems(plan)) + ").")
     new_ids = [c["id"] for c in plan["checkpoints"] if c["id"] not in st["checkpoints"]]
     if not new_ids:
         die("No new checkpoints were appended to checkpoints.json")

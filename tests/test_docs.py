@@ -710,7 +710,10 @@ def project(name):
     rx(d, "config", "--set", "min_review_seconds=0", "providers=[]")
     run = d / ".ratchet" / "runs" / "f"
     (run / "app-scout.json").write_text("{}")
-    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "checkpoints": [{
+    OBJ = {"users": "the people who use this test project", "goal": "get the checkpoint under test built",
+           "done_means": ["the checkpoint's own done_when criteria are met"],
+           "out_of_scope": ["anything not listed in the checkpoint's plan"]}
+    (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": OBJ, "checkpoints": [{
         "id": "CP1", "title": "Step 1", "summary": "s", "done_when": ["works"], "risk": "low",
         "gates": {"behavior": True, "ui": False, "adversarial": True},
         "tests": {"files": ["tests/test_cp1.py"], "command": "python3 tests/test_cp1.py"}}]}))

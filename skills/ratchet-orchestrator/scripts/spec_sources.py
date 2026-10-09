@@ -31,6 +31,10 @@ from pathlib import Path
 
 PLAIN = {"openspec": "OpenSpec change", "speckit": "Spec Kit feature", "bmad": "BMAD story"}
 CHECKBOX = re.compile(r"^(\s*)[-*+] \[( |x|X)\]\s+(.*)$")
+# A draft objective part Ratchet could not fill in from the spec starts with this, never with an invented guess
+# (e.g. "The people who use <feature>") and never with a story's title. plan-submit refuses any part that still
+# starts with it, naming the part, so the planner or user must fill it in before the plan is approved.
+FILL_IN_PREFIX = "FILL IN:"
 
 
 def _slug(s: str) -> str:
@@ -77,6 +81,42 @@ def _edit_file(p: Path, fn) -> bool:
 
 def _strip_md(s: str) -> str:
     return re.sub(r"\*\*|__|`", "", s).strip()
+
+
+def _story_who(text: str) -> str:
+    """The audience named in a user-story narrative ('As a <user>, I want ...' / 'As an <user> ...'), the shape
+    OpenSpec, Spec Kit and BMAD narratives all use; '' when the text has no such sentence. Used so the drafted
+    objective's users come from what a story actually says about who it is for, never from a story's title."""
+    m = re.search(r"as an?\s+(.+?),?\s+i want\s+", text, re.I | re.M)
+    return _strip_md(m.group(1)).strip() if m else ""
+
+
+def _section(text: str, headings: tuple) -> str:
+    """The plain-text body of the first '## <heading>' section matching one of these names (case-insensitive),
+    joined to one paragraph, or '' if the spec has none. Used to draft the objective's goal and out_of_scope from
+    a spec's own words (an OpenSpec proposal's Why paragraph, a Non-Goals/Out of Scope section)."""
+    pat = "|".join(re.escape(h) for h in headings)
+    m = re.search(rf"^##\s+(?:{pat})\s*\n+(.*?)(?=^##\s|\Z)", text, re.M | re.I | re.S)
+    if not m:
+        return ""
+    return _strip_md(" ".join(m.group(1).split()))
+
+
+def _section_lines(text: str, headings: tuple) -> list:
+    """Bullet lines (or, with none, the first plain line) of the first matching section, for out_of_scope."""
+    pat = "|".join(re.escape(h) for h in headings)
+    m = re.search(rf"^##\s+(?:{pat})\s*\n+(.*?)(?=^##\s|\Z)", text, re.M | re.I | re.S)
+    if not m:
+        return []
+    out = []
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        bm = re.match(r"^[-*+]\s+(.+)$", line)
+        if bm:
+            out.append(_strip_md(bm.group(1)).strip())
+        elif line and not out:
+            out.append(_strip_md(line))
+    return [o for o in out if o]
 
 
 # ------------------------------------------------------------------------------------------------ OpenSpec
@@ -217,6 +257,9 @@ def load_openspec_change(root: Path, change_id: str) -> dict:
             "archived": archived,
             "approved": True,  # a change on disk is the team's agreed proposal; the user still confirms Ratchet's plan
             "summary": _strip_md(re.sub(r"^#.*$", "", proposal, flags=re.M)).strip()[:800],
+            "why": _section(proposal, ("Why",))[:400],
+            "who": _story_who(proposal),
+            "non_goals": _section_lines(proposal, ("Non-Goals", "Out of Scope")),
             "requirements": reqs, "removed": removed, "tasks": tasks, "standards": standards,
             "spec_files": [str(p.relative_to(root)) for p in sorted((d / "specs").rglob("spec.md"))] if (d / "specs").is_dir() else []}
 
@@ -264,6 +307,8 @@ def load_speckit_feature(root: Path, feature: str) -> dict:
             continue
         if re.match(r"^##\s", line) and not re.match(r"^##\s+User Scenarios", line, re.I):
             story = None
+        if story is not None and not story["text"] and line.strip() and not line.strip().startswith(("**", "-", "#")):
+            story["text"] = _strip_md(line.strip())
         m = re.match(r"^\s*(\d+)\.\s+\*\*Given\*\*\s*(.+?),?\s+\*\*When\*\*\s*(.+?),?\s+\*\*Then\*\*\s*(.+)$", line, re.I)
         if m and story is not None:
             story["scenarios"].append({"ref": f"{story['ref']}/AS{m.group(1)}", "name": f"scenario {m.group(1)}",
@@ -282,6 +327,9 @@ def load_speckit_feature(root: Path, feature: str) -> dict:
     return {"tool": "speckit", "id": feature, "title": (m.group(1).strip() if m else feature)[:120],
             "path": str(d.relative_to(root)), "status": status.group(1) if status else "Draft",
             "approved": bool(tasks),  # a feature that reached /tasks has been specified and planned
+            "why": reqs[0]["text"] if reqs and reqs[0].get("text") else "",
+            "who": _story_who(text),
+            "non_goals": _section_lines(text, ("Non-Goals", "Out of Scope")),
             "requirements": reqs + frs, "tasks": tasks, "standards": standards,
             "unclear": [f["ref"] for f in frs if f.get("unclear")],
             "spec_files": [str((d / "spec.md").relative_to(root))],
@@ -371,9 +419,14 @@ def load_bmad_story(root: Path, path: Path, version: str = "v4") -> dict:
         if (root / cand).exists():
             standards.append(cand)
             break
+    story_m = re.search(r"as an?\s+(.+?),?\s+i want\s+(.+?)(?:,?\s+so that\s+(.+?))?\.?\s*$",
+                        text, re.I | re.M)
     return {"tool": "bmad", "version": version, "id": sid, "title": (m.group(3) or sid).strip()[:120],
             "path": str(path.relative_to(root)), "status": status or "unknown", "approved": approved,
             "status_line": status is not None,
+            "who": _strip_md(story_m.group(1)).strip() if story_m else "",
+            "why": _strip_md(story_m.group(3) or story_m.group(2)).strip() if story_m else "",
+            "non_goals": [],
             "requirements": acs, "tasks": tasks, "standards": standards, "spec_files": [str(path.relative_to(root))]}
 
 
@@ -436,6 +489,37 @@ def spec_digest(items: list[dict]) -> list:
 
 
 # ------------------------------------------------------------------------------------------------ draft plan
+
+def _draft_objective(items: list[dict], feature: str) -> dict:
+    """A first-pass objective for the planner to refine: goal from the spec's own words when it states them
+    (an OpenSpec proposal's Why paragraph, a Spec Kit user story's paragraph, a BMAD 'so that' clause),
+    users from the audience named in a user-story narrative ('As a <user>, I want ...') in an OpenSpec, Spec
+    Kit or BMAD item alike -- never from a story's title -- done_means from requirement titles, and
+    out_of_scope from a Non-Goals/Out of Scope section when the spec has one, or one plain default line naming
+    the fallback. When no item states its audience, users is left as an explicit FILL_IN_PREFIX placeholder
+    instead of a guess, so plan-submit's objective check can refuse it and make the planner or user ask."""
+    goal, users = "", ""
+    done_means, out_of_scope = [], []
+    for it in items:
+        if not goal and it.get("why"):
+            goal = it["why"]
+        if not users and it.get("who"):
+            users = it["who"]
+        for r in it.get("requirements", []):
+            if r.get("title") and len(done_means) < 8:
+                done_means.append(r["title"])
+        out_of_scope += it.get("non_goals") or []
+    if not goal:
+        reqs = [r for it in items for r in it.get("requirements", [])]
+        goal = (reqs[0].get("text") or reqs[0]["title"]) if reqs else f"Deliver {feature}"
+    if not users:
+        users = f"{FILL_IN_PREFIX} who will use {feature}?"
+    if not done_means:
+        done_means = [f"{feature} works as the spec describes"]
+    if not out_of_scope:
+        out_of_scope = ["Anything not named in this spec's requirements (confirm with the user before building it)"]
+    return {"users": users[:300], "goal": goal[:400], "done_means": done_means[:8], "out_of_scope": out_of_scope[:8]}
+
 
 def _words(s: str) -> set:
     return {w for w in re.findall(r"[a-z0-9]+", str(s).lower()) if len(w) > 3}
@@ -509,7 +593,8 @@ def draft_plan(items: list[dict], feature: str) -> tuple[dict, dict]:
                                   "given": s.get("given", ""), "when": s.get("when", ""), "then": s.get("then", ""),
                                   "spec_ref": s["ref"]})
             tests[cid] = {"checkpoint": cid, "cases": cases}
-    plan = {"feature": feature, "spec_sources": [f"{it['tool']}:{it['id']}" for it in items], "checkpoints": cps}
+    plan = {"feature": feature, "spec_sources": [f"{it['tool']}:{it['id']}" for it in items], "checkpoints": cps,
+            "objective": _draft_objective(items, feature)}
     return plan, tests
 
 
