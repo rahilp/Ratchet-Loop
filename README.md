@@ -131,6 +131,16 @@ You can also tell it to build without hooks, but then the gates are only suggest
 
 That reply only counts if Ratchet's prompt hook is running, because that hook is how Ratchet hears you. If none of its hooks run in your CLI at all, the agent will tell you to install them.
 
+### Accepting a review finding yourself
+
+Sometimes a review round blocks on something you judge isn't worth another round: a narrow edge case, a cost you've decided to live with, a finding you disagree with. You can say so, once, with your own reason, and move on. The agent can't do this on its own; it can only ask, and only the open (blocking) findings of the round that's actually stuck can be asked about. It shows you each finding and the exact reply that accepts it:
+
+> accept: <your reason>
+
+Only your first reply after that question, in those exact words plus your own reason, accepts the findings it named; anything else accepts nothing. If two reviewers of the same round happened to report a finding with the same id, naming just that bare id is refused as ambiguous; say which reviewer's you mean (`reviewer/id`, e.g. `codex-correctness/A1`) and it accepts exactly that one. Each one you accept is written down with your reason, in `.ratchet/learnings.md`, in the step's list of findings left for later, and in that round's own record, so you (and later reviews) can see why it was let through. Accept every open finding of a blocked round and the step passes without another round of review; accept only some and the step stays blocked on the rest. If the code changes afterwards, normal review rules apply again, findings and all: accepting something once never exempts the code that comes after it.
+
+In a director-enrolled lane, a chat reply never accepts a finding: the director must sign it instead (`director-sign accept-finding`), the same as every other approval in that lane.
+
 ## If your team writes specs (OpenSpec, Spec Kit, BMAD)
 
 If your project already uses OpenSpec, GitHub Spec Kit or the BMAD Method, Ratchet builds from the spec you've written instead of making up its own plan:
@@ -317,7 +327,8 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py providers [--discover] [--check [id]] [--add <id> --preset <p> --model <m>] [--remove <id>]` | agent tools that can review: find, test, add or remove them |
 | `ratchet.py models` | which model each role's sub-agent uses on this host |
 | `ratchet.py spec detect`, `spec import <openspec\|speckit\|bmad\|auto> <id>`, `spec status` | build from an OpenSpec change, Spec Kit feature or BMAD story; which scenarios are proven so far; `spec keep on\|off` records the user's answer about a running spec |
-| `ratchet.py deferred` | review findings noted for later instead of blocking (minor ones, and any blocker/major/unknown-severity one with no `user_impact`) |
+| `ratchet.py deferred` | review findings noted for later instead of blocking (minor ones, and any blocker/major/unknown-severity one with no `user_impact`), plus, in their own section first, any findings you accepted yourself, with your reason and who accepted them |
+| `ratchet.py ask accept-finding CPn F1,F2`, `accept-finding CPn` | ask the user to accept named open (blocking) findings of a blocked round, with their own reason (`accept: <reason>`); record it once they reply |
 | `ratchet.py occurrences <kind>` | the real code where reviewers found a kind of mistake |
 | `ratchet.py repeats` | kinds of finding seen twice or more that could become an automatic check |
 | `ratchet.py guardrail --kind <k> --title <t> --why <w> --check-command "<c> {target}" --target <dir> --bad-example <fixture> --test-command <c> --test-file <f>` | after you pick the "automatic check" option: add the step that builds it |
@@ -344,6 +355,7 @@ It runs half as many suites at a time as the machine has CPU cores, at least 2, 
 Each test file is a standalone script; none needs a framework, so you can also run one suite on its own. Every suite makes its temp folders through `tests/_tmp.py`, which removes them, and stops any background server the suite started, when the suite ends, whether it passes, fails a check or crashes. The one exception is `tests/test_cleanup.py`, which tests that helper and so makes and removes its own throwaway folders without it. `tests/test_runner.py` tests run_all.py itself against tiny made-up suites and never runs the real ones.
 
 ```
+python3 tests/test_accept_finding.py
 python3 tests/test_cleanup.py
 python3 tests/test_docs.py
 python3 tests/test_gates.py

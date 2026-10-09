@@ -1783,7 +1783,12 @@ def new_cp_state(cp):
 
 # --------------------------------------------------------------------------- next action
 
-def next_action(ctx: Ctx, st=None) -> dict:
+def next_action(ctx: Ctx, st=None, compute_accept_note: bool = True) -> dict:
+    """`compute_accept_note=False` skips `_blocked_accept_note` (and the working-tree fingerprint it can trigger
+    via `_code_changed_since_round`) for callers that never read `accept_note` from the result: the Stop hook
+    (`decide_stop`, which only reads `stop_ok`) and the viewer (`viewer_data`, whose `next` the UI never shows
+    `accept_note` from). `ratchet.py next` and `status --json`, the only places this line is ever printed, always
+    pass the default so their behavior is unchanged."""
     st = st or ctx.state()
     phase = st["phase"]
     if phase == "planning":
@@ -1828,6 +1833,9 @@ def next_action(ctx: Ctx, st=None) -> dict:
         if phase == "blocked":
             na["options"] = blocked_options(st.get("blocked_reason"))
             na["reason_plain"] = plain_reason(st.get("blocked_reason"))
+            note = _blocked_accept_note(ctx, st) if compute_accept_note else None
+            if note:
+                na["accept_note"] = note
         return na
 
     # building
@@ -1906,7 +1914,10 @@ def plain_reason(reason):
 
 def blocked_options(reason) -> list:
     """2-3 lettered choices for the user, fitted to why the run is blocked. Offered by the agent, not typed.
-    Only offers things that can work: raising a review limit is a user-confirmed config change."""
+    Only offers things that can work: raising a review limit is a user-confirmed config change. Accepting an
+    open finding is never one of these: it is never a lettered pick (so a pick followed by `human-approve` can
+    never stand in for the user's own `accept: <reason>` reply). When that is a real option here, `next`/`status`
+    add it as its own plain line instead (see `_blocked_accept_note`)."""
     r = (reason or "").lower()
     if "round cap" in r or "run-wide" in r:
         texts = ["Raise the review limit so the reviewers can keep going.",
@@ -1924,6 +1935,67 @@ def blocked_options(reason) -> list:
     else:
         texts = ["Try again.", "Change the plan for this step.", "Stop here and keep what is already finished."]
     return [{"letter": "ABC"[i], "text": t} for i, t in enumerate(texts)]
+
+
+ACCEPT_NOTE_CACHE_NAME = ".accept-note-cache.json"  # see _cached_code_changed_since_round: a performance cache only
+
+
+def _blocked_accept_note(ctx, st) -> str | None:
+    """One plain line (never a lettered option) for `next`/`status` when the run is blocked on an adversarial
+    round limit, per-checkpoint or run-wide, and the current checkpoint's last recorded round still has open
+    findings: either the user can accept them with their own reason (`ask accept-finding` + their own
+    `accept: <reason>` reply, never a lettered pick or `human-approve`, which never accepts anything), or, when
+    the code changed since that round, those findings need a fresh review round instead (point at raising the
+    limit, option A). None when the block is some other kind, there is no current checkpoint, no round was ever
+    recorded for it, or the recorded round simply has nothing open (an approved round, or one already fully
+    accepted): a presence check against the round's own open findings always runs FIRST, before the code-change
+    check, so neither line is ever printed about findings that do not exist."""
+    if st.get("phase") != "blocked":
+        return None
+    cur = st.get("current")
+    cps = (st.get("checkpoints") or {}).get(cur) if cur else None
+    if not cur or cps is None or not _adv_round_block_reason_for(cur, st.get("blocked_reason")):
+        return None
+    rnd = cps.get("adv_round")
+    if not rnd or not _adv_open_findings(ctx, cur, rnd, cps):
+        return None
+    if _cached_code_changed_since_round(ctx, st, rnd):
+        return ("The last fix changed the code, so these findings need a fresh look; raise the limit (A) for one "
+                "more round.")
+    return ("You can also accept open findings yourself: the agent asks with `ask accept-finding`, and only "
+            "your reply `accept: <reason>` closes them.")
+
+
+def _cached_code_changed_since_round(ctx, st, rnd) -> bool:
+    """Same answer as `_code_changed_since_round`, but skips its working-tree fingerprint (a `git add -A` into a
+    fresh temp index, re-hashing every file) when nothing that could change it has happened since the last time
+    THIS exact round was checked. Only `_blocked_accept_note` calls this: while a run sits `blocked` waiting on
+    the user, the Stop hook re-runs `next_action` on every turn end, each a fresh process with no memory of the
+    last one, so without this the fingerprint was being recomputed on every single stop. The cache key is the
+    round's own number and fingerprint plus state.json's own mtime: every command that could add a new round or
+    change the code also saves state (standards #12, the one atomic write), so a cache entry still matching all
+    three was computed after the same state.json this call is reading, and the working tree cannot have changed
+    code Ratchet would recognise since then without some command also updating one of those three. A mismatch
+    (a new/replaced round, or state.json touched since) always recomputes rather than trust a stale entry; a
+    write race between two callers only costs an extra recompute, never a wrong answer. `ask accept-finding` and
+    `accept-finding` never call this cached wrapper: they call `_code_changed_since_round` directly, uncached,
+    for their own authoritative, must-be-fresh refusal check."""
+    slug = st.get("slug")
+    try:
+        state_mtime = ctx.state_path(slug).stat().st_mtime
+    except OSError:
+        state_mtime = None
+    key = {"round": rnd.get("round"), "fingerprint": rnd.get("fingerprint"), "state_mtime": state_mtime}
+    cache_path = ctx.run_dir(slug) / ACCEPT_NOTE_CACHE_NAME
+    cached, why = _read_record(cache_path, missing=None)
+    if why is None and isinstance(cached, dict) and all(cached.get(k) == v for k, v in key.items()):
+        return bool(cached.get("changed"))
+    changed = _code_changed_since_round(ctx, rnd)
+    try:
+        _write_record(cache_path, dict(key, changed=changed))
+    except OSError:
+        pass  # a performance cache only: a failed write just means the next call recomputes too
+    return changed
 
 
 def plain_now(ctx: Ctx, st, plan=None) -> str:
@@ -2069,6 +2141,8 @@ def cmd_status_text(ctx: Ctx):
     note = exit_code_only_note(plan, st)
     if note:
         print(note)
+    for line in _accepted_findings_lines(st):
+        print(line)
     w = live_wait(st)
     if w:
         print(f"Waiting on: {w['reason']} (until {w['until'][:16].replace('T', ' ')} UTC).")
@@ -2081,6 +2155,9 @@ def cmd_status_text(ctx: Ctx):
         print("What would you like to do?")
         for o in blocked_options(st.get("blocked_reason")):
             print(f"  {o['letter']}) {o['text']}")
+        note = _blocked_accept_note(ctx, st)
+        if note:
+            print(note)
     hs = hooks_view(ctx, st)
     if hs.get("waived"):
         print("Hooks were skipped at your request, so the checks are only advice.")
@@ -2201,6 +2278,11 @@ def cmd_plan_summary(args):
               "and so on), I can check them and use them for reviews.")
     if hooks_view(ctx, st).get("waived"):
         print("\nNote: hooks were skipped at your request, so the checks are only advice.")
+    acc = _accepted_findings_lines(st)
+    if acc:
+        print("")
+        for line in acc:
+            print(line)
 
 
 # ---- providers: discover, test and register other agent CLIs ------------------------------------------------
@@ -3194,6 +3276,25 @@ def _human_since(ctx: Ctx, since_iso: str | None):
     return out
 
 
+def _chat_transcript_paths(ctx: Ctx, since_iso: str | None) -> set[str]:
+    """Repo-relative paths a genuine, Ratchet-recorded human reply (human_log.jsonl, hash-chained: not a bare
+    claim) used as its transcript since `since_iso`. The agent CLI's own chat transcript is never the code under
+    review, so a gate must not go stale only because it changed (a reply recorded between a gate passing and
+    `complete` otherwise would, if the transcript happens to live inside the project, as the CLI chooses, not
+    Ratchet)."""
+    out = set()
+    for e in _human_since(ctx, since_iso or "0"):
+        tp = e.get("transcript_path")
+        if not tp:
+            continue
+        try:
+            rel = str(Path(tp).resolve().relative_to(ctx.root.resolve())).replace("\\", "/")
+        except (OSError, ValueError):
+            continue
+        out.add(rel)
+    return out
+
+
 # ---- director-signed approvals -------------------------------------------------------
 # A director (an orchestrator running many lanes) holds a secret key OUTSIDE every repo.
 # It signs one specific pause of one specific run; the lane verifies the signature.
@@ -3724,6 +3825,7 @@ def cmd_director_sign(args):
             "approve-changes": ["building", "blocked", "awaiting_checkpoint_review", "awaiting_final_review"],
             "ui-respec": ["building", "blocked"],
             "guardrail": ["building", "blocked"],
+            "accept-finding": ["building", "blocked"],
             "cancel": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
                        "awaiting_checkpoint_review", "awaiting_final_review", "planning_feedback"],
             "set-review": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
@@ -4968,6 +5070,40 @@ def cmd_ui_respec(args):
     ok(f"{args.cp}: the capture spec and scope may be changed once; the next recorded round becomes the new baseline.")
 
 
+def _dedupe_finding_ids(findings: list) -> list:
+    """Gives every finding from ONE reviewer a usable, unique id before `reviewer` is stamped on it: a finding
+    with no `id`, or one whose `id` repeats an earlier finding's from the SAME reviewer (two independent
+    reviewers sharing an id is normal and handled elsewhere, by `_finding_key`'s 'reviewer/id'; this is about one
+    reviewer's own list carrying a duplicate or a blank id), gets a synthetic one instead
+    (`<id-or-'F'>-dup<n>`, counting only the repeats, so the first of each id is left exactly as the reviewer
+    wrote it). The synthetic id is never just assumed unique: it is checked against every explicit (non-blank) id
+    anywhere else in the SAME reviewer's list, and against every synthetic id already handed out, bumping the
+    counter until it really is new. Without this, `_finding_key` could still collide for two DIFFERENT findings
+    of the same reviewer (a blank id's synthetic default happening to match an id the reviewer wrote by hand,
+    e.g. a blank id next to an explicit 'F'): the one the user was shown and asked about, and one they never
+    saw, so accepting the shown one would silently also clear the other (and a blank id could never be named
+    with `accept-finding` at all)."""
+    explicit_ids = {f.get("id") for f in findings if f.get("id") not in (None, "")}
+    seen: dict = {}
+    assigned: set = set()
+    out = []
+    for f in findings:
+        fid = f.get("id")
+        key = fid if fid not in (None, "") else "\x00missing"
+        seen[key] = seen.get(key, 0) + 1
+        n = seen[key]
+        if fid in (None, "") or n > 1:
+            base = str(fid) if fid not in (None, "") else "F"
+            candidate = base if (fid in (None, "") and n == 1) else f"{base}-dup{n}"
+            while candidate in explicit_ids or candidate in assigned:
+                n += 1
+                candidate = f"{base}-dup{n}"
+            assigned.add(candidate)
+            f = dict(f, id=candidate)
+        out.append(f)
+    return out
+
+
 def cmd_adv_record(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -5028,7 +5164,7 @@ def cmd_adv_record(args):
     for rid in required:
         rp, r, raw, fst, (origin, why) = reviews[rid]
         spec = _roster_spec(cfg, rid) or {}
-        findings = r.get("findings", []) or []
+        findings = _dedupe_finding_ids(r.get("findings", []) or [])
         all_findings += [dict(f, reviewer=rid) for f in findings]
         how = {"script-signed": "signed by external_review.py",
                "confirmed": "written by the ratchet-adversary sub-agent, confirmed by the guard hook"}.get(origin, UNCONFIRMED)
@@ -5076,7 +5212,10 @@ def cmd_adv_record(args):
         keep = [x for x in cps.get("deferred") or [] if x.get("round") != rnd["round"]]
         cps["deferred"] = keep + [dict(x, round=rnd["round"]) for x in deferred]
     approved = not all_findings
-    g["rounds"] = g.get("rounds", []) + [{"at": now(), "fingerprint": fp["id"], "verdicts": verdicts,
+    # "round" is stamped on the entry itself (not left to list position) so it is found by identity later
+    # (cmd_accept_finding marks it accepted): a round `reviewers` opens and then replaces before recording (the
+    # fingerprint changed) advances rnd['round'] without adding an entry here, so position alone drifts from it.
+    g["rounds"] = g.get("rounds", []) + [{"round": rnd["round"], "at": now(), "fingerprint": fp["id"], "verdicts": verdicts,
                                           "findings": len(all_findings), "deferred": len(deferred),
                                           "raw_findings": raw_count, "substitutions": subs,
                                           "blocking_files": sorted({_norm_path(f.get("file") or f.get("path") or f.get("location"), ctx.root)
@@ -5108,6 +5247,55 @@ def cmd_adv_record(args):
             if deferred else "")
     _announce_repeats(ctx, st)
     ok(f"Gate 3 (adversarial) APPROVED by all {need} reviewer(s) for {args.cp}.{note} Next: ratchet.py complete {args.cp}")
+
+
+def _adv_round_dir(ctx, cp_id: str, round_no: int) -> Path:
+    return ctx.evidence(cp_id) / "adversarial" / f"round-{round_no:02d}"
+
+
+def _read_findings_file(p: Path) -> list:
+    """Reads an evidence findings file (a JSON list) through `_read_record`, the one reader: a damaged one is
+    treated as empty, never a crash, like every other Ratchet record."""
+    data, why = _read_record(p, kind=list, missing=[])
+    if why is not None:
+        _note_unreadable(p, why, "Ratchet treats a damaged findings file as empty")
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _adv_open_findings(ctx, cp_id: str, rnd, cps=None) -> list:
+    """The findings still open (blocking) in a checkpoint's recorded adversarial round, or [] when the round never
+    blocked (or never recorded). State, not the evidence file, is the one authoritative record of what was
+    accepted (standards #12): open-findings.json is only a mirror. `adv-record` writes it once, when it records a
+    round (never rewriting an EARLIER round's own file), and `accept-finding` rewrites its own round's file as its
+    own last write; a process killed between the state commit and that last write can leave this one round's file
+    stale (still listing an id state already marked accepted), possibly for good if that was the final
+    acceptance — the gate has already passed, so nothing ever revisits that file again. When `cps` (the
+    checkpoint's own state dict) is given, any finding already
+    recorded accepted in cps['deferred'] for this round is filtered out here regardless of what the stale file
+    still says, so every caller -- ask accept-finding, accept-finding's own checks -- sees the same, correct,
+    state-derived answer. Pass cps whenever it is available; omit it only for callers that merely mirror the
+    file's raw contents."""
+    if not rnd or not rnd.get("recorded"):
+        return []
+    raw = _read_findings_file(_adv_round_dir(ctx, cp_id, rnd["round"]) / "open-findings.json")
+    if cps is None:
+        return raw
+    accepted_keys = {_finding_key(f) for f in _round_deferred(cps, rnd["round"]) if f.get("accepted")}
+    return [f for f in raw if _finding_key(f) not in accepted_keys]
+
+
+def _round_deferred(cps, round_no) -> list:
+    """The step's deferred findings belonging to one round (cps['deferred'] entries are tagged with their round)."""
+    return [f for f in cps.get("deferred") or [] if f.get("round") == round_no]
+
+
+def _learnings_text(ctx) -> str:
+    p = ctx.ratchet / "learnings.md"
+    try:
+        return p.read_text()
+    except OSError:
+        return ""
 
 
 MINOR_SEVERITIES = {"minor", "nit", "nitpick", "trivial", "info", "suggestion", "low", "style"}
@@ -6178,9 +6366,34 @@ def _spec_finish(ctx, st) -> list[str]:
     return notes
 
 
+_SEVERITY_RANK = {"blocker": 0, "major": 1, "minor": 2, "nit": 2, "nitpick": 2, "trivial": 2, "low": 2, "style": 2,
+                   "info": 3, "suggestion": 3}
+
+
+def _accepted_findings_lines(st) -> list[str]:
+    """Findings the user accepted with `ratchet.py ask accept-finding` / `accept-finding`, blockers and majors
+    first, for `status`, `plan-summary` and `deferred` (the final review's own command) to show in their own
+    section: they were reviewed and agreed to on purpose, with a reason and who accepted them, so they must never
+    read as a finding that simply 'did not block'."""
+    rows = [(cp, f) for cp, c in (st.get("checkpoints") or {}).items() for f in c.get("deferred") or []
+            if f.get("accepted")]
+    if not rows:
+        return []
+    rows.sort(key=lambda cf: _SEVERITY_RANK.get(str(cf[1].get("severity", "")).strip().lower(), 4))
+    lines = ["Findings accepted by you (blockers and majors first; they no longer block):"]
+    for cp, f in rows:
+        desc = str(f.get("description", "")).strip()[:200]
+        who = f.get("accepted_by") or "human"
+        lines.append(f"  {cp} {_finding_key(f)} ({f.get('severity', '?')}): {desc}  -  reason: {f.get('reason', '')}"
+                     f"  -  accepted by: {who}")
+    return lines
+
+
 def cmd_deferred(args):
     """Findings that were recorded instead of blocking (minor ones, and any blocker/major/unknown-severity
-    finding with no user_impact), for the user to decide on at the end."""
+    finding with no user_impact), for the user to decide on at the end, PLUS, in their own section first,
+    findings the user accepted while a round was blocked: these were shown to the user and agreed to on purpose,
+    with a reason and who accepted them, so they are never mixed in with ones that simply never blocked."""
     ctx = Ctx(find_root())
     st = ctx.state()
     rows = [(cp, f) for cp, c in (st.get("checkpoints") or {}).items() for f in c.get("deferred") or []]
@@ -6190,11 +6403,19 @@ def cmd_deferred(args):
     if not rows:
         print("No findings were left for later.")
         return
-    print(f"{len(rows)} finding(s) were left for later (they did not block):")
-    for cp, f in rows:
-        where = f" ({f['file']}{':' + str(f['line']) if f.get('line') else ''})" if f.get("file") else ""
-        why = f" [{f['deferred_because']}]" if f.get("deferred_because") else ""
-        print(f"- {cp}{where}: {f.get('description', '').strip()[:240]}{why}")
+    other = [(cp, f) for cp, f in rows if not f.get("accepted")]
+    acc_lines = _accepted_findings_lines(st)
+    if acc_lines:
+        for line in acc_lines:
+            print(line)
+        if other:
+            print("")
+    if other:
+        print(f"{len(other)} finding(s) were left for later (they did not block):")
+        for cp, f in other:
+            where = f" ({f['file']}{':' + str(f['line']) if f.get('line') else ''})" if f.get("file") else ""
+            why = f" [{f['deferred_because']}]" if f.get("deferred_because") else ""
+            print(f"- {cp} {_finding_key(f)}{where}: {f.get('description', '').strip()[:240]}{why}")
 
 
 def cmd_complete(args):
@@ -6220,7 +6441,9 @@ def cmd_complete(args):
         # The fingerprint never reads Ratchet's folder from the working tree, only from HEAD: a difference there alone
         # is a checkpoint commit (its shared .ratchet files) made by an earlier `complete` that failed before it
         # could save, not a change to the reviewed code. The rerun then finds that commit instead of making another.
-        changed = [f for f in changed_files(ctx.root, gfp, fp) if f != RATCHET_DIR and not f.startswith(RATCHET_DIR + "/")]
+        chat_paths = _chat_transcript_paths(ctx, g.get("passed_at"))
+        changed = [f for f in changed_files(ctx.root, gfp, fp) if f != RATCHET_DIR and not f.startswith(RATCHET_DIR + "/")
+                  and f not in chat_paths]
         if not changed:
             continue
         if name == "behavior":
@@ -6329,37 +6552,13 @@ def cmd_human_approve(args):
     allow = st.get("choice_allow") or {}
     if st["phase"] == "blocked" and allow.get("unblock") and not getattr(args, "director_token", None):
         msg = {"by": "human", "prompt": f"picked option {allow['letter']}: {allow.get('reply', '')}"}
-        allow["unblock"] = False
-        if not allow.get("files") and not allow.get("guardrail"):
-            st.pop("choice_allow", None)
     else:
         msg = _require_human(ctx, st, "human-approve", getattr(args, "director_token", None))
     if (st.get("pending") or {}).get("action") == "human-approve":
         st.pop("pending", None)  # answered (or overtaken by the user's pick at a block)
     order = [c["id"] for c in (ctx.plan() or {"checkpoints": []})["checkpoints"]]
     if st["phase"] == "blocked":
-        back = st.pop("blocked_from", None) or "building"
-        if back == "blocked":
-            back = "building"
-        st["phase"] = back
-        st["blocked_reason"] = None
-        cur = st.get("current")
-        cfg = ctx.config()
-        if int(st.get("adv_rounds_total", 0)) >= cfg["max_adversarial_rounds_run"]:
-            st["adv_rounds_total"] = 0  # the user chose to continue: the run-wide budget starts again
-        if back == "building" and not cur:  # nothing current: pick up the next unfinished checkpoint
-            pending = [c for c in order if st["checkpoints"][c]["status"] != "done"]
-            if pending:
-                _advance(st, pending[0], fingerprint(ctx.root)["id"])
-            else:
-                st["phase"] = "awaiting_final_review"
-        elif cur:
-            # a human unblock resets the attempt counters on the current checkpoint's failing gates
-            for g in st["checkpoints"][cur]["gates"].values():
-                if g["status"] != "passed":
-                    g["attempts"] = 0
-            st["checkpoints"][cur]["guardrail_tries"] = 0
-        ctx.log(st, "unblocked", by=msg["by"], note=msg.get("prompt", "")[:200], back_to=st["phase"])
+        _unblock(ctx, st, msg["by"], msg.get("prompt", "")[:200])
     else:
         target = st.get("review_target")
         done_ids = [target] if target else [c for c in order if st["checkpoints"][c]["status"] == "done"]
@@ -6582,10 +6781,13 @@ ASKABLE = {"approve-plan": "start building the plan as it is",
            "claim": "continue this Ratchet run in THIS chat",
            "hooks-waive": "build without the Ratchet hooks (the checks then only advise; nothing enforces them)",
            "ui-respec": "change what the UI check compares for this step (its capture steps or scope), as explained above",
-           "choice": "go with one of the lettered options you listed"}
+           "choice": "go with one of the lettered options you listed",
+           "accept-finding": "accept the open finding(s) named above as a known limit, with your own reason, instead "
+                             "of running another review round"}
 # the command that carries out a "yes" to each question
 PENDING_COMMAND = {"approve-plan": "approve-plan", "human-approve": "human-approve", "approve-changes": "approve-changes", "cancel": "cancel", "set-review": "set-review",
-                   "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec", "choice": "choice"}
+                   "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec", "choice": "choice",
+                   "accept-finding": "accept-finding"}
 REVIEW_MODE_WORDS = {"end": "only at the end", "each": "after every step", "none": "never (fully autonomous)"}
 
 
@@ -6609,11 +6811,17 @@ def cmd_ask(args):
         die("ask set-review needs the mode: end | each | none")
     if args.action == "ui-respec" and not (args.mode and args.mode in (st.get("checkpoints") or {})):
         die("ask ui-respec needs the checkpoint id, e.g. `ratchet.py ask ui-respec CP2`")
-    if args.action not in ("set-review", "ui-respec") and args.mode:
+    if args.action == "accept-finding" and not (args.mode and args.mode in (st.get("checkpoints") or {})):
+        die("ask accept-finding needs the checkpoint id, e.g. `ratchet.py ask accept-finding CP2 F1,F2`")
+    if args.action == "accept-finding" and not getattr(args, "ids", None):
+        die("ask accept-finding needs the finding ids to accept, e.g. `ratchet.py ask accept-finding CP2 F1,F2`")
+    if args.action not in ("set-review", "ui-respec", "accept-finding") and args.mode:
         die(f"ask {args.action} takes no extra value")
     _bind_owner(ctx, st, args.action, asker)
     if args.action == "choice":
         return _ask_choice(ctx, st, args)
+    if args.action == "accept-finding":
+        return _ask_accept_finding(ctx, st, args)
     detail = ""
     if args.action == "approve-changes":
         probs = integrity_problems(ctx, st)
@@ -6818,6 +7026,128 @@ def _ask_choice(ctx, st, args):
                      "one (it may add a lint or architecture-test tool to the project). Say so in the option.")
     lines.append(f"After they reply, run `ratchet.py choice`. It records which option they picked.")
     print("\n".join(lines))
+
+
+ACCEPT_FINDING_RE = re.compile(r"^accept:\s*(.+)$", re.I | re.S)
+
+
+def _accept_reply_reason(text: str) -> str | None:
+    """The reason in a reply of the exact form `accept: <reason>`, or None when the reply is not that form (or
+    gives no reason)."""
+    m = ACCEPT_FINDING_RE.match((text or "").strip())
+    if not m:
+        return None
+    reason = m.group(1).strip()
+    return reason or None
+
+
+def _finding_key(f) -> str:
+    """The identity shown and recorded for a finding: 'reviewer/id' (e.g. 'codex-correctness/A1') when it carries a
+    reviewer (every finding cmd_adv_record records does, tagged there), else the bare id. A finding's own `id` field
+    is only unique per reviewer, not per round: two independent reviewers routinely pick the same id (their shared
+    prompt gives every one of them the identical example "id":"A1"), so the bare id alone is never enough on its own
+    to say WHICH finding is meant."""
+    fid = f.get("id") or "?"
+    rev = f.get("reviewer")
+    return f"{rev}/{fid}" if rev else fid
+
+
+def _resolve_finding_ref(ref: str, findings: list):
+    """The finding `ref` (a bare id, or 'reviewer/id') names among `findings`. Returns (finding, error): `finding`
+    is the single match, or None when `ref` names none of them. `error` is set instead, only for a bare id that
+    matches more than one reviewer's finding here (normal in any round with more than one reviewer: nothing stops
+    two of them picking the same id) — it names the colliding reviewers so the agent can ask again precisely, as
+    'reviewer/id'. A qualified ref ('reviewer/id') is never ambiguous: it is matched exactly or not at all."""
+    if "/" in ref:
+        rev, _, fid = ref.partition("/")
+        for f in findings:
+            if f.get("id") == fid and str(f.get("reviewer") or "") == rev:
+                return f, None
+        return None, None
+    matches = [f for f in findings if f.get("id") == ref]
+    reviewers = sorted({str(f.get("reviewer")) for f in matches})
+    if len(reviewers) > 1:
+        return None, (f"\"{ref}\" is ambiguous: {', '.join(reviewers)} each reported a finding with id \"{ref}\" "
+                      f"here. Say which one, e.g. `{reviewers[0]}/{ref}`.")
+    return (matches[0] if matches else None), None
+
+
+def _why_not_open(f) -> str:
+    """The real reason a non-open (deferred) finding doesn't block, for a refusal message (standards #11: name the
+    actual reason, not a guess): its own `deferred_because` when cmd_adv_record recorded one (covered by an
+    automatic check, or no user_impact stated), else 'deferred as minor' only when its severity really is minor."""
+    why = str(f.get("deferred_because") or "").strip()
+    if why:
+        return why
+    if str(f.get("severity", "")).strip().lower() in MINOR_SEVERITIES:
+        return "deferred as minor, not blocking"
+    return "deferred, not blocking"
+
+
+def _ask_accept_finding(ctx, st, args):
+    """`ask accept-finding CPn F1,F2` (or 'reviewer/F1' when a bare id is ambiguous): only when that checkpoint's
+    latest adversarial round blocked, and only for ids that are still open (blocking) findings of that round. An id
+    that never existed, or that was only ever a deferred/minor finding, is refused here; an id already accepted is
+    left to `accept-finding` itself to refuse (so this can be asked again without first re-deriving which ids are
+    already done). A bare id matching more than one reviewer's finding here is refused too, naming the colliding
+    reviewers: say which one as 'reviewer/id'."""
+    cp = args.mode
+    ids = list(dict.fromkeys(i.strip() for i in (args.ids or "").split(",") if i.strip()))  # de-dupe repeated ids
+    if not ids:
+        die("ask accept-finding needs the finding ids to accept, e.g. `ratchet.py ask accept-finding CP2 F1,F2`")
+    cps = (st.get("checkpoints") or {}).get(cp)
+    if cps is None:
+        die(f"No such checkpoint {cp}.")
+    rnd = cps.get("adv_round")
+    if rnd and _code_changed_since_round(ctx, rnd):
+        die(f"{cp}: the code changed since this review round; run a new review round first. Nothing was asked.")
+    open_findings = _adv_open_findings(ctx, cp, rnd, cps)  # state-filtered: a stale file can't un-accept an id
+    if not open_findings:
+        die(f"There are no open findings to accept for {cp} - the review already passed (or no round has blocked "
+            "there yet). Nothing was asked.")
+    deferred = _round_deferred(cps, rnd["round"])
+    open_now = ', '.join(sorted(_finding_key(f) for f in open_findings)) or '(none)'
+    resolved = []  # [(canonical key, finding shown in the question)], in ids' own order
+    for ref in ids:
+        f, err = _resolve_finding_ref(ref, open_findings)
+        if err:
+            die(f"{err} Nothing was asked.")
+        if f is not None:
+            resolved.append((_finding_key(f), f))
+            continue
+        d, derr = _resolve_finding_ref(ref, deferred)
+        if derr:
+            die(f"{derr} Nothing was asked.")
+        if d is not None and d.get("accepted"):
+            resolved.append((_finding_key(d), d))  # already accepted earlier: `accept-finding` refuses this clearly
+            continue
+        if d is not None:
+            die(f"{ref} is not an open finding of this round for {cp}; it was already {_why_not_open(d)} "
+                f"(open now: {open_now}). Nothing was asked.")
+        die(f"{ref} is unknown: not an open finding of this round for {cp} (open now: {open_now}). Nothing was "
+            "asked.")
+    by_key = {}
+    for key, f in resolved:
+        by_key.setdefault(key, f)
+    canon_ids = list(by_key)
+    overtook = _overtake(ctx, st, "accept-finding", cp)
+    asked = now()
+    st["pending"] = {"action": "accept-finding", "mode": cp, "ids": canon_ids, "round": rnd["round"],
+                     "fingerprint": rnd["fingerprint"], "asked_at": asked, "prev_awaiting": st.get("awaiting_since"),
+                     "session": _asking_session(ctx, st, "accept-finding"), **overtook}
+    st["awaiting_since"] = asked
+    ctx.log(st, "question_asked", action="accept-finding", cp=cp, ids=canon_ids)
+    ctx.save_state(st)
+    if overtook:
+        print(_not_asked_text(f"`ratchet.py ask accept-finding {cp} {','.join(canon_ids)}`", overtook))
+        return
+    named = "; ".join(f"{key} ({by_key[key].get('severity', '?')}): "
+                      f"{str(by_key[key].get('description', '')).strip()[:160]}" for key in canon_ids)
+    print(f"ASK THE USER: {cp}'s review is blocked on: {named}. Shall I accept {', '.join(canon_ids)} as a known "
+          "limit, with their reason, instead of running another review round? To accept them, their reply must be "
+          "exactly: accept: <their reason>. Only their first reply counts, and only that exact form (starting with "
+          "\"accept: \") accepts them; any other reply accepts nothing.")
+    print(ASK_ALONE)
 
 
 def cmd_choice(args):
@@ -7035,6 +7365,277 @@ def cmd_hooks_waive(args):
        "Recorded: the user chose to build without hooks. The checks are advice only; missing hooks never block work.")
 
 
+def _adv_round_block_reason_for(cp, reason) -> bool:
+    """True when `reason` is the kind of block that accepting `cp`'s open findings resolves: either `cp`'s own
+    adversarial round limit (`cmd_adv_record`'s 'still has N finding(s) after R rounds', or `cmd_reviewers`'s 'R
+    adversarial rounds used without approval'), or the run-wide round cap (`cmd_reviewers`), which also blocks
+    before a new round opens while `cp`'s last recorded round still has open findings of its own. Any other
+    block (behavior, UI, a different checkpoint's reason) is left alone: accepting a finding here does not fix
+    it, so the run should stay exactly as blocked as it was."""
+    r = reason or ""
+    if r.startswith(f"{cp}:") and "adversarial" in r and "rounds" in r:
+        return True
+    return r.startswith("Run-wide adversarial round cap reached")
+
+
+def _code_changed_since_round(ctx, rnd) -> bool:
+    """True when the code has changed since this adversarial round's own fingerprint was captured, excluding
+    `.ratchet/` and any chat transcript recorded since the round opened (the same exclusions `complete` applies
+    to its own gates): `ask accept-finding` and `accept-finding` must refuse once this is true, rather than act
+    on a round that no longer matches the code (the round's own `fingerprint`/`round` identity check only catches
+    a NEW round having opened since the question was asked; it says nothing about code edited while the stale
+    round just sits there, still the current one, still blocked)."""
+    fp = fingerprint(ctx.root)
+    if fp["id"] == rnd["fingerprint"]:
+        return False
+    chat_paths = _chat_transcript_paths(ctx, rnd.get("opened_at"))
+    changed = [f for f in changed_files(ctx.root, {"kind": fp.get("kind", "git-tree"), "id": rnd["fingerprint"]}, fp)
+               if f != RATCHET_DIR and not f.startswith(RATCHET_DIR + "/") and f not in chat_paths]
+    return bool(changed)
+
+
+def _unblock(ctx, st, by, note) -> str:
+    """Resolves a `blocked` run back to the phase it was blocked from (building, or the review phase it reaches
+    when nothing is left to build), exactly as `human-approve`'s own unblock does: resets the run-wide
+    adversarial round budget when that cap was the cause ("the user chose to continue: the run's budget starts
+    again"), resets the current checkpoint's own failing-gate attempt counters, picks up the next unfinished
+    checkpoint when none is current, and consumes any stored `choice_allow['unblock']` so a stale pick from an
+    earlier block can never unblock a LATER one without a fresh question. The one place both `human-approve` and
+    `accept-finding` resolve a block, so a fix to how unblocking works is made once, not twice. Returns the phase
+    the run is in afterward."""
+    allow = st.get("choice_allow") or {}
+    if allow.get("unblock"):
+        allow["unblock"] = False
+        if not allow.get("files") and not allow.get("guardrail"):
+            st.pop("choice_allow", None)
+    order = [c["id"] for c in (ctx.plan() or {"checkpoints": []})["checkpoints"]]
+    back = st.pop("blocked_from", None) or "building"
+    if back == "blocked":
+        back = "building"
+    st["phase"] = back
+    st["blocked_reason"] = None
+    cur = st.get("current")
+    cfg = ctx.config()
+    if int(st.get("adv_rounds_total", 0)) >= cfg["max_adversarial_rounds_run"]:
+        st["adv_rounds_total"] = 0  # the user chose to continue: the run's budget starts again
+    if back == "building" and not cur:  # nothing current: pick up the next unfinished checkpoint
+        pending = [c for c in order if st["checkpoints"][c]["status"] != "done"]
+        if pending:
+            _advance(st, pending[0], fingerprint(ctx.root)["id"])
+        else:
+            st["phase"] = "awaiting_final_review"
+    elif cur:
+        # resets the attempt counters on the current checkpoint's failing gates
+        for g in st["checkpoints"][cur]["gates"].values():
+            if g["status"] != "passed":
+                g["attempts"] = 0
+        st["checkpoints"][cur]["guardrail_tries"] = 0
+    ctx.log(st, "unblocked", by=by, note=note, back_to=st["phase"])
+    return st["phase"]
+
+
+def cmd_accept_finding(args):
+    """Record the open findings the user accepted: only their FIRST reply after `ask accept-finding`, from the
+    owning chat, in the exact form `accept: <reason>`, accepts them (reuses the same consent machinery and rules
+    as every other approval: _require_pending, _replies, the transcript check). In a director-enrolled lane a chat
+    reply never counts (same rule as every other approval here): a director token signed for this action is
+    required instead, with --reason carrying the director's own reason since there is no chat reply to read one
+    from. When every open finding of that round is then accepted, the adversarial gate passes for that round's
+    fingerprint without another round; a later code change (a new fingerprint) brings back the normal review
+    rules."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    _require_pending(st, "accept-finding", args.cp)
+    p = st["pending"]
+    cp = p["mode"]
+    ids = p.get("ids") or []
+    if p.get("overtook"):
+        _clear_pending(st)
+        ctx.log(st, "accept_finding_unclear", cp=cp, ids=ids)
+        ctx.save_state(st)
+        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'))}"
+            "?) was still waiting for the user's first reply, so their reply could be meant for either. Nothing was "
+            f"accepted. Run `ratchet.py ask accept-finding {cp} {','.join(ids)}` again on its own.")
+    token = getattr(args, "director_token", None)
+    if token or approval_mode(ctx) == "director":
+        # --reason is checked BEFORE the token is verified or anything is cleared (standards #11): a token is not
+        # a one-time secret by itself here (unlike a chat reply), but _require_approval's own verification is
+        # bound to st['awaiting_since'], which _clear_pending resets once the question is answered, so clearing
+        # pending over a merely-forgotten --reason would make the director's own still-valid token stale, costing
+        # a second signature for one missing flag. Dying here first, with the question still pending and nothing
+        # saved, means the SAME command with --reason added simply works.
+        reason = (getattr(args, "reason", None) or "").strip()
+        if not reason:
+            die(f"accept-finding needs --reason \"...\" when a director token approves it (there is no chat reply "
+                f"to read a reason from). Nothing was accepted, and the question is still waiting: run the same "
+                f"command again with --reason \"...\" added.")
+        # Reuses _require_approval's own director check and token verification (standards #2/#19: don't re-implement
+        # the same gate): dies here, exactly as every other approval does, when this lane is director-enrolled and
+        # no (or a bad) director token was given; a chat "accept: ..." reply is never enough in that lane.
+        appr = _require_approval(ctx, st, "accept-finding", token)
+        by = appr["by"]
+    else:
+        msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the question was asked in can answer it
+        if not msgs:
+            die("No reply has been recorded in the owning chat since this question was asked. End your turn and wait "
+                "for the user's reply, exactly `accept: <reason>`; a reply typed in another chat does not count.")
+        entry = msgs[0]  # the first reply answers the question; later messages never do
+        reply = entry.get("prompt", "")
+        reason = _accept_reply_reason(reply)
+        if reason is None:
+            _spend_question(ctx, st, reply)
+            die(f"The user's first reply after the question was not the exact form `accept: <reason>`: \"{reply[:120]}\". "
+                "Nothing was accepted, and the question is closed, so a later reply in that form does not count. Run "
+                f"`ratchet.py ask accept-finding {cp} {','.join(ids)}` again if they still want to accept them.")
+        if ctx.config().get("verify_transcripts", True):
+            good, why = _transcript_ok(entry, p.get("asked_at"))
+            if not good:
+                _spend_question(ctx, st, reply)
+                die(f"Couldn't confirm that reply came from the user ({why}). Nothing was accepted. Run `ratchet.py ask "
+                    f"accept-finding {cp} {','.join(ids)}` again and ask them to reply in this chat.")
+        by = "human"
+    cps = (st.get("checkpoints") or {}).get(cp)
+    if cps is None:
+        _clear_pending(st)
+        ctx.save_state(st)
+        die(f"No such checkpoint {cp} any more. Nothing was accepted.")
+    rnd = cps.get("adv_round")
+    if not rnd or rnd.get("round") != p.get("round") or rnd.get("fingerprint") != p.get("fingerprint"):
+        # the round itself moved on (a new one was opened, e.g. after a real code change): `reviewers` already
+        # re-checks the fingerprint when that happens, so this is never fooled by anything that only touches the
+        # chat transcript (a reply does not change the code, so it never opens a new round on its own)
+        _clear_pending(st)
+        ctx.save_state(st)
+        die(f"The review round for {cp} has moved on since this question was asked (a new round opened, most "
+            "likely because the code changed). Nothing was accepted. Run "
+            f"`ratchet.py ask accept-finding {cp} ...` again against the current round.")
+    if _code_changed_since_round(ctx, rnd):
+        _clear_pending(st)
+        ctx.save_state(st)
+        die(f"{cp}: the code changed since this review round; run a new review round first. Nothing was accepted.")
+    g = cps["gates"]["adversarial"]
+    # State-filtered (not the raw file): a crash between the state commit and the evidence-file writes of an
+    # earlier accept-finding call can leave open-findings.json stale, still listing an id state already marked
+    # accepted. Checking the state-derived list (and deferred_by_key) rather than the raw file means a retry of
+    # that same id is always caught as already-accepted here, never re-recorded as a second acceptance.
+    open_findings = _adv_open_findings(ctx, cp, rnd, cps)
+    open_by_key = {_finding_key(f): f for f in open_findings}
+    deferred_by_key = {_finding_key(f): f for f in _round_deferred(cps, rnd["round"])}
+    already = [i for i in ids if (deferred_by_key.get(i) or {}).get("accepted")]
+    if already:
+        _clear_pending(st)
+        ctx.save_state(st)
+        die(f"{', '.join(already)} already closed/accepted earlier for {cp}; nothing new to do. Nothing was changed.")
+    missing = [i for i in ids if i not in open_by_key]
+    if missing:
+        _clear_pending(st)
+        ctx.save_state(st)
+        die(f"{', '.join(missing)} is not an open finding of {cp}'s current round. Nothing was accepted.")
+    at = now()
+    accepted_entries = [dict(open_by_key[i], accepted=True, reason=reason, accepted_at=at, accepted_by=by,
+                            round=rnd["round"]) for i in ids]
+    remaining_open = [f for f in open_findings if _finding_key(f) not in ids]
+    dest = _adv_round_dir(ctx, cp, rnd["round"])
+
+    # Simplified write order (no "heal from state" machinery): everything below the state commit (c) is written
+    # BEFORE it, so a crash before (c) leaves AT MOST a harmless extra learnings.md note or an un-committed
+    # deferred-findings.json write -- the accept itself never happened (state still shows every id open), so a
+    # plain retry (the question is still pending) starts clean and finishes once. A crash can never leave a
+    # COMMITTED accept without its own notes, because both are written first.
+    # (a) .ratchet/learnings.md: one line per accepted entry, keyed by a marker unique to this run, checkpoint,
+    # round AND reviewer/id (never just reviewer/id, which repeats across rounds and checkpoints) so a retry
+    # after an earlier crash that already wrote the line never duplicates it, and two DIFFERENT findings that
+    # happen to share a reviewer/id (a later round, or a later checkpoint) both get their own line.
+    learnings = _learnings_text(ctx)
+    for i in ids:
+        f = open_by_key[i]
+        marker = f"Accepted finding {st['slug']}/{cp}/round-{rnd['round']}/{_finding_key(f)} ("
+        if marker in learnings:
+            continue
+        # One learnings.md bullet is one line: a multi-line description or reason (the reason especially, since
+        # ACCEPT_FINDING_RE accepts one spanning several lines) is collapsed to a single line here, in the
+        # learnings text only; the reason kept verbatim everywhere else (accepted_entries, round_rec, state) is
+        # untouched.
+        desc_line = " ".join(str(f.get("description", "")).split())[:200]
+        reason_line = " ".join(reason.split())
+        _append_learning(ctx, f"{marker}{cp}, {f.get('severity', '?')}): "
+                               f"{desc_line}. Reason: {reason_line}",
+                          f"{by}, accept-finding")
+        learnings += marker  # a second id accepted in this same call never duplicates its own line either
+    # (b) the round's own deferred-findings.json, written WHOLE for this round (never appended) from the list
+    # state is about to commit.
+    new_deferred = (cps.get("deferred") or []) + accepted_entries
+    round_deferred = [f for f in new_deferred if f.get("round") == rnd["round"]]
+    dest.mkdir(parents=True, exist_ok=True)
+    write_json(dest / "deferred-findings.json", round_deferred)
+    cps["deferred"] = new_deferred
+    rounds = g.get("rounds") or []
+    # Found by the round number stamped on the entry, not by list position: a round `reviewers` opens and then
+    # replaces before recording (the fingerprint changed) advances rnd['round'] without adding an entry, so
+    # position alone can name the wrong entry, or none. A round recorded before that stamp existed falls back to
+    # position for that one entry only.
+    round_rec = next((rr for rr in rounds if rr.get("round") == rnd["round"]), None)
+    if round_rec is None and rounds and 0 < rnd["round"] <= len(rounds):
+        round_rec = rounds[rnd["round"] - 1]
+    if round_rec is not None:
+        round_rec.setdefault("accepted", []).extend(
+            [{"id": i, "reason": reason, "at": at, "by": by} for i in ids])
+    ctx.log(st, "finding_accepted", cp=cp, ids=ids, reason=reason[:200], by=by)
+    unblocked_to = None
+    if not remaining_open:
+        g["status"] = "passed"
+        # stamped with the round's OWN fingerprint (what was actually reviewed), not a fresh one: a reply itself
+        # changes nothing in the code, but recomputing now would still pick up whatever it touched meanwhile
+        # (e.g. the chat transcript, if the agent CLI keeps it inside the project).
+        g["fingerprint"] = {"kind": fingerprint(ctx.root).get("kind", "git-tree"), "id": rnd["fingerprint"]}
+        # the round's OWN opened_at, not now(): that is when this fingerprint was actually captured, so `complete`
+        # correctly looks for chat replies (never the code) from then on, the ask/reply this acceptance needed
+        # included, when it decides whether anything that matters has changed since.
+        g["passed_at"] = rnd.get("opened_at") or at
+        cps["step"] = _earliest_open_step(cps)
+        # The user's accept IS their decision on the block when the run is stuck here only because of this
+        # checkpoint's own adversarial round limit OR the run-wide round cap (never a lettered option: the only
+        # way here is the plain accept_note line `next`/`status` print, pointing at `ask accept-finding` plus the
+        # user's own `accept: <reason>` reply): the gate just passed, so there is nothing left to be stuck on.
+        # Leaving phase at "blocked" would make `complete` refuse ("Not building") and `status`/`next` keep
+        # showing a block whose cause, the open findings, is already resolved. Any OTHER block reason (behavior,
+        # UI, a different checkpoint) is left exactly as it was: accepting a finding here does not resolve it.
+        # `_unblock` is the same helper `human-approve` uses to resolve a block: it resets the run-wide round
+        # budget when that cap was the cause, resets this checkpoint's own gate attempt counters, and consumes
+        # any stored choice_allow so a later, unrelated block can't be unblocked by this same stale pick.
+        if st.get("phase") == "blocked" and st.get("current") == cp \
+                and _adv_round_block_reason_for(cp, st.get("blocked_reason")):
+            unblocked_to = _unblock(ctx, st, by, "accept-finding resolved the round limit")
+    _clear_pending(st)
+    # (c) commit state: the one atomic, authoritative write (standards #12) that says these findings are accepted.
+    ctx.save_state(st)
+
+    build_viewer(ctx)
+    # (d) open-findings.json last: the file that says these findings still block, now rewritten to drop them.
+    # Readers never need this file alone to know what is open: `_adv_open_findings` always computes it as the
+    # file's own contents minus whatever state already records accepted for that round, so a stale copy left by a
+    # crash between (c) and (d) is never mistaken for a reopened finding.
+    write_json(dest / "open-findings.json", remaining_open)
+
+    msg = f"Accepted {', '.join(ids)} for {cp} with reason: {reason}."
+    if remaining_open:
+        left = sorted(_finding_key(f) for f in remaining_open)
+        msg += f" Still open: {', '.join(left)} - {cp} remains blocked until those are resolved or accepted too."
+    else:
+        msg += f" No open findings remain for {cp}: the adversarial gate is now passed without another round."
+        if unblocked_to:
+            msg += " The run is no longer blocked."
+        if st.get("phase") == "building" and st.get("current") == cp and cps.get("step") == "complete":
+            msg += f" Next: ratchet.py complete {cp}"
+        elif st.get("phase") == "blocked":
+            msg += (f" {cp}'s review now passes, but the run is still blocked "
+                    f"({plain_reason(st.get('blocked_reason')) or st.get('blocked_reason')}); resolve that first "
+                    "(see `ratchet.py next`).")
+        else:
+            msg += " Run `ratchet.py next` to see what happens now."
+    ok(msg)
+
+
 def cmd_next(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -7218,6 +7819,7 @@ def status_json(ctx: Ctx) -> dict:
             "current": st.get("current"), "step": na.get("step"), "next": na["action"], "stop_ok": na["stop_ok"],
             "waiting_on": waiting_on, "blocked_reason": st.get("blocked_reason"),
             "blocked_reason_plain": plain_reason(st.get("blocked_reason")),
+            "accept_note": na.get("accept_note"),
             "awaiting_since": st.get("awaiting_since"), "approval_mode": approval_mode(ctx),
             "wait": live_wait(st),
             "adv_rounds_used": st.get("adv_rounds_total", 0),
@@ -7351,7 +7953,10 @@ def viewer_data(ctx: Ctx):
             "prototype": (ctx.run_dir() / "reference" / "prototype.html").exists(),
             "history": st.get("history", [])[-40:], "plan": plan, "tests": tests,
             "learnings": learn.read_text() if learn.exists() else "",
-            "next": dict(next_action(ctx, st), label=plain_now(ctx, st, plan)), "hooks": hooks_view(ctx, st), "generated_at": now()}
+            # compute_accept_note=False: the viewer never shows accept_note from this "next" object (only `label`
+            # and `action`), so it must not pay _blocked_accept_note's working-tree fingerprint on every rebuild.
+            "next": dict(next_action(ctx, st, compute_accept_note=False), label=plain_now(ctx, st, plan)),
+            "hooks": hooks_view(ctx, st), "generated_at": now()}
 
 
 def build_viewer(ctx: Ctx) -> Path:
@@ -9191,7 +9796,7 @@ def hooks_warning(ctx, hs=None) -> str | None:
 STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "red", "implemented", "behavior",
                      "ui-record", "adv-record", "complete", "human-approve", "feedback", "plan-extend", "pause",
                      "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
-                     "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait")
+                     "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait", "accept-finding")
 LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers")  # tests, checks, a regression suite, provider probes
 # The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
 OVERRIDE_CMDS = ("approve-plan", "human-approve", "approve-changes", "cancel", "set-review", "resume", "hooks-waive",
@@ -9434,9 +10039,10 @@ def main(argv=None):
     a.add_argument("--claim", action="store_true"); a.set_defaults(fn=cmd_resume)
     a = sp.add_parser("ask", help="record and print the question you're about to ask the user (needed before approve-plan, "
                                   "human-approve, cancel, set-review, approve-changes, hooks-waive, resume --claim, "
-                                  "ui-respec)")
+                                  "ui-respec, accept-finding)")
     a.add_argument("action", choices=list(ASKABLE) + ["withdraw"])
-    a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec: the checkpoint id")
+    a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec/accept-finding: the checkpoint id")
+    a.add_argument("ids", nargs="?", help="accept-finding: the finding ids to accept, comma-separated (e.g. F1,F2)")
     a.add_argument("--options", help="choice: the option letters, e.g. A,B,C")
     a.add_argument("--guardrail", action="append", metavar="LETTER=KIND",
                    help="choice: picking LETTER adds a guardrail step (an automatic check) for this kind of finding")
@@ -9444,6 +10050,11 @@ def main(argv=None):
                    help="choice: picking LETTER approves changing these locked files (repeatable)")
     a.set_defaults(fn=cmd_ask)
     sp.add_parser("accept-state", help=argparse.SUPPRESS).set_defaults(fn=cmd_accept_state)
+    a = sp.add_parser("accept-finding", help="record the open findings the user accepted (after `ask accept-finding` "
+                                             "and their 'accept: <reason>' reply, or a director token)")
+    a.add_argument("cp"); a.add_argument("--director-token")
+    a.add_argument("--reason", help="director mode only: the director's reason (there is no chat reply to read one from)")
+    a.set_defaults(fn=cmd_accept_finding)
     a = sp.add_parser("hooks-waive", help="record the user's choice to build without hooks (after `ask hooks-waive`)")
     a.add_argument("--director-token")
     a.set_defaults(fn=cmd_hooks_waive)
@@ -9519,7 +10130,8 @@ def main(argv=None):
     sp.add_parser("director-enroll").set_defaults(fn=cmd_director_enroll)
     a = sp.add_parser("director-sign"); a.add_argument("action", choices=["approve-plan", "human-approve", "feedback",
                                                                           "approve-changes", "cancel", "set-review",
-                                                                          "hooks-waive", "ui-respec", "guardrail"])
+                                                                          "hooks-waive", "ui-respec", "guardrail",
+                                                                          "accept-finding"])
     a.add_argument("--kind", help="guardrail: the kind of finding it covers")
     a.set_defaults(fn=cmd_director_sign)
     sp.add_parser("fingerprint").set_defaults(fn=cmd_fingerprint)

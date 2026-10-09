@@ -365,29 +365,39 @@ def t09_checkpoint_command_leaves_nothing():
 
 def t10_no_existing_check_touched():
     print("CP1-T10: no existing check() assertion was weakened, skipped or removed")
+    # Pinned to CP1's own commit range: this proves only that CP1's own change (a24a31d..END_COMMIT)
+    # left existing check() lines alone. It must not keep diffing against the live working tree,
+    # which would forbid every later checkpoint from ever adding a check() to an older suite.
+    END_COMMIT = "f624da15927cd62059a7710ca0b989c934befe82"
     ls = subprocess.run(["git", "ls-tree", "-r", "--name-only", BASE_COMMIT, "--", "tests"],
                          cwd=str(ROOT), capture_output=True, text=True)
-    setup_ok = ls.returncode == 0
+    end_ls = subprocess.run(["git", "ls-tree", "-r", "--name-only", END_COMMIT, "--", "tests"],
+                             cwd=str(ROOT), capture_output=True, text=True)
+    setup_ok = ls.returncode == 0 and end_ls.returncode == 0
     existing = [ln for ln in ls.stdout.splitlines() if re.match(r"tests/test_.*\.py$", ln)]
     check("[CP1-T10] setup: the pinned base commit and its tests/test_*.py files are readable via git",
           setup_ok and existing, (ls.returncode, ls.stderr[-300:]))
 
     # A check() line that disappears from its original file is not "removed" if it moved, verbatim, into
-    # some other current tests/*.py file (e.g. a later checkpoint splitting a monolithic suite into parts).
-    # Only a line that is gone everywhere, or whose text changed, counts as touched.
+    # some other tests/*.py file as it stood at the end of CP1's own commit (e.g. a later checkpoint
+    # splitting a monolithic suite into parts). Only a line that is gone everywhere, or whose text
+    # changed, counts as touched. Both sides of this are read from git, not the live filesystem, so
+    # the check depends only on CP1's own commit, never on what later checkpoints did afterward.
+    end_files = [ln for ln in end_ls.stdout.splitlines() if re.match(r"tests/.*\.py$", ln)]
     current_check_lines = set()
-    for cf in sorted(ROOT.glob("tests/*.py")):
-        try:
-            for line in cf.read_text(encoding="utf-8").splitlines():
-                s = line.strip()
-                if "check(" in s:
-                    current_check_lines.add(s)
-        except OSError:
-            pass
+    for cf in end_files:
+        show = subprocess.run(["git", "show", f"{END_COMMIT}:{cf}"], cwd=str(ROOT),
+                               capture_output=True, text=True)
+        if show.returncode != 0:
+            continue
+        for line in show.stdout.splitlines():
+            s = line.strip()
+            if "check(" in s:
+                current_check_lines.add(s)
 
     bad = []
     for f in existing:
-        d = subprocess.run(["git", "diff", BASE_COMMIT, "--", f], cwd=str(ROOT),
+        d = subprocess.run(["git", "diff", BASE_COMMIT, END_COMMIT, "--", f], cwd=str(ROOT),
                             capture_output=True, text=True)
         for line in d.stdout.splitlines():
             if line.startswith("+++") or line.startswith("---"):

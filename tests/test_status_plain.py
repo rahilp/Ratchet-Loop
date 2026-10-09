@@ -581,6 +581,46 @@ def main():
         r = subprocess.run([sys.executable, str(ROOT / "tests" / t)], capture_output=True, text=True, timeout=590)
         check(f"[CP3-T21] {t} exits 0", r.returncode == 0, r.stdout[-300:] + r.stderr[-200:])
 
+    # ------------------------------------------------------------ T24 (adv-round-06 fix: the per-checkpoint
+    # round-limit branch must still offer a "change the step" option, alongside raise/stop, not just those two)
+    print("[CP3-T24] per-checkpoint round limit still offers raise, change-the-step, and stop")
+    d, reason = variants["adv"]
+    out = status_text(d).stdout
+    opts = opts_in(out)
+    texts_low = " ".join(t for _, t in opts).lower()
+    check("[CP3-T24] per-checkpoint limit offers exactly 3 options", len(opts) == 3, out)
+    check("[CP3-T24] one of them raises the review limit", "raise the review limit" in texts_low, out)
+    check("[CP3-T24] one of them changes the step so the review notes no longer apply",
+          "change the step" in texts_low, out)
+    check("[CP3-T24] one of them stops and keeps what is finished", "stop" in texts_low, out)
+    cap_d, cap_reason = variants["cap"]
+    cap_opts = opts_in(status_text(cap_d).stdout)
+    check("[CP3-T24] the run-wide cap branch stays distinct (2 options, no change-the-step)",
+          len(cap_opts) == 2 and "change the step" not in " ".join(t for _, t in cap_opts).lower(), cap_opts)
+
+    # ------------------------------------------------------------ T25 (adv-round-06 fix): _blocked_accept_note
+    # must never claim "the last fix changed the code, these findings need a fresh look" when the blocked round's
+    # own record has nothing open to begin with -- only the stale-file shortcut used to say that regardless.
+    print("[CP3-T25] no stale 'fresh look'/accept line when the recorded round has nothing open")
+    d25 = clone(base)
+    old_fp = json.loads(rx(d25, "fingerprint").stdout)["id"]
+    (Path(d25) / "src/a.js").write_text("export const a = 2; // changed after CP3's round was recorded\n")
+
+    def _inject_approved_round_no_findings(st):
+        finish(st, 2)
+        st["checkpoints"]["CP3"]["adv_round"] = {
+            "round": 1, "recorded": "2026-01-01T00:00:00+00:00", "opened_at": "2026-01-01T00:00:00+00:00",
+            "fingerprint": old_fp, "nonce": "n1", "reviewers": ["host-both"]}
+        blocked("Run-wide adversarial round cap reached (30/30) - needs a human decision.")(st)
+
+    mutate(d25, _inject_approved_round_no_findings)
+    nj = json.loads(rx(d25, "next").stdout)
+    check("[CP3-T25] next prints no accept_note: the recorded round has no open findings",
+          nj.get("accept_note") is None, nj)
+    out25 = rx(d25, "status").stdout
+    check("[CP3-T25] status prints no 'fresh look' or accept-finding line either",
+          "fresh look" not in out25.lower() and "accept-finding" not in out25.lower(), out25)
+
     for d in KEEP:
         shutil.rmtree(d, ignore_errors=True)
     print(f"\n{PASS} passed, {FAIL} failed")

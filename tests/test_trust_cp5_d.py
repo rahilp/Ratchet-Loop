@@ -306,6 +306,7 @@ _CP5R11_WRITES = {
     "_snapshot_tests": "an evidence copy of the tests",
     "_write_review_evidence": "an evidence copy of a review",
     "cmd_adv_record": "evidence findings",
+    "cmd_accept_finding": "evidence findings (the round's open/deferred findings, same as cmd_adv_record)",
     "_insert_guardrail_step": "the plan and a test plan",
     "_run_check_in": "an evidence log",
     "_finish_guardrail": "config.json",
