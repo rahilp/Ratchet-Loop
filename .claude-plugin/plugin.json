@@ -1,6 +1,6 @@
 {
   "name": "ratchet-loop",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "description": "Ratchet Loop — a checkpoint-and-gate build loop for AI coding agents, working with any model provider: a single orchestrator splits a feature into small ordered checkpoints, and every checkpoint must pass four hard gates (behavior tests, UI review against a prototype, adversarial code review, human review) before the next one starts. Includes the checkpoint planner, test planner, prototype/design agents, isolated UI reviewers, adversary + fixer, a Stop hook that won't let the agent quit early, and a checkpoint viewer.",
   "author": { "name": "Rahil Pirani" },
   "keywords": ["ratchet", "orchestrator", "tdd", "quality-gates", "adversarial-review", "ui-review", "prototype", "design-md"]
