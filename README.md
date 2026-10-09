@@ -212,6 +212,10 @@ At the start of each run the agent checks which AI tools are installed and sends
 
 Each role also gets its own model. Planning, coding, fixing and reviewing use a strong model. Lighter jobs like planning tests use a cheaper one, and running tests the cheapest. You can change this in `.ratchet/config.json`.
 
+### Staying aimed at real users
+
+Every reviewer's prompt, and every builder, fixer and test-writer's brief, opens with the plan's objective: who the project's users are, what they want, what done means, what's out of scope. Reviewers judge every finding against that objective, not against some other project's users, so a finding has to describe real harm to this project's users in realistic use, and severity follows real user harm in normal use. What's out of scope comes from the objective's own `out_of_scope`, and it differs by project: Ratchet's own plans list deliberately evading one of Ratchet's own checks as out of scope and, at most, a minor note (an accepted same-user-forgery limit), but a public-facing project's plan can and should treat malicious users as in scope. A reviewer has to say who is hurt and how (`user_impact`) next to a finding's severity; a blocker, major or unrecognized-severity finding with no `user_impact` never blocks, at any round and any risk, and is recorded instead for the final review (`ratchet.py deferred`). A run whose plan has no stated objective (one approved before this existed) still reviews normally, falling back to the project's own standards.md for who the users are and what's out of scope, with a plain note that none was given.
+
 ### Mistakes that keep coming back
 
 Reviewers label every finding with the kind of mistake it is. When the same kind shows up a second time, the agent offers to turn it into an automatic check, like a lint rule or an architecture test. Say yes and the check is built as its own small step, through every gate. Before it counts, Ratchet runs it against a deliberately bad example and against the real code where the mistake was found. It has to catch both and pass on today's code. For high-risk mistakes (security, data, money), a separate writer who never sees the check first writes disguised versions of the mistake, and the check has to catch those too. If a reviewer later finds a case the check missed, Ratchet strengthens it automatically and tells you.
@@ -313,7 +317,7 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py providers [--discover] [--check [id]] [--add <id> --preset <p> --model <m>] [--remove <id>]` | agent tools that can review: find, test, add or remove them |
 | `ratchet.py models` | which model each role's sub-agent uses on this host |
 | `ratchet.py spec detect`, `spec import <openspec\|speckit\|bmad\|auto> <id>`, `spec status` | build from an OpenSpec change, Spec Kit feature or BMAD story; which scenarios are proven so far; `spec keep on\|off` records the user's answer about a running spec |
-| `ratchet.py deferred` | minor review findings noted for later instead of blocking |
+| `ratchet.py deferred` | review findings noted for later instead of blocking (minor ones, and any blocker/major/unknown-severity one with no `user_impact`) |
 | `ratchet.py occurrences <kind>` | the real code where reviewers found a kind of mistake |
 | `ratchet.py repeats` | kinds of finding seen twice or more that could become an automatic check |
 | `ratchet.py guardrail --kind <k> --title <t> --why <w> --check-command "<c> {target}" --target <dir> --bad-example <fixture> --test-command <c> --test-file <f>` | after you pick the "automatic check" option: add the step that builds it |
@@ -351,6 +355,7 @@ python3 tests/test_install.py
 python3 tests/test_objective.py
 python3 tests/test_providers.py
 python3 tests/test_results.py
+python3 tests/test_review_objective.py
 python3 tests/test_runner.py
 python3 tests/test_signing.py
 python3 tests/test_specs.py

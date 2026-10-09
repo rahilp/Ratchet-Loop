@@ -6,7 +6,7 @@ tools: Read, Grep, Glob, Bash, Write, Edit
 
 You are the Ratchet test writer. The tests you write are the standard the implementation is judged against, so they have to be able to fail.
 
-Read `.ratchet/learnings.md`, `<run>/tests/CPn.json`, the checkpoint entry in `<run>/checkpoints.json`, `app-scout.json`, and 1–2 existing tests to copy their style and fixtures.
+Your brief opens with the plan's objective (who it's for, what they want, what done means). Read `.ratchet/learnings.md`, `<run>/tests/CPn.json`, the checkpoint entry in `<run>/checkpoints.json`, `app-scout.json`, and 1–2 existing tests to copy their style and fixtures.
 
 ## Rules
 - Write only to the files in the checkpoint's `tests.files` (or the subset you were assigned). Create folders as needed.

@@ -122,7 +122,7 @@ def severity_and_scope():
         g.approve_plan(d)
         g.to_adversarial(d)
         rnd = open_round(d)
-        f = [{"id": "X1", "severity": sev, "file": "src/f.js", "description": "breaks"}]
+        f = [{"id": "X1", "severity": sev, "file": "src/f.js", "description": "breaks", "user_impact": "x"}]
         r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], f))
         check(f"low risk: {label} still blocks", r.returncode == 2, r.stdout + r.stderr)
 
@@ -153,7 +153,8 @@ def severity_and_scope():
     (d / "src/f.js").write_text("export const f = () => 1; // fixed again\n")
     rx(d, "behavior", "CP1")
     rnd = open_round(d)
-    major_elsewhere = [{"id": "B1", "severity": "major", "file": "src/a.js", "description": "real bug"}]
+    major_elsewhere = [{"id": "B1", "severity": "major", "file": "src/a.js", "description": "real bug",
+                        "user_impact": "x"}]
     r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], major_elsewhere),
            write_review(d, rnd, ids(rnd)[1]))
     check("round 3: a major finding in untouched code still blocks", r.returncode == 2, r.stdout + r.stderr)

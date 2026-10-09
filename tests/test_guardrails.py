@@ -42,7 +42,8 @@ def record(d, cp, rnd, findings_by_reviewer=None):
 
 
 DBF = lambda where: [{"id": "D1", "severity": "major", "kind": "Handler imports DB", "file": where,
-                      "rule": "standards.md §2", "description": "handler reaches into the database layer"}]
+                      "rule": "standards.md §2", "description": "handler reaches into the database layer",
+                      "user_impact": "x"}]
 
 CHECK_JS = """import fs from 'node:fs'; import path from 'node:path';
 // guardrail: no source file may contain the word FORBIDDEN

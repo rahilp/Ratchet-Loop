@@ -528,7 +528,7 @@ def t12_signed_review_with_findings_still_flows():
     env = make_env("claude")
     finding = {"id": "F1", "severity": "major", "file": "src/f.js", "line": 1,
                "description": "off-by-one in the loop bound", "rule": "loop bounds must be checked",
-               "fix": "use < not <="}
+               "fix": "use < not <=", "user_impact": "a shopper's total is wrong by one unit"}
     env = with_fake_provider(env, json.dumps({"findings": [finding]}))
     d = cp3_project(env)
     use_codex_provider(d, env)

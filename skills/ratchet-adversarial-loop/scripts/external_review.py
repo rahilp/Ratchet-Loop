@@ -131,7 +131,11 @@ def build_prompt(eng, ctx, cfg, cp, rid, spec, fp, fixes_path, base_tree=None, n
     fixes = ""
     if fixes_path and Path(fixes_path).exists():
         fixes = "\n\n## Fixer rebuttals from the previous round (fixes.md)\n" + Path(fixes_path).read_text()[:MAX_DOC]
-    return f"""{adversary_instructions()}
+    objective = eng.objective_brief(ctx.plan())
+    return f"""## {objective}
+
+---
+{adversary_instructions()}
 
 ---
 # This review (non-interactive — everything you need is below; you have no tools and must not ask questions)
@@ -156,8 +160,8 @@ Code fingerprint: {fp}
 Reply with ONLY one JSON object, no markdown fences, exactly this shape:
 {{"reviewer":"{rid}","lens":"{spec.get('lens', 'both')}","checkpoint":"{cp['id']}","fingerprint":"{fp}",
  "verdict":"APPROVE or CHANGES_REQUESTED",
- "findings":[{{"id":"X1","severity":"blocker|major|minor","kind":"short-kebab-label-for-this-type-of-mistake","file":"path","line":0,"rule":"cited rule or failure scenario","description":"...","fix":"..."}}]}}
-An empty findings list means you approve. Every finding needs a cited rule or a concrete failure scenario. `kind` names the TYPE of mistake (e.g. handler-imports-db, unvalidated-input), the same label whenever that type appears again.
+ "findings":[{{"id":"X1","severity":"blocker|major|minor","kind":"short-kebab-label-for-this-type-of-mistake","file":"path","line":0,"rule":"cited rule or failure scenario","description":"...","fix":"...","user_impact":"who is hurt and how, in normal use — required for a blocker or major finding"}}]}}
+An empty findings list means you approve. Every finding needs a cited rule or a concrete failure scenario. `kind` names the TYPE of mistake (e.g. handler-imports-db, unvalidated-input), the same label whenever that type appears again. `user_impact` names who is hurt and how, in normal use, clearing the realistic-use bar above; a blocker, major or unknown-severity finding with no `user_impact` is recorded for the final review instead of blocking.
 """
 
 

@@ -1656,6 +1656,29 @@ def objective_problems(plan) -> list[str]:
     return errs
 
 
+NO_OBJECTIVE_NOTE = "no objective was stated for this run (an older plan, approved before this feature existed)"
+
+
+def objective_brief(plan) -> str:
+    """Plain text of the plan's objective, for the top of every reviewer prompt and every sub-agent's brief: who
+    the result is for, what they want, what done means, what is out of scope. A plan with no objective at all
+    (a run approved before CP1's objective_problems() existed) gets a plain note instead of a crash, so a legacy
+    run keeps reviewing normally."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    if not isinstance(obj, dict) or not obj:
+        return f"Objective: {NO_OBJECTIVE_NOTE}."
+    lines = ["Objective", f"Who it's for: {obj.get('users', '')}", f"What they want: {obj.get('goal', '')}"]
+    dm = obj.get("done_means") or []
+    if dm:
+        lines.append("Done means:")
+        lines += [f"  - {x}" for x in dm]
+    oos = obj.get("out_of_scope") or []
+    if oos:
+        lines.append("Out of scope:")
+        lines += [f"  - {x}" for x in oos]
+    return "\n".join(lines)
+
+
 def _objective_fill_ins(obj: dict) -> list[str]:
     """Every objective part that still starts with the spec draft's placeholder (specsrc.FILL_IN_PREFIX,
     e.g. 'FILL IN: who will use this?') instead of a real answer, named so the planner or user must fill it in
@@ -5034,10 +5057,20 @@ def cmd_adv_record(args):
     # findings always block, whatever label they carry
     all_findings = [f for f in all_findings if not any(f is c or (f.get("id"), f.get("reviewer")) == (c.get("id"), c.get("reviewer"))
                                                        for c in covered_minor)]
+    # Realistic-use bar: a blocker, major or unknown-severity finding that does not say who is hurt and how
+    # (user_impact) never blocks, at any round and any risk. It is recorded for the final review instead. This
+    # is narrower than the existing minor-severity rules below: minor findings keep following those, whether or
+    # not they carry a user_impact.
+    no_impact = [f for f in all_findings
+                 if str(f.get("severity", "")).strip().lower() not in MINOR_SEVERITIES
+                 and not str(f.get("user_impact") or "").strip()]
+    if no_impact:
+        all_findings = [f for f in all_findings if not any(f is n for n in no_impact)]
+    no_impact_deferred = [dict(f, deferred_because="no user impact stated") for f in no_impact]
     changed_since = _changed_since_last_round(ctx, cfg, g, fp["id"])
     raw_count = len(all_findings)
     all_findings, deferred = split_findings(cfg, cp.get("risk", "normal"), all_findings, changed_since, ctx.root)
-    deferred = covered_minor + deferred
+    deferred = covered_minor + no_impact_deferred + deferred
     if deferred:
         write_json(dest / "deferred-findings.json", deferred)
         keep = [x for x in cps.get("deferred") or [] if x.get("round") != rnd["round"]]
@@ -6146,7 +6179,8 @@ def _spec_finish(ctx, st) -> list[str]:
 
 
 def cmd_deferred(args):
-    """Minor findings that were recorded instead of blocking, for the user to decide on at the end."""
+    """Findings that were recorded instead of blocking (minor ones, and any blocker/major/unknown-severity
+    finding with no user_impact), for the user to decide on at the end."""
     ctx = Ctx(find_root())
     st = ctx.state()
     rows = [(cp, f) for cp, c in (st.get("checkpoints") or {}).items() for f in c.get("deferred") or []]
@@ -6156,10 +6190,11 @@ def cmd_deferred(args):
     if not rows:
         print("No findings were left for later.")
         return
-    print(f"{len(rows)} minor finding(s) were left for later (they did not block):")
+    print(f"{len(rows)} finding(s) were left for later (they did not block):")
     for cp, f in rows:
         where = f" ({f['file']}{':' + str(f['line']) if f.get('line') else ''})" if f.get("file") else ""
-        print(f"- {cp}{where}: {f.get('description', '').strip()[:240]}")
+        why = f" [{f['deferred_because']}]" if f.get("deferred_because") else ""
+        print(f"- {cp}{where}: {f.get('description', '').strip()[:240]}{why}")
 
 
 def cmd_complete(args):
@@ -7033,7 +7068,10 @@ def cmd_reviewers(args):
     st = ctx.state()
     cps = _cur(ctx, st, args.cp)
     _expect_step(cps, ["adversarial", "complete"], args.cp)
-    cp = cp_by_id(ctx.plan(), args.cp)
+    plan = ctx.plan()
+    cp = cp_by_id(plan, args.cp)
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    obj_oneline = re.sub(r"\s*\n\s*", " ", objective_brief(plan))
     fp = fingerprint(ctx.root)["id"]
     g = cps["gates"]["adversarial"]
     rnd = cps.get("adv_round")
@@ -7105,14 +7143,16 @@ def cmd_reviewers(args):
         if spec["kind"] == "agent":
             want = ("a model DIFFERENT from yours: " + " or ".join(host_model_map(cfg).get("alternates") or [])
                     if spec.get("alt") else role_model(cfg, "ratchet-adversary"))
-            spec["how"] = (f"Spawn a ratchet-adversary sub-agent (model: {want}): lens={spec['lens']}, reviewer id '{rid}', "
+            spec["how"] = (f"Objective: {obj_oneline} | Spawn a ratchet-adversary sub-agent (model: {want}): "
+                           f"lens={spec['lens']}, reviewer id '{rid}', "
                            f"fingerprint {fp}, round_nonce {rnd['nonce']}, checkpoint {args.cp}, output {spec['output']}"
                            + (f", fixes.md {fixes}" if rnd["round"] > 1 else "")
                            + ("" if not rules else ". Review rules for this round (tell it): " + " ".join(rules)))
         else:
             spec["how"] = f"python3 {ext_script} --reviewer {rid} --cp {args.cp} --out {spec['output']}{fixes_arg}"
         rows.append(spec)
-    res = {"checkpoint": args.cp, "risk": cp.get("risk", "normal"), "round": rnd["round"], "fingerprint": fp,
+    res = {"checkpoint": args.cp, "objective": obj if isinstance(obj, dict) and obj else NO_OBJECTIVE_NOTE,
+           "risk": cp.get("risk", "normal"), "round": rnd["round"], "fingerprint": fp,
            "review_rules": rules, "focus_files": sorted(focus) if focus is not None else None,
            "round_nonce": rnd["nonce"], "output_dir": str(out_dir),
            "fixes_md": str(fixes) if rnd["round"] > 1 else None,
@@ -7123,6 +7163,11 @@ def cmd_reviewers(args):
         return
     print(f"{args.cp} risk={res['risk']} round={rnd['round']} fingerprint={fp[:12]} nonce={rnd['nonce']} "
           f"(run rounds {res['run_rounds_used']}/{res['run_rounds_cap']})")
+    if isinstance(obj, dict) and obj:
+        print(f"Who it's for: {obj.get('users', '')}")
+        print(f"What they want: {obj.get('goal', '')}")
+    else:
+        print(f"Note: {NO_OBJECTIVE_NOTE}.")
     for r in rows:
         print(f"  - {r['id']:<22} [{r['vendor']}/{r['lens']}] {r['how']}")
         for skipped in r["fallback_for"]:
@@ -9453,7 +9498,7 @@ def main(argv=None):
     b = ssp.add_parser("status", help="which spec scenarios are proven by passing tests")
     b.add_argument("--json", action="store_true")
     a.set_defaults(fn=cmd_spec)
-    a = sp.add_parser("deferred", help="minor findings recorded for later instead of blocking")
+    a = sp.add_parser("deferred", help="findings recorded for later instead of blocking (minor, or no user_impact)")
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_deferred)
     sp.add_parser("next").set_defaults(fn=cmd_next)
     a = sp.add_parser("status"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_status)

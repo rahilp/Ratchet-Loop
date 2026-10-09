@@ -572,7 +572,8 @@ def main():
     check("re-reading the same round doesn't count again", open_round(d)["run_rounds_used"] == 1)
     r = rx(d, "adv-record", "CP1", "--reviews", str(fake))
     check("a hand-made review without the round nonce is refused", r.returncode != 0 and "nonce" in r.stderr, r.stderr)
-    p = write_review(d, rnd, R0(rnd), findings=[{"id": "A1", "severity": "major", "description": "x"}])
+    p = write_review(d, rnd, R0(rnd), findings=[{"id": "A1", "severity": "major", "description": "x",
+                                                  "user_impact": "x"}])
     r = rx(d, "adv-record", "CP1", "--reviews", p)
     check("a finding fails the gate", r.returncode == 2)
     (d / "src/f.js").write_text("export const f = () => 1; // fixed\n")
