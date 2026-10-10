@@ -124,6 +124,10 @@ DEFAULT_CONFIG = {
     # From round 2 on, a minor finding only blocks if it is in code changed since the previous round; blocker and
     # major findings block wherever they are. Stops each round from turning into a fresh review of everything.
     "scope_later_rounds": True,
+    # From round converge_after_round + 1 on (default: round 3), a minor finding never blocks, even in code changed
+    # since the previous round; it is recorded for later instead (`ratchet.py deferred`). Blocker and major
+    # findings always block, at any round. Keeps reviews converging instead of chasing ever-narrower nits.
+    "converge_after_round": 2,
     # After this many blocking adversarial rounds in a row (or a second round where an unseen finding kind shows
     # up in a file an earlier round already flagged), pause for a check-in (`ratchet.py check-in CPn`) before
     # opening another round: see "Check-in" in schemas.md section 7.
@@ -1533,7 +1537,7 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "fingerprint_include", "approver", "ui_single_reviewer_ok", "min_review_timeout_sec", "test_timeout_sec",
              "host_provider", "ui_reviewers", "design_md", "max_stop_blocks", "unavailable_ttl_hours",
              "verify_transcripts", "min_review_seconds", "commit_per_checkpoint", "blocking_severities",
-             "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round"]
+             "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round", "converge_after_round"]
 
 
 def _file_sha(p: Path) -> str | None:
@@ -2301,6 +2305,12 @@ def cmd_plan_summary(args):
         sl = _step_spec_line(cp)
         if sl:
             print(f"   From the spec: {sl}")
+    converge_after = int(cfg.get("converge_after_round", 2))
+    print(f"\nReview rules: after round 1, only the kind of review (bugs or standards) that still has an open "
+          f"blocker or major finding is asked again; two reviewers that turn out to be the same company, model "
+          f"and kind of review count once, not twice; a round nobody reviewed yet costs nothing to replace; and "
+          f"from round {converge_after + 1} on, a minor finding alone no longer blocks (it is still recorded, see "
+          f"`ratchet.py deferred`).")
     rows = dict(models_table(cfg))
     groups = {}
     for role, m in rows.items():
@@ -3178,12 +3188,27 @@ def reviewer_binary(cfg, rid):
     return cmd[0] if cmd else None
 
 
+def _dup_key(spec):
+    """(vendor, model, lens) for a command-kind reviewer, so two slots that resolve to the same company, model
+    and lens collapse into one reviewer instead of running twice. When no explicit model is set, the provider/tool
+    id is folded into the key instead, so two different CLIs from the same company (each picking its own default
+    model) are never collapsed as duplicates — only the same tool, with the same unspecified model and lens,
+    collapses. None for a host (`agent`) reviewer, or an unknown one, which never collapses this way."""
+    if not spec or spec.get("kind") != "command":
+        return None
+    model = spec.get("model")
+    return (spec.get("vendor"), model if model else ("tool", spec.get("provider") or spec.get("preset")),
+            spec.get("lens"))
+
+
 def resolve_reviewers(ctx, cfg, cp) -> list[dict]:
     """Turn review slots into concrete reviewer ids for THIS round.
 
     Returns [{"id", "slot", "fallback_for": [ids skipped], "reasons": {...}}]. Other providers are
     preferred in the order written, a provider not yet used this round before a repeat; the host's own
-    sub-agents fill any slot whose other providers are unavailable.
+    sub-agents fill any slot whose other providers are unavailable. A slot whose own pick turns out to be the
+    same company, model and lens as a reviewer an earlier slot already chose collapses (no entry): that review
+    already runs once, not twice, under a different id.
     """
     if cp.get("reviewers"):
         slots = list(cp["reviewers"])
@@ -3195,7 +3220,7 @@ def resolve_reviewers(ctx, cfg, cp) -> list[dict]:
     roster_ = {rid: _roster_spec(cfg, rid) for rid in set(roster(cfg)) | {a for sl in slots for a in expand_slot(cfg, sl)}}
     roster_ = {k: v for k, v in roster_.items() if v is not None}
     risk = cp.get("risk", "normal")
-    chosen, out = set(), []
+    chosen, chosen_keys, out = set(), set(), []
     for n, slot in enumerate(slots, 1):
         alts = expand_slot(cfg, slot)
         unknown = [a for a in alts if a not in roster_]
@@ -3220,9 +3245,18 @@ def resolve_reviewers(ctx, cfg, cp) -> list[dict]:
         if pick and candidates and pick != candidates[0]:
             skipped.append(candidates[0])
             reasons[candidates[0]] = "provider already reviewing this round; preferring a different one"
+        if pick is not None:
+            dup_key = _dup_key(roster_[pick])
+            if dup_key is not None and dup_key in chosen_keys:
+                skipped.append(pick)
+                reasons[pick] = "same company, model and lens as a reviewer already chosen this round; runs once"
+                pick = None
         if pick is None:
-            continue  # every alternative already used or down: slot collapses into the others
+            continue  # every alternative already used, down, or a duplicate: slot collapses into the others
         chosen.add(pick)
+        dup_key = _dup_key(roster_[pick])
+        if dup_key is not None:
+            chosen_keys.add(dup_key)
         spec = roster_[pick]
         model = spec.get("model") if spec.get("kind") == "command" else (
             "a different model: " + " or ".join(host_model_map(cfg).get("alternates") or []) if spec.get("alt")
@@ -5502,7 +5536,8 @@ def cmd_adv_record(args):
     no_impact_deferred = [dict(f, deferred_because="no user impact stated") for f in no_impact]
     changed_since = _changed_since_last_round(ctx, cfg, g, fp["id"])
     raw_count = len(all_findings)
-    all_findings, deferred = split_findings(cfg, cp.get("risk", "normal"), all_findings, changed_since, ctx.root)
+    all_findings, deferred = split_findings(cfg, cp.get("risk", "normal"), all_findings, changed_since, ctx.root,
+                                             round_no=rnd["round"])
     deferred = covered_minor + no_impact_deferred + deferred
     if deferred:
         write_json(dest / "deferred-findings.json", deferred)
@@ -5585,6 +5620,20 @@ def _adv_open_findings(ctx, cp_id: str, rnd, cps=None) -> list:
     return [f for f in raw if _finding_key(f) not in accepted_keys]
 
 
+def _open_blocking_lenses(ctx, cfg, cp_id: str, rnd, cps=None) -> set:
+    """Lenses with a still-open BLOCKER or MAJOR finding (never a minor one) in a checkpoint's latest recorded
+    adversarial round. `reviewers` narrows the next round to just these lenses; a lens whose only open finding
+    was minor doesn't keep it in the loop, and a lens that approved isn't in here at all."""
+    out = set()
+    for f in _adv_open_findings(ctx, cp_id, rnd, cps):
+        if str(f.get("severity", "")).strip().lower() in MINOR_SEVERITIES:
+            continue
+        spec = _roster_spec(cfg, f.get("reviewer")) if f.get("reviewer") else None
+        if spec and spec.get("lens"):
+            out.add(spec["lens"])
+    return out
+
+
 def _round_deferred(cps, round_no) -> list:
     """The step's deferred findings belonging to one round (cps['deferred'] entries are tagged with their round)."""
     return [f for f in cps.get("deferred") or [] if f.get("round") == round_no]
@@ -5635,12 +5684,17 @@ def _in_scope(path: str, scope: set) -> bool:
     return False
 
 
-def split_findings(cfg, risk: str, findings: list, changed_since: set | None, root=None) -> tuple[list, list]:
+def split_findings(cfg, risk: str, findings: list, changed_since: set | None, root=None,
+                    round_no: int | None = None) -> tuple[list, list]:
     """(blocking, deferred). Severities not known to be minor always block (a reviewer can't escape the bar by
     inventing a severity name). `changed_since` is the round's scope: files changed since the previous round plus
-    files that had a blocking finding last round (a finding the fixer ignored can't be waved through)."""
+    files that had a blocking finding last round (a finding the fixer ignored can't be waved through). `round_no`
+    is this round's own number; from round `converge_after_round` + 1 (config, default 2, so round 3 by default)
+    a minor finding never blocks any more, whatever its scope — blocker and major findings keep blocking at every
+    round."""
     bar = (cfg.get("blocking_severities") or {}).get(risk, "all")
     bar_l = [str(x).strip().lower() for x in (bar or [])] if bar != "all" else None
+    converge_after = int(cfg.get("converge_after_round", 2))
     blocking, deferred = [], []
     for f in findings:
         sev = str(f.get("severity", "")).strip().lower()
@@ -5648,6 +5702,9 @@ def split_findings(cfg, risk: str, findings: list, changed_since: set | None, ro
         where = _norm_path(f.get("file") or f.get("path") or f.get("location"), root)
         if minor and bar_l is not None and sev not in bar_l:
             deferred.append(dict(f, deferred_because=f"{risk}-risk step: only {' and '.join(bar)} findings block"))
+        elif minor and round_no is not None and round_no > converge_after:
+            deferred.append(dict(f, deferred_because=f"round {round_no}: minor findings stop blocking from round "
+                                                       f"{converge_after + 1} on (config converge_after_round)"))
         elif minor and changed_since is not None and not _in_scope(where, changed_since):
             deferred.append(dict(f, deferred_because="later round: not in code changed since the previous round"))
         else:
@@ -8045,12 +8102,32 @@ def cmd_reviewers(args):
                 good, detail, _saved = probe_provider(ctx, cfg, provider_by_id(cfg, pid))
                 print(f"  checked {pid}: {'working' if good else 'not usable now (' + detail + ')'}", file=sys.stderr)
             resolved = resolve_reviewers(ctx, cfg, cp)
+        # Narrow after round 1: when the round being replaced was recorded (it blocked) and was itself NOT
+        # narrowed, the next round only asks the lens(es) that still had an open blocker/major finding — a lens
+        # that approved isn't re-run. A narrowed round whose fix still left a blocker open brings back the full
+        # set for the round after it (narrow_now stays False), rather than narrowing further.
+        was_narrowed = bool(rnd.get("narrowed")) if rnd else False
+        narrow_now = False
+        if rnd and rnd.get("recorded") and not was_narrowed:
+            open_lenses = _open_blocking_lenses(ctx, cfg, args.cp, rnd, cps)
+            if open_lenses:
+                narrowed_resolved = [r for r in resolved if (_roster_spec(cfg, r["id"]) or {}).get("lens") in open_lenses]
+                if narrowed_resolved:
+                    resolved = narrowed_resolved
+                    narrow_now = True
         g["attempts"] += 1
         st["adv_rounds_total"] = int(st.get("adv_rounds_total", 0)) + 1
         prev = rnd["round"] if rnd else 0
+        if rnd and not rnd.get("recorded"):
+            # Replacing a round nobody reviewed yet (the code changed again before any review was written) costs
+            # nothing: refund this round-opening's own increment back out, never below zero.
+            prev_dir = _review_round_dir(ctx, args.cp, "adv", prev)
+            if not any(prev_dir.glob("*.json")):
+                g["attempts"] = max(0, g["attempts"] - 1)
+                st["adv_rounds_total"] = max(0, int(st.get("adv_rounds_total", 0)) - 1)
         old_key = review_key_file(ctx.root, st, args.cp, "adv", prev) if prev else None
         rnd = {"round": prev + 1, "nonce": secrets.token_hex(8), "fingerprint": fp, "opened_at": now(),
-               "reviewers": [r["id"] for r in resolved],
+               "reviewers": [r["id"] for r in resolved], "narrowed": narrow_now,
                "substitutions": [{"used": r["id"], "instead_of": r["fallback_for"], "why": r["reasons"]}
                                  for r in resolved if r["fallback_for"]],
                "resolved": resolved}
@@ -8102,7 +8179,7 @@ def cmd_reviewers(args):
     res = {"checkpoint": args.cp, "objective": obj if isinstance(obj, dict) and obj else NO_OBJECTIVE_NOTE,
            "risk": cp.get("risk", "normal"), "round": rnd["round"], "fingerprint": fp,
            "review_rules": rules, "focus_files": sorted(focus) if focus is not None else None,
-           "round_nonce": rnd["nonce"], "output_dir": str(out_dir),
+           "round_nonce": rnd["nonce"], "output_dir": str(out_dir), "narrowed": rnd.get("narrowed", False),
            "fixes_md": str(fixes) if rnd["round"] > 1 else None,
            "run_rounds_used": st.get("adv_rounds_total", 0), "run_rounds_cap": cfg["max_adversarial_rounds_run"],
            "reviewers": rows}

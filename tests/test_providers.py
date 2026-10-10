@@ -171,8 +171,11 @@ def severity_and_scope():
 
 def review_holes():
     print("Fresh-eyes findings: ways around the bar must not work")
-    # a minor finding the fixer ignored is not waved through in round 2
-    d = g.project("carry", extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20", "checkin_round=99"])
+    # a minor finding the fixer ignored is not waved through in round 2. CP5: this loop runs several rounds just
+    # to exercise path-spelling normalization, well past where minors would stop blocking by default (round 3);
+    # raise converge_after_round so that cutoff doesn't interfere with what this is actually testing.
+    d = g.project("carry", extra_cp={"risk": "normal"},
+                  config=["max_adversarial_rounds=20", "checkin_round=99", "converge_after_round=50"])
     g.approve_plan(d)
     g.to_adversarial(d)
     rnd = open_round(d)

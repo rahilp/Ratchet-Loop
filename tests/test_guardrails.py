@@ -94,8 +94,8 @@ def main():
     r = record(d, "CP1", rnd, {0: DBF("src/f.js")})
     check("round 1: the finding blocks, no repeat yet", r.returncode == 2 and "REPEAT" not in r.stdout, r.stdout)
     put(d, "CP1", {"src/f.js": BAD_F.replace("1;", "1; ")})          # "fixed", but the mistake is still there
-    rnd = open_round(d, "CP1")
-    r = record(d, "CP1", rnd, {1: DBF("src/f.js")})
+    rnd = open_round(d, "CP1")  # CP5: round 1 blocked on one lens, so round 2 may be narrowed to just that one
+    r = record(d, "CP1", rnd, {0: DBF("src/f.js")})
     check("the same unfixed finding raised again is not a repeat", "REPEAT" not in r.stdout, r.stdout)
     put(d, "CP1", {"src/f.js": OK_F, "src/a.js": BAD_A})
     rnd = open_round(d, "CP1")
@@ -225,10 +225,10 @@ def main():
     tp4 = json.loads((d / ".ratchet/runs/f/tests/CP4.json").read_text())
     check("its test plan adds the missed case", [c["id"] for c in tp4["cases"]] == ["CP4-T01", "CP4-T02", "CP4-T03"], tp4)
     put(d, "CP2", {"src/g.js": "export const g = () => 2; // reviewed\n"})
-    rnd = open_round(d, "CP2")
+    rnd = open_round(d, "CP2")  # CP5: the previous round only had one reviewer with an open finding, so this one
+    # may be narrowed to just that reviewer; write to however many `reviewers` the round actually lists.
     minor = [dict(DBF("src/g.js")[0], severity="minor")]
-    r = rx(d, "adv-record", "CP2", "--reviews", g.write_review(d, rnd, rnd["reviewers"][0]["id"], findings=minor,
-           files_reviewed=["src/g.js"]), g.write_review(d, rnd, rnd["reviewers"][1]["id"], files_reviewed=["src/g.js"]))
+    r = record(d, "CP2", rnd, {0: minor})
     check("a minor finding of a covered kind is noted, not fixed", r.returncode == 0 and "recorded for later" in r.stdout,
           r.stdout + r.stderr)
     check("… and the deferred list says why", "automatic check already covers" in rx(d, "deferred", "--json").stdout)

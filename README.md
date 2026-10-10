@@ -222,6 +222,15 @@ At the start of each run the agent checks which AI tools are installed and sends
 
 Each role also gets its own model. Planning, coding, fixing and reviewing use a strong model. Lighter jobs like planning tests use a cheaper one, and running tests the cheapest. You can change this in `.ratchet/config.json`.
 
+### Later rounds cost less
+
+Round 1 of a step always asks every reviewer. After that, review gets cheaper on purpose:
+
+- **Fewer reviewers after round 1.** Once a round blocks, the next one only asks back the reviewer(s) whose kind of review still has an open serious finding; one that approved isn't re-run. If the fix doesn't actually settle it, the round after that brings back the full set again, rather than narrowing down forever.
+- **No double-counting.** If two review slots would end up at the same reviewer (same company, same model, same kind of review), it only runs once, and you're told the real number that reviewed, not the number of slots configured.
+- **A replaced round that nobody reviewed yet is free.** If the code changes again before any reviewer wrote a review, re-opening the round doesn't use up any of your review budget. Once a review has been written, though, that round counts, whether or not it was ever recorded.
+- **Small issues stop blocking after a couple of rounds.** Serious findings always block, every round. A minor one — a nit, a style note — blocks for the first couple of rounds (`converge_after_round` in config, default 2; so round 3 on), after which it's simply recorded for the final review instead of starting another round over it.
+
 ### Staying aimed at real users
 
 Every reviewer's prompt, and every builder, fixer and test-writer's brief, opens with the plan's objective: who the project's users are, what they want, what done means, what's out of scope. Reviewers judge every finding against that objective, not against some other project's users, so a finding has to describe real harm to this project's users in realistic use, and severity follows real user harm in normal use. What's out of scope comes from the objective's own `out_of_scope`, and it differs by project: Ratchet's own plans list deliberately evading one of Ratchet's own checks as out of scope and, at most, a minor note (an accepted same-user-forgery limit), but a public-facing project's plan can and should treat malicious users as in scope. A reviewer has to say who is hurt and how (`user_impact`) next to a finding's severity; a blocker, major or unrecognized-severity finding with no `user_impact` never blocks, at any round and any risk, and is recorded instead for the final review (`ratchet.py deferred`). A run whose plan has no stated objective (one approved before this existed) still reviews normally, falling back to the project's own standards.md for who the users are and what's out of scope, with a plain note that none was given.
@@ -364,6 +373,8 @@ Each test file is a standalone script; none needs a framework, so you can also r
 python3 tests/test_accept_finding.py
 python3 tests/test_checkin.py
 python3 tests/test_cleanup.py
+python3 tests/test_converge.py
+python3 tests/test_dedup_unknown_model.py
 python3 tests/test_docs.py
 python3 tests/test_gates.py
 python3 tests/test_guardrails.py
