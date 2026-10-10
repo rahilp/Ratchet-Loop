@@ -1576,8 +1576,11 @@ def approval_snapshot(ctx, st) -> dict:
     cfg = ctx.config()
     return {"plan": _plan_hash(plan, ctx),
             "objective": plan.get("objective"),
-            "cps": {c["id"]: _sha(c) for c in plan["checkpoints"]},
-            "tests": {c["id"]: _sha(test_plan(ctx, c["id"])) for c in plan["checkpoints"]},
+            # Same fallback as _plan_hash: a checkpoint missing "id" must not crash the snapshot every
+            # command's integrity check runs; validate_plan is what names that as a plan problem.
+            "cps": {c.get("id", f"#{i}"): _sha(c) for i, c in enumerate(plan["checkpoints"])},
+            "tests": {c.get("id", f"#{i}"): _sha(test_plan(ctx, c.get("id", f"#{i}")))
+                     for i, c in enumerate(plan["checkpoints"])},
             "rules": {k: _sha(cfg.get(k)) for k in RULE_KEYS},
             "files": _reference_files(ctx),
             "custom_providers": _custom_providers_sha(cfg),
@@ -2029,7 +2032,9 @@ def plain_now(ctx: Ctx, st, plan=None) -> str:
     """One plain sentence about what is happening now (no phase ids, no commands)."""
     phase = st.get("phase")
     plan = plan if plan is not None else (ctx.plan() or {})
-    titles = {c["id"]: c.get("title", c["id"]) for c in plan.get("checkpoints", [])}
+    # c.get("id", f"#{i}"): a checkpoint missing "id" must not crash `status`; validate_plan is what names it.
+    titles = {c.get("id", f"#{i}"): c.get("title", c.get("id", f"#{i}"))
+              for i, c in enumerate(plan.get("checkpoints", []))}
     fixed = {
         "planning": "Planning: splitting the feature into steps.",
         "awaiting_plan_approval": "The plan is ready and waiting for your approval. Say yes to start building, "
@@ -2155,10 +2160,18 @@ def cmd_status_text(ctx: Ctx):
         if left:
             print(f"{len(left)} finding(s) were left for later (never accepted or fixed): run `ratchet.py "
                   "deferred` to see them.")
+        flaky_steps = [cid for cid, c in (st.get("checkpoints") or {}).items()
+                       if any((g or {}).get("flaky") for g in (c.get("gates") or {}).values())
+                       or c.get("regression_flaky")]
+        if flaky_steps:
+            print(f"Flaky (a test run failed once, then passed on an immediate automatic re-run): "
+                  f"{', '.join(flaky_steps)}.")
         print("")
     cps = plan.get("checkpoints", [])
     total = len(cps)
-    done = [c for c in cps if (st["checkpoints"].get(c["id"]) or {}).get("status") == "done"]
+    # c.get("id"): a checkpoint missing "id" (a malformed hand-edit) was never registered in state under any
+    # key, so it is correctly treated as not done here, instead of crashing `status`.
+    done = [c for c in cps if (st["checkpoints"].get(c.get("id")) or {}).get("status") == "done"]
     if not total:
         print("No plan yet.")
     elif len(done) == total:
@@ -3201,7 +3214,7 @@ def _dup_key(spec):
             spec.get("lens"))
 
 
-def resolve_reviewers(ctx, cfg, cp) -> list[dict]:
+def resolve_reviewers(ctx, cfg, cp, exclude=None) -> list[dict]:
     """Turn review slots into concrete reviewer ids for THIS round.
 
     Returns [{"id", "slot", "fallback_for": [ids skipped], "reasons": {...}}]. Other providers are
@@ -3209,7 +3222,12 @@ def resolve_reviewers(ctx, cfg, cp) -> list[dict]:
     sub-agents fill any slot whose other providers are unavailable. A slot whose own pick turns out to be the
     same company, model and lens as a reviewer an earlier slot already chose collapses (no entry): that review
     already runs once, not twice, under a different id.
+
+    `exclude`: reviewer ids never picked even though reviewer_availability still calls them okay — a reply cut
+    off mid-answer twice this round falls back only its own slot, without the long-lived unavailable_ttl_hours
+    mark a genuine quota/auth/timeout failure gets (see cmd_reviewers' same-round branch).
     """
+    exclude = exclude or set()
     if cp.get("reviewers"):
         slots = list(cp["reviewers"])
     else:
@@ -3231,7 +3249,7 @@ def resolve_reviewers(ctx, cfg, cp) -> list[dict]:
             alts += _host_fallbacks(cfg, alts[0])
         skipped, reasons, pick, candidates = [], {}, None, []
         for a in alts:
-            if a in chosen:
+            if a in chosen or a in exclude:
                 continue
             okay, why = reviewer_availability(ctx, cfg, a, risk)
             if okay:
@@ -3276,7 +3294,10 @@ def required_reviewers(cfg, cp, ctx=None) -> list[str]:
 def _plan_hash(plan, ctx=None):
     body = {"cps": plan.get("checkpoints")}
     if ctx is not None:  # the test plans are part of what the user approves
-        body["tests"] = {c["id"]: test_plan(ctx, c["id"]) for c in plan.get("checkpoints", [])}
+        # A checkpoint missing "id" is a plan problem (caught by validate_plan), not a reason to crash here:
+        # fall back to its position so every other command that hashes the plan can still run.
+        body["tests"] = {c.get("id", f"#{i}"): test_plan(ctx, c.get("id", f"#{i}"))
+                         for i, c in enumerate(plan.get("checkpoints", []) or [])}
     return hashlib.sha1(json.dumps(body, sort_keys=True).encode()).hexdigest()[:12]
 
 
@@ -4488,26 +4509,47 @@ def cmd_behavior(args):
     cfg = ctx.config()
     g = cps["gates"]["behavior"]
     g["attempts"] += 1
+    g["runs"] = g.get("runs", 0) + 1  # a persistent invocation counter for evidence filenames: unlike `attempts`,
+    # this never decrements for a forgiven flaky pass, so a later invocation can never reuse (and overwrite) an
+    # earlier invocation's behavior log.
     files, missing, _ = _coverage(ctx, cp)
     if missing:
         g["status"] = "failed"
         ctx.save_state(st)
         die(f"Behavior gate FAILED: planned cases were removed from tests: {', '.join(missing)}. "
             "Tests may not be deleted or weakened to pass the gate.")
-    log = ctx.evidence(args.cp) / f"behavior-{g['attempts']:02d}.log"
     rpath = _report_path(ctx, cp)
-    code, out, dur = _run_cmd(ctx, cp["tests"]["command"], log, cfg["test_timeout_sec"], rpath)
-    bad = []
-    if rpath:
-        cases, why = _read_test_report(ctx, rpath)
-        bad = [why] if why else _case_problems(ctx, cp, cases, red=False)[0]
+
+    def run_once(suffix):
+        log_ = ctx.evidence(args.cp) / f"behavior-{g['runs']:02d}{suffix}.log"
+        code_, out_, dur_ = _run_cmd(ctx, cp["tests"]["command"], log_, cfg["test_timeout_sec"], rpath)
+        bad_ = []
+        if rpath:
+            cases, why = _read_test_report(ctx, rpath)
+            bad_ = [why] if why else _case_problems(ctx, cp, cases, red=False)[0]
+        return code_, out_, dur_, bad_, log_
+
+    code, out, dur, bad, log = run_once("")
+    flaky = False
+    if (code != 0 or bad) and not g.get("flaky_used"):
+        # One immediate automatic re-run, once per step: a failure that passes on it is flaky, not a real attempt.
+        # The allowance is spent the moment this retry is attempted, win or lose, so a second failing call never
+        # gets a free retry of its own just because this one's retry also failed.
+        g["flaky_used"] = True
+        code2, out2, dur2, bad2, log2 = run_once("b")
+        if code2 == 0 and not bad2:
+            code, out, dur, bad, log = code2, out2, dur2, bad2, log2
+            flaky = True
+            g["attempts"] -= 1  # the retry spends no attempt of this step's own allowance
+        # else: a second failure (genuine or another flaky-shaped one) is never forgiven — falls through below,
+        # still counted as exactly one attempt.
     failed_check = None
     fp_tests = fingerprint(ctx.root)["id"] if code == 0 and not bad and cfg.get("checks") else None
     if code == 0 and not bad:
         for chk in cfg.get("checks") or []:
             if not isinstance(chk, dict) or not chk.get("command"):
                 continue
-            clog = ctx.evidence(args.cp) / f"check-{re.sub(r'[^a-z0-9]+', '-', str(chk.get('kind', 'x')))}-{g['attempts']:02d}.log"
+            clog = ctx.evidence(args.cp) / f"check-{re.sub(r'[^a-z0-9]+', '-', str(chk.get('kind', 'x')))}-{g['runs']:02d}.log"
             ccode, cout, _ = _run_cmd(ctx, chk["command"], clog, cfg["test_timeout_sec"])
             if ccode != 0:
                 code, out, log, failed_check = ccode, cout, clog, chk
@@ -4542,13 +4584,14 @@ def cmd_behavior(args):
         die(f"Behavior gate FAILED for {args.cp} (exit {code}" + ("; " + "; ".join(bad) if bad else "") +
             f"). Log: {log.relative_to(ctx.root)}. "
             "Give the failure to ratchet-implementer (do NOT edit the tests to make them pass) and re-run.", 2)
-    g.update(status="passed", fingerprint=fp, passed_at=now(),
+    g.update(status="passed", fingerprint=fp, passed_at=now(), flaky=flaky or bool(g.get("flaky")),
              last={"exit": 0, "log": str(log.relative_to(ctx.root)), "at": now(), "duration": dur})
     cps["step"] = _earliest_open_step(cps)
-    ctx.log(st, "behavior_passed", cp=args.cp, attempt=g["attempts"])
+    ctx.log(st, "behavior_passed", cp=args.cp, attempt=g["attempts"], flaky=flaky)
     ctx.save_state(st)
     build_viewer(ctx)
-    ok(f"Gate 1 (behavior) PASSED for {args.cp}. Next step: {cps['step']}")
+    ok(f"Gate 1 (behavior) PASSED for {args.cp}{' (flaky: passed on an immediate re-run)' if flaky else ''}. "
+       f"Next step: {cps['step']}")
 
 
 def _ui_verdict(review: dict, cfg) -> tuple[str, list]:
@@ -6849,6 +6892,17 @@ def cmd_complete(args):
     if cfg.get("regression_command"):
         code, out, _ = _run_cmd(ctx, cfg["regression_command"], ctx.evidence(args.cp) / "regression.log",
                                 cfg["test_timeout_sec"])
+        if code != 0 and not st.get("regression_flaky_used"):
+            # The run's own one-time allowance (not per-step): a regression failure that passes on one
+            # immediate automatic re-run is flaky, never spending this; a second one anywhere is never forgiven.
+            # Spent the moment this retry is attempted, win or lose, so a later failed complete call never gets
+            # its own free retry just because this one's retry also failed.
+            st["regression_flaky_used"] = True
+            code2, out2, _ = _run_cmd(ctx, cfg["regression_command"],
+                                      ctx.evidence(args.cp) / "regression-retry.log", cfg["test_timeout_sec"])
+            if code2 == 0:
+                code, out = code2, out2
+                cps["regression_flaky"] = True
         if code != 0:
             print(_tail(out))
             die(f"Regression suite failed (exit {code}) — an earlier behaviour broke. Fix before completing.", 2)
@@ -6984,14 +7038,25 @@ def cmd_feedback(args):
        "ratchet-test-planner for each new one, then run ratchet.py plan-extend.")
 
 
+def _validate_new_checkpoints(ctx, plan, new_ids):
+    """New checkpoints appended to the plan, whether by plan-extend's feedback or a hand-edited approve-changes,
+    must be well-formed and have a test plan before they are registered; a malformed or missing-test checkpoint
+    is refused here, not registered and left to crash later (standards #3). Shared by both call sites so a future
+    change to what a new checkpoint requires only needs to be made once. Both callers already run validate_plan
+    on this same `plan` before reaching here, so it is not repeated."""
+    missing = [c for c in new_ids if cp_by_id(plan, c)["gates"].get("behavior") and not test_plan(ctx, c)]
+    if missing:
+        die(f"Test plans missing for new checkpoints {missing}")
+
+
 def cmd_plan_extend(args):
     ctx = Ctx(find_root())
     st = ctx.state()
     if st["phase"] != "planning_feedback":
         die("plan-extend is only valid after ratchet.py feedback")
     plan = ctx.plan()
-    errs = validate_plan(plan)
-    if errs:
+    errs = validate_plan(plan)  # before any code below indexes a checkpoint's "id": a malformed plan is a
+    if errs:                    # named plan problem, never a bare KeyError.
         die("Plan invalid:\n  - " + "\n  - ".join(errs))
     had_objective = (st.get("approved") or {}).get("objective")
     if had_objective and not objective_problems({"objective": had_objective}) and objective_problems(plan):
@@ -7006,9 +7071,7 @@ def cmd_plan_extend(args):
     edited = [c["id"] for c in plan["checkpoints"] if c["id"] in approved_cps and _sha(c) != approved_cps[c["id"]]]
     if edited:
         die(f"Existing checkpoint(s) {edited} were edited. Feedback only APPENDS new checkpoints; restore the originals.")
-    missing = [c for c in new_ids if cp_by_id(plan, c)["gates"].get("behavior") and not test_plan(ctx, c)]
-    if missing:
-        die(f"Test plans missing for new checkpoints {missing}")
+    _validate_new_checkpoints(ctx, plan, new_ids)
     for cid in new_ids:
         st["checkpoints"][cid] = new_cp_state(cp_by_id(plan, cid))
     st["plan_hash"] = _plan_hash(plan, ctx)
@@ -7205,6 +7268,9 @@ def cmd_ask(args):
         return _ask_accept_finding(ctx, st, args)
     detail = ""
     if args.action == "approve-changes":
+        # integrity_problems (via approval_snapshot/_plan_hash) no longer raises KeyError for a checkpoint
+        # missing "id": it falls back to its position, so this stays a question, not a crash (CP6-X04). The
+        # mutating command (`ratchet.py approve-changes`) is what validates the plan's shape and refuses.
         probs = integrity_problems(ctx, st)
         if not probs:
             ok("Nothing has changed since approval — no question needed.")
@@ -7649,6 +7715,9 @@ def cmd_approve_changes(args):
     """The user confirmed a change to the plan, test plans or rules after approval: accept it as the new baseline."""
     ctx = Ctx(find_root())
     st = ctx.state()
+    errs = validate_plan(ctx.plan())  # before integrity_problems/approval_snapshot/_plan_hash trust any
+    if errs:                         # checkpoint's "id": a malformed plan is a named plan problem, never a
+        die("Plan invalid:\n  - " + "\n  - ".join(errs))  # bare KeyError.
     probs = integrity_problems(ctx, st)
     if not probs:
         ok("Nothing has changed since approval.")
@@ -7669,6 +7738,12 @@ def cmd_approve_changes(args):
                 "(`ratchet.py ask approve-changes`).")
         _require_pending(st, "approve-changes")
         msg = _require_human(ctx, st, "approve-changes", getattr(args, "director_token", None))
+    plan = ctx.plan()
+    new_ids = [c["id"] for c in plan["checkpoints"] if c["id"] not in st["checkpoints"]]
+    if new_ids:
+        _validate_new_checkpoints(ctx, plan, new_ids)
+    for cid in new_ids:
+        st["checkpoints"][cid] = new_cp_state(cp_by_id(plan, cid))
     st["approved"] = approval_snapshot(ctx, st)
     cur = st.get("current")
     if cur and (st["checkpoints"].get(cur) or {}).get("red_tests") is not None:
@@ -8118,16 +8193,26 @@ def cmd_reviewers(args):
         g["attempts"] += 1
         st["adv_rounds_total"] = int(st.get("adv_rounds_total", 0)) + 1
         prev = rnd["round"] if rnd else 0
+        free_replace = False
         if rnd and not rnd.get("recorded"):
             # Replacing a round nobody reviewed yet (the code changed again before any review was written) costs
             # nothing: refund this round-opening's own increment back out, never below zero.
             prev_dir = _review_round_dir(ctx, args.cp, "adv", prev)
-            if not any(prev_dir.glob("*.json")):
+            if not any(p for p in prev_dir.glob("*.json") if not p.name.endswith(".cutoff.json")):
+                free_replace = True
                 g["attempts"] = max(0, g["attempts"] - 1)
                 st["adv_rounds_total"] = max(0, int(st.get("adv_rounds_total", 0)) - 1)
         old_key = review_key_file(ctx.root, st, args.cp, "adv", prev) if prev else None
+        # The round being replaced, before it is overwritten -- unless it was itself never reviewed (free
+        # replace): its own fingerprint is not a baseline any reviewer has seen, so carry forward ITS
+        # prev_round_tree (the last ACTUALLY-REVIEWED tree) instead, never the discarded round's fingerprint.
+        if free_replace:
+            prev_round_tree = rnd.get("prev_round_tree")
+        else:
+            prev_round_tree = rnd["fingerprint"] if rnd else None
         rnd = {"round": prev + 1, "nonce": secrets.token_hex(8), "fingerprint": fp, "opened_at": now(),
                "reviewers": [r["id"] for r in resolved], "narrowed": narrow_now,
+               "prev_round_tree": prev_round_tree,
                "substitutions": [{"used": r["id"], "instead_of": r["fallback_for"], "why": r["reasons"]}
                                  for r in resolved if r["fallback_for"]],
                "resolved": resolved}
@@ -8139,12 +8224,21 @@ def cmd_reviewers(args):
         ctx.save_state(st)
         drop_review_key(old_key)  # the replaced round (now saved as replaced) stops counting
     else:
-        # same round: if a listed reviewer has become unavailable (its CLI failed), give its slot to the next choice
-        fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp)}
+        # same round: if a listed reviewer has become unavailable (its CLI failed), give its slot to the next
+        # choice. A review file already written in this round's own folder is never discarded or re-resolved,
+        # even for a slot that otherwise looks replaceable. A reply cut off mid-answer twice (external_review.py's
+        # own retry already tried once) falls its own slot back for this round only — read from the round's
+        # folder, never the long-lived unavailable_ttl_hours store, so the rest of this reviewer's slots, and
+        # every other reviewer on the same CLI, keep running.
+        out_dir_now = _review_round_dir(ctx, args.cp, "adv", rnd["round"])
+        round_cutoff = {p.name[:-len(".cutoff.json")] for p in out_dir_now.glob("*.cutoff.json")}
+        fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff)}
         changed = False
         for i, r in enumerate(rnd["resolved"]):
+            if (out_dir_now / f"{r['id']}.json").exists():
+                continue  # a finished review in this round is kept untouched, never re-resolved
             okay, _why = reviewer_availability(ctx, cfg, r["id"])
-            if not okay and r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
+            if (not okay or r["id"] in round_cutoff) and r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
                 rnd["resolved"][i] = fresh[r["slot"]]
                 changed = True
         if changed:
@@ -8227,11 +8321,14 @@ def status_json(ctx: Ctx) -> dict:
     st = ctx.state()
     plan = ctx.plan() or {"checkpoints": []}
     cps = []
-    for cp in plan["checkpoints"]:
-        s = st["checkpoints"].get(cp["id"]) or {}
-        cps.append({"id": cp["id"], "title": cp["title"], "risk": cp.get("risk", "normal"),
+    for i, cp in enumerate(plan["checkpoints"]):
+        # A checkpoint missing "id" (a malformed hand-edit) is a plan problem, not a reason for `status` to
+        # crash: fall back to its position so the run stays visible; validate_plan names the real problem.
+        cid = cp.get("id", f"#{i}")
+        s = st["checkpoints"].get(cid) or {}
+        cps.append({"id": cid, "title": cp.get("title", "?"), "risk": cp.get("risk", "normal"),
                     "status": s.get("status", "unsubmitted"), "step": s.get("step"), "commit": s.get("commit"),
-                    "gates": {n: {k: g.get(k) for k in ("status", "attempts", "by", "unconfirmed") if g.get(k) is not None}
+                    "gates": {n: {k: g.get(k) for k in ("status", "attempts", "by", "unconfirmed", "flaky") if g.get(k) is not None}
                               for n, g in (s.get("gates") or {}).items()}})
     na = next_action(ctx, st)
     hs = hooks_view(ctx, st)
@@ -9072,9 +9169,15 @@ def _stop_error(root: Path, why: str) -> tuple[bool, str]:
 # A real reply with a marker at the start of one of its lines is dropped too (the safe side): the user sends it
 # again. Every line of the text is checked, in one linear pass, so no amount of ordinary preamble text ahead of the
 # marker line changes the answer: there is no fixed line count, block count or blank-line cap to tune or bypass.
-HOST_TURN_MARKERS = ("Another Claude session sent a message:",   # Claude Code: a background sub-agent's hand-back
+HOST_TURN_MARKERS = ("Another Claude session sent a message:",   # Claude Code's ON-SCREEN RENDERING of a hand-back
+                                                                   # (kept too: an older run or a differently-
+                                                                   # rendering host may still only show this text)
                      "[SYSTEM NOTIFICATION - NOT USER INPUT]",    # a host notice about background work
                      "<task-notification>")                       # Claude Code: a background task finished
+# The real bytes the UserPromptSubmit hook receives for a sub-agent hand-back: wrapped as
+# `<agent-message from="...">...</agent-message>` (the attribution value is not fixed). Matched by the opening
+# tag alone, so any attribute content or closing-tag spelling still counts.
+HOST_TURN_MARKER_RE = re.compile(r"\A<agent-message\b")
 HOST_TURN_WRAPPER_TAGS = ("system-reminder",)
 _HOST_TURN_SPACE = "[\\s\\u180e\\u200b\\u200c\\u200d\\u2060\\ufeff]"  # \s is Unicode-aware; plus the zero-width ones
 _HOST_TURN_TAGS = "|".join(map(re.escape, HOST_TURN_WRAPPER_TAGS))
@@ -9083,10 +9186,11 @@ _HOST_TURN_EOL_RE = re.compile("\r\n|[\n\r\v\f\x1c\x1d\x1e\x85  ]")  # the b
 
 
 def host_generated_turn(prompt) -> bool:
-    """Is this prompt one the agent CLI generated itself: does a HOST_TURN_MARKERS entry start any line of it, once
-    that line's own leading whitespace and leading wrapper tags are set aside? One linear pass over the text, line
-    by line; no fixed line count, block count or blank-line cap, so no amount of preamble text ahead of the marker
-    line changes the answer."""
+    """Is this prompt one the agent CLI generated itself: does a HOST_TURN_MARKERS entry, or the real
+    `<agent-message ...>` wrapper (HOST_TURN_MARKER_RE), start any line of it, once that line's own leading
+    whitespace and leading wrapper tags are set aside? One linear pass over the text, line by line; no fixed
+    line count, block count or blank-line cap, so no amount of preamble text ahead of the marker line changes
+    the answer. A marker only mentioned mid-line (not at the start of any line) changes nothing."""
     text = prompt if isinstance(prompt, str) else ""
     pos = 0
     while True:
@@ -9096,7 +9200,7 @@ def host_generated_turn(prompt) -> bool:
         pad = HOST_TURN_PAD_RE.match(line)
         if pad:
             line = line[pad.end():]
-        if line.startswith(HOST_TURN_MARKERS):
+        if line.startswith(HOST_TURN_MARKERS) or HOST_TURN_MARKER_RE.match(line):
             return True
         if not m:
             return False

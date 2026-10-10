@@ -150,6 +150,26 @@ def ui_round_dir(d, cp="CP1", slug="f"):
     return p
 
 
+def _default_files_reviewed(d, rnd, slug="f"):
+    """Whatever really changed since this checkpoint's base_tree, the same tree-to-tree comparison adv-record's
+    own changed-files check uses (git diff-tree, base_tree vs the current fingerprint — untracked new files, like
+    a freshly written test file, never show up in a plain `git diff`), so a default review written by
+    write_review() always overlaps it, even for a fixture (like test_flaky.py's flaky-command projects) that
+    never touches src/f.js. Falls back to the old hardcoded guess if anything about that lookup is missing, so
+    existing fixtures keep behaving the same."""
+    try:
+        st = json.loads((Path(d) / f".ratchet/runs/{slug}/state.json").read_text())
+        base = (st["checkpoints"].get(rnd["checkpoint"]) or {}).get("base_tree")
+        if not base:
+            return ["src/f.js"]
+        fp = json.loads(rx(d, "fingerprint").stdout)["id"]
+        r = git(d, "diff-tree", "-r", "--no-renames", "--name-only", base, fp)
+        files = [l for l in r.stdout.splitlines() if l]
+        return files or ["src/f.js"]
+    except Exception:
+        return ["src/f.js"]
+
+
 def write_review(d, rnd, rid, findings=None, **over):
     """Writes an adversarial review into the round's own folder. CP7: a hand-written review only counts when the
     guard hook has recorded, at write time, that a ratchet-adversary sub-agent is writing this exact file; so the
@@ -159,7 +179,8 @@ def write_review(d, rnd, rid, findings=None, **over):
     g = guard(d, "Write", {"file_path": str(p)}, agent="ratchet-adversary")
     assert g.returncode == 0, g.stdout + g.stderr
     body = {"reviewer": rid, "checkpoint": rnd["checkpoint"], "fingerprint": rnd["fingerprint"],
-            "round_nonce": rnd["round_nonce"], "findings": findings or [], "files_reviewed": ["src/f.js"]}
+            "round_nonce": rnd["round_nonce"], "findings": findings or [],
+            "files_reviewed": _default_files_reviewed(d, rnd)}
     body.update(over)
     p.write_text(json.dumps(body))
     return str(p)

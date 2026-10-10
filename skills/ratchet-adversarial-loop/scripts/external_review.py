@@ -75,21 +75,71 @@ def load_engine():
 
 
 def git(root, *args):
-    r = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+    # core.quotepath=off: a path with non-ASCII characters is printed as raw UTF-8 (e.g. café.py), not quoted
+    # and octal-escaped (e.g. "caf\303\251.py") — so the plain unquoted header regex below matches it too.
+    r = subprocess.run(["git", "-c", "core.quotepath=off", *args], cwd=root, capture_output=True, text=True)
     return r.stdout if r.returncode == 0 else ""
 
 
-def collect_diff(root: Path, base_tree: str | None, current_tree: str | None) -> str:
+_DIFF_FILE_RE = re.compile(r'^diff --git a/(.*?) b/(.*?)\n', re.M)
+_DIFF_FILE_QUOTED_RE = re.compile(r'^diff --git "((?:[^"\\]|\\.)*)" "((?:[^"\\]|\\.)*)"\n', re.M)
+
+
+def _git_unquote(quoted: str) -> str:
+    """Undo git's C-style quoting of a pathname (octal byte escapes, plus \\\\, \\" , \\t, \\n), still produced
+    for a path with characters git quotes regardless of core.quotepath (quotes, backslashes, control bytes)."""
+    buf, i = bytearray(), 0
+    while i < len(quoted):
+        c = quoted[i]
+        if c == "\\" and i + 1 < len(quoted):
+            nxt = quoted[i + 1]
+            if nxt.isdigit():
+                buf.append(int(quoted[i + 1:i + 4], 8) & 0xFF)
+                i += 4
+                continue
+            esc = {"n": "\n", "t": "\t", '"': '"', "\\": "\\"}.get(nxt)
+            if esc is not None:
+                buf.extend(esc.encode())
+                i += 2
+                continue
+        buf.extend(c.encode("utf-8"))
+        i += 1
+    return buf.decode("utf-8", errors="replace")
+
+
+def _diff_file_chunks(diff_text: str) -> list[tuple[str, str]]:
+    """Split one unified diff into [(path, its own chunk text)], in the order git printed them. `path` is the
+    'b/' side (the file's new name), or the 'a/' side for a pure deletion. Handles both git's plain header
+    (diff --git a/x b/x) and its quoted header (diff --git "a/x" "b/x"), so a chunk is never silently dropped."""
+    out = []
+    parts = re.split(r"(?m)^(?=diff --git )", diff_text)
+    for part in parts:
+        if not part.startswith("diff --git "):
+            continue
+        m = _DIFF_FILE_RE.match(part)
+        if m:
+            a_path, b_path = m.group(1), m.group(2)
+        else:
+            mq = _DIFF_FILE_QUOTED_RE.match(part)
+            if not mq:
+                continue
+            a_path, b_path = _git_unquote(mq.group(1)), _git_unquote(mq.group(2))
+        out.append((b_path if b_path != "dev/null" else a_path, part))
+    return out
+
+
+def collect_diff(root: Path, base_tree: str | None, current_tree: str | None, prev_round_tree: str | None = None) -> str:
     """Everything that changed since the checkpoint started — committed, uncommitted and untracked alike.
 
     Both sides are tree ids from ratchet.py's fingerprint (a snapshot of the whole working tree), so a
     checkpoint can't hide code from reviewers by committing it or by naming a commit 'ratchet(...)'.
+
+    `prev_round_tree`: round 2+ only (None on round 1, which keeps the plain order below). The tree the
+    PREVIOUS review round was stamped with: files that changed since then are put first, so a reviewer always
+    sees what is new since it last looked, even when the whole diff is too large to include and the rest gets
+    cut. When the size limit still cuts content, the files left out are named, not just a generic char count.
     """
-    parts = []
-    if base_tree and current_tree:
-        parts = [f"# Changes in this checkpoint ({base_tree[:10]} → {current_tree[:10]})\n",
-                 git(root, "diff-tree", "-r", "-p", "--no-color", base_tree, current_tree)]
-    else:  # non-git project or an old run: fall back to the working-tree diff against HEAD
+    if not (base_tree and current_tree):  # non-git project or an old run: the working-tree diff against HEAD
         parts = ["# Diff against HEAD\n", git(root, "diff", "HEAD", "--", ".", ":(exclude).ratchet")]
         for f in [l for l in git(root, "ls-files", "--others", "--exclude-standard").splitlines()
                   if l and not l.startswith(".ratchet/")]:
@@ -99,10 +149,44 @@ def collect_diff(root: Path, base_tree: str | None, current_tree: str | None) ->
                     parts.append(f"\n# NEW FILE {f}\n" + p.read_text(errors="ignore"))
             except OSError:
                 pass
-    text = "".join(parts)
-    if len(text) > MAX_DIFF:
-        text = text[:MAX_DIFF] + f"\n\n[diff truncated at {MAX_DIFF} chars — flag anything you could not see]"
-    return text
+        text = "".join(parts)
+        if len(text) > MAX_DIFF:
+            text = text[:MAX_DIFF] + f"\n\n[diff truncated at {MAX_DIFF} chars — flag anything you could not see]"
+        return text
+    header = f"# Changes in this checkpoint ({base_tree[:10]} → {current_tree[:10]})\n"
+    full_diff = git(root, "diff-tree", "-r", "-p", "--no-color", base_tree, current_tree)
+    if not prev_round_tree or prev_round_tree == current_tree:
+        text = header + full_diff
+        if len(text) > MAX_DIFF:
+            text = text[:MAX_DIFF] + f"\n\n[diff truncated at {MAX_DIFF} chars — flag anything you could not see]"
+        return text
+    chunks = _diff_file_chunks(full_diff)
+    changed_since = {f for f in git(root, "diff-tree", "-r", "--no-renames", "--name-only",
+                                    prev_round_tree, current_tree).splitlines() if f}
+    priority = [(f, c) for f, c in chunks if f in changed_since]
+    rest = [(f, c) for f, c in chunks if f not in changed_since]
+    note = (f"# Files changed since the previous review round ({', '.join(f for f, _ in priority) or '(none)'}): "
+            "their diffs come first below.\n") if priority else \
+           "# No files changed since the previous review round; showing the whole diff below.\n"
+    parts = [header, note]
+    total = len(header) + len(note)
+    cut = []
+    for f, c in priority + rest:
+        remaining = MAX_DIFF - total
+        if remaining <= 0:
+            cut.append(f)
+            continue
+        if len(c) > remaining:  # this file's own diff is what the size limit cuts into (shown as far as it fits)
+            parts.append(c[:remaining])
+            total += remaining
+            cut.append(f)
+            continue
+        parts.append(c)
+        total += len(c)
+    if cut:
+        parts.append(f"\n[diff truncated at {MAX_DIFF} chars — left out or cut short (ask about these if they "
+                     f"matter): {', '.join(cut)}]")
+    return "".join(parts)
 
 
 def read_doc(root: Path, rel: str) -> str:
@@ -122,7 +206,8 @@ def adversary_instructions() -> str:
     return "You are an adversarial code reviewer. Assume the code is wrong and prove it."
 
 
-def build_prompt(eng, ctx, cfg, cp, rid, spec, fp, fixes_path, base_tree=None, nonce=None, rules=None) -> str:
+def build_prompt(eng, ctx, cfg, cp, rid, spec, fp, fixes_path, base_tree=None, nonce=None, rules=None,
+                 prev_round_tree=None) -> str:
     root = ctx.root
     docs = "".join(read_doc(root, s) for s in cfg.get("standards", []))
     docs += read_doc(root, ".ratchet/learnings.md")
@@ -154,7 +239,7 @@ Code fingerprint: {fp}
 {("## Rules for this round" + chr(10) + chr(10).join("- " + r for r in rules)) if rules else ""}
 
 ## Code under review
-{collect_diff(root, base_tree, fp)}
+{collect_diff(root, base_tree, fp, prev_round_tree)}
 
 ---
 Reply with ONLY one JSON object, no markdown fences, exactly this shape:
@@ -199,31 +284,57 @@ def argv_problem(cmd: list[str], env: dict) -> str | None:
 
 
 def parse_findings(text: str) -> dict | None:
-    """Take the LAST top-level JSON object in the text that has a 'findings' key."""
+    """Take the first top-level JSON object in the text whose 'findings' key is a list. Uses the stdlib decoder's
+    own `raw_decode` (properly escape-aware, unlike a hand-written brace/string scanner) from each '{' in the
+    text that is not nested inside an object already decoded; `raw_decode` parses one complete JSON value
+    starting at that index and ignores anything after it, so a brace or quote inside an earlier string value can
+    never throw off where a later, real JSON object starts or ends. Once a '{' has been decoded (whether or not
+    it qualified), every position inside its span is skipped rather than tried on its own, so a finding's own
+    nested object (e.g. an "evidence" dict that happens to contain a literal "findings" key) is never mistaken
+    for the real top-level reply."""
     text = re.sub(r"```(?:json)?", "", text)
-    best, depth, start, in_str, esc = None, 0, None, False, False
-    for i, ch in enumerate(text):
-        if in_str:
-            esc = (not esc) if ch == "\\" else False
-            if ch == '"' and not esc:
-                in_str = False
+    dec = json.JSONDecoder()
+    end = 0
+    for m in re.finditer(r"\{", text):
+        start = m.start()
+        if start < end:
+            continue  # nested inside the object just decoded — never considered on its own
+        try:
+            obj, end = dec.raw_decode(text, start)
+        except json.JSONDecodeError:
             continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}" and depth:
-            depth -= 1
-            if depth == 0 and start is not None:
-                try:
-                    obj = json.loads(text[start:i + 1])
-                    if isinstance(obj, dict) and "findings" in obj:
-                        best = obj
-                except json.JSONDecodeError:
-                    pass
-    return best
+        if isinstance(obj, dict) and isinstance(obj.get("findings"), list):
+            return obj
+    return None
+
+
+def _looks_cut_off(text: str) -> bool:
+    """A reply counts as cut off only if it opens what looks like the findings-reply JSON itself — a '{' followed,
+    within a short window, by one of the findings-reply keys 'reviewer', 'verdict' or 'findings' — and
+    `json.JSONDecoder.raw_decode` (properly escape-aware; see parse_findings) fails to parse a complete JSON value
+    there because the text ran out before the object closed: either an unterminated string (the decoder only
+    raises this when it scans from an opening quote to the end of the text without finding the matching one) or
+    any other decode error positioned at the very end of the (right-stripped) text, where the parser ran out of
+    input expecting more. A decode error positioned earlier in the text is a real syntax mistake in an otherwise
+    complete reply, not a truncation, and is not mistaken for one. A complete JSON value such as
+    {"error": {"message": "quota exceeded"}} carries none of the findings-reply keys, so it is never mistaken for a
+    truncated reply, whether on the first call or a retry: it goes straight to unavailable(), same as a plain-text
+    error, with no retry wasted and no cutoff.json marker written. A genuinely truncated findings reply (an opening
+    brace with no matching close) is retried once before anything is held against the reviewer."""
+    stripped = re.sub(r"```(?:json)?", "", text)
+    dec = json.JSONDecoder()
+    end = len(stripped.rstrip())
+    for m in re.finditer(r"\{", stripped):
+        start = m.start()
+        if not re.search(r'"(?:reviewer|verdict|findings)"\s*:', stripped[start:start + 2000]):
+            continue  # not the start of a findings-reply object — some other brace in the text
+        try:
+            dec.raw_decode(stripped, start)
+        except json.JSONDecodeError as e:
+            if e.msg.startswith("Unterminated string") or e.pos >= end:
+                return True  # this candidate never closes — a genuine truncation
+            continue  # a real syntax mistake mid-text, not a truncation — some other brace, keep looking
+    return False
 
 
 def main():
@@ -262,7 +373,8 @@ def main():
         sys.exit(f"No open review round for {a.cp} that includes '{a.reviewer}' at the current code. "
                  f"Run `ratchet.py reviewers {a.cp}` first and launch exactly the reviewers it lists.")
     _focus, rules = eng.review_rules(ctx, cfg, cp, cps["gates"]["adversarial"], rnd, fp)
-    prompt = build_prompt(eng, ctx, cfg, cp, a.reviewer, spec, fp, a.fixes, cps.get("base_tree"), rnd["nonce"], rules)
+    prompt = build_prompt(eng, ctx, cfg, cp, a.reviewer, spec, fp, a.fixes, cps.get("base_tree"), rnd["nonce"], rules,
+                          prev_round_tree=rnd.get("prev_round_tree"))
 
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -312,24 +424,54 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
                     f"command-line argument: {too_big}. Give this provider a 'command' that reads {{prompt_file}} "
                     "or stdin to review changes this large")
     shown = " ".join(c if len(c) < 80 else c[:40] + "…" for c in cmd)
-    print(f"running {a.reviewer}: {shown}", file=sys.stderr)
-    try:
-        # run from an empty folder, flagged as nested: the reviewer needs nothing but the prompt, can't touch the
-        # project, and its CLI's own hooks must not log this prompt as if the user had typed it
-        r = subprocess.run(cmd, cwd=work, input=prompt if use_stdin else None, capture_output=True, text=True,
-                           stdin=None if use_stdin else subprocess.DEVNULL, timeout=a.timeout, env=env)
-    except FileNotFoundError:
-        unavailable(f"'{cmd[0]}' is not installed or not on PATH")
-    except subprocess.TimeoutExpired:
-        unavailable(f"timed out after {a.timeout}s")
-    except OSError as e:  # the system refused to start it (E2BIG: the arguments were too large after all, ...)
-        if e.errno == errno.E2BIG:
-            unavailable(f"the review prompt ({len(prompt):,} characters) is too large to pass to '{cmd[0]}' as a "
-                        "command-line argument. Give this provider a 'command' that reads {prompt_file} or stdin "
-                        "to review changes this large")
-        unavailable(f"'{cmd[0]}' could not be started: {e.strerror or e}")
-    text = (out_file.read_text() if out_file.exists() else "") + "\n" + (r.stdout or "")
+
+    def run_once():
+        print(f"running {a.reviewer}: {shown}", file=sys.stderr)
+        try:
+            # run from an empty folder, flagged as nested: the reviewer needs nothing but the prompt, can't touch
+            # the project, and its CLI's own hooks must not log this prompt as if the user had typed it
+            rr = subprocess.run(cmd, cwd=work, input=prompt if use_stdin else None, capture_output=True, text=True,
+                               stdin=None if use_stdin else subprocess.DEVNULL, timeout=a.timeout, env=env)
+        except FileNotFoundError:
+            unavailable(f"'{cmd[0]}' is not installed or not on PATH")
+        except subprocess.TimeoutExpired:  # a hang is never retried — one timeout is enough to sideline it
+            unavailable(f"timed out after {a.timeout}s")
+        except OSError as e:  # the system refused to start it (E2BIG: the arguments were too large after all, ...)
+            if e.errno == errno.E2BIG:
+                unavailable(f"the review prompt ({len(prompt):,} characters) is too large to pass to '{cmd[0]}' as a "
+                            "command-line argument. Give this provider a 'command' that reads {prompt_file} or "
+                            "stdin to review changes this large")
+            unavailable(f"'{cmd[0]}' could not be started: {e.strerror or e}")
+        tt = (out_file.read_text() if out_file.exists() else "") + "\n" + (rr.stdout or "")
+        return rr, tt
+
+    r, text = run_once()
     review = parse_findings(text)
+    if review is None and _looks_cut_off(text):
+        # A reply cut off mid-answer (an opening brace with no matching close) — not a genuine failure, just an
+        # incomplete one — gets one immediate retry before anything is held against this reviewer.
+        print(f"{a.reviewer}: reply cut off mid-answer; retrying once", file=sys.stderr)
+        out_file.unlink(missing_ok=True)  # stale truncated output from the first try must not leak into the retry
+        r2, text2 = run_once()
+        review2 = parse_findings(text2)
+        if review2 is not None:
+            r, text, review = r2, text2, review2
+        elif _looks_cut_off(text2):
+            # Cut off twice: fall back only THIS slot for this round — no unavailable_ttl_hours mark, so the
+            # provider is never sidelined for hours and its other slots keep running (see cmd_reviewers' same-
+            # round branch, which reads this marker from the round's own folder).
+            (out.parent / f"{a.reviewer}.raw.txt").write_text(text2 + "\n--- stderr ---\n" + (r2.stderr or ""))
+            marker = out.parent / f"{a.reviewer}.cutoff.json"
+            marker.write_text(json.dumps({"reason": "reply cut off mid-answer twice in a row", "at": eng.now()}))
+            print(f"{a.reviewer}: cut off twice in a row (the reply never finished). This slot falls back for "
+                  f"round {rnd['round']} only — run `ratchet.py reviewers {a.cp}` again.", file=sys.stderr)
+            sys.exit(3)
+        else:
+            # The retry's reply is not cut off at all — a genuine failure (quota, auth, plain error, ...), not
+            # another truncation. This goes through the normal unavailable() path, same as any other real failure.
+            (out.parent / f"{a.reviewer}.raw.txt").write_text(text2 + "\n--- stderr ---\n" + (r2.stderr or ""))
+            tail = ((r2.stderr or "") + (r2.stdout or "")).strip().splitlines()[-1:] or [""]
+            unavailable(f"exit {r2.returncode}, no findings JSON ({tail[0][:160]})")
     if review is None:
         (out.parent / f"{a.reviewer}.raw.txt").write_text(text + "\n--- stderr ---\n" + (r.stderr or ""))
         tail = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()[-1:] or [""]
