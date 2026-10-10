@@ -124,6 +124,10 @@ DEFAULT_CONFIG = {
     # From round 2 on, a minor finding only blocks if it is in code changed since the previous round; blocker and
     # major findings block wherever they are. Stops each round from turning into a fresh review of everything.
     "scope_later_rounds": True,
+    # After this many blocking adversarial rounds in a row (or a second round where an unseen finding kind shows
+    # up in a file an earlier round already flagged), pause for a check-in (`ratchet.py check-in CPn`) before
+    # opening another round: see "Check-in" in schemas.md section 7.
+    "checkin_round": 2,
     "unavailable_ttl_hours": 6,     # an other-provider reviewer that failed (auth, quota, timeout) is skipped this long
     "max_adversarial_rounds": 6,    # per checkpoint; after this the loop blocks and escalates
     "max_adversarial_rounds_run": 30,  # across the whole run (quota guard); then blocks and escalates
@@ -1529,7 +1533,7 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "fingerprint_include", "approver", "ui_single_reviewer_ok", "min_review_timeout_sec", "test_timeout_sec",
              "host_provider", "ui_reviewers", "design_md", "max_stop_blocks", "unavailable_ttl_hours",
              "verify_transcripts", "min_review_seconds", "commit_per_checkpoint", "blocking_severities",
-             "scope_later_rounds", "host_models", "role_models", "checks"]
+             "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round"]
 
 
 def _file_sha(p: Path) -> str | None:
@@ -1677,6 +1681,25 @@ def objective_brief(plan) -> str:
         lines.append("Out of scope:")
         lines += [f"  - {x}" for x in oos]
     return "\n".join(lines)
+
+
+def _final_review_lines(plan) -> list[str]:
+    """What `status` (and `status --json`'s own fields, read by the human-approve question) opens the final review
+    with: the objective's goal and users, then every done_means line, plain, for the user to judge against the
+    evidence themselves. Completing every checkpoint never proves a done_means line is actually met (simplifying a
+    step, or the user accepting a finding, can leave one unmet), so no line here claims met or not met; `status`
+    prints the findings accepted along the way (`_accepted_findings_lines`) and anything left for later right
+    after, so the user judges each line with that context, not a bare claim. A plan with no stated objective
+    (approved before this existed) gets a plain note instead of a crash."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    if not isinstance(obj, dict) or not obj:
+        return [f"Objective: {NO_OBJECTIVE_NOTE}."]
+    lines = [f"Objective: {obj.get('goal', '')}", f"Who it's for: {obj.get('users', '')}",
+              "Done means (check each against what was actually built and the findings below; finishing the "
+              "checkpoints does not by itself mean these are met):"]
+    for dm in obj.get("done_means") or []:
+        lines.append(f"  - check: {dm}")
+    return lines
 
 
 def _objective_fill_ins(obj: dict) -> list[str]:
@@ -2120,6 +2143,15 @@ def exit_code_only_note(plan, st):
 def cmd_status_text(ctx: Ctx):
     st = ctx.state()
     plan = ctx.plan() or {"checkpoints": []}
+    if st.get("phase") == "awaiting_final_review":
+        for line in _final_review_lines(plan):
+            print(line)
+        left = [f for c in (st.get("checkpoints") or {}).values() for f in c.get("deferred") or []
+                if not f.get("accepted")]
+        if left:
+            print(f"{len(left)} finding(s) were left for later (never accepted or fixed): run `ratchet.py "
+                  "deferred` to see them.")
+        print("")
     cps = plan.get("checkpoints", [])
     total = len(cps)
     done = [c for c in cps if (st["checkpoints"].get(c["id"]) or {}).get("status") == "done"]
@@ -2138,6 +2170,10 @@ def cmd_status_text(ctx: Ctx):
     if st.get("phase") == "building" and any(g.get("status") in ("stale", "invalid")
                                              for g in (cur.get("gates") or {}).values()):
         print("The code changed since the checks last passed, so they must be re-run.")
+    ci_open = (cur.get("checkin") or {}).get("open")
+    if ci_open:
+        print(f"A check-in is open for {st.get('current')} (round {ci_open.get('round')}): run "
+              f"`ratchet.py check-in {st.get('current')}` to see it, then `--decision simplify|stop` to resolve it.")
     note = exit_code_only_note(plan, st)
     if note:
         print(note)
@@ -2282,6 +2318,11 @@ def cmd_plan_summary(args):
     if acc:
         print("")
         for line in acc:
+            print(line)
+    ci_lines = _checkin_decisions_lines(st)
+    if ci_lines:
+        print("")
+        for line in ci_lines:
             print(line)
 
 
@@ -5104,6 +5145,262 @@ def _dedupe_finding_ids(findings: list) -> list:
     return out
 
 
+def _checkin_state(cps) -> dict:
+    """The checkpoint's own check-in record (state.json, never a separate file): whether each of the two triggers
+    has already fired once for this step, the running count of rounds that hit the 'new kind in an already-flagged
+    file' condition, the check-in that is currently open (or None), and every past decision. `cps` is the same
+    dict object held inside `state.json`'s `checkpoints`, so mutating what this returns and saving state is enough;
+    nothing here is written as its own file."""
+    return cps.setdefault("checkin", {"round_count_fired": False, "new_kind_fired": False,
+                                      "new_kind_repeats": 0, "open": None, "decided": []})
+
+
+def _checkin_trigger(ctx, st, cp_id, cps, g, rnd, blocking_findings) -> str | None:
+    """Call right after a round is recorded as still blocking (g['rounds'] already carries this round's own entry,
+    last in the list). Opens a check-in (see cmd_check_in) at most once per trigger per step: either this is the
+    `checkin_round`'th (default 2) round in a row to block, or this is the SECOND round where a finding kind never
+    seen before in this step shows up in a file an earlier round already had a blocking finding in. Returns a short
+    note for the adv-record refusal message when one just opened, else None. Mutates `cps` in place; the caller
+    still has to `ctx.save_state(st)`."""
+    ci = _checkin_state(cps)
+    if ci.get("open"):
+        return None  # already waiting on an earlier check-in; don't stack a second one on top
+    cfg = ctx.config()
+    # New-kind events are counted every round, whichever trigger (if any) ends up opening a check-in this round;
+    # otherwise a round that also satisfies the round-count trigger would never have its own new-kind event
+    # counted, undercounting new_kind_repeats for a later round.
+    prior_blocking_files: set = set()
+    for rr in (g.get("rounds") or [])[:-1]:
+        prior_blocking_files |= set(rr.get("blocking_files") or [])
+    seen_kinds_before = {k for k, hits in (st.get("finding_kinds") or {}).items()
+                         if any(h.get("cp") == cp_id and h.get("round") is not None and h["round"] < rnd["round"]
+                                for h in hits)}
+    new_kind_hit = any(
+        finding_kind(f) and finding_kind(f) not in seen_kinds_before
+        and _norm_path(f.get("file") or f.get("path") or f.get("location"), ctx.root) in prior_blocking_files
+        for f in blocking_findings)
+    if new_kind_hit:
+        ci["new_kind_repeats"] = int(ci.get("new_kind_repeats", 0)) + 1
+    trigger = None
+    consecutive_blocking = 0
+    for rr in reversed(g.get("rounds") or []):
+        if rr.get("findings", 0) > 0:
+            consecutive_blocking += 1
+        else:
+            break  # an approved round (no blocking findings) resets the consecutive count
+    if not ci.get("round_count_fired") and consecutive_blocking >= int(cfg.get("checkin_round", 2)):
+        trigger = "round_count"
+    elif new_kind_hit and not ci.get("new_kind_fired") and ci["new_kind_repeats"] >= 2:
+        trigger = "new_kind_repeat"
+    if not trigger:
+        return None
+    ci["open"] = {"round": rnd["round"], "trigger": trigger, "opened_at": now()}
+    ci["round_count_fired" if trigger == "round_count" else "new_kind_fired"] = True
+    return f"A check-in opened (reviews have been dragging): run `ratchet.py check-in {cp_id}` before fixing more."
+
+
+def _checkin_all_open_findings(ctx, cp_id, cps, g) -> list:
+    """The still-open (not accepted) findings for the check-in brief: the latest recorded round's own
+    open-findings.json, the same current view `reviewers` and the fixer already use (`_adv_open_findings`). A
+    finding fixed or withdrawn by a later round never reappears here, and a reviewer reusing an id (e.g. `A1`) for
+    a different problem in a later round is never confused with an earlier round's now-resolved one, because only
+    the latest round's file is read."""
+    return _adv_open_findings(ctx, cp_id, cps.get("adv_round"), cps)
+
+
+def _checkin_kinds_by_file(ctx, findings: list) -> dict:
+    out: dict = {}
+    for f in findings:
+        where = _norm_path(f.get("file") or f.get("path") or f.get("location"), ctx.root) or "(unknown file)"
+        kinds = out.setdefault(where, [])
+        k = finding_kind(f) or "?"
+        if k not in kinds:
+            kinds.append(k)
+    return out
+
+
+CHECKIN_OPTIONS = [
+    {"letter": "A", "text": "Simplify: narrow or change the step so the review notes stop applying; record why "
+                            "with `ratchet.py check-in CPn --decision simplify --why \"...\"` (no user question)."},
+    {"letter": "B", "text": "Accept the open findings as a known limit: only the user's own reply through `ask "
+                            "accept-finding` / `accept-finding` does this; check-in can't accept anything itself."},
+    {"letter": "C", "text": "Stop here and ask the user how to wrap up (`ratchet.py check-in CPn --decision stop`)."},
+]
+
+
+def _checkin_brief(ctx, plan, cp_id, cps, g, ci) -> dict:
+    open_ci = ci.get("open") or {}
+    findings = _checkin_all_open_findings(ctx, cp_id, cps, g)
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    return {"checkpoint": cp_id, "round": open_ci.get("round"), "trigger": open_ci.get("trigger"),
+            "rounds_used": len(g.get("rounds") or []),
+            "objective": obj if isinstance(obj, dict) and obj else NO_OBJECTIVE_NOTE,
+            "findings": [{"id": _finding_key(f), "severity": f.get("severity"),
+                          "file": f.get("file") or f.get("path") or f.get("location"), "kind": finding_kind(f),
+                          "description": f.get("description"), "user_impact": f.get("user_impact")}
+                         for f in findings],
+            "kinds_by_file": _checkin_kinds_by_file(ctx, findings),
+            "options": CHECKIN_OPTIONS, "decided": ci.get("decided") or []}
+
+
+def _print_checkin_brief(brief: dict):
+    print(f"Check-in for {brief['checkpoint']} (round {brief['round']}, rounds used: {brief['rounds_used']}, "
+          f"trigger: {brief['trigger']}).")
+    obj = brief["objective"]
+    if isinstance(obj, dict):
+        print(f"Who it's for: {obj.get('users', '')}")
+        print(f"What they want: {obj.get('goal', '')}")
+    else:
+        print(f"Note: {obj}.")
+    print("Open findings:")
+    for f in brief["findings"]:
+        line = f"  - {f['id']} ({f.get('severity', '?')}) {f.get('file') or ''}: {f.get('description', '') or ''}"
+        print(line.rstrip())
+        if f.get("user_impact"):
+            print(f"      user impact: {f['user_impact']}")
+    if brief["kinds_by_file"]:
+        print("Finding kinds by file:")
+        for fl, kinds in brief["kinds_by_file"].items():
+            print(f"  - {fl}: {', '.join(kinds)}")
+    print("What next:")
+    for o in brief["options"]:
+        print(f"  {o['letter']}) {o['text']}")
+
+
+def cmd_check_in(args):
+    """`ratchet.py check-in CPn` (optionally `--decision simplify|accept|stop [--why "..."]`, `--json`). With no
+    decision: prints (or returns as JSON) the open check-in's brief and changes nothing. `simplify` is recorded
+    from the reasoning given in `--why` (no user question; the skill requires that reasoning come from a fresh
+    strong-model consult, not the orchestrator's own continued reasoning, but this command itself only records
+    whatever `--why` carries); `accept` is always refused, pointing at the accept-finding flow (CP3), which needs
+    the user's own reply; `stop` hands the run to the existing blocked/ask flow for the user to decide how to wrap
+    up."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    plan = ctx.plan() or {}
+    cp_id = args.cp
+    cps = (st.get("checkpoints") or {}).get(cp_id)
+    if cps is None:
+        die(f"No such checkpoint {cp_id}.")
+    ci = _checkin_state(cps)
+    g = ((cps.get("gates") or {}).get("adversarial")) or {}
+    decision = getattr(args, "decision", None)
+    if decision is None:
+        if not ci.get("open"):
+            if getattr(args, "json", False):
+                print(json.dumps({"checkpoint": cp_id, "open": False}, indent=2))
+            else:
+                print(f"No check-in is open for {cp_id}.")
+            return
+        brief = _checkin_brief(ctx, plan, cp_id, cps, g, ci)
+        if getattr(args, "json", False):
+            print(json.dumps(brief, indent=2))
+        else:
+            _print_checkin_brief(brief)
+        return
+    open_ci = ci.get("open")
+    if not open_ci:
+        die(f"No check-in is open for {cp_id}. Nothing to decide.")
+    decision = decision.strip().lower()
+    if decision == "accept":
+        die("check-in cannot accept an open finding itself: a cooperative agent must not wave its own findings "
+            f"through here. That needs the user's own reply, through `ratchet.py ask accept-finding {cp_id} <ids>` "
+            "then `ratchet.py accept-finding` (CP3's own flow). Nothing was changed.")
+    if decision == "simplify":
+        why = (getattr(args, "why", None) or "").strip()
+        if not why:
+            die("check-in --decision simplify needs --why \"...\" explaining the reasoning. Nothing was recorded.")
+        ci.setdefault("decided", []).append({"round": open_ci["round"], "trigger": open_ci["trigger"],
+                                             "decision": "simplify", "why": why, "decided_at": now()})
+        ci["open"] = None
+        ctx.log(st, "checkin_simplify", cp=cp_id, round=open_ci["round"], why=why[:300])
+        ctx.save_state(st)
+        ok(f"Recorded: simplify ({why}). `ratchet.py reviewers {cp_id}` can open the next round now.")
+        return
+    if decision == "stop":
+        ci.setdefault("decided", []).append({"round": open_ci["round"], "trigger": open_ci["trigger"],
+                                             "decision": "stop", "decided_at": now()})
+        ci["open"] = None
+        _set_blocked(st, f"{cp_id}: a check-in paused the review loop after reviews kept dragging — needs the "
+                         "user's decision on how to wrap up.")
+        ctx.log(st, "checkin_stop", cp=cp_id, round=open_ci["round"])
+        ctx.save_state(st)
+        ok("Recorded: stop. The run now waits for the user to say how to wrap up.")
+        return
+    die("check-in --decision must be simplify, accept or stop.")
+
+
+TRIAGE_DECISIONS = {"fix", "rebut"}
+TRIAGE_REDIRECT = {"accept", "defer", "waive", "skip"}
+
+
+def _read_triage(dest: Path) -> dict:
+    return read_json(dest / "triage.json", {}, record="Ratchet treats a damaged triage file as empty")
+
+
+def cmd_triage(args):
+    """`ratchet.py triage CPn <ref>=fix:<reason> ...` or `<ref>=rebut:<reason> ...`, any number of decisions in one
+    call, `ref` being a finding's key from the checkpoint's latest recorded (blocked) round's open findings (a bare
+    id, or 'reviewer/id' when a bare id is ambiguous — the same keys `open-findings.json` lists). Only fix or rebut
+    are accepted: the orchestrator can never defer, accept or waive a finding through triage, since that needs the
+    user's own reply through the accept-finding flow (CP3). An empty reason is refused. Writes the round's own
+    triage.json (every decision ever recorded for this round; a later call may change one) and fix-list.json (only
+    the findings decided 'fix', for the fixer)."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    cps = (st.get("checkpoints") or {}).get(args.cp)
+    if cps is None:
+        die(f"No such checkpoint {args.cp}.")
+    rnd = cps.get("adv_round")
+    if not rnd or not rnd.get("recorded"):
+        die(f"{args.cp} has no recorded blocking round to triage yet. Run `ratchet.py reviewers {args.cp}` and "
+            "record a review first.")
+    open_findings = _adv_open_findings(ctx, args.cp, rnd, cps)
+    by_key = {_finding_key(f): f for f in open_findings}
+    if not by_key:
+        die(f"{args.cp}'s latest recorded round has no open findings to triage.")
+    dest = _adv_round_dir(ctx, args.cp, rnd["round"])
+    triage = _read_triage(dest)
+    changed = []
+    for item in args.decisions:
+        ref, sep, rest = item.partition("=")
+        ref = ref.strip()
+        if not sep:
+            die(f"{item!r}: use <id>=fix:<reason> or <id>=rebut:<reason>. Nothing was recorded.")
+        # Resolved the same way accept-finding resolves a ref (`_resolve_finding_ref`): a bare id unique among this
+        # round's open findings works directly; a bare id two reviewers both used is refused as ambiguous, naming
+        # them, instead of silently failing the "not open" check below (by_key is keyed by the qualified
+        # 'reviewer/id', so a bare ref never matched it on its own).
+        f, err = _resolve_finding_ref(ref, open_findings)
+        if err:
+            die(f"{err} Nothing was recorded.")
+        if f is None:
+            die(f"{ref} is not an open finding of {args.cp}'s latest recorded round (open now: "
+                f"{', '.join(sorted(by_key)) or '(none)'}). Nothing was recorded for it.")
+        key = _finding_key(f)
+        decision, _, reason = rest.partition(":")
+        decision = decision.strip().lower()
+        reason = reason.strip()
+        if decision in TRIAGE_REDIRECT:
+            die(f"{ref}={decision} is refused: the orchestrator can never {decision} a finding through triage. "
+                f"That needs the user's own reply, through `ratchet.py ask accept-finding {args.cp} {ref}` and "
+                "their `accept: <reason>`. Nothing was recorded.")
+        if decision not in TRIAGE_DECISIONS:
+            die(f"{ref}={decision or '(none)'}: triage decisions are 'fix' or 'rebut' only. Nothing was recorded.")
+        if not reason:
+            die(f"{ref}={decision} needs a one-line reason after ':' (e.g. {ref}={decision}:why this is, or is "
+                "not, a real problem for the objective's users). Nothing was recorded for it.")
+        triage[key] = {"decision": decision, "reason": reason, "at": now()}
+        changed.append(key)
+    write_json(dest / "triage.json", triage)
+    fix_list = [dict(by_key[k], triage_reason=v["reason"]) for k, v in triage.items()
+                if v.get("decision") == "fix" and k in by_key]
+    write_json(dest / "fix-list.json", fix_list)
+    ctx.log(st, "triage_recorded", cp=args.cp, round=rnd["round"], ids=changed)
+    ctx.save_state(st)
+    ok(f"Recorded triage for {', '.join(changed)} ({args.cp} round {rnd['round']}).")
+
+
 def cmd_adv_record(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -5224,6 +5521,7 @@ def cmd_adv_record(args):
                                                          "model": rr.get("model")} for rr in rnd.get("resolved") or []]}]
     if not approved:
         g["status"] = "failed"
+        ci_note = _checkin_trigger(ctx, st, args.cp, cps, g, rnd, all_findings)
         if g["attempts"] >= cfg["max_adversarial_rounds"]:
             _set_blocked(st, f"{args.cp}: adversarial review still has {len(all_findings)} finding(s) after "
                              f"{g['attempts']} rounds — needs a human/director decision.")
@@ -5235,8 +5533,10 @@ def cmd_adv_record(args):
         _announce_repeats(ctx, st)
         die(f"Gate 3 (adversarial) NOT approved: {len(all_findings)} blocking finding(s)"
             + (f" ({len(deferred)} minor ones recorded for later)" if deferred else "") + " → "
-            f"{(dest / 'open-findings.json').relative_to(ctx.root)}. Spawn ratchet-fixer with that file, "
-            "re-run behavior (and UI if visible code changed), then re-run the adversaries.", 2)
+            f"{(dest / 'open-findings.json').relative_to(ctx.root)}. Decide fix or rebut for each (`ratchet.py "
+            f"triage {args.cp} <id>=fix:\"reason\"` or `=rebut:\"reason\"`), then spawn ratchet-fixer with "
+            "fix-list.json, re-run behavior (and UI if visible code changed), then re-run the adversaries."
+            + (f" {ci_note}" if ci_note else ""), 2)
     g.update(status="passed", fingerprint=fp, passed_at=now(), evidence=str(dest.relative_to(ctx.root)))
     cps["step"] = _earliest_open_step(cps)
     ctx.log(st, "adversarial_approved", cp=args.cp, round=g["attempts"])
@@ -5517,6 +5817,13 @@ def review_rules(ctx, cfg, cp, g, rnd, fp_id) -> tuple[set | None, list[str]]:
                      + (", ".join(sorted(focus)[:20]) or "nothing changed") + "). Re-raise any earlier finding that "
                      "still isn't fixed, wherever it is. Beyond that, a new minor problem outside those files is "
                      "recorded, not fixed; blocker and major problems count anywhere.")
+    if rnd["round"] > 1:
+        prev_triage = _read_triage(_adv_round_dir(ctx, cp["id"], rnd["round"] - 1))
+        for ref, dec in prev_triage.items():
+            if dec.get("decision") == "rebut":
+                rules.append(f"Rebuttal from the last round on {ref}: {dec.get('reason', '')} — withdraw this "
+                             "finding if the rebuttal holds up, or re-raise it with a stronger user_impact if it "
+                             "doesn't.")
     return focus, rules
 
 
@@ -6386,6 +6693,23 @@ def _accepted_findings_lines(st) -> list[str]:
         who = f.get("accepted_by") or "human"
         lines.append(f"  {cp} {_finding_key(f)} ({f.get('severity', '?')}): {desc}  -  reason: {f.get('reason', '')}"
                      f"  -  accepted by: {who}")
+    return lines
+
+
+def _checkin_decisions_lines(st) -> list[str]:
+    """Check-in decisions recorded so far (a simplify's reasoning, or a stop), for `plan-summary` to show next to
+    the findings the user accepted: the orchestrator's own reasoning for narrowing scope is on the record too.
+    Never shown by plain `status` (an open check-in prints its own brief instead; a past decision must never make
+    `status` look like one is open again when it isn't)."""
+    rows = [(cp, d) for cp, c in (st.get("checkpoints") or {}).items() for d in (c.get("checkin") or {}).get("decided") or []]
+    if not rows:
+        return []
+    lines = ["Check-in decisions along the way:"]
+    for cp, d in rows:
+        if d.get("decision") == "simplify":
+            lines.append(f"  {cp} round {d.get('round')}: simplify - {d.get('why', '')}")
+        else:
+            lines.append(f"  {cp} round {d.get('round')}: {d.get('decision')}")
     return lines
 
 
@@ -7442,7 +7766,8 @@ def cmd_accept_finding(args):
     required instead, with --reason carrying the director's own reason since there is no chat reply to read one
     from. When every open finding of that round is then accepted, the adversarial gate passes for that round's
     fingerprint without another round; a later code change (a new fingerprint) brings back the normal review
-    rules."""
+    rules. When no open finding remains, an open check-in for this step (reviews dragging) is also cleared: it had
+    nothing left to pause on."""
     ctx = Ctx(find_root())
     st = ctx.state()
     _require_pending(st, "accept-finding", args.cp)
@@ -7606,6 +7931,14 @@ def cmd_accept_finding(args):
         if st.get("phase") == "blocked" and st.get("current") == cp \
                 and _adv_round_block_reason_for(cp, st.get("blocked_reason")):
             unblocked_to = _unblock(ctx, st, by, "accept-finding resolved the round limit")
+        # No open blocking finding remains for this step, so any check-in paused on this gate dragging has nothing
+        # left to pause on: clear it the same as `reviewers` requires it resolved before another round, otherwise
+        # it would sit open forever (check-in only ever clears itself through `check-in --decision simplify/stop`,
+        # never through acceptance) and `status`/`next` would keep reporting one that is already moot.
+        ci = _checkin_state(cps)
+        if ci.get("open"):
+            ctx.log(st, "checkin_resolved_by_accept", cp=cp, round=ci["open"]["round"], ids=ids)
+            ci["open"] = None
     _clear_pending(st)
     # (c) commit state: the one atomic, authoritative write (standards #12) that says these findings are accepted.
     ctx.save_state(st)
@@ -7677,6 +8010,20 @@ def cmd_reviewers(args):
     g = cps["gates"]["adversarial"]
     rnd = cps.get("adv_round")
     if not rnd or rnd.get("recorded") or rnd["fingerprint"] != fp:
+        ci = _checkin_state(cps)
+        if ci.get("open"):
+            die(f"{args.cp}: a check-in is open from round {ci['open']['round']} (reviews have been dragging). "
+                f"Run `ratchet.py check-in {args.cp}` to see it, then `ratchet.py check-in {args.cp} --decision "
+                "simplify --why \"...\"` or `--decision stop` to resolve it before another round opens.")
+        if rnd and rnd.get("recorded"):
+            open_findings = _adv_open_findings(ctx, args.cp, rnd, cps)
+            if open_findings:  # every remaining blocking finding needs its own fix-or-rebut decision, even one
+                triage = _read_triage(_adv_round_dir(ctx, args.cp, rnd["round"]))
+                missing = sorted({_finding_key(f) for f in open_findings} - set(triage))
+                if missing:
+                    die(f"{args.cp} round {rnd['round']} still has blocking finding(s) with no fix-or-rebut "
+                        f"decision: {', '.join(missing)}. Run `ratchet.py triage {args.cp} "
+                        f"{missing[0]}=fix:\"reason\"` (or `=rebut:\"reason\"`) for each, then try again.")
         if g["attempts"] >= cfg["max_adversarial_rounds"]:
             _set_blocked(st, f"{args.cp}: {g['attempts']} adversarial rounds used without approval — needs a "
                              "human/director decision.")
@@ -7815,8 +8162,10 @@ def status_json(ctx: Ctx) -> dict:
     waiting_on = None
     if st["phase"] in ("awaiting_plan_approval", "awaiting_checkpoint_review", "awaiting_final_review", "blocked"):
         waiting_on = "director" if approval_mode(ctx) == "director" else "human"
+    obj = plan.get("objective") if isinstance(plan, dict) else None
     return {"root": str(ctx.root), "slug": st["slug"], "feature": st["feature"], "phase": st["phase"],
             "current": st.get("current"), "step": na.get("step"), "next": na["action"], "stop_ok": na["stop_ok"],
+            "objective": obj if isinstance(obj, dict) and obj else NO_OBJECTIVE_NOTE,
             "waiting_on": waiting_on, "blocked_reason": st.get("blocked_reason"),
             "blocked_reason_plain": plain_reason(st.get("blocked_reason")),
             "accept_note": na.get("accept_note"),
@@ -9796,7 +10145,8 @@ def hooks_warning(ctx, hs=None) -> str | None:
 STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "red", "implemented", "behavior",
                      "ui-record", "adv-record", "complete", "human-approve", "feedback", "plan-extend", "pause",
                      "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
-                     "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait", "accept-finding")
+                     "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait", "accept-finding",
+                     "check-in", "triage")
 LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers")  # tests, checks, a regression suite, provider probes
 # The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
 OVERRIDE_CMDS = ("approve-plan", "human-approve", "approve-changes", "cancel", "set-review", "resume", "hooks-waive",
@@ -10117,6 +10467,12 @@ def main(argv=None):
                   ).set_defaults(fn=cmd_plan_summary)
     a = sp.add_parser("reviewers"); a.add_argument("cp"); a.add_argument("--json", action="store_true")
     a.set_defaults(fn=cmd_reviewers)
+    a = sp.add_parser("check-in", help="print (or decide) the check-in opened when reviews drag")
+    a.add_argument("cp"); a.add_argument("--decision", choices=["simplify", "accept", "stop"])
+    a.add_argument("--why"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_check_in)
+    a = sp.add_parser("triage", help="record fix-or-rebut decisions for a blocked round's open findings")
+    a.add_argument("cp"); a.add_argument("decisions", nargs="+", metavar="ref=fix|rebut:reason")
+    a.set_defaults(fn=cmd_triage)
     a = sp.add_parser("reviewer-status"); a.add_argument("--reset", metavar="ID")
     a.add_argument("--mark", metavar="ID"); a.add_argument("--reason"); a.set_defaults(fn=cmd_reviewer_status)
     a = sp.add_parser("lanes"); a.add_argument("--scan", default="."); a.add_argument("--json", action="store_true")

@@ -919,6 +919,8 @@ def x11_same_reviewer_id_accepted_in_two_rounds_both_reach_learnings_with_their_
     reply(d, tp, env, "accept: round one's own reason")
     r1 = th.rx(d, env, "accept-finding", "CP1")
     check("[CP3-X11] (setup) round 1's F1 is accepted (F2 stays open)", r1.returncode == 0, r1.stdout + r1.stderr)
+    tr = th.rx(d, env, "triage", "CP1", f"{rid}/F2=fix:redact the card number from logs")
+    assert tr.returncode == 0, tr.stdout + tr.stderr  # F2 is still open and needs its own decision before round 2
     r_open = th.rx(d, env, "reviewers", "CP1", "--json")
     check("[CP3-X11] (setup) a second round opens for CP1", r_open.returncode == 0, r_open.stdout + r_open.stderr)
     rnd2 = json.loads(r_open.stdout)
@@ -1010,6 +1012,7 @@ def x12_accepting_at_the_run_wide_cap_resets_it_so_a_fresh_checkpoint_can_still_
     path = write_round_review(d, env, rnd, rid, [F1, F2])
     r = th.rx(d, env, "adv-record", "CP1", "--reviews", path)
     check("[CP3-X12] (setup) CP1's round blocks with F1,F2 open", r.returncode == 2, r.stdout + r.stderr)
+    th.rx(d, env, "triage", "CP1", f"{rid}/F1=fix:known tradeoff", f"{rid}/F2=fix:known tradeoff")
     r2 = th.rx(d, env, "reviewers", "CP1", "--json")
     out2 = r2.stdout + r2.stderr
     check("[CP3-X12] (setup) opening a second round for CP1 hits the RUN-WIDE cap, not a per-checkpoint one",
@@ -1210,6 +1213,7 @@ def x18_lettered_block_options_never_offer_accepting_a_finding():
     rid2 = th.cp3_R0(rnd2)
     path2 = write_round_review(d2, env2, rnd2, rid2, [F1, F2])
     th.rx(d2, env2, "adv-record", "CP1", "--reviews", path2)
+    th.rx(d2, env2, "triage", "CP1", f"{rid2}/F1=fix:known tradeoff", f"{rid2}/F2=fix:known tradeoff")
     th.rx(d2, env2, "reviewers", "CP1", "--json")
     st2 = th.cp3_state(d2)
     check("[CP3-X18] (setup) run-wide cap blocked the run", st2.get("phase") == "blocked", st2.get("phase"))
@@ -1260,6 +1264,7 @@ def x20_plain_accept_line_shown_when_open_findings_exist_for_the_current_code():
     rid = th.cp3_R0(rnd)
     path = write_round_review(d, env, rnd, rid, [F1, F2])
     th.rx(d, env, "adv-record", "CP1", "--reviews", path)
+    th.rx(d, env, "triage", "CP1", f"{rid}/F1=fix:known tradeoff", f"{rid}/F2=fix:known tradeoff")
     th.rx(d, env, "reviewers", "CP1", "--json")
     st = th.cp3_state(d)
     check("[CP3-X20] (setup) the run is blocked at the run-wide cap", st.get("phase") == "blocked", st.get("phase"))

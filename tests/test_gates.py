@@ -123,6 +123,13 @@ def to_adversarial(d, cp="CP1"):
 
 def open_round(d, cp="CP1"):
     r = rx(d, "reviewers", cp, "--json")
+    if r.returncode != 0 and "no fix-or-rebut" in r.stderr:
+        # the previous recorded round blocked; fix-or-rebut every finding it still lists before the next
+        # round can open. These fixtures are about the gates themselves, not triage, so just fix them.
+        m = re.search(r"no fix-or-rebut decision: (.+?)\. Run", r.stderr)
+        for ref in (m.group(1).split(", ") if m else []):
+            rx(d, "triage", cp, f'{ref}=fix:"test fixture"')
+        r = rx(d, "reviewers", cp, "--json")
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout)
 

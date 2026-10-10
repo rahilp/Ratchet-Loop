@@ -29,6 +29,14 @@ rx = g.rx
 
 def open_round(d, cp):
     r = rx(d, "reviewers", cp, "--json")
+    if r.returncode != 0 and "no fix-or-rebut" in r.stderr:
+        # the new triage gate: the previous recorded round blocked, so fix-or-rebut every finding it still
+        # lists before the next round can open. This fixture is about guardrails, not triage, so just fix them.
+        import re as _re
+        m = _re.search(r"no fix-or-rebut decision: (.+?)\. Run", r.stderr)
+        for ref in (m.group(1).split(", ") if m else []):
+            rx(d, "triage", cp, f'{ref}=fix:"test fixture"')
+        r = rx(d, "reviewers", cp, "--json")
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout)
 
@@ -78,7 +86,7 @@ BAD_A = "// FORBIDDEN: import db\nexport const a = 1;\n"
 
 def main():
     print("Spotting a repeat")
-    d = g.project("guard", cps=2, extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20"])
+    d = g.project("guard", cps=2, extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20", "checkin_round=99"])
     g.approve_plan(d)
     g.to_adversarial(d, "CP1")
     put(d, "CP1", {"src/f.js": BAD_F})
@@ -278,7 +286,7 @@ def main():
     check("an explicit kind is normalised", m.finding_kind({"kind": "Unvalidated Input!"}) == "unvalidated-input")
 
     print("A guardrail can't replace an existing check")
-    d2 = g.project("guard2", cps=2, extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20",
+    d2 = g.project("guard2", cps=2, extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20", "checkin_round=99",
                    'checks=[{"kind":"sqli","command":"node -e 0"}]'])
     g.approve_plan(d2)
     g.to_adversarial(d2, "CP1")
@@ -292,7 +300,7 @@ def main():
     check("… and a guardrail for it is refused", r.returncode != 0 and "already exists" in r.stderr, r.stderr)
 
     print("A check that can't fail is refused, even when its tests were gamed")
-    d3 = g.project("guard3", cps=2, extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20"])
+    d3 = g.project("guard3", cps=2, extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20", "checkin_round=99"])
     g.approve_plan(d3)
     g.to_adversarial(d3, "CP1")
     for where in ("src/f.js", "src/a.js"):
@@ -327,7 +335,7 @@ def main():
     check("… and nothing was added to the project's checks", not cfg.get("checks"), cfg.get("checks"))
 
     print("High-risk kinds: disguised variants written without seeing the check")
-    d5 = g.project("guard5", cps=2, extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20"])
+    d5 = g.project("guard5", cps=2, extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20", "checkin_round=99"])
     g.approve_plan(d5)
     g.to_adversarial(d5, "CP1")
     BLK = lambda where: [dict(DBF(where)[0], severity="blocker")]

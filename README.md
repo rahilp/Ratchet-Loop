@@ -226,6 +226,10 @@ Each role also gets its own model. Planning, coding, fixing and reviewing use a 
 
 Every reviewer's prompt, and every builder, fixer and test-writer's brief, opens with the plan's objective: who the project's users are, what they want, what done means, what's out of scope. Reviewers judge every finding against that objective, not against some other project's users, so a finding has to describe real harm to this project's users in realistic use, and severity follows real user harm in normal use. What's out of scope comes from the objective's own `out_of_scope`, and it differs by project: Ratchet's own plans list deliberately evading one of Ratchet's own checks as out of scope and, at most, a minor note (an accepted same-user-forgery limit), but a public-facing project's plan can and should treat malicious users as in scope. A reviewer has to say who is hurt and how (`user_impact`) next to a finding's severity; a blocker, major or unrecognized-severity finding with no `user_impact` never blocks, at any round and any risk, and is recorded instead for the final review (`ratchet.py deferred`). A run whose plan has no stated objective (one approved before this existed) still reviews normally, falling back to the project's own standards.md for who the users are and what's out of scope, with a plain note that none was given.
 
+### When reviews drag on
+
+Reviewers can go back and forth for a while on a hard step. Ratchet itself watches for that, not the agent: once a step blocks a second round in a row, or a kind of finding the agent hadn't seen yet shows up a second time in a file an earlier round already flagged, it pauses before another round and makes the agent check in against the plan's own goal. The agent never decides this alone: it spawns a fresh strong-model reviewer with the objective, the open findings and the round history, which recommends narrowing or changing the step (simplify), asking you to accept the open findings as a known limit (only your own reply does that; the agent can't wave them through itself), or stopping to ask you how to wrap up. Separately, once a round blocks, the agent has to decide fix or rebut for every remaining open finding, however many, with a one-line reason, before it can open another round; a disputed finding it chose to rebut is shown to the next round's reviewers, who either drop it or press it again with a clearer case for who it would actually hurt. The final review, when everything is built, opens the same way: your goal, who it's for, and each thing "done" was supposed to mean, listed plainly for you to judge against the evidence, not claimed as met just because the checkpoints finished.
+
 ### Mistakes that keep coming back
 
 Reviewers label every finding with the kind of mistake it is. When the same kind shows up a second time, the agent offers to turn it into an automatic check, like a lint rule or an architecture test. Say yes and the check is built as its own small step, through every gate. Before it counts, Ratchet runs it against a deliberately bad example and against the real code where the mistake was found. It has to catch both and pass on today's code. For high-risk mistakes (security, data, money), a separate writer who never sees the check first writes disguised versions of the mistake, and the check has to catch those too. If a reviewer later finds a case the check missed, Ratchet strengthens it automatically and tells you.
@@ -329,6 +333,8 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py spec detect`, `spec import <openspec\|speckit\|bmad\|auto> <id>`, `spec status` | build from an OpenSpec change, Spec Kit feature or BMAD story; which scenarios are proven so far; `spec keep on\|off` records the user's answer about a running spec |
 | `ratchet.py deferred` | review findings noted for later instead of blocking (minor ones, and any blocker/major/unknown-severity one with no `user_impact`), plus, in their own section first, any findings you accepted yourself, with your reason and who accepted them |
 | `ratchet.py ask accept-finding CPn F1,F2`, `accept-finding CPn` | ask the user to accept named open (blocking) findings of a blocked round, with their own reason (`accept: <reason>`); record it once they reply |
+| `ratchet.py triage CPn <ref>=fix:"<reason>"` / `<ref>=rebut:"<reason>"` | whenever a round blocks: decide fix or rebut for every blocking finding, even a single one, before the next round opens; never accept/defer/waive |
+| `ratchet.py check-in CPn [--decision simplify\|accept\|stop] [--why "<reasoning>"]` | when reviews drag, see (or decide) the check-in against the plan's objective; `accept` is always refused here |
 | `ratchet.py occurrences <kind>` | the real code where reviewers found a kind of mistake |
 | `ratchet.py repeats` | kinds of finding seen twice or more that could become an automatic check |
 | `ratchet.py guardrail --kind <k> --title <t> --why <w> --check-command "<c> {target}" --target <dir> --bad-example <fixture> --test-command <c> --test-file <f>` | after you pick the "automatic check" option: add the step that builds it |
@@ -356,6 +362,7 @@ Each test file is a standalone script; none needs a framework, so you can also r
 
 ```
 python3 tests/test_accept_finding.py
+python3 tests/test_checkin.py
 python3 tests/test_cleanup.py
 python3 tests/test_docs.py
 python3 tests/test_gates.py

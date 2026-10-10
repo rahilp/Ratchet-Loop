@@ -89,6 +89,15 @@ def ids(rnd):
 
 def open_round(d, env=None):
     r = rx(d, "reviewers", "CP1", "--json", env=env)
+    if r.returncode != 0 and "no fix-or-rebut" in r.stderr:
+        # the new triage gate: the previous recorded round blocked, so fix-or-rebut every finding it still
+        # lists before the next round can open. These fixtures are about severity/scope/providers, not triage,
+        # so just fix them.
+        import re as _re
+        m = _re.search(r"no fix-or-rebut decision: (.+?)\. Run", r.stderr)
+        for ref in (m.group(1).split(", ") if m else []):
+            rx(d, "triage", "CP1", f'{ref}=fix:"test fixture"', env=env)
+        r = rx(d, "reviewers", "CP1", "--json", env=env)
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout)
 
@@ -127,7 +136,7 @@ def severity_and_scope():
         check(f"low risk: {label} still blocks", r.returncode == 2, r.stdout + r.stderr)
 
     print("What blocks: normal risk, and later rounds scoped to what changed")
-    d = g.project("sevnorm", extra_cp={"risk": "normal"})
+    d = g.project("sevnorm", extra_cp={"risk": "normal"}, config=["checkin_round=99"])
     g.approve_plan(d)
     g.to_adversarial(d)
     rnd = open_round(d)
@@ -163,7 +172,7 @@ def severity_and_scope():
 def review_holes():
     print("Fresh-eyes findings: ways around the bar must not work")
     # a minor finding the fixer ignored is not waved through in round 2
-    d = g.project("carry", extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20"])
+    d = g.project("carry", extra_cp={"risk": "normal"}, config=["max_adversarial_rounds=20", "checkin_round=99"])
     g.approve_plan(d)
     g.to_adversarial(d)
     rnd = open_round(d)
