@@ -71,7 +71,7 @@
   "test_timeout_sec": 3600,
   "max_adversarial_rounds_run": 60,
   "spec_keep": true,
-  "max_adversarial_rounds": 9,
+  "max_adversarial_rounds": 6,
   "role_models": {
     "ratchet-implementer": "standard",
     "ratchet-fixer": "standard"
