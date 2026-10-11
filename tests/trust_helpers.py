@@ -398,7 +398,17 @@ def cp3_state(d):
     return json.loads((Path(d) / ".ratchet/runs/f/state.json").read_text())
 
 
-CP4_CODE_RE = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
+# The engine always prints the override code on its own prompt line, as exactly 6 digits (ratchet.py:
+# f"{secrets.randbelow(10 ** 6):06d}"). Anchoring to that literal prompt text and fixing the length to 6 - rather
+# than hunting for any 4-8 digit run anywhere in the captured pty output - avoids two failure modes that only show
+# up when several of these pty tests run at once under load: (1) a false match on unrelated digits printed earlier
+# (a PID, a temp-folder name that happens to hold a run of digits); and (2) a false *miss* when the test's own
+# echoed answer lands, under scheduling delay, before the rest of the engine's prompt write has been delivered,
+# concatenating the printed code and its echo into one long digit run that a variable-length pattern can no longer
+# match at all (confirmed by reproduction: captured output like "...Enter: 104774104774\r\n\r\n> RATCHET ✓ ...",
+# the real code immediately followed by its own echoed answer, with the old (?<!\d)(\d{4,8})(?!\d) pattern matching
+# nothing in that 12-digit run).
+CP4_CODE_RE = re.compile(r"type this code and press Enter: (\d{6})")
 
 
 def cp4_find_code(output):
