@@ -99,7 +99,12 @@ starts with `FILL IN:`, naming the part, so the planner or user must fill it in 
 A run whose plan was approved before this field existed keeps working with no objective at all — nothing about
 it is required retroactively. `ratchet.py brief CPn --role <role>` prints this same objective text, then that
 role's own standing rules; every sub-agent's spawn prompt starts with its output instead of the orchestrator
-writing the objective by hand.
+writing the objective by hand. This is enforced only on Claude Code: the guard hook refuses (exit 2) a
+`ratchet-<role>` sub-agent (`Task`/`Agent`, `subagent_type` matching `ratchet-<role>` with or without a plugin
+prefix) launched during a build (`building` or `blocked`) whose prompt is missing this objective text, naming the
+`brief` command to fix it; a prompt carrying it, however re-wrapped, always passes, and an unreadable plan fails
+the check open. Codex, Gemini and Copilot give hooks no way to see a sub-agent launch at all, so this check is not
+enforced on those three; it is documented here, not built there.
 
 ```json
 {

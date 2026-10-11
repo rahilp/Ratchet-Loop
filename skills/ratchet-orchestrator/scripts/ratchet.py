@@ -9956,6 +9956,51 @@ def _run_phase(root: Path) -> str | None:
         return None
 
 
+SUBAGENT_LAUNCH_TOOLS = {"task", "agent"}  # Claude Code's PreToolUse tool_name for a sub-agent launch (Agent on
+                                            # current builds, or Task on older ones); no other host is checked by
+                                            # this guard (CP3).
+
+
+def _subagent_role(subagent_type) -> str | None:
+    """The Ratchet role name for a Task/Agent launch's `subagent_type` ('ratchet-implementer',
+    'ratchet-loop:ratchet-fixer', with or without a plugin prefix before the last ':'), or None when it does not
+    name a Ratchet sub-agent at all -- a non-Ratchet agent such as 'general-purpose' or 'Explore' is never checked
+    by this guard."""
+    tok = str(subagent_type or "")
+    if ":" in tok:
+        tok = tok.rsplit(":", 1)[1]
+    if not tok.startswith("ratchet-"):
+        return None
+    return _normalize_role(tok)
+
+
+def _brief_guard(n: dict, root: Path) -> str | None:
+    """CP3: on Claude Code only, refuse (with a plain message) a Task/Agent launch of a Ratchet sub-agent during a
+    build (phase 'building' or 'blocked') whose prompt does not carry the plan's objective -- the exact text
+    `objective_brief` renders (the same text `brief` prints), compared with runs of whitespace collapsed so
+    re-wrapping, doubled spaces or a tab/space mix never cause a false refusal. A non-Ratchet sub-agent, any launch
+    while no run is building, and any non-Claude-Code host are never checked here (None: allow). Reading the plan
+    can raise (an unreadable checkpoints.json calls `die`, a SystemExit) -- deliberately not caught here, since
+    `run_hook`'s own fail-open handling turns that into an allowed launch with a recorded crash, exactly like any
+    other guard crash."""
+    if n["host"] != "claude" or n["tool"].lower() not in SUBAGENT_LAUNCH_TOOLS:
+        return None
+    role = _subagent_role(n["input"].get("subagent_type"))
+    if role is None:
+        return None
+    if _run_phase(root) not in ("building", "blocked"):
+        return None
+    ctx = Ctx(root)
+    expected = re.sub(r"\s+", " ", objective_brief(ctx.plan())).strip()
+    got = re.sub(r"\s+", " ", str(n["input"].get("prompt") or n["prompt"] or "")).strip()
+    if expected and expected in got:
+        return None
+    st, _why = _read_record(ctx.state_path())
+    cp = (st or {}).get("current") or "CPn"
+    return (f"RATCHET GUARD: this sub-agent's prompt is missing the plan's objective. Start its prompt with the "
+            f"output of `$RATCHET brief {cp} --role {role}`, then the rest of the prompt.")
+
+
 def decide_guard(n: dict) -> tuple[bool, str]:
     cmd, cwd = n["command"], n["cwd"]
     if not _is_director_session():
@@ -9977,6 +10022,9 @@ def decide_guard(n: dict) -> tuple[bool, str]:
             return True, ("RATCHET GUARD: only the director (or the user, in their own terminal) can switch a "
                           "reviewer off. Reviewers that genuinely fail are marked unavailable automatically.")
     root = find_root(Path(cwd))
+    why = _brief_guard(n, root)
+    if why:
+        return True, why
     marks = False
     if (root / RATCHET_DIR).is_dir():
         _heartbeat(root, "guard", n["host"])

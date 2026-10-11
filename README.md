@@ -284,6 +284,8 @@ The four CLIs do not all enforce the same things. Here is what each one actually
 
 Only Claude Code tells Ratchet which sub-agent is acting; none of the other three can do that today, so Ratchet cannot confirm reviewer identity on Codex, Gemini or Copilot the way it can on Claude Code.
 
+One more check is Claude-Code-only: launching a Ratchet sub-agent during a build without the plan's objective in its prompt is enforced (refused) only on Claude Code. Codex, Gemini and Copilot cannot see a sub-agent launch at all, so this objective check is not enforced on those three; paste the objective by hand there regardless.
+
 Review checks, on all four CLIs: a review from another provider counts only as a script-signed review. `external_review.py` (and `ui_review.py` for the screen reviews, which also signs the capture manifest the reviewers judged) signs what it writes with a secret made for that one round, kept in Ratchet's per-user folder, never printed, never in the project, and deleted once the round is recorded. A review from another provider that was typed, copied or edited by hand, or signed for another round or step, is refused as unsigned. A review by the host's own reviewer sub-agent is not signed, and how much Ratchet can check it depends on the CLI. Only Claude Code confirms which sub-agent wrote it: there the review counts only when Ratchet's guard hook saw that reviewer sub-agent write it with the Write tool, and a review written by the main session, through the shell, or by hand is refused as unsigned. On Codex, Gemini and Copilot, or when you waived the hooks, Ratchet cannot tell who wrote a host reviewer's file: any file in the round's folder with the right round nonce and code version counts, even one typed by hand, so the run never stalls, but `status` (and the viewer, for code reviews) marks it "not independently confirmed". Run outside a Ratchet run, `ui_review.py` still compares screens for an ad-hoc check, but its results are marked unsigned and never count for a gate. The secret protects against a different process on the same machine, not against the operating system: any program running as your own user can read Ratchet's per-user folder, and only the guard keeps the agent out of it.
 
 On all four, the guard also refuses commands that set Ratchet's reserved variables (`RATCHET_HUMAN_OVERRIDE`, `RATCHET_ROLE`, `RATCHET_HOME`, `RATCHET_DIRECTOR_KEY_FILE`), including indirect ways such as `declare`, `eval` or a `python3 -c` that writes `os.environ`. Ratchet itself also refuses a per-user folder or key file the hooks don't use, and the human override only works after a person types back a code shown in a real terminal. This is best-effort against an agent that can run anything: one that writes a script to a file and runs it later, or starts its own pseudo-terminal to read the code, can get further than the guard sees. Put plainly: these protections stop an agent from stumbling past a gate or taking an easy shortcut, but a script deliberately written to cheat, running as your own user, can still forge Ratchet's records, for example by calling Ratchet's own hook command directly with made-up input.
@@ -293,6 +295,17 @@ If the guard or prompt hook breaks, it lets the action through and writes the er
 **Waiting on background work.** The stop hook normally refuses to let the agent end its turn while a gate is open, and after too many refused stops in a row without progress (`max_stop_blocks`) it halts the run for you to look at. When the agent has started reviewers or sub-agents in the background and has nothing to do until they report back, it runs `ratchet.py wait --for "<what it is waiting on>" --minutes N` first. Until that time (N is kept between 1 and 120 minutes; 30 if not given) the stop hook lets the run's own chat end its turn, and those stops are not counted as a blocked stop, so waiting never trips the safety valve. Only the chat the run belongs to can wait, and Ratchet tells which chat that is from what its own hooks saw, never from an id the agent passes in. The wait ends early as soon as a gate makes progress, or the run is paused, resumed or cancelled; after that, or once the time is up, stopping is blocked again as before. `status` and `next` show what the run is waiting on and until when. A wait lets the agent stop no more than `pause` already does; it just keeps the run going instead of pausing it.
 
 **Full requirements:** Python 3.8+, git, and Node 18+ with Playwright for checking screens. Other AI tools are optional (`claude`, `codex`, `gemini`, `copilot` and others); without them, your agent's own sub-agents do every review.
+
+### Objective check on sub-agent launches
+
+Launching a Ratchet sub-agent during a build without the plan's objective in its prompt is only enforced (refused) on Claude Code, because it's the only one of the four CLIs whose hooks can see a sub-agent launch at all.
+
+| CLI | Objective check on sub-agent launches |
+|---|---|
+| Claude Code | Yes, enforced: a Ratchet sub-agent launched during a build without the plan's objective in its prompt is refused. |
+| Codex | No, not enforced: the objective check does not run because Codex cannot see a sub-agent launch. |
+| Gemini | No, not enforced: the objective check does not run because Gemini cannot see a sub-agent launch. |
+| Copilot | No, not enforced: the objective check does not run because Copilot cannot see a sub-agent launch. |
 
 ## Reference (commands the agent runs)
 
@@ -389,6 +402,7 @@ Each test file is a standalone script; none needs a framework, so you can also r
 ```
 python3 tests/test_accept_finding.py
 python3 tests/test_brief.py
+python3 tests/test_brief_guard.py
 python3 tests/test_checkin.py
 python3 tests/test_cleanup.py
 python3 tests/test_converge.py
