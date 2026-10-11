@@ -534,21 +534,32 @@ def _read_record(path: Path, kind=dict, missing=_FRESH, lines: bool = False, tai
     return data, None
 
 
-def _write_record(path: Path, data, pretty: bool = False):
+def _write_record(path: Path, data, pretty: bool = False, raw: bool = False):
     """The one writer of Ratchet's records: replace the file in one rename, through a temp file of this process's
     own (pid plus a random token), flushed to disk first, so two writers never share a temp file, a reader never
     sees half a write, and a crash never leaves a half-written record. The temp file is removed on failure.
-    Raises OSError when it can't write; every caller handles that on its own terms."""
+    Raises OSError when it can't write; every caller handles that on its own terms.
+    raw=True: `data` is already the text to write, not a JSON value to encode (for a non-JSON generated
+    artifact such as ci-export's workflow file); `pretty` is ignored in that case. When `data` is `bytes`
+    (raw=True only), the temp file is opened in binary mode and those exact bytes are written, with no
+    newline translation or re-encoding, so a caller that already computed its own encoded bytes (so a
+    comparison, a write and a printed preview can never disagree) gets exactly those bytes on disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}-{secrets.token_hex(4)}.tmp")
-    text = (json.dumps(data, indent=2, ensure_ascii=False) + "\n") if pretty else json.dumps(data)
+    text = data if raw else ((json.dumps(data, indent=2, ensure_ascii=False) + "\n") if pretty else json.dumps(data))
     try:
-        # backslashreplace: a lone surrogate (from a reviewer's reply) is written as its own JSON escape, "\ud83d",
-        # which reads back as the same string; every other character encodes as UTF-8 unchanged
-        with open(tmp, "w", encoding="utf-8", errors="backslashreplace") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
+        if raw and isinstance(text, bytes):
+            with open(tmp, "wb") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+        else:
+            # backslashreplace: a lone surrogate (from a reviewer's reply) is written as its own JSON escape,
+            # "\ud83d", which reads back as the same string; every other character encodes as UTF-8 unchanged
+            with open(tmp, "w", encoding="utf-8", errors="backslashreplace") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
         os.replace(tmp, path)
     finally:
         try:
@@ -11390,6 +11401,28 @@ def render_github_actions(ctx: Ctx, commands: list) -> str:
     return out
 
 
+CI_WORKFLOW_MARKER = CI_WORKFLOW_HEADER.split("\n", 1)[0] + "\n"  # the fixed first line that marks a file as Ratchet's
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _normalized_for_marker_check(data: bytes) -> bytes:
+    """`data` with an optional leading UTF-8 BOM stripped and CRLF normalized to LF, so a file Ratchet wrote
+    that git's core.autocrlf (or a BOM-writing editor) converted on checkout is still recognized as Ratchet's
+    own. Used only to decide ownership; the byte-equality check against the canonical (no-BOM, LF-only) text
+    still uses the raw bytes, so a converted file is treated as needing an update back to that canonical text,
+    not as already up to date."""
+    if data.startswith(_UTF8_BOM):
+        data = data[len(_UTF8_BOM):]
+    return data.replace(b"\r\n", b"\n")
+
+
+def _ci_workflow_bytes(text: str) -> bytes:
+    """The exact bytes ci-export writes, compares and prints for workflow text `text` (backslashreplace,
+    matching _write_record's own error handler), computed once so the up-to-date check, the file write and
+    --stdout can never disagree, even when a check command holds a lone surrogate or other unencodable char."""
+    return text.encode("utf-8", "backslashreplace")
+
+
 def cmd_ci_export(args):
     ctx = Ctx(find_root())
     commands = ci_commands(ctx)
@@ -11398,10 +11431,47 @@ def cmd_ci_export(args):
             "test command. Set one (for example `ratchet.py config --set regression_command=...`) and "
             "run this again.")
     text = render_github_actions(ctx, commands)
-    if not getattr(args, "stdout", False):
-        die("writing .github/workflows/ratchet.yml comes in a later step; run `ratchet.py ci-export "
-            "--stdout` to print it for now.")
-    print(text, end="")
+    data = _ci_workflow_bytes(text)
+    if getattr(args, "stdout", False):
+        buf = getattr(sys.stdout, "buffer", None)
+        if buf is not None:
+            sys.stdout.flush()
+            buf.write(data)
+            buf.flush()
+        else:  # no underlying byte stream (e.g. stdout replaced in a test harness): fall back to text
+            print(text, end="")
+        return
+    path = ctx.root / ".github" / "workflows" / "ratchet.yml"
+    cant_replace = ("won't replace it. Run `ratchet.py ci-export --stdout` to print the workflow instead, "
+                     "so you can show it to the developer.")
+    for parent in (ctx.root / ".github", ctx.root / ".github" / "workflows"):
+        if parent.is_symlink():
+            die(f"{parent} is a symlink: {cant_replace}")
+    if path.is_symlink():
+        die(f"{path} is a symlink, not a workflow Ratchet wrote: {cant_replace}")
+    if path.is_dir():
+        die(f"{path} is a directory, not a file: {cant_replace}")
+    if path.exists():
+        try:
+            existing = path.read_bytes()
+        except OSError as e:
+            die(f"could not read {path}: {e}. Fix the permission or ownership problem, then run this again.")
+        if not _normalized_for_marker_check(existing).startswith(CI_WORKFLOW_MARKER.encode()):
+            die(f"{path} already exists and was not written by Ratchet (it doesn't start with Ratchet's "
+                f"marker line): {cant_replace}")
+        if existing == data:
+            ok(f"{path} is already up to date.")
+            return
+    else:
+        for parent in (ctx.root / ".github", ctx.root / ".github" / "workflows"):
+            if parent.exists() and not parent.is_dir():
+                die(f"{parent} already exists and is not a directory, so Ratchet can't write the workflow "
+                    "there. Remove or rename it, then run this again.")
+    try:
+        _write_record(path, data, raw=True)
+    except OSError as e:
+        die(f"could not write {path}: {e}. Fix the permission or ownership problem, then run this again.")
+    ok(f"wrote {path}")
 
 
 def main(argv=None):
@@ -11587,8 +11657,8 @@ def main(argv=None):
     a.set_defaults(fn=cmd_install_hooks)
     a = sp.add_parser("doctor", help="which hosts have Ratchet hooks, and are they firing?")
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_doctor)
-    a = sp.add_parser("ci-export", help="print (or, later, write) the GitHub Actions workflow that keeps "
-                       "running the regression command and saved checks after the run ends")
+    a = sp.add_parser("ci-export", help="write (or, with --stdout, print) the GitHub Actions workflow that "
+                       "keeps running the regression command and saved checks after the run ends")
     a.add_argument("--stdout", action="store_true", help="print the workflow instead of writing a file")
     a.set_defaults(fn=cmd_ci_export)
 
