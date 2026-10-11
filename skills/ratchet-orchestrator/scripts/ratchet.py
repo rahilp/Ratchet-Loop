@@ -11206,31 +11206,88 @@ CI_WORKFLOW_HEADER = (
 )
 
 
+_NOTED_BAD_SHAPE = set()
+
+
+def _note_bad_shape(path: Path, why: str, outcome: str):
+    """Say plainly, on stderr, that one of Ratchet's own records held the wrong JSON shape and what
+    ci-export did instead (once per file and cause in a process). Worded like read_json's record= notes,
+    but for a file that parsed fine yet doesn't hold the shape expected at that point."""
+    key = (str(path), why, outcome)
+    if key in _NOTED_BAD_SHAPE:
+        return
+    _NOTED_BAD_SHAPE.add(key)
+    print(f"ratchet: {path} {why}; {outcome}", file=sys.stderr)
+
+
 def _ci_step_tests(ctx: Ctx) -> list:
     """Completed steps' own tests.command, across every run under runs/, ordered by that run's created_at
     (not its folder name) and then by the checkpoint order its own checkpoints.json saved. Each run's
-    checkpoints.json gives a checkpoint's tests.command; its state.json says which checkpoints are done."""
+    checkpoints.json gives a checkpoint's tests.command; its state.json says which checkpoints are done.
+    A run folder whose state.json or checkpoints.json doesn't hold the shape expected is skipped whole, with
+    a plain stderr note naming the file; a single malformed checkpoint entry or item inside an otherwise
+    well-shaped run is skipped on its own, with its own note, leaving the run's other checkpoints intact."""
     runs_dir = ctx.ratchet / "runs"
     if not runs_dir.is_dir():
         return []
     runs = []
     for run_dir in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
-        state = read_json(run_dir / "state.json", {},
+        state_path = run_dir / "state.json"
+        plan_path = run_dir / "checkpoints.json"
+        state = read_json(state_path, {},
                            record="ci-export skips this run folder's step tests") or {}
-        plan = read_json(run_dir / "checkpoints.json", {},
+        plan = read_json(plan_path, {},
                           record="ci-export skips this run folder's step tests") or {}
         if not isinstance(state, dict) or not isinstance(plan, dict):
             continue
-        runs.append((str(state.get("created_at") or ""), run_dir.name, state, plan))
+        if "checkpoints" not in state:
+            done = {}
+        else:
+            done = state.get("checkpoints")
+            if not isinstance(done, dict):
+                _note_bad_shape(state_path, "holds a \"checkpoints\" value that isn't an object",
+                                 "ci-export skips this run folder's step tests")
+                continue
+        if "checkpoints" not in plan:
+            plan_checkpoints = []
+        else:
+            plan_checkpoints = plan.get("checkpoints")
+            if not isinstance(plan_checkpoints, list):
+                _note_bad_shape(plan_path, "holds a \"checkpoints\" value that isn't a list",
+                                 "ci-export skips this run folder's step tests")
+                continue
+        runs.append((str(state.get("created_at") or ""), run_dir.name, done, plan_checkpoints, state_path,
+                     plan_path))
     runs.sort(key=lambda r: (r[0], r[1]))
     out = []
-    for _created, slug, state, plan in runs:
-        done = state.get("checkpoints") or {}
-        for cp in plan.get("checkpoints") or []:
-            cp_id = cp.get("id") if isinstance(cp, dict) else None
-            if not cp_id or not isinstance(done.get(cp_id), dict) or done[cp_id].get("status") != "done":
+    for _created, slug, done, plan_checkpoints, state_path, plan_path in runs:
+        for cp in plan_checkpoints:
+            if not isinstance(cp, dict):
+                _note_bad_shape(plan_path, "has a \"checkpoints\" item that isn't an object",
+                                 "ci-export skips that checkpoint's step test")
                 continue
-            command = ((cp.get("tests") or {}).get("command") or "")
+            cp_id = cp.get("id")
+            if not isinstance(cp_id, str) or not cp_id:
+                _note_bad_shape(plan_path, "has a \"checkpoints\" item whose \"id\" isn't a nonempty string",
+                                 "ci-export skips that checkpoint's step test")
+                continue
+            if cp_id not in done:
+                continue
+            entry = done[cp_id]
+            if not isinstance(entry, dict):
+                _note_bad_shape(state_path, f"has a \"{cp_id}\" checkpoint entry that isn't an object",
+                                 "ci-export skips that checkpoint's step test")
+                continue
+            if entry.get("status") != "done":
+                continue
+            if "tests" not in cp:
+                continue
+            tests = cp["tests"]
+            if not isinstance(tests, dict):
+                _note_bad_shape(plan_path, f"has a \"{cp_id}\" checkpoint whose \"tests\" value isn't an object",
+                                 "ci-export skips that checkpoint's step test")
+                continue
+            command = tests.get("command") or ""
             command = command.strip() if isinstance(command, str) else ""
             if command:
                 out.append({"name": f"{slug} {cp_id} tests", "command": command})

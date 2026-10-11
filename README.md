@@ -427,6 +427,7 @@ python3 tests/test_brief_guard.py
 python3 tests/test_checkin.py
 python3 tests/test_ci_export.py
 python3 tests/test_ci_export_docs.py
+python3 tests/test_ci_export_shapes.py
 python3 tests/test_ci_export_write.py
 python3 tests/test_cleanup.py
 python3 tests/test_converge.py
