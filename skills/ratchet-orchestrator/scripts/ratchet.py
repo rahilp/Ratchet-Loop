@@ -1789,6 +1789,15 @@ def validate_plan(plan: dict) -> list[str]:
     return errs
 
 
+def risk_reason_problems(checkpoints) -> list[str]:
+    """CP1: a 'high'-risk checkpoint must say which users could be harmed and how. Checked only where a
+    checkpoint is newly registered — `cmd_plan_submit` for every checkpoint in a plan, `cmd_plan_extend` for only
+    the ones it appends — so an already-approved plan's existing high-risk checkpoint, built before this rule
+    existed, keeps working untouched."""
+    return [f"{cp.get('id', '?')}: risk \"high\" needs risk_reason naming which users could be harmed and how"
+            for cp in checkpoints if cp.get("risk") == "high" and not str(cp.get("risk_reason") or "").strip()]
+
+
 def cp_by_id(plan, cp_id):
     for cp in plan.get("checkpoints", []):
         if cp["id"] == cp_id:
@@ -1861,7 +1870,7 @@ def next_action(ctx: Ctx, st=None, compute_accept_note: bool = True) -> dict:
     if phase in ("blocked", "paused", "done", "cancelled"):
         na = {"phase": phase, "action": st.get("blocked_reason") or phase, "stop_ok": True}
         if phase == "blocked":
-            na["options"] = blocked_options(st.get("blocked_reason"))
+            na["options"] = blocked_options(st)
             na["reason_plain"] = plain_reason(st.get("blocked_reason"))
             note = _blocked_accept_note(ctx, st) if compute_accept_note else None
             if note:
@@ -1942,20 +1951,50 @@ def plain_reason(reason):
     return reason
 
 
-def blocked_options(reason) -> list:
-    """2-3 lettered choices for the user, fitted to why the run is blocked. Offered by the agent, not typed.
-    Only offers things that can work: raising a review limit is a user-confirmed config change. Accepting an
-    open finding is never one of these: it is never a lettered pick (so a pick followed by `human-approve` can
-    never stand in for the user's own `accept: <reason>` reply). When that is a real option here, `next`/`status`
-    add it as its own plain line instead (see `_blocked_accept_note`)."""
+def _adv_base_cap(cfg, g) -> int:
+    """The round limit before any check-in round-limit grant: this step's raised cap, once the user has raised
+    it (CP1's one-time `raise-limit`, recorded as `gates.adversarial.cap_raised_to`), else the run's configured
+    `max_adversarial_rounds`. A later `config --set max_adversarial_rounds=...` only ever changes the fallback,
+    so it never lifts a cap this step already has recorded. Kept separate from `_adv_round_cap` (which also adds
+    `round_limit_grants`) so raising the limit always adds exactly one round on top of the CONFIGURED cap,
+    whichever order a raise and a round-limit grant happen in, instead of compounding on top of each other."""
+    return g.get("cap_raised_to") or cfg["max_adversarial_rounds"]
+
+
+def _adv_round_cap(cfg, cps) -> int:
+    """The round limit THIS checkpoint's adversarial gate blocks at: `_adv_base_cap` plus however many one-time
+    round-limit grants this step has used (`round_limit_grants`: at most one from `check-in --decision simplify`
+    and one from `check-in --decision change`, each reusing check-in's own simplify record to hand back exactly
+    one more round at the step's own round-limit block, never more than once each — see `cmd_check_in`)."""
+    g = (cps.get("gates") or {}).get("adversarial") or {}
+    return _adv_base_cap(cfg, g) + int(g.get("round_limit_grants", 0))
+
+
+def blocked_options(st) -> list:
+    """2-4 lettered choices for the user, fitted to why the run is blocked. Offered by the agent, not typed.
+    Only offers things that can work. Accepting an open finding is never one of these: it is never a lettered
+    pick (so a pick followed by `human-approve` can never stand in for the user's own `accept: <reason>` reply).
+    When that is a real option here, `next`/`status` add it as its own plain line instead (see
+    `_blocked_accept_note`). At a step's own round-limit block the menu leads with simplify, then change the
+    step, then stop; raising the limit (CP1: at most once per step, ever) comes last, and only while this step's
+    own `cap_raised_to` (on the blocked checkpoint's adversarial gate) is still unset. The older, run-wide cap
+    (a different mechanism: a config change plus `approve-changes`, not scoped to one step) keeps offering raise
+    every time, just reordered the same way."""
+    reason = st.get("blocked_reason")
     r = (reason or "").lower()
+    cur = st.get("current")
+    cps = (st.get("checkpoints") or {}).get(cur) if cur else None
+    raise_used = bool(((cps or {}).get("gates") or {}).get("adversarial", {}).get("cap_raised_to")) if cps else False
     if "round cap" in r or "run-wide" in r:
-        texts = ["Raise the review limit so the reviewers can keep going.",
-                 "Stop here and keep what is already finished."]
+        texts = ["Simplify the step so the reviewers can approve it in the rounds already allowed.",
+                 "Stop here and keep what is already finished.",
+                 "Raise the review limit so the reviewers can keep going."]
     elif "rounds used" in r or ("adversarial" in r and re.search(r"after \d+ rounds", r)):
-        texts = ["Raise the review limit so the reviewers can keep going.",
+        texts = ["Simplify the step, then let the reviewers look at it once more.",
                  "Change the step so the review notes no longer apply.",
                  "Stop here and keep what is already finished."]
+        if not raise_used:
+            texts.append("Raise the review limit so the reviewers can keep going.")
     elif "behavior gate failed" in r:
         texts = ["Try again with a different approach.", "Change or revise this step (its tests or its scope).",
                  "Stop here and keep what is already finished."]
@@ -1964,7 +2003,7 @@ def blocked_options(reason) -> list:
                  "Stop here and keep what is already finished."]
     else:
         texts = ["Try again.", "Change the plan for this step.", "Stop here and keep what is already finished."]
-    return [{"letter": "ABC"[i], "text": t} for i, t in enumerate(texts)]
+    return [{"letter": "ABCD"[i], "text": t} for i, t in enumerate(texts)]
 
 
 ACCEPT_NOTE_CACHE_NAME = ".accept-note-cache.json"  # see _cached_code_changed_since_round: a performance cache only
@@ -1984,7 +2023,7 @@ def _blocked_accept_note(ctx, st) -> str | None:
         return None
     cur = st.get("current")
     cps = (st.get("checkpoints") or {}).get(cur) if cur else None
-    if not cur or cps is None or not _adv_round_block_reason_for(cur, st.get("blocked_reason")):
+    if not cur or cps is None or _adv_block_kind(st, cur) not in ("own", "run_wide"):
         return None
     rnd = cps.get("adv_round")
     if not rnd or not _adv_open_findings(ctx, cur, rnd, cps):
@@ -2206,7 +2245,7 @@ def cmd_status_text(ctx: Ctx):
     if st.get("phase") == "blocked":
         print(f"Why: \"{plain_reason(st.get('blocked_reason')) or 'no reason was recorded'}\"")
         print("What would you like to do?")
-        for o in blocked_options(st.get("blocked_reason")):
+        for o in blocked_options(st):
             print(f"  {o['letter']}) {o['text']}")
         note = _blocked_accept_note(ctx, st)
         if note:
@@ -3327,7 +3366,8 @@ def cmd_plan_submit(args):
     plan = ctx.plan()
     if plan is None:
         die("checkpoints.json not found in the run folder")
-    errs = validate_plan(plan) + objective_problems(plan) + spec_plan_problems(ctx, plan)
+    errs = (validate_plan(plan) + objective_problems(plan) + spec_plan_problems(ctx, plan)
+            + risk_reason_problems(plan.get("checkpoints", [])))
     if errs:
         die("Plan invalid:\n  - " + "\n  - ".join(errs))
     st["phase"] = "awaiting_plan_approval"
@@ -5345,13 +5385,21 @@ def _print_checkin_brief(brief: dict):
 
 
 def cmd_check_in(args):
-    """`ratchet.py check-in CPn` (optionally `--decision simplify|accept|stop [--why "..."]`, `--json`). With no
-    decision: prints (or returns as JSON) the open check-in's brief and changes nothing. `simplify` is recorded
-    from the reasoning given in `--why` (no user question; the skill requires that reasoning come from a fresh
-    strong-model consult, not the orchestrator's own continued reasoning, but this command itself only records
-    whatever `--why` carries); `accept` is always refused, pointing at the accept-finding flow (CP3), which needs
-    the user's own reply; `stop` hands the run to the existing blocked/ask flow for the user to decide how to wrap
-    up."""
+    """`ratchet.py check-in CPn` (optionally `--decision simplify|change|accept|stop [--why "..."]`, `--json`).
+    With no decision: prints (or returns as JSON) the open check-in's brief and changes nothing. `simplify` and
+    `change` are recorded from the reasoning given in `--why` (no user question; the skill requires that
+    reasoning come from a fresh strong-model consult, not the orchestrator's own continued reasoning, but this
+    command itself only records whatever `--why` carries); `accept` is always refused, pointing at the
+    accept-finding flow (CP3), which needs the user's own reply; `stop` hands the run to the existing
+    blocked/ask flow for the user to decide how to wrap up.
+
+    `simplify`/`change` also work with no check-in open, while `cp_id` is `blocked` on its OWN adversarial
+    round-limit (`_adv_block_kind` returning "own"): CP1's lettered menu there leads with simplify, then change, so
+    each reuses check-in's own simplify record to grant this step exactly one extra review round, at most once
+    each (`gates.adversarial.round_limit_simplify_used` / `round_limit_change_used`, added to
+    `round_limit_grants`, which `_adv_round_cap` adds on top of the step's cap) -- never a fresh budget, and
+    never offered a second time for either. A plain `human-approve` (with or without a lettered pick) never
+    grants this; only these two commands, and `raise-limit`, ever hand a step more review rounds."""
     ctx = Ctx(find_root())
     st = ctx.state()
     plan = ctx.plan() or {}
@@ -5375,10 +5423,35 @@ def cmd_check_in(args):
         else:
             _print_checkin_brief(brief)
         return
+    decision = decision.strip().lower()
     open_ci = ci.get("open")
     if not open_ci:
-        die(f"No check-in is open for {cp_id}. Nothing to decide.")
-    decision = decision.strip().lower()
+        if decision in ("simplify", "change") and _adv_block_kind(st, cp_id) == "own":
+            why = (getattr(args, "why", None) or "").strip()
+            if not why:
+                die(f"check-in --decision {decision} needs --why \"...\" explaining the reasoning. Nothing was "
+                    "recorded.")
+            used_key = f"round_limit_{decision}_used"
+            if g.get(used_key):
+                die(f"{cp_id}'s round-limit {decision} grant was already used once; it is never granted again "
+                    f"for this step. Nothing was changed. Run `ratchet.py ask raise-limit {cp_id}` instead if "
+                    "this step hasn't used its one raise yet.")
+            g[used_key] = True
+            g["round_limit_grants"] = int(g.get("round_limit_grants", 0)) + 1
+            ci.setdefault("decided", []).append({"round": g.get("attempts"), "trigger": "round_limit",
+                                                 "decision": decision, "why": why, "decided_at": now()})
+            ctx.log(st, "checkin_round_limit_grant", cp=cp_id, decision=decision, why=why[:300])
+            prev_attempts = g.get("attempts", 0)  # preserved across _unblock exactly like raise-limit: this
+            # grants exactly one more round, not a fresh budget.
+            _unblock(ctx, st, "agent", f"check-in {decision} granted {cp_id} one extra review round: {why}")
+            g["attempts"] = prev_attempts
+            ctx.save_state(st)
+            build_viewer(ctx)
+            ok(f"Recorded: {decision} ({why}). {cp_id} now has one extra review round. "
+               f"`ratchet.py reviewers {cp_id}` can open it now.")
+            return
+        die(f"No check-in is open for {cp_id}, and it isn't blocked on its own round limit either. Nothing to "
+            "decide.")
     if decision == "accept":
         die("check-in cannot accept an open finding itself: a cooperative agent must not wave its own findings "
             f"through here. That needs the user's own reply, through `ratchet.py ask accept-finding {cp_id} <ids>` "
@@ -5404,7 +5477,11 @@ def cmd_check_in(args):
         ctx.save_state(st)
         ok("Recorded: stop. The run now waits for the user to say how to wrap up.")
         return
-    die("check-in --decision must be simplify, accept or stop.")
+    if decision == "change":
+        die(f"check-in --decision change only applies while {cp_id} is blocked on its own adversarial round "
+            "limit, not during an open check-in; run `check-in --decision simplify` instead (it already covers "
+            "narrowing or changing the step while reviews are dragging). Nothing was changed.")
+    die("check-in --decision must be simplify, change, accept or stop.")
 
 
 TRIAGE_DECISIONS = {"fix", "rebut"}
@@ -5600,7 +5677,7 @@ def cmd_adv_record(args):
     if not approved:
         g["status"] = "failed"
         ci_note = _checkin_trigger(ctx, st, args.cp, cps, g, rnd, all_findings)
-        if g["attempts"] >= cfg["max_adversarial_rounds"]:
+        if g["attempts"] >= _adv_round_cap(cfg, cps):
             _set_blocked(st, f"{args.cp}: adversarial review still has {len(all_findings)} finding(s) after "
                              f"{g['attempts']} rounds — needs a human/director decision.")
         ctx.log(st, "adversarial_changes_requested", cp=args.cp, findings=len(all_findings))
@@ -7071,6 +7148,9 @@ def cmd_plan_extend(args):
     edited = [c["id"] for c in plan["checkpoints"] if c["id"] in approved_cps and _sha(c) != approved_cps[c["id"]]]
     if edited:
         die(f"Existing checkpoint(s) {edited} were edited. Feedback only APPENDS new checkpoints; restore the originals.")
+    rr_errs = risk_reason_problems([cp_by_id(plan, cid) for cid in new_ids])  # only the APPENDED checkpoints: an
+    if rr_errs:                                                              # existing high-risk one predating
+        die("Plan invalid:\n  - " + "\n  - ".join(rr_errs))                  # this rule keeps working untouched.
     _validate_new_checkpoints(ctx, plan, new_ids)
     for cid in new_ids:
         st["checkpoints"][cid] = new_cp_state(cp_by_id(plan, cid))
@@ -7227,11 +7307,13 @@ ASKABLE = {"approve-plan": "start building the plan as it is",
            "ui-respec": "change what the UI check compares for this step (its capture steps or scope), as explained above",
            "choice": "go with one of the lettered options you listed",
            "accept-finding": "accept the open finding(s) named above as a known limit, with your own reason, instead "
-                             "of running another review round"}
+                             "of running another review round",
+           "raise-limit": "raise this step's review-round limit by one round, with your own reason, so the "
+                          "reviewers can keep going (offered at most once per step, ever)"}
 # the command that carries out a "yes" to each question
 PENDING_COMMAND = {"approve-plan": "approve-plan", "human-approve": "human-approve", "approve-changes": "approve-changes", "cancel": "cancel", "set-review": "set-review",
                    "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec", "choice": "choice",
-                   "accept-finding": "accept-finding"}
+                   "accept-finding": "accept-finding", "raise-limit": "raise-limit"}
 REVIEW_MODE_WORDS = {"end": "only at the end", "each": "after every step", "none": "never (fully autonomous)"}
 
 
@@ -7259,9 +7341,13 @@ def cmd_ask(args):
         die("ask accept-finding needs the checkpoint id, e.g. `ratchet.py ask accept-finding CP2 F1,F2`")
     if args.action == "accept-finding" and not getattr(args, "ids", None):
         die("ask accept-finding needs the finding ids to accept, e.g. `ratchet.py ask accept-finding CP2 F1,F2`")
-    if args.action not in ("set-review", "ui-respec", "accept-finding") and args.mode:
+    if args.action == "raise-limit" and not (args.mode and args.mode in (st.get("checkpoints") or {})):
+        die("ask raise-limit needs the checkpoint id, e.g. `ratchet.py ask raise-limit CP2`")
+    if args.action not in ("set-review", "ui-respec", "accept-finding", "raise-limit") and args.mode:
         die(f"ask {args.action} takes no extra value")
     _bind_owner(ctx, st, args.action, asker)
+    if args.action == "raise-limit":
+        return _ask_raise_limit(ctx, st, args)
     if args.action == "choice":
         return _ask_choice(ctx, st, args)
     if args.action == "accept-finding":
@@ -7529,6 +7615,42 @@ def _why_not_open(f) -> str:
     if str(f.get("severity", "")).strip().lower() in MINOR_SEVERITIES:
         return "deferred as minor, not blocking"
     return "deferred, not blocking"
+
+
+def _ask_raise_limit(ctx, st, args):
+    """`ask raise-limit CPn`: refused outright, before anything is asked, once this checkpoint's one raise is
+    already spent (`gates.adversarial.cap_raised_to` set) — a step's raise is offered, and spent, at most once,
+    ever, whatever `config.json`'s `max_adversarial_rounds` is edited to afterward. Also refused outright, before
+    anything is asked, unless `_adv_block_kind(st, cp)` is "own" or "run_wide": the one-time raise exists for a
+    step genuinely stuck at its adversarial round limit, never for a step still building or already done, where
+    this question's own fixed wording ("reviewers have used all the review rounds allowed and are still
+    blocked") would be false."""
+    cp = args.mode
+    cps = (st.get("checkpoints") or {}).get(cp)
+    if cps is None:
+        die(f"No such checkpoint {cp}.")
+    g = (cps.get("gates") or {}).get("adversarial") or {}
+    if g.get("cap_raised_to"):
+        die(f"{cp}'s review-round limit was already raised once (to {g['cap_raised_to']} rounds); it is never "
+            "offered a second time. Nothing was asked.")
+    if _adv_block_kind(st, cp) not in ("own", "run_wide"):
+        die(f"{cp} is not blocked on an adversarial review-round limit right now; raise-limit only applies then. "
+            "Nothing was asked.")
+    overtook = _overtake(ctx, st, "raise-limit", cp)
+    asked = now()
+    st["pending"] = {"action": "raise-limit", "mode": cp, "asked_at": asked, "prev_awaiting": st.get("awaiting_since"),
+                     "session": _asking_session(ctx, st, "raise-limit"), **overtook}
+    st["awaiting_since"] = asked
+    ctx.log(st, "question_asked", action="raise-limit", cp=cp)
+    ctx.save_state(st)
+    if overtook:
+        print(_not_asked_text(f"`ratchet.py ask raise-limit {cp}`", overtook))
+        return
+    print(f"ASK THE USER: {cp}'s reviewers have used all the review rounds allowed and are still blocked. Shall I "
+          "raise this step's review-round limit by one round (its one and only raise) so they can keep going? To "
+          "agree, their reply must be exactly: raise: <their reason>. Only their first reply counts, and only "
+          "that exact form (starting with \"raise: \") raises it; any other reply raises nothing.")
+    print(ASK_ALONE)
 
 
 def _ask_accept_finding(ctx, st, args):
@@ -7821,17 +7943,28 @@ def cmd_hooks_waive(args):
        "Recorded: the user chose to build without hooks. The checks are advice only; missing hooks never block work.")
 
 
-def _adv_round_block_reason_for(cp, reason) -> bool:
-    """True when `reason` is the kind of block that accepting `cp`'s open findings resolves: either `cp`'s own
-    adversarial round limit (`cmd_adv_record`'s 'still has N finding(s) after R rounds', or `cmd_reviewers`'s 'R
-    adversarial rounds used without approval'), or the run-wide round cap (`cmd_reviewers`), which also blocks
-    before a new round opens while `cp`'s last recorded round still has open findings of its own. Any other
-    block (behavior, UI, a different checkpoint's reason) is left alone: accepting a finding here does not fix
-    it, so the run should stay exactly as blocked as it was."""
-    r = reason or ""
-    if r.startswith(f"{cp}:") and "adversarial" in r and "rounds" in r:
-        return True
-    return r.startswith("Run-wide adversarial round cap reached")
+def _adv_block_kind(st, cp_id) -> str | None:
+    """Classifies the adversarial block the run is in for `cp_id`, when any: "own" when `cp_id` is current and
+    `blocked` on its OWN round limit (`cmd_adv_record`'s 'still has N finding(s) after R rounds', or
+    `cmd_reviewers`'s 'R adversarial rounds used without approval') -- the same classification `blocked_options`
+    uses to put simplify/change/stop ahead of raise in its menu, and the one state where `check-in --decision
+    simplify|change` reuses check-in's own simplify record to grant this step one more review round (the soft
+    check-in trigger, an open `ci['open']`, and this hard block never coincide, because `reviewers` refuses to
+    open a further round while a check-in sits open, so the hard cap is only ever reached after any earlier
+    check-in was already resolved); "run_wide" when `cp_id` is current and blocked instead on the run-wide round
+    cap (`cmd_reviewers`), which also blocks before a new round opens while `cp_id`'s last recorded round still
+    has open findings of its own. None for any other block (behavior, UI, a different checkpoint's reason, or no
+    block at all): accepting a finding or raising `cp_id`'s own cap does not fix those, so the run should stay
+    exactly as blocked as it was."""
+    if st.get("phase") != "blocked" or st.get("current") != cp_id:
+        return None
+    r = (st.get("blocked_reason") or "")
+    rl = r.lower()
+    if "rounds used" in rl or ("adversarial" in rl and re.search(r"after \d+ rounds", rl) is not None):
+        return "own"
+    if r.startswith("Run-wide adversarial round cap reached"):
+        return "run_wide"
+    return None
 
 
 def _code_changed_since_round(ctx, rnd) -> bool:
@@ -7868,9 +8001,16 @@ def _unblock(ctx, st, by, note) -> str:
     back = st.pop("blocked_from", None) or "building"
     if back == "blocked":
         back = "building"
+    cur = st.get("current")
+    preserve_adv = (_adv_block_kind(st, cur) == "own") if cur else False  # read before phase/blocked_reason are
+    # cleared below: True exactly when CUR's OWN adversarial round limit caused this block -- not the run-wide
+    # cap, not any other checkpoint's reason -- in which case its attempts must NOT be reset below (CP1: only
+    # raise-limit, with the user's own reason, ever grants a step more review rounds; this generic unblock must
+    # not do it for free, whether reached via human-approve directly, via accept-finding, or via a lettered
+    # block-menu choice that calls it). A run-wide-cap block (which is not cur's own round limit) still resets
+    # cur's adversarial attempts here, same as every other failing gate.
     st["phase"] = back
     st["blocked_reason"] = None
-    cur = st.get("current")
     cfg = ctx.config()
     if int(st.get("adv_rounds_total", 0)) >= cfg["max_adversarial_rounds_run"]:
         st["adv_rounds_total"] = 0  # the user chose to continue: the run's budget starts again
@@ -7881,9 +8021,9 @@ def _unblock(ctx, st, by, note) -> str:
         else:
             st["phase"] = "awaiting_final_review"
     elif cur:
-        # resets the attempt counters on the current checkpoint's failing gates
-        for g in st["checkpoints"][cur]["gates"].values():
-            if g["status"] != "passed":
+        # resets the attempt counters on the current checkpoint's other failing gates
+        for name, g in st["checkpoints"][cur]["gates"].items():
+            if g["status"] != "passed" and not (preserve_adv and name == "adversarial"):
                 g["attempts"] = 0
         st["checkpoints"][cur]["guardrail_tries"] = 0
     ctx.log(st, "unblocked", by=by, note=note, back_to=st["phase"])
@@ -8060,8 +8200,7 @@ def cmd_accept_finding(args):
         # `_unblock` is the same helper `human-approve` uses to resolve a block: it resets the run-wide round
         # budget when that cap was the cause, resets this checkpoint's own gate attempt counters, and consumes
         # any stored choice_allow so a later, unrelated block can't be unblocked by this same stale pick.
-        if st.get("phase") == "blocked" and st.get("current") == cp \
-                and _adv_round_block_reason_for(cp, st.get("blocked_reason")):
+        if _adv_block_kind(st, cp) in ("own", "run_wide"):
             unblocked_to = _unblock(ctx, st, by, "accept-finding resolved the round limit")
         # No open blocking finding remains for this step, so any check-in paused on this gate dragging has nothing
         # left to pause on: clear it the same as `reviewers` requires it resolved before another round, otherwise
@@ -8098,6 +8237,104 @@ def cmd_accept_finding(args):
                     "(see `ratchet.py next`).")
         else:
             msg += " Run `ratchet.py next` to see what happens now."
+    ok(msg)
+
+
+RAISE_LIMIT_RE = re.compile(r"^raise:\s*(.+)$", re.I | re.S)
+
+
+def _raise_reply_reason(text: str) -> str | None:
+    """The reason in a reply of the exact form `raise: <reason>`, or None when the reply is not that form (or
+    gives no reason)."""
+    m = RAISE_LIMIT_RE.match((text or "").strip())
+    if not m:
+        return None
+    reason = m.group(1).strip()
+    return reason or None
+
+
+def cmd_raise_limit(args):
+    """CP1: raise ONE checkpoint's adversarial round-limit cap by one round — only after `ask raise-limit CPn`
+    and the owning chat's own FIRST reply after it, exactly `raise: <reason>` (never a lettered pick, never
+    `human-approve`, which never raises anything). Only once per step, ever: once raised, the step records its
+    own cap (`gates.adversarial.cap_raised_to`), so `cmd_reviewers`/`cmd_adv_record` compare attempts against
+    THAT, not `cfg['max_adversarial_rounds']`, and a later `config --set max_adversarial_rounds=...` can never
+    lift it again. The reason is appended to `.ratchet/learnings.md`: a standing instruction for later rounds
+    and agents, exactly like any other human-review learning. Refuses outright, before recording anything,
+    unless `_adv_block_kind(st, cp)` is "own" or "run_wide": the one-time raise only ever applies while the step
+    is genuinely blocked on an adversarial round limit, the same precondition `_ask_raise_limit` enforces before
+    asking."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    _require_pending(st, "raise-limit", args.cp)
+    p = st["pending"]
+    cp = p["mode"]
+    cps = (st.get("checkpoints") or {}).get(cp)
+    if cps is None:
+        _clear_pending(st)
+        ctx.save_state(st)
+        die(f"No such checkpoint {cp} any more. Nothing was raised.")
+    if p.get("overtook"):
+        _clear_pending(st)
+        ctx.log(st, "raise_limit_unclear", cp=cp)
+        ctx.save_state(st)
+        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'))}"
+            "?) was still waiting for the user's first reply, so their reply could be meant for either. Nothing was "
+            f"raised. Run `ratchet.py ask raise-limit {cp}` again on its own.")
+    g = cps["gates"]["adversarial"]
+    if g.get("cap_raised_to"):
+        _clear_pending(st)
+        ctx.save_state(st)
+        die(f"{cp}'s review-round limit was already raised once (to {g['cap_raised_to']} rounds); it is never "
+            "offered a second time. Nothing was changed.")
+    if _adv_block_kind(st, cp) not in ("own", "run_wide"):
+        _clear_pending(st)
+        ctx.save_state(st)
+        die(f"{cp} is not blocked on an adversarial review-round limit right now; raise-limit only applies then. "
+            "Nothing was changed.")
+    msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the question was asked in can answer it
+    if not msgs:
+        die("No reply has been recorded in the owning chat since this question was asked. End your turn and wait "
+            "for the user's reply, exactly `raise: <reason>`; a reply typed in another chat does not count.")
+    entry = msgs[0]  # the first reply answers the question; later messages never do
+    reply = entry.get("prompt", "")
+    reason = _raise_reply_reason(reply)
+    if reason is None:
+        _spend_question(ctx, st, reply)
+        die(f"The user's first reply after the question was not the exact form `raise: <reason>`: \"{reply[:120]}\". "
+            "Nothing was raised, and the question is closed, so a later reply in that form does not count. Run "
+            f"`ratchet.py ask raise-limit {cp}` again if they still want to raise it.")
+    if ctx.config().get("verify_transcripts", True):
+        good, why = _transcript_ok(entry, p.get("asked_at"))
+        if not good:
+            _spend_question(ctx, st, reply)
+            die(f"Couldn't confirm that reply came from the user ({why}). Nothing was raised. Run `ratchet.py ask "
+                f"raise-limit {cp}` again and ask them to reply in this chat.")
+    cfg = ctx.config()
+    prev_attempts = g.get("attempts", 0)  # preserved across _unblock below so the raise grants exactly one more
+    # round, not a fresh budget: _unblock() resets failing-gate attempt counters to 0 for every other unblock path,
+    # but here that would hand back `cap` whole rounds instead of the one the user just approved.
+    cap = _adv_base_cap(cfg, g) + 1  # based on the CONFIGURED cap, never on any round_limit_grants already used,
+    # so a raise always adds exactly one round on top of config, whichever order it and a check-in round-limit
+    # grant happen in, instead of compounding on top of each other (see _adv_base_cap/_adv_round_cap).
+    g["cap_raised_to"] = cap
+    _clear_pending(st)
+    ctx.log(st, "round_limit_raised", cp=cp, cap=cap, reason=reason[:300])
+    _append_learning(ctx, f"{cp}'s review-round limit was raised to {cap} rounds: {reason}", source="raise-limit")
+    unblocked_to = None
+    if _adv_block_kind(st, cp) == "own":  # raise-limit only ever lifts CP's own step cap, so it only ever
+        # unblocks CP's own round-limit block, never the run-wide cap (raising one step's cap does not touch
+        # the run-wide budget; that needs a plain human-approve, same as any other failing gate).
+        unblocked_to = _unblock(ctx, st, "human", f"raised {cp}'s round limit to {cap}")
+        g["attempts"] = prev_attempts
+    ctx.save_state(st)
+    build_viewer(ctx)
+    msg = f"{cp}'s review-round limit raised to {cap} rounds, with reason: {reason}."
+    if unblocked_to:
+        msg += " The run is no longer blocked."
+        msg += f" Next: `ratchet.py reviewers {cp}` can open another round now."
+    else:
+        msg += f" `ratchet.py reviewers {cp}` can open another round for this step once it is blocked there again."
     ok(msg)
 
 
@@ -8156,7 +8393,7 @@ def cmd_reviewers(args):
                     die(f"{args.cp} round {rnd['round']} still has blocking finding(s) with no fix-or-rebut "
                         f"decision: {', '.join(missing)}. Run `ratchet.py triage {args.cp} "
                         f"{missing[0]}=fix:\"reason\"` (or `=rebut:\"reason\"`) for each, then try again.")
-        if g["attempts"] >= cfg["max_adversarial_rounds"]:
+        if g["attempts"] >= _adv_round_cap(cfg, cps):
             _set_blocked(st, f"{args.cp}: {g['attempts']} adversarial rounds used without approval — needs a "
                              "human/director decision.")
             ctx.save_state(st)
@@ -10327,7 +10564,7 @@ STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "re
                      "ui-record", "adv-record", "complete", "human-approve", "feedback", "plan-extend", "pause",
                      "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
                      "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait", "accept-finding",
-                     "check-in", "triage")
+                     "raise-limit", "check-in", "triage")
 LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers")  # tests, checks, a regression suite, provider probes
 # The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
 OVERRIDE_CMDS = ("approve-plan", "human-approve", "approve-changes", "cancel", "set-review", "resume", "hooks-waive",
@@ -10586,6 +10823,11 @@ def main(argv=None):
     a.add_argument("cp"); a.add_argument("--director-token")
     a.add_argument("--reason", help="director mode only: the director's reason (there is no chat reply to read one from)")
     a.set_defaults(fn=cmd_accept_finding)
+    a = sp.add_parser("raise-limit", help="raise one checkpoint's review-round limit by one round (after `ask "
+                                          "raise-limit` and the owning chat's own 'raise: <reason>' reply); "
+                                          "offered at most once per step, ever")
+    a.add_argument("cp")
+    a.set_defaults(fn=cmd_raise_limit)
     a = sp.add_parser("hooks-waive", help="record the user's choice to build without hooks (after `ask hooks-waive`)")
     a.add_argument("--director-token")
     a.set_defaults(fn=cmd_hooks_waive)
@@ -10649,7 +10891,7 @@ def main(argv=None):
     a = sp.add_parser("reviewers"); a.add_argument("cp"); a.add_argument("--json", action="store_true")
     a.set_defaults(fn=cmd_reviewers)
     a = sp.add_parser("check-in", help="print (or decide) the check-in opened when reviews drag")
-    a.add_argument("cp"); a.add_argument("--decision", choices=["simplify", "accept", "stop"])
+    a.add_argument("cp"); a.add_argument("--decision", choices=["simplify", "change", "accept", "stop"])
     a.add_argument("--why"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_check_in)
     a = sp.add_parser("triage", help="record fix-or-rebut decisions for a blocked round's open findings")
     a.add_argument("cp"); a.add_argument("decisions", nargs="+", metavar="ref=fix|rebut:reason")

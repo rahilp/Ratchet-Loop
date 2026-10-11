@@ -45,6 +45,12 @@ OBJECTIVE_MIN = {
     "out_of_scope": ["anything not listed in the checkpoint's plan"],
 }
 
+# CP1: a 'high'-risk checkpoint needs risk_reason naming who is harmed and how, or plan-submit/plan-extend refuse
+# it. Fixtures across suites that build a high-risk checkpoint (not testing that refusal itself) use this one
+# shared reason so they don't all have to say it separately.
+RISK_REASON_MIN = ("a wrong check here would let a corner-cutting agent ship broken or unsafe behavior straight "
+                   "past review, hurting whoever uses the resulting feature")
+
 _LOCK = threading.RLock()
 _LIVE: list = []          # TmpDir objects not cleaned up yet, oldest first
 _PROCS: list = []         # processes tracked without a folder (see track())

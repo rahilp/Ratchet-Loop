@@ -89,6 +89,8 @@ def project(name="p", cps=1, extra_cp=None, config=None) -> Path:
               "tests": {"files": [f"tests/cp{i}.test.js"], "command": f"node --test tests/cp{i}.test.js"}}
         if extra_cp:
             cp.update(extra_cp)
+        if cp.get("risk") == "high" and not cp.get("risk_reason"):
+            cp["risk_reason"] = _tmp.RISK_REASON_MIN  # CP1: plan-submit refuses high risk with no risk_reason
         plan["checkpoints"].append(cp)
         (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code"}]}))
     (run / "checkpoints.json").write_text(json.dumps(plan))

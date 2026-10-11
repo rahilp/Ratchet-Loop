@@ -143,6 +143,8 @@ def plan_project(approve: bool) -> Path:
         cp = {"id": f"CP{i + 1}", "title": TITLES[i], "summary": "s", "done_when": [DONE_WHEN[i], "second line"],
               "gates": {"behavior": True, "ui": UI[i], "adversarial": True}, "risk": RISKS[i],
               "tests": {"files": [f"tests/cp{i + 1}.test.js"], "command": f"node --test tests/cp{i + 1}.test.js"}}
+        if RISKS[i] == "high":
+            cp["risk_reason"] = _tmp.RISK_REASON_MIN  # CP1: plan-submit refuses high risk with no risk_reason
         if UI[i]:
             cp.update(ui_scope="the page", ui_states=[{"name": "default", "how": "open it"}])
         plan["checkpoints"].append(cp)
@@ -553,9 +555,14 @@ def main():
         mutate(d, lambda st, reason=reason: (finish(st, 2), blocked(reason)(st)))
         out = status_text(d).stdout
         low = out.lower()
+        opts = opts_in(out)
+        texts_low = [t.lower() for _, t in opts]
         check(f"[CP3-T22] {label}: no 'another round' option, offers raising the limit",
               "another round" not in low and re.search(r"raise the review limit", low) is not None, out)
-        check(f"[CP3-T22] {label}: 2-3 options", 2 <= len(opts_in(out)) <= 3, out)
+        expected = 3 if label == "run cap" else 4
+        check(f"[CP3-T22] {label}: {expected} options (CP1 order), simplify first and raise last",
+              len(opts) == expected and bool(texts_low) and "simplify" in texts_low[0]
+              and "raise" in texts_low[-1], out)
 
     print("[CP3-T23] block reasons are shown in plain words; raw text stays in status --json")
     REAL["behavior"] = "CP3: behavior gate failed 3 times \u2014 needs a human decision."
@@ -587,16 +594,22 @@ def main():
     d, reason = variants["adv"]
     out = status_text(d).stdout
     opts = opts_in(out)
-    texts_low = " ".join(t for _, t in opts).lower()
-    check("[CP3-T24] per-checkpoint limit offers exactly 3 options", len(opts) == 3, out)
-    check("[CP3-T24] one of them raises the review limit", "raise the review limit" in texts_low, out)
-    check("[CP3-T24] one of them changes the step so the review notes no longer apply",
-          "change the step" in texts_low, out)
-    check("[CP3-T24] one of them stops and keeps what is finished", "stop" in texts_low, out)
+    texts_low = [t.lower() for _, t in opts]
+    check("[CP3-T24] per-checkpoint limit offers exactly 4 options (CP1 order: simplify, change, stop, raise)",
+          len(opts) == 4, out)
+    check("[CP3-T24] option 1 simplifies the step", len(texts_low) > 0 and "simplify" in texts_low[0], out)
+    check("[CP3-T24] option 2 changes the step so the review notes no longer apply",
+          len(texts_low) > 1 and "change the step" in texts_low[1], out)
+    check("[CP3-T24] option 3 stops and keeps what is finished", len(texts_low) > 2 and "stop" in texts_low[2], out)
+    check("[CP3-T24] option 4 (last) raises the review limit",
+          len(texts_low) > 3 and "raise the review limit" in texts_low[3], out)
     cap_d, cap_reason = variants["cap"]
     cap_opts = opts_in(status_text(cap_d).stdout)
-    check("[CP3-T24] the run-wide cap branch stays distinct (2 options, no change-the-step)",
-          len(cap_opts) == 2 and "change the step" not in " ".join(t for _, t in cap_opts).lower(), cap_opts)
+    cap_texts_low = [t.lower() for _, t in cap_opts]
+    check("[CP3-T24] the run-wide cap branch stays distinct (3 options: simplify, stop, raise; no change-the-step)",
+          len(cap_opts) == 3 and "change the step" not in " ".join(cap_texts_low), cap_opts)
+    check("[CP3-T24] the run-wide cap branch still leads with simplify and ends with raise",
+          bool(cap_texts_low) and "simplify" in cap_texts_low[0] and "raise" in cap_texts_low[-1], cap_opts)
 
     # ------------------------------------------------------------ T25 (adv-round-06 fix): _blocked_accept_note
     # must never claim "the last fix changed the code, these findings need a fresh look" when the blocked round's

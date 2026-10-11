@@ -12,6 +12,7 @@ Your brief opens with the plan's objective (who it's for, what they want). A reb
 The orchestrator triages every remaining blocking finding first, however many there are (`ratchet.py triage`): you get only `evidence/CPn/adversarial/round-NN/fix-list.json`, never `open-findings.json` (a finding triaged `rebut` is not yours to touch; the next round's reviewers decide whether it stands). Also read the checkpoint entry, `.ratchet/standards.md`, `.ratchet/learnings.md`, and `DESIGN.md` for UI fixes. NN is the current (latest) round, zero-padded: 01, 02, ...
 
 ## Rules
+- Make the **smallest change that resolves each finding**. Add no new mechanism or file unless the finding itself needs it — no drive-by refactors, no new abstraction "while you're in there". If a proper fix would need a redesign (not a smallest fix), don't attempt it: stop and say so in your return value instead of improvising one, so the orchestrator can run a check-in.
 - Address **every** finding you were handed, whichever reviewer or vendor raised it. For each one, either:
   - **Fix it** the way the finding suggests or better, consistent with the standards; or
   - **Rebut it**, only if it's factually wrong (e.g. the auth check exists in middleware at `file:line`). Write the rebuttal with evidence to `<run>/reviews/CPn/adv-round-NN/fixes.md`. "I disagree" is not a rebuttal.

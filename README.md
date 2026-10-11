@@ -141,6 +141,14 @@ Only your first reply after that question, in those exact words plus your own re
 
 In a director-enrolled lane, a chat reply never accepts a finding: the director must sign it instead (`director-sign accept-finding`), the same as every other approval in that lane.
 
+### Raising a step's review limit
+
+When a step hits its review-round limit, the agent offers you a short menu: simplify the step, change it so the review notes no longer apply, or stop here and keep what's already finished. Raising the limit so the reviewers get one more round is always listed last, and only once per step, ever — ask for it a second time on the same step and the agent won't offer it again, however many rounds `.ratchet/config.json` allows elsewhere. If you want to raise it, say so with your own reason:
+
+> raise: <your reason>
+
+Only your first reply after the question, in those exact words plus your reason, raises it; anything else raises nothing. Your reason is written down in `.ratchet/learnings.md`, the same as an accepted finding, so later rounds and agents see it too. Editing `max_adversarial_rounds` in `.ratchet/config.json` afterwards never lifts a step's own raised cap: once it's used, it's used, for that step, for the rest of this run.
+
 ## If your team writes specs (OpenSpec, Spec Kit, BMAD)
 
 If your project already uses OpenSpec, GitHub Spec Kit or the BMAD Method, Ratchet builds from the spec you've written instead of making up its own plan:
@@ -216,7 +224,7 @@ So for every review, Ratchet tries these in order:
 2. A different model from the same company, for example Sonnet reviewing work done by Opus.
 3. The same model that did the work, only if nothing else is available.
 
-Each step has a risk level, which you see in the plan. Risk decides how many reviewers look (one for low, two for normal, four for high). It never changes who gets asked first. On low-risk steps, only serious findings block.
+Each step has a risk level, which you see in the plan. Risk decides how many reviewers look (one for low, two for normal, four for high). It never changes who gets asked first. On low-risk steps, only serious findings block. `normal` is the default risk; a `high`-risk step also has to say which users could be harmed and how if it's gotten wrong (`risk_reason`) — a new plan with a high-risk step that doesn't say so is refused before you ever see it, naming the step.
 
 At the start of each run the agent checks which AI tools are installed and sends each one a tiny test request. A tool that's signed out or out of credit gets skipped for six hours, and the next one takes its place. When nothing else works, the host's own sub-agents fill the slot so the build never stalls. On a high-risk step that can mean fewer distinct reviewers than four. Substitutions are logged, the plan and viewer say who reviewed each round, and you're told up front if every review will come from the same company that did the build.
 
@@ -349,8 +357,9 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py spec detect`, `spec import <openspec\|speckit\|bmad\|auto> <id>`, `spec status` | build from an OpenSpec change, Spec Kit feature or BMAD story; which scenarios are proven so far; `spec keep on\|off` records the user's answer about a running spec |
 | `ratchet.py deferred` | review findings noted for later instead of blocking (minor ones, and any blocker/major/unknown-severity one with no `user_impact`), plus, in their own section first, any findings you accepted yourself, with your reason and who accepted them |
 | `ratchet.py ask accept-finding CPn F1,F2`, `accept-finding CPn` | ask the user to accept named open (blocking) findings of a blocked round, with their own reason (`accept: <reason>`); record it once they reply |
+| `ratchet.py ask raise-limit CPn`, `raise-limit CPn` | ask the user to raise a blocked step's own review-round limit by one round, with their own reason (`raise: <reason>`); offered at most once per step, ever, whatever `config.json`'s `max_adversarial_rounds` is later edited to |
 | `ratchet.py triage CPn <ref>=fix:"<reason>"` / `<ref>=rebut:"<reason>"` | whenever a round blocks: decide fix or rebut for every blocking finding, even a single one, before the next round opens; never accept/defer/waive |
-| `ratchet.py check-in CPn [--decision simplify\|accept\|stop] [--why "<reasoning>"]` | when reviews drag, see (or decide) the check-in against the plan's objective; `accept` is always refused here |
+| `ratchet.py check-in CPn [--decision simplify\|change\|accept\|stop] [--why "<reasoning>"]` | when reviews drag, see (or decide) the check-in against the plan's objective; `accept` is always refused here |
 | `ratchet.py occurrences <kind>` | the real code where reviewers found a kind of mistake |
 | `ratchet.py repeats` | kinds of finding seen twice or more that could become an automatic check |
 | `ratchet.py guardrail --kind <k> --title <t> --why <w> --check-command "<c> {target}" --target <dir> --bad-example <fixture> --test-command <c> --test-file <f>` | after you pick the "automatic check" option: add the step that builds it |
@@ -390,6 +399,7 @@ python3 tests/test_hooks.py
 python3 tests/test_hooks_status.py
 python3 tests/test_hooks_waiver.py
 python3 tests/test_install.py
+python3 tests/test_limits.py
 python3 tests/test_objective.py
 python3 tests/test_plan_change.py
 python3 tests/test_providers.py
