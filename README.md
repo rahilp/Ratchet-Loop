@@ -368,7 +368,7 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py doctor [--json]` | which CLIs have Ratchet hooks and when each last fired |
 | `ratchet.py status [--json]`, `plan-summary` | plain-text state; the plan step by step |
 | `ratchet.py changes CPn [--json]` | read-only: which changes since the step started are docs, which are code and how many code lines changed, which test files name each changed doc, and whether `doc_test_command` is configured |
-| `ratchet.py brief [CPn] --role implementer\|fixer\|test-writer\|reviewer\|scout\|planner` | a sub-agent's opening text: the plan's objective (word for word as `plan-summary` shows it, or a plain no-objective note), then that role's own rules; the orchestrator pastes this at the top of every spawn prompt |
+| `ratchet.py brief [CPn] --role implementer\|fixer\|test-writer\|reviewer\|scout\|planner` | a sub-agent's opening text: the plan's objective (word for word as `plan-summary` shows it, or a plain no-objective note), then that role's own rules; the orchestrator pastes this at the top of every spawn prompt. For the planner, it also ends with a "What earlier work says" section: recent learnings, findings earlier runs saved for later and nobody accepted yet, and limits the user already accepted, most relevant first then newest, each part capped with a count and a pointer to the full file (`.ratchet/learnings.md`, or a run's `state.json` under `.ratchet/runs/`). It also lists the related recorded specs for the parts being changed (OpenSpec, including Ratchet's own running records; finished Spec Kit features; done BMAD stories), each with its title, a one-line purpose and its path; no earlier work at all gets one plain line instead |
 | `ratchet.py view` | the viewer link (live URL if a server runs, else a `file://` link) |
 | `ratchet.py view --serve [--open]` | live page on a free port (4477 and up) at `http://127.0.0.1:<port>/` |
 | `ratchet.py view --serve --bind 0.0.0.0 [--public-host my-box.local]` | share `http://<host>:<port>/?t=<token>` (requests without the token get 403) |
@@ -418,6 +418,9 @@ python3 tests/test_checkin.py
 python3 tests/test_cleanup.py
 python3 tests/test_converge.py
 python3 tests/test_dedup_unknown_model.py
+python3 tests/test_digest.py
+python3 tests/test_digest_docstring.py
+python3 tests/test_digest_specs.py
 python3 tests/test_docs.py
 python3 tests/test_flaky.py
 python3 tests/test_gates.py

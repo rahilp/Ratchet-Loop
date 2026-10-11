@@ -56,16 +56,16 @@
   },
   "providers": [
     {
-      "id": "codex",
-      "preset": "codex"
-    },
-    {
       "id": "gemini",
       "preset": "gemini"
     },
     {
       "id": "claude",
       "preset": "claude"
+    },
+    {
+      "id": "codex",
+      "preset": "codex"
     },
     {
       "id": "copilot",
@@ -80,5 +80,6 @@
   "role_models": {
     "ratchet-implementer": "standard",
     "ratchet-fixer": "standard"
-  }
+  },
+  "min_review_seconds": 20
 }
