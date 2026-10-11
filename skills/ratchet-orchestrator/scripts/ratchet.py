@@ -7411,6 +7411,265 @@ def cmd_mark_fixed(args):
        "`ratchet.py deferred` to see it under 'fixed later in the run'.")
 
 
+# ---- receipt: one honest proof receipt to paste into the pull request, at the end of a run -----------------
+
+def _plain_duration(seconds) -> str:
+    """A wall-clock span as a plain duration ('4h 17m', '38m'): never cost, never tokens, just time."""
+    seconds = max(0, int(seconds or 0))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if days or hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _elapsed_seconds(a_iso, b_iso) -> int:
+    return max(0, int(_iso(b_iso) - _iso(a_iso)))
+
+
+def _step_reviewed_tree(cps) -> str | None:
+    """The git-tree id Ratchet recorded as reviewed for this checkpoint: its adversarial gate's own `fingerprint`
+    once that gate has passed, else the last adversarial round's own `fingerprint` (what that round actually
+    looked at), else None when no round has ever opened."""
+    g = (cps.get("gates") or {}).get("adversarial") or {}
+    fp = g.get("fingerprint")
+    if isinstance(fp, dict) and fp.get("id"):
+        return fp["id"]
+    rounds = g.get("rounds") or []
+    if rounds:
+        last_fp = rounds[-1].get("fingerprint")
+        if isinstance(last_fp, dict):
+            return last_fp.get("id")
+        if last_fp:
+            return last_fp
+    return None
+
+
+def _step_commit(ctx, cps) -> str | None:
+    """The short commit id to show for a checkpoint: its own recorded `commit` field (the one `complete` makes)
+    when there is one, else the one commit -- if any -- whose own git tree is exactly the tree Ratchet recorded
+    as reviewed for this step (`_step_reviewed_tree`: the step's passed adversarial gate, or else its last
+    adversarial round). Covers the one case `complete` itself leaves with no `commit` of its own even though
+    commit_per_checkpoint is on: the code was already committed by some other means (directly, by the user or
+    agent -- the accepted same-user limit) before `complete` ran, so there was nothing left for Ratchet's own
+    commit to add. Never guesses from commit dates or a time window (an ordinary manual commit made mid-step
+    that the reviewed tree does not match is never shown), so a step with no recorded commit and no commit whose
+    tree matches what was actually reviewed still says 'no commit recorded'."""
+    commit = cps.get("commit")
+    if commit:
+        return commit
+    tree = _step_reviewed_tree(cps)
+    if not tree or not _is_git(ctx.root):
+        return None
+    r = subprocess.run(["git", "log", "--format=%H %T"], cwd=ctx.root, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    for line in r.stdout.splitlines():
+        sha, _, cur_tree = line.partition(" ")
+        if cur_tree == tree:
+            return sha[:7]
+    return None
+
+
+def _step_elapsed(cps) -> tuple:
+    """(status, seconds) for one checkpoint: 'finished' (started_at..completed_at), 'not finished' (started_at..now,
+    the step is still mid-build) or 'not started' (no started_at yet: this step was never reached)."""
+    started = cps.get("started_at")
+    completed = cps.get("completed_at")
+    if not started:
+        return "not started", 0
+    if completed:
+        return "finished", _elapsed_seconds(started, completed)
+    return "not finished", _elapsed_seconds(started, now())
+
+
+def _run_elapsed(st) -> tuple:
+    """(status, seconds) for the whole run: 'finished' once the run-level 'approved' history event exists
+    (created_at..that event's own timestamp, the latest one if it is ever logged more than once), else 'not
+    finished' (created_at..now: time so far, never a final total presented as if the run had ended)."""
+    created = st.get("created_at")
+    if not created:
+        return "not finished", 0
+    approved_at = None
+    for h in st.get("history") or []:
+        if h.get("event") == "approved":
+            approved_at = h.get("at")  # the latest one wins when logged more than once
+    if approved_at:
+        return "finished", _elapsed_seconds(created, approved_at)
+    return "not finished", _elapsed_seconds(created, now())
+
+
+def _round_reviewer_entries(cfg, rnd_record: dict) -> list:
+    """One entry per reviewer this round actually recorded (the round's own 'reviewers' list, the final set after
+    any mid-round swap): {"round", "id", "host_fallback", "replaced", "reason"}. A host sub-agent reviewer
+    ('kind': 'agent' on the roster) is always marked `host_fallback`; its `reason` comes from the round's own
+    `substitutions` (cmd_reviewers' fallback record, fresh-round or the same-round re-resolve this checkpoint also
+    fills in) when one names it, else 'reason not recorded' -- never invented, never left blank -- including when
+    the round carries no `substitutions` key at all (a round recorded before that field existed). When today's
+    roster has nothing for this id (removed or renamed since this round ran), `host_fallback` is decided from the
+    recorded id's own naming convention (every host sub-agent id starts with "host-") instead of defaulting to
+    false, so a roster edit made later in the run never hides a real host-company fallback or its reason.
+
+    `reviewers` holds plain string ids while a round is still open (cmd_reviewers' own shape, including its
+    same-round re-resolve branch, before adv-record ever runs) and dicts ({"id", "vendor", "model"}) once that
+    round is recorded; either shape is accepted here. `substitutions` already carries the same `{"used",
+    "instead_of", "why"}` records for a pending round (built from its own `resolved` list) as for a recorded one,
+    so the lookup below needs no separate pending-round path."""
+    subs = rnd_record.get("substitutions")
+    by_used: dict = {}
+    if isinstance(subs, list):
+        for s in subs:
+            by_used.setdefault(s.get("used"), []).append(s)
+    out = []
+    for r in rnd_record.get("reviewers") or []:
+        rid = r if isinstance(r, str) else r.get("id")
+        spec = _roster_spec(cfg, rid) or {}
+        if spec:
+            host_fallback = spec.get("kind") == "agent"
+        else:
+            # Today's roster has nothing for this id (a custom host-agent reviewer renamed or removed since
+            # this round ran): fall back to the recorded id's own naming convention instead of calling it an
+            # outside reviewer. Every host sub-agent id this engine ever hands out starts with "host-".
+            host_fallback = bool(rid) and rid.startswith("host-")
+        replaced, reason = [], None
+        if host_fallback:
+            why = {}
+            for m in by_used.get(rid) or []:
+                for x in m.get("instead_of") or []:
+                    if x not in replaced:
+                        replaced.append(x)
+                why.update(m.get("why") or {})
+            if why:
+                reason = next(iter(why.values())) if len(why) == 1 else \
+                    "; ".join(f"{k}: {v}" for k, v in why.items())
+            else:
+                reason = "reason not recorded"
+        out.append({"round": rnd_record.get("round"), "id": rid, "host_fallback": host_fallback,
+                    "replaced": replaced, "reason": reason})
+    return out
+
+
+def _step_reviewer_entries(cfg, cps) -> list:
+    """Every recorded round's reviewers, plus the checkpoint's own currently-open round (`adv_round`) when one
+    exists and adv-record has not recorded it yet -- so a receipt asked for while a round is pending (or just
+    re-resolved mid-round) still honestly names its reviewers instead of silently omitting the step's own
+    in-progress round."""
+    rounds = ((cps.get("gates") or {}).get("adversarial") or {}).get("rounds") or []
+    out = []
+    for rnd_record in rounds:
+        out += _round_reviewer_entries(cfg, rnd_record)
+    pending = cps.get("adv_round")
+    if pending and not pending.get("recorded"):
+        out += _round_reviewer_entries(cfg, pending)
+    return out
+
+
+def _reviewer_line(e: dict) -> str:
+    if not e["host_fallback"]:
+        return f"  - round {e['round']}: {e['id']}"
+    if e["replaced"]:
+        return (f"  - round {e['round']}: {e['id']} - host's own company standing in, instead of "
+                f"{', '.join(e['replaced'])} ({e['reason']})")
+    return f"  - round {e['round']}: {e['id']} - host's own company fallback ({e['reason']})"
+
+
+def _receipt_accepted(st) -> list:
+    # "id" stays the finding's own bare id (the --json contract); "reviewer" is carried alongside it so two
+    # reviewers who independently picked the same bare id within one checkpoint can still be told apart
+    # (the qualified `_finding_key(f)` form the markdown prints uses exactly these two fields).
+    return [{"checkpoint": cp, "id": f.get("id"), "reviewer": f.get("reviewer"), "severity": f.get("severity"),
+             "description": f.get("description"), "reason": f.get("reason"),
+             "accepted_by": f.get("accepted_by") or "human"}
+            for cp, c in (st.get("checkpoints") or {}).items() for f in c.get("deferred") or [] if f.get("accepted")]
+
+
+def _receipt_left_for_later(st) -> list:
+    return [{"checkpoint": cp, "id": f.get("id"), "reviewer": f.get("reviewer"), "description": f.get("description"),
+             "deferred_because": f.get("deferred_because")}
+            for cp, c in (st.get("checkpoints") or {}).items() for f in left_for_later(c)]
+
+
+def _receipt_fixed_later(st) -> list:
+    out = []
+    for cp, c in (st.get("checkpoints") or {}).items():
+        for f in _fixed_later(c):
+            fx = f.get("fixed") or {}
+            out.append({"checkpoint": cp, "id": f.get("id"), "reviewer": f.get("reviewer"),
+                        "description": f.get("description"), "round": fx.get("round"), "how": fx.get("how")})
+    return out
+
+
+def cmd_receipt(args):
+    """`ratchet.py receipt` (plain markdown, or `--json`): one honest proof receipt to paste into the pull
+    request. Each step's title, short commit and elapsed time, the whole run's own elapsed time (wall-clock,
+    including any time spent waiting on you; never cost or tokens), who reviewed each step (a host-company
+    fallback marked as such, with why when Ratchet recorded it), the findings you accepted with their reason, and
+    findings left for later or fixed later in the run (CP1's own `left_for_later`/`_fixed_later` rule, so this
+    always agrees with `ratchet.py deferred` and `status`)."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    cfg = ctx.config()
+    plan = ctx.plan() or {"checkpoints": []}
+    cps_map = st.get("checkpoints") or {}
+    run_status, run_seconds = _run_elapsed(st)
+    steps = []
+    for cp in plan.get("checkpoints") or []:
+        cid = cp.get("id")
+        cps = cps_map.get(cid) or {}
+        status, seconds = _step_elapsed(cps)
+        steps.append({"id": cid, "title": cp.get("title", "?"), "commit": _step_commit(ctx, cps),
+                      "finished": status == "finished", "status": status, "elapsed_seconds": seconds,
+                      "reviewers": _step_reviewer_entries(cfg, cps)})
+    accepted, left, fixed = _receipt_accepted(st), _receipt_left_for_later(st), _receipt_fixed_later(st)
+    if getattr(args, "json", False):
+        data = {"run": {"elapsed_seconds": run_seconds, "finished": run_status == "finished"},
+                "steps": [{k: s[k] for k in ("id", "title", "commit", "finished", "elapsed_seconds", "reviewers")}
+                         for s in steps],
+                "accepted": accepted, "left_for_later": left, "fixed_later": fixed}
+        print(json.dumps(data, indent=2))
+        return
+    print(f"# Proof receipt: {plan.get('feature') or st.get('feature') or st.get('slug')}")
+    print("")
+    print("Steps (time is wall-clock, including any time spent waiting on you):")
+    for s in steps:
+        commit_txt = s["commit"] or "no commit recorded"
+        dur_txt = _plain_duration(s["elapsed_seconds"])
+        time_txt = dur_txt if s["finished"] else (
+            "not started" if s["status"] == "not started" else f"not finished (time so far: {dur_txt})")
+        print(f"- {s['id']} {s['title']}: commit {commit_txt}, time {time_txt}")
+        for e in s["reviewers"]:
+            print(_reviewer_line(e))
+    print("")
+    run_dur = _plain_duration(run_seconds)
+    run_txt = run_dur if run_status == "finished" else f"run not finished (time so far: {run_dur})"
+    print(f"Whole run time: {run_txt}")
+    acc_lines = _accepted_findings_lines(st)
+    if acc_lines:
+        print("")
+        for line in acc_lines:
+            print(line)
+    if fixed:
+        print("")
+        print(f"{len(fixed)} finding(s) fixed later in the run (a later round reviewed the change):")
+        for f in fixed:
+            print(f"- {f['checkpoint']} {_finding_key(f)}: {(f.get('description') or '').strip()[:240]} "
+                  f"[fixed in round {f.get('round')}: {f.get('how', '')}]")
+    if left:
+        print("")
+        print(f"{len(left)} finding(s) left for later (they did not block):")
+        for f in left:
+            why = f" [{f['deferred_because']}]" if f.get("deferred_because") else ""
+            print(f"- {f['checkpoint']} {_finding_key(f)}: {(f.get('description') or '').strip()[:240]}{why}")
+    if not (acc_lines or fixed or left):
+        print("")
+        print("No findings were accepted, left for later or fixed later in this run.")
+
+
 def cmd_complete(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -8962,16 +9221,21 @@ def cmd_reviewers(args):
         out_dir_now = _review_round_dir(ctx, args.cp, "adv", rnd["round"])
         round_cutoff = {p.name[:-len(".cutoff.json")] for p in out_dir_now.glob("*.cutoff.json")}
         fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff)}
-        changed = False
+        changed, swapped_in = False, []
         for i, r in enumerate(rnd["resolved"]):
             if (out_dir_now / f"{r['id']}.json").exists():
                 continue  # a finished review in this round is kept untouched, never re-resolved
             okay, _why = reviewer_availability(ctx, cfg, r["id"])
             if (not okay or r["id"] in round_cutoff) and r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
-                rnd["resolved"][i] = fresh[r["slot"]]
+                new_r = fresh[r["slot"]]
+                rnd["resolved"][i] = new_r
                 changed = True
+                if new_r["fallback_for"]:
+                    swapped_in.append({"used": new_r["id"], "instead_of": new_r["fallback_for"], "why": new_r["reasons"]})
         if changed:
             rnd["reviewers"] = [r["id"] for r in rnd["resolved"]]
+            if swapped_in:  # record the same-round swap the same shape a fresh round's own substitutions use
+                rnd["substitutions"] = (rnd.get("substitutions") or []) + swapped_in
             ctx.log(st, "reviewer_fallback", cp=args.cp, detail="re-resolved within round " + str(rnd["round"]))
             ctx.save_state(st)
     _key, why = open_review_key(ctx, args.cp, "adv", rnd["round"], st)
@@ -11427,6 +11691,9 @@ def main(argv=None):
     a = sp.add_parser("mark-fixed", help="record that a deferred finding was really fixed and reviewed again")
     a.add_argument("cp"); a.add_argument("decision", metavar='ref="how it was fixed"')
     a.set_defaults(fn=cmd_mark_fixed)
+    a = sp.add_parser("receipt", help="one proof receipt to paste into the pull request: steps, time, reviewers, "
+                                      "accepted/left-for-later/fixed-later findings")
+    a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_receipt)
     sp.add_parser("next").set_defaults(fn=cmd_next)
     a = sp.add_parser("status"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_status)
     sp.add_parser("plan-summary", help="plain per-step summary of the plan, to show the user before they approve"

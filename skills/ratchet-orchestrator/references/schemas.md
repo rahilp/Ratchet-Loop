@@ -14,6 +14,7 @@ Contents
 9. `ratchet.py status --json` / `lanes --json` — director interfaces
 10. Hooks
 11. Building from a spec tool (OpenSpec, Spec Kit, BMAD)
+12. `ratchet.py receipt`
 
 ---
 
@@ -486,4 +487,33 @@ Write-back: when a checkpoint completes, Ratchet ticks its `spec_refs` tasks (`-
 No spec tool: when a run is approved in a project where `spec detect` finds nothing and config `spec_keep` is unset, `human-approve` (or the last `complete` in `none` mode) prints an `Offer:` line, and the agent asks the user once. `ratchet.py spec keep on|off` records the answer in config `spec_keep`. With it on, every approved run writes `openspec/specs/<run slug>/spec.md` in OpenSpec's format (a `### Requirement:` per completed step with `The system SHALL…` and its done-when list, a `#### Scenario:` per planned test with GIVEN/WHEN/THEN and a `<!-- proven by test CPn-Tnn in <file>, commit <id> -->` note; guardrail steps are left out) and commits it with the config on its own. Answering `on` after a finished run records that run straight away.
 
 `ratchet.py spec status [--json]`: per scenario, its tests, steps and state (`not planned`, `planned`, `proven` once every step covering it is done, `left out: <reason>`), and which tasks are ticked. `viewer-data.json` has the same under `spec`.
+
+## 12. `ratchet.py receipt`
+
+One honest proof receipt to paste into the pull request, run at the final review (see the orchestrator's Phase C). Plain markdown by default; `--json` prints the same facts as data, for anything that wants to read them instead of the agent pasting the markdown. Never posts anywhere and never reads cost or token figures: neither appears in either form.
+
+**Sections (markdown).** Per step: its title, a short commit or `no commit recorded` when `complete` never made or found one, and a plain duration (`"4h 17m"`) or, for a step still mid-build, `not finished (time so far: <duration>)`; under it, its own adversarial review rounds and reviewers. The whole run's own line: a plain duration from `created_at` to the run-level `approved` history event, or, before that event exists, `run not finished (time so far: <duration>)`. Every duration is wall-clock, including any time spent waiting on you, and the receipt says so. Then the findings you accepted (`ratchet.py ask accept-finding` / `accept-finding`, reused from `_accepted_findings_lines`), findings fixed later in the run (CP1's `mark-fixed`, `_fixed_later`), and findings left for later (`left_for_later`) — the same grouping `ratchet.py deferred` uses, so the two commands always agree. Every finding printed in these three sections is identified by `_finding_key(f)` (`reviewer/id`, or the bare id when no reviewer is recorded), the same qualified reference `ratchet.py deferred` prints: two reviewers routinely pick the same bare id within one checkpoint, so the checkpoint alone never disambiguates them.
+
+**Commit.** A step's own `commit` field (the one `complete` records) when it has one. When `complete` ran with `commit_per_checkpoint` on but made no commit of its own because the code was already committed some other way before it ran (directly, by the user or agent — the accepted same-user limit), the receipt still names the real commit instead of a false "no commit recorded", by an exact rule, never a date guess: it looks for the one commit, if any, whose own git tree is exactly the tree Ratchet recorded as reviewed for that step — the step's passed adversarial gate's own `fingerprint`, or else its last adversarial round's own `fingerprint` when the gate never passed. A step with `commit_per_checkpoint` off, or where no commit's tree matches what was actually reviewed, still says `no commit recorded`.
+
+**Reviewers.** Built per round from `gates.adversarial.rounds[]`'s own `reviewers` ({"id", "vendor", "model"}, the final set for that round, including any mid-round swap) and `substitutions` ({"used", "instead_of", "why"}). Any reviewer whose roster entry is `"kind": "agent"` (a host sub-agent, the host's own company) is always marked as the host's own company standing in. Its reason: when that round's `substitutions` names it as the `used` reviewer, the `why` text for the reviewer(s) it `instead_of` replaced; when the round carries a `substitutions` key but no entry names this reviewer, or carries no `substitutions` key at all (a round recorded before this field existed), `reason not recorded` — never invented, never left blank. A reviewer whose own roster entry is not `"kind": "agent"` (an outside provider) carries no fallback marking or reason. `--json`'s `reason` is a single string or `null` (never present for a non-host reviewer).
+
+**`--json` shape:**
+```json
+{
+  "run": {"elapsed_seconds": 22200, "finished": true},
+  "steps": [
+    {"id": "CP1", "title": "Step 1", "commit": "abc1234", "finished": true, "elapsed_seconds": 15420,
+     "reviewers": [{"round": 1, "id": "host-alt-standards", "host_fallback": true,
+                    "replaced": ["codex-standards"], "reason": "out of credits"}]}
+  ],
+  "accepted": [{"checkpoint": "CP1", "id": "B1", "reviewer": "codex-standards", "severity": "blocker",
+                "description": "unsafe write", "reason": "low risk, tracked separately", "accepted_by": "human"}],
+  "left_for_later": [{"checkpoint": "CP1", "id": "S2", "reviewer": "codex-standards", "description": "README is stale",
+                       "deferred_because": "deferred as minor, not blocking"}],
+  "fixed_later": [{"checkpoint": "CP1", "id": "S1", "reviewer": "codex-standards", "description": "missing a guard note",
+                    "round": 2, "how": "added the blocked-state guard, confirmed by the later clean round"}]
+}
+```
+`steps`, `accepted`, `left_for_later` and `fixed_later` carry the same facts the markdown shows, in the same order the plan's own `checkpoints` list gives (not the order checkpoints finished). `accepted`/`left_for_later`/`fixed_later` carry the finding's own bare `id` PLUS its own `reviewer` (`null` when the finding was never tagged with one): the checkpoint alone never disambiguates two reviewers who independently picked the same bare id within one checkpoint, which is normal (their shared prompt gives every reviewer the identical example id), so `id` and `reviewer` together are this shape's own identity, matching the qualified `reviewer/id` form (`_finding_key`) the markdown prints. `run.finished` and a step's own `finished` are `true` only once the matching timestamp (the run's `approved` event; the step's `completed_at`) is on record; while false, the paired `elapsed_seconds` is time so far, not a final total.
 
