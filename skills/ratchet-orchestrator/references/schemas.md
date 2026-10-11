@@ -109,7 +109,11 @@ enforced on those three; it is documented here, not built there. For the planner
 `.ratchet/learnings.md` bullets, the findings earlier (non-active) runs saved for later that nobody accepted yet,
 and the limits the user already accepted, most relevant to the new feature first then newest, each part capped
 with a count and a pointer to the full file (`.ratchet/learnings.md`, or a run's `state.json` under
-`.ratchet/runs/`); a project with no earlier work of any kind gets one plain line instead.
+`.ratchet/runs/`). The same section also lists the related recorded specs for the parts being changed — OpenSpec
+specs under `openspec/specs/` (including Ratchet's own running records), finished Spec Kit features and done
+BMAD stories — each with its title, a one-line purpose and its path, ranked and capped together with the rest;
+a project with no specs at all gets no such list, and the planner still reads in full the specs it actually
+touches. A project with no earlier work of any kind gets one plain line instead.
 
 ```json
 {

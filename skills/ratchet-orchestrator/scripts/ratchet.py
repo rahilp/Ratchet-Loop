@@ -1756,6 +1756,8 @@ def _normalize_role(raw: str) -> str | None:
 DIGEST_HEADING = "What earlier work says"
 DIGEST_ITEM_CAP = 5  # a few items per section; the rest are named by count and pointed at their file, not printed
 DIGEST_ITEM_MAX_CHARS = 200  # a fixed length per printed item, so one long or multi-line item can't break the list
+DIGEST_SPEC_HEAD = "Related specs:"
+DIGEST_SPEC_PATH_NOTE = "openspec/specs/, specs/ (Spec Kit) and docs/stories/ (BMAD)"
 
 _BULLET_HEAD_RE = re.compile(r"^-\s*\([^)]*\)\s*(.*)$")  # strips a learnings.md bullet's "(date, source)" head, leaving the text
 _BULLET_DATE_RE = re.compile(r"^-\s*\((\d{4}-\d{2}-\d{2})\b")  # the date at the start of that same head, for ranking
@@ -1873,6 +1875,73 @@ def _earlier_runs(ctx, active_slug):
     return out
 
 
+def _spec_digest_entry(title: str, purpose: str, path: str) -> str:
+    """One printed 'Related specs:' line: "<title>: <purpose> (<path>)". The path is reserved its own room and
+    appended last, after the title/purpose head is truncated to fit -- so a long title can never push the path
+    past _digest_clean_item's length cap and drop the one thing the planner needs to open the full spec."""
+    title = str(title or "").strip()
+    purpose = str(purpose or "").strip()
+    path = str(path or "").strip()
+    tail = f" ({path})"
+    budget = max(DIGEST_ITEM_MAX_CHARS - len(tail), 0)
+    head = title + (f": {purpose}" if purpose else "")
+    if len(head) > budget:
+        head = head[:budget - 3].rstrip() + "..." if budget > 3 else head[:budget]
+    return f"{head}{tail}"
+
+
+def _related_spec_items(ctx, relevant_to: set) -> list[tuple]:
+    """(sort_key, line) for every recorded spec worth telling the planner about, ranked with the same
+    relevance-then-recency rule as every other digest section so no one spec tool is favoured over another:
+    OpenSpec's living records under openspec/specs/ (including Ratchet's own running records written by
+    living_spec_text), a finished Spec Kit feature (every task in tasks.md ticked) and a done BMAD story (status
+    text containing "done"). An open or unfinished one is left out -- `spec detect` already covers those. Each
+    source is read the tolerant way (a bad or missing file is skipped, never fatal), since a brief must never
+    fail to print over a spec file someone is still editing."""
+    items = []
+    try:
+        openspec = specsrc.openspec_specs(ctx.root)
+    except (OSError, ValueError):
+        openspec = []
+    for s in openspec:
+        words = _digest_words(f"{s['title']} {s['purpose']}")
+        line = _spec_digest_entry(s["title"], s["purpose"], s["path"])
+        items.append((_digest_rank(words, relevant_to, _digest_recency(s["mtime"])), line))
+    try:
+        features = specsrc.speckit_features(ctx.root)
+    except (OSError, ValueError):
+        features = []
+    for f in features:
+        tasks = f.get("tasks") or []
+        if not tasks or not all(t.get("done") for t in tasks):
+            continue
+        path = f"{f['path']}/spec.md"
+        try:
+            mtime = (ctx.root / path).stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        purpose = f.get("why") or ""
+        words = _digest_words(f"{f['title']} {purpose}")
+        line = _spec_digest_entry(f["title"], purpose, path)
+        items.append((_digest_rank(words, relevant_to, _digest_recency(mtime)), line))
+    try:
+        stories = specsrc.bmad_stories(ctx.root)
+    except (OSError, ValueError):
+        stories = []
+    for s in stories:
+        if str(s.get("status") or "").strip().lower() != "done":
+            continue
+        try:
+            mtime = (ctx.root / s["path"]).stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        purpose = s.get("why") or ""
+        words = _digest_words(f"{s['title']} {purpose}")
+        line = _spec_digest_entry(s["title"], purpose, s["path"])
+        items.append((_digest_rank(words, relevant_to, _digest_recency(mtime)), line))
+    return items
+
+
 def _earlier_work_lines(ctx) -> list[str]:
     """Everything the planner's brief shows about earlier work: the project's recent learnings, the findings
     earlier (non-active) runs saved for later that nobody accepted yet, and the limits the user already
@@ -1945,6 +2014,7 @@ def _earlier_work_lines(ctx) -> list[str]:
                                "each run's state.json under .ratchet/runs/")
     lines += _digest_cap_lines(accepted_items, "Accepted limits:",
                                "each run's state.json under .ratchet/runs/, and .ratchet/learnings.md")
+    lines += _digest_cap_lines(_related_spec_items(ctx, relevant_to), DIGEST_SPEC_HEAD, DIGEST_SPEC_PATH_NOTE)
     if not lines:
         return [DIGEST_HEADING, "There is no earlier work recorded for this project yet."]
     return [DIGEST_HEADING] + lines
