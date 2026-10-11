@@ -9235,7 +9235,16 @@ def normalize_hook(data: dict, host: str) -> dict:
         ti = {"value": ti}
     cmd = ti.get("command") or ti.get("cmd") or ti.get("script") or ""
     if isinstance(cmd, list):
-        cmd = " ".join(str(c) for c in cmd)
+        cmd = [str(c) for c in cmd]
+        # An argv-list Bash call some hosts send (Codex: ["bash", "-lc", "<script>"]) names its script as one
+        # argument; joining the list with spaces would run the script's own text (quotes, heredocs and all)
+        # through the word-by-word join, splitting it up and changing what the guard sees. Read the script as
+        # the command itself instead, exactly as a plain string Bash call would send it.
+        if (len(cmd) == 3 and re.fullmatch(r"[A-Za-z0-9_./-]*(bash|sh|zsh|dash|ksh)", cmd[0]) and
+                re.fullmatch(r"-[a-z]*c[a-z]*", cmd[1])):
+            cmd = cmd[2]
+        else:
+            cmd = " ".join(cmd)
     paths = [str(ti[k]) for k in ("file_path", "path", "absolute_path", "notebook_path", "filePath", "target_file")
              if isinstance(ti.get(k), str)]
     patch = ""
@@ -9665,7 +9674,64 @@ ENGINE_CALL_RE = re.compile(r"""^\s*(?:(?:\S*python3?(?:\.\d+)?|py)\s+(?:-\S+\s+
                             r"""|\S*node\s+(?:-\S+\s+)*["']?\S*capture\.mjs\b)""")
 NESTED_AGENT_RE = re.compile(r"(^|[\s;&|(/])(claude|gemini|copilot)(?![\w.-])[^;&|\n]*\s(-p|--print|--prompt)\b"
                              r"|(^|[\s;&|(/])codex(?![\w.-])[^;&|\n]*\sexec\b")
-SELF_HOOK_RE = re.compile(r"\bhook\s+(stop|prompt|guard)\b|\bhook-(stop|prompt|guard)\b")
+SELF_HOOK_RE = re.compile(r"\bhook\b[\s'\",]+(stop|prompt|guard)\b|\bhook-(stop|prompt|guard)\b")
+# For a command the shell-word reader can't follow at all (a command substitution, a heredoc, $'...'): only refuse
+# it as a hook call when a hook word directly follows `ratchet.py` or a $VAR/${VAR} token, never on the hook words
+# alone -- that's what let a plain mention ("hook guard" inside a grep pattern or comment, with an unrelated $(...)
+# or "$f" elsewhere in the same unreadable command) get refused before. The separator between `hook` and its
+# subcommand also allows a quote or comma, so an argv-style call spelled out as separate quoted words
+# (`subprocess.run(['ratchet.py','hook','guard'])`) still counts, not just a literal space.
+UNREADABLE_HOOK_RE = re.compile(
+    r"(?:\bratchet\.py\b|\$\{?[A-Za-z_]\w*\}?)[^;&|\n]*?(?:" + SELF_HOOK_RE.pattern + ")", re.I)
+
+
+def _redact_literal_quotes(cmd: str) -> str:
+    """For UNREADABLE_HOOK_RE only: blank single-quoted text and the literal parts of double-quoted text (a
+    commit message, a note) so a mention saved as data there (`git commit -m 'document ratchet.py hook guard'`)
+    isn't mistaken for a call. A live command substitution inside double quotes ($(...) or `...`) is left in
+    place, since the shell still runs it. Everything else -- unquoted text, $'...', anything this can't account
+    for -- is left exactly as is and still fails safe."""
+    out, i, n = list(cmd), 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            i += 2
+        elif c == "'":
+            j = cmd.find("'", i + 1)
+            if j < 0:
+                break
+            for k in range(i, j + 1):
+                out[k] = "x"
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and cmd[j] != '"':
+                if cmd[j] == "\\" and j + 1 < n:
+                    out[j] = out[j + 1] = "x"
+                    j += 2
+                    continue
+                if cmd[j] == "`" or cmd.startswith("$(", j):
+                    if cmd[j] == "`":
+                        k = cmd.find("`", j + 1)
+                        j = (k + 1) if k >= 0 else n
+                    else:
+                        depth, k = 1, j + 2
+                        while k < n and depth:
+                            if cmd[k] == "(":
+                                depth += 1
+                            elif cmd[k] == ")":
+                                depth -= 1
+                            k += 1
+                        j = k
+                    continue
+                out[j] = "x"
+                j += 1
+            i = j + 1 if j < n else j
+        else:
+            i += 1
+    return "".join(out)
+
+
 ASSIGN_RE = re.compile(r"""(?:^|[\s;&|(])(?:export\s+)?([A-Za-z_]\w*)=("[^"]*"|'[^']*'|[^\s;&|]+)""")
 HEREDOC_RE = re.compile(r"""<<-?\s*(['"]?)(\w+)\1([^\n]*)\n.*?\n\s*\2\s*(?=\n|$)""", re.S)
 
@@ -9702,37 +9768,115 @@ ENV_INDIRECT_RE = re.compile(
     r"|\b(putenv|setenv|Setenv|SetEnvironmentVariable)\s*\(|process\.env\s*\[[^\]]*\]\s*=(?!=)"
     r"|Object\.assign\s*\(\s*process\.env|\bENV\s*\[[^\]]*\]\s*=(?!=)|\$ENV\{[^}]*\}\s*=(?!=)|--(set)?env\b")
 ENV_TOKEN_RE = re.compile(r"(?<![\w$])(?<!\$\{)(?<!\$\{!)(?<!\$\{#)RATCHET\w*", re.I)
+LEADING_ASSIGN_TOKEN_RE = re.compile(r"^([A-Za-z_]\w*)=")
+
+
+def _leading_assign_names(seg: str) -> list[str]:
+    """Every name in `seg`'s leading assignment sequence: a run of bare `VAR=value` words before the actual
+    command, optionally after `export` (one) or `env` and its own no-argument options (`-i`, `-0`, ...). Checks
+    the whole sequence, not just the first assignment, so `FOO=1 RATCHET_ROLE=director ls` and
+    `env FOO=1 RATCHET_HOME=x ls` are seen whatever program (even a read-only one) follows them."""
+    toks = seg.strip().split()
+    if toks and toks[0] == "export":
+        toks = toks[1:]
+    elif toks and toks[0] == "env":
+        toks = toks[1:]
+        while toks and toks[0].startswith("-"):
+            toks.pop(0)
+    names = []
+    while toks:
+        m = LEADING_ASSIGN_TOKEN_RE.match(toks[0])
+        if not m:
+            break
+        names.append(m.group(1))
+        toks.pop(0)
+    return names
+PRINTF_V_RE = re.compile(r"(?:^|\s)-v\b")
+# Programs that take their own argument as code, not a note or a message, so that argument's quotes must stay
+# visible (`export "NAME=1"`, `env NAME="$(x)"`, `printf -v 'NAME' x`): everything else gets the literal-quote
+# redaction below.
+EXCEPT_PROGS = {"export", "declare", "typeset", "local", "readonly", "env", "set", "setenv"}
+_INTERPRETER_NAMES = r"python[\d.]*|py|node|deno|bun|bash|sh|zsh|dash|ksh|perl|ruby|php|osascript"
+# An interpreter given inline code to run, rather than a script file: -c/-e/-lc/a bare "-", nothing else on the
+# command line (reads from stdin), a here-string (`<<<`), or the target of a pipe (`echo ... | bash`), the
+# inline-code option itself possibly coming after a run of ordinary interpreter options first (`python3 -u -c`,
+# `python3 -X dev -c`, `bash -x -c`, `node --no-warnings -e`). A script FILE with its own arguments
+# (`python3 -u /path/ratchet.py learn "..."`) is not inline.
+INLINE_CODE_RE = re.compile(
+    r"(^|[\s;&|(/])(?:" + _INTERPRETER_NAMES + r")\b(?:"
+    r"\s+(?:-\S+(?:\s+[^-\s;&|()][^\s;&|()]*)?\s+)*(?:-[A-Za-z]*[ce][A-Za-z]*|-)(?=\s|$)"
+    r"|\s+<<<|\s*(?:[;&|)\n]|$))"
+    r"|(?<!\|)\|(?!\|)\s*(?:(?:sudo|env|command|exec|time|nice|nohup|timeout|xargs|stdbuf)\s+(?:-\S+\s+)*)?"
+    r"(?:" + _INTERPRETER_NAMES + r")\b")
+# eval, source or a dot command run whatever text they're given as code; so does `env -S`/`--split-string`.
+INLINE_RUNS_RE = re.compile(r"\beval\b|\bsource\s|(^|[;&|(]\s*)\.\s+\S|\benv\b[^;&|\n]*\s(-[A-Za-z]*S|--split-string)")
+
+
+def _leading_word(seg: str) -> str:
+    toks = seg.strip().split()
+    return os.path.basename(toks[0]) if toks else ""
 
 
 def _reserved_env_problem(cmd: str) -> str | None:
     """The guard message when a shell command sets (directly or indirectly) a variable only a person or the
-    director may set; None otherwise. The one detector for every reserved variable (plain reads stay allowed).
+    director may set; None otherwise. The one detector for every reserved variable (plain reads stay allowed,
+    and so is a heredoc body that only writes a file -- it's data, not code, unless the same command actually
+    feeds it to a shell or an interpreter).
+
+    A reserved name inside a program's own quoted text (a commit message, an echo/printf note, a heredoc note
+    saved to a file) sets nothing and is allowed, UNLESS the command also runs code inline -- an interpreter
+    given `-c`/`-e`/a bare `-`/nothing/a pipe/a here-string, `eval`, `source`, a dot command, or `env -S` -- in
+    which case every word is scanned exactly as written, with no exemption at all, since that quoted text is
+    then the code. Known limit: a reserved name quoted in the SAME command as inline interpreter code is refused
+    even when it sits in an unrelated argument, since this can't tell the two apart; it fails safe.
+
     Best-effort: a script written to a file first and run later is not seen here, which is why the engine also
     distrusts these values on its own (terminal code, hook-recorded folder, key file and director role)."""
-    indirect = bool(ENV_INDIRECT_RE.search(cmd) or ENV_INDIRECT_RE.search(_expand(cmd)))
-    texts = [cmd] + ([_expand(cmd)] if _expand(cmd) != cmd else [])
-    for text in texts:
-        for seg in _segments(text):
-            prog, _sub = _program(seg)
-            if prog in READ_ONLY_PROGRAMS and "$(" not in seg and "`" not in seg:
-                continue  # grep/cat/... only read; mentioning a name there sets nothing
-            for m in ENV_TOKEN_RE.finditer(seg):
-                tok = m.group(0)
-                full = next(((n, msg) for n, msg in RESERVED_ENV if tok.upper() == n), None)
-                if full:
-                    name, msg = full
-                    after = seg[m.end():]
-                    before = seg[:m.start()]
-                    if re.match(r"""['"\]}]*\s*\+?=(?!=)|['"]\s*:""", after) or \
-                            re.search(r"""(?:^|[\s;&|(])[A-Za-z_]\w*=\s*['"]?$""", before) or \
-                            re.search(r"\b(export|declare|typeset|local|readonly|setenv)\b|\bset\s+-[A-Za-z]*x",
-                                      before) or \
-                            re.search(r"\b(putenv|setenv|Setenv|SetEnvironmentVariable|setdefault|update|"
-                                      r"__setitem__)\s*\(\s*['\"]?$", before) or indirect:
-                        return msg
-                elif tok.startswith("RATCHET") and indirect and \
-                        any(n.startswith(tok) and n != tok for n, _m in RESERVED_ENV):
-                    return RESERVED_PIECES_MSG
+    heredoc_run = bool(INTERPRETER_RE.search(cmd) and HEREDOC_RE.search(cmd))
+    expanded = _expand(cmd)  # heredoc bodies not run as code are dropped here; variable assignments are substituted
+    raw_texts = [expanded] + ([cmd] if heredoc_run and cmd != expanded else [])
+    indirect = any(ENV_INDIRECT_RE.search(t) for t in raw_texts)
+    code = _redact_literal_quotes(expanded)  # literal quoted text blanked; a live $(...) or backtick stays visible
+    runs_inline = heredoc_run or bool(INLINE_CODE_RE.search(code) or INLINE_RUNS_RE.search(code))
+
+    if runs_inline:
+        seg_pairs = [(seg, seg) for text in raw_texts for seg in _segments(text)]
+    else:
+        code_segs, raw_segs = _segments(code), _segments(expanded)
+        if len(code_segs) != len(raw_segs):  # a quoted delimiter desynced the split: fail safe with raw text
+            code_segs = raw_segs
+        seg_pairs = list(zip(code_segs, raw_segs))
+
+    for scan_seg, raw_seg in seg_pairs:
+        for lead_name in _leading_assign_names(raw_seg):
+            full = next((msg for n, msg in RESERVED_ENV if lead_name.upper() == n), None)
+            if full:  # a leading reserved assignment (bare or after `env`), anywhere in that leading sequence,
+                return full  # is refused whatever follows it, read-only programs included
+        prog, sub = _program(raw_seg)
+        if prog in READ_ONLY_PROGRAMS:
+            continue  # grep/cat/ls/.../ only read; a name there sets nothing
+        if not runs_inline:
+            leading = _leading_word(raw_seg)
+            printf_v = leading == "printf" and bool(PRINTF_V_RE.search(raw_seg))
+            if leading in EXCEPT_PROGS or printf_v:
+                scan_seg = raw_seg  # this program's own argument is code: keep its quotes visible
+        for m in ENV_TOKEN_RE.finditer(scan_seg):
+            tok = m.group(0)
+            full = next(((n, msg) for n, msg in RESERVED_ENV if tok.upper() == n), None)
+            if full:
+                name, msg = full
+                after = scan_seg[m.end():]
+                before = scan_seg[:m.start()]
+                if re.match(r"""['"\]}]*\s*\+?=(?!=)|['"]\s*:""", after) or \
+                        re.search(r"""(?:^|[\s;&|(])[A-Za-z_]\w*=\s*['"]?$""", before) or \
+                        re.search(r"\b(export|declare|typeset|local|readonly|setenv)\b|\bset\s+-[A-Za-z]*x",
+                                  before) or \
+                        re.search(r"\b(putenv|setenv|Setenv|SetEnvironmentVariable|setdefault|update|"
+                                  r"__setitem__)\s*\(\s*['\"]?$", before) or indirect:
+                    return msg
+            elif tok.upper() != "RATCHET" and tok.startswith("RATCHET") and indirect and \
+                    any(n.startswith(tok) and n != tok for n, _m in RESERVED_ENV):
+                return RESERVED_PIECES_MSG
     return None
 
 
@@ -9857,10 +10001,19 @@ def _calls_own_hook(cmd: str, depth: int = 0) -> bool:
     """True when `cmd` really runs `ratchet.py hook ...` (directly, through python, a wrapper such as env or
     timeout, an unknown $PROGRAM, `bash -c` or eval). Text that only mentions a hook (a grep pattern, an echo, a
     commit message, a comment) is not a call. A command the shell-word reader can't follow (a command substitution,
-    a heredoc, $'...') is blocked whenever it mentions a hook at all, so what can't be read fails safe."""
+    a heredoc, $'...') is blocked only when a hook word directly follows `ratchet.py` or a `$VAR`/`${VAR}` token in
+    it, not when the hook words merely appear somewhere else (a grep pattern inside it, say); a mention saved as
+    literal data in a single-quoted argument, or the literal part of a double-quoted one (a commit message, a
+    note), doesn't count even when an unrelated command substitution sits elsewhere in the same command. What
+    can't be read this far still fails safe."""
     words = _shell_words(cmd)
     if words is None:
-        return bool(SELF_HOOK_RE.search(cmd))
+        # Same rule as _reserved_env_problem: quoted text is data unless the command also runs inline code
+        # (an interpreter given -c/-e/a pipe/here-string, eval, source, a dot command, env -S); then every word,
+        # quoted or not, is scanned, since that quoted text is the code actually being run.
+        redacted = _redact_literal_quotes(cmd)
+        runs_inline = bool(INLINE_CODE_RE.search(redacted) or INLINE_RUNS_RE.search(redacted))
+        return bool(UNREADABLE_HOOK_RE.search(cmd if runs_inline else redacted))
     for w in _simple_commands(words):
         while w and _ASSIGNMENT_RE.match(w[0]):
             w = w[1:]
