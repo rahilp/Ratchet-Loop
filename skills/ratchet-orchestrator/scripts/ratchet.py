@@ -7410,6 +7410,8 @@ def cmd_complete(args):
             spec_notes += _spec_finish(ctx, st)
             register_active(ctx.root, None)
     ctx.save_state(st)
+    if st["phase"] == "done":
+        _ci_export_hint(ctx)
     build_viewer(ctx)
     ok(f"{args.cp} complete{f' (commit {commit})' if commit else ''}.")
     for n_ in spec_notes:
@@ -7469,6 +7471,8 @@ def cmd_human_approve(args):
     # "done" still accepts later feedback, so it keeps a pause marker
     st["awaiting_since"] = now() if st["phase"] in ("done", "awaiting_final_review") else None
     ctx.save_state(st)
+    if st["phase"] == "done":
+        _ci_export_hint(ctx)
     build_viewer(ctx)
     ok(f"Human approval recorded. Phase → {st['phase']}")
     print(json.dumps(next_action(ctx, st), indent=2))
@@ -11197,6 +11201,8 @@ CI_WORKFLOW_HEADER = (
     "# It does not run Ratchet's AI review gates (adversarial review, UI review, human review). CI\n"
     "# machines don't have the agent CLIs and credentials those gates need, so those gates stay a\n"
     "# step a person or an agent runs, not a CI job.\n"
+    "#\n"
+    "# To regenerate this file, ask your agent to run Ratchet's CI export; don't edit it by hand.\n"
 )
 
 
@@ -11472,6 +11478,28 @@ def cmd_ci_export(args):
     except OSError as e:
         die(f"could not write {path}: {e}. Fix the permission or ownership problem, then run this again.")
     ok(f"wrote {path}")
+
+
+def _ci_export_hint(ctx: Ctx) -> None:
+    """Printed once by whichever command finishes a run (cmd_complete when human_review is none, the
+    final cmd_human_approve otherwise): one line telling the agent it can keep this run's mechanical
+    checks running on every push and pull request with `ratchet.py ci-export`, and asking it to mention
+    that to the developer in plain words. Asks nothing new (no pending question) and stays silent when
+    there is nothing to export, or .github/workflows/ratchet.yml already matches what ci-export would
+    write -- reusing ci-export's own helpers (ci_commands, render_github_actions) so this can never
+    disagree with what `ratchet.py ci-export` itself would decide."""
+    try:
+        commands = ci_commands(ctx)
+        if not commands:
+            return
+        data = _ci_workflow_bytes(render_github_actions(ctx, commands))
+        path = ctx.root / ".github" / "workflows" / "ratchet.yml"
+        if path.exists() and not path.is_dir() and not path.is_symlink() and path.read_bytes() == data:
+            return
+    except Exception:
+        return
+    print("You can keep these checks running on every push and pull request: run `ratchet.py ci-export` "
+          "to write a GitHub Actions workflow for them, and mention this to the developer in plain words.")
 
 
 def main(argv=None):
