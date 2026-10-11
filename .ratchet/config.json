@@ -56,21 +56,12 @@
   },
   "providers": [
     {
-      "id": "codex",
-      "preset": "codex"
-    },
-    {
       "id": "gemini",
       "preset": "gemini"
     },
     {
       "id": "claude",
       "preset": "claude"
-    },
-    {
-      "id": "copilot",
-      "preset": "copilot",
-      "model": "grok-4.7"
     }
   ],
   "test_timeout_sec": 3600,
@@ -80,5 +71,6 @@
   "role_models": {
     "ratchet-implementer": "standard",
     "ratchet-fixer": "standard"
-  }
+  },
+  "min_review_seconds": 20
 }

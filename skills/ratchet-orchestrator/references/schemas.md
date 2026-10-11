@@ -104,7 +104,12 @@ writing the objective by hand. This is enforced only on Claude Code: the guard h
 prefix) launched during a build (`building` or `blocked`) whose prompt is missing this objective text, naming the
 `brief` command to fix it; a prompt carrying it, however re-wrapped, always passes, and an unreadable plan fails
 the check open. Codex, Gemini and Copilot give hooks no way to see a sub-agent launch at all, so this check is not
-enforced on those three; it is documented here, not built there.
+enforced on those three; it is documented here, not built there. For the planner, `brief` also ends with a
+"What earlier work says" section, built by the engine itself from records already on disk: recent
+`.ratchet/learnings.md` bullets, the findings earlier (non-active) runs saved for later that nobody accepted yet,
+and the limits the user already accepted, most relevant to the new feature first then newest, each part capped
+with a count and a pointer to the full file (`.ratchet/learnings.md`, or a run's `state.json` under
+`.ratchet/runs/`); a project with no earlier work of any kind gets one plain line instead.
 
 ```json
 {

@@ -1744,6 +1744,212 @@ def _normalize_role(raw: str) -> str | None:
     return tok if tok in ROLE_BRIEFS else None
 
 
+# ------------------------------------------------------------------------------------------------- earlier-work digest
+# So a new feature builds on what earlier work in this project already learned, instead of rediscovering or
+# contradicting it, the planner's own brief ends with a short "What earlier work says" section built entirely
+# from records already on disk; the orchestrator never has to collect this by hand. Entirely read-only: every
+# OTHER run's state.json is read with _read_record directly, never ctx.state() (which verifies the chain and
+# binds an owner -- right for the run this process is actually working on, wrong for history it only reads), and
+# a damaged or missing record is skipped, never fatal. CP2 adds a recorded-specs section to the same list this
+# helper returns, so cmd_brief only ever has one block to print.
+
+DIGEST_HEADING = "What earlier work says"
+DIGEST_ITEM_CAP = 5  # a few items per section; the rest are named by count and pointed at their file, not printed
+DIGEST_ITEM_MAX_CHARS = 200  # a fixed length per printed item, so one long or multi-line item can't break the list
+
+_BULLET_HEAD_RE = re.compile(r"^-\s*\([^)]*\)\s*(.*)$")  # strips a learnings.md bullet's "(date, source)" head, leaving the text
+_BULLET_DATE_RE = re.compile(r"^-\s*\((\d{4}-\d{2}-\d{2})\b")  # the date at the start of that same head, for ranking
+_ACCEPTED_FINDING_MARKER_RE = re.compile(r"^Accepted finding (\S+) \(", re.I)  # the marker _append_learning writes
+
+
+def _digest_words(text: str) -> set:
+    return specsrc._words(text or "")
+
+
+def _digest_clean_item(text: str) -> str:
+    """One printed digest item, made safe for the short, plain list `_digest_cap_lines` prints: whitespace (including
+    embedded newlines) collapsed to single spaces, non-ASCII replaced, and truncated to DIGEST_ITEM_MAX_CHARS with a
+    trailing "..." when cut, so a multi-line or very long description can never break the list or defeat "stays
+    short"."""
+    one_line = " ".join(str(text or "").split())
+    ascii_text = one_line.encode("ascii", "replace").decode("ascii")
+    if len(ascii_text) > DIGEST_ITEM_MAX_CHARS:
+        ascii_text = ascii_text[:DIGEST_ITEM_MAX_CHARS - 3].rstrip() + "..."
+    return ascii_text
+
+
+def _digest_cp_order(cp) -> int:
+    """A checkpoint id ('CP1', 'CP12', ...) as a plain int for ordering, so 'later checkpoint first' is a number
+    comparison rather than a string one (where 'CP2' would wrongly sort after 'CP10')."""
+    m = re.search(r"(\d+)\s*$", str(cp or ""))
+    return int(m.group(1)) if m else 0
+
+
+def _digest_epoch(text) -> float | None:
+    """`text` parsed as an ISO-8601 timestamp (what `now()` writes, e.g. an `accepted_at`) into epoch seconds, or
+    None when it isn't one."""
+    if not text:
+        return None
+    try:
+        return _dt.datetime.fromisoformat(str(text)).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _digest_recency(epoch: float, cp: str = "", round_no=0) -> tuple:
+    """One comparable recency key, in the same unit (epoch seconds) for every item in a digest section, whatever
+    its source: a learnings.md bullet's own date, a finding's own recorded time, or (falling back) the run file's
+    mtime as a date. `cp`/`round_no` are a secondary, same-run tie-break only: many findings in one run share that
+    run's single mtime, so without this every one of them ties and a stable sort keeps the oldest five instead of
+    the newest; a later checkpoint and later round sort as newer when the timestamp itself ties."""
+    return (epoch, _digest_cp_order(cp), int(round_no or 0))
+
+
+def _digest_rank(words: set, relevant_to: set, recency) -> tuple:
+    """Sort key for one digest item: an item sharing a word with the active run's feature request comes before
+    everything else; within each of those two groups, the newest comes first (the run's own assumption: relevance
+    first, newest as the tie-break and the only order left once there is no feature to match against). `recency` is
+    a single comparable number or a `_digest_recency` tuple; either way every component sorts newest-first."""
+    relevant = bool(relevant_to) and bool(words & relevant_to)
+    if not isinstance(recency, tuple):
+        recency = (recency,)
+    return (0 if relevant else 1, tuple(-r for r in recency))
+
+
+def _learnings_bullets(ctx) -> list[str]:
+    """Every '- (...)' bullet line in learnings.md, oldest first (the file's own append order; age itself is read
+    from each bullet's own "(YYYY-MM-DD, ...)" head, see _digest_bullet_epoch, not from this order)."""
+    return [l.strip() for l in _learnings_text(ctx).splitlines() if l.strip().startswith("-")]
+
+
+def _digest_bullet_epoch(raw: str, fallback_index: int) -> float:
+    """A learnings.md bullet's own recency, in the same epoch-seconds unit every other digest item uses: the date
+    in its "(YYYY-MM-DD, ...)" head, read as UTC midnight. A bullet with no such date (malformed, or hand-edited)
+    falls back to its position in the file so it still sorts somewhere instead of crashing the brief."""
+    m = _BULLET_DATE_RE.match(raw)
+    if m:
+        try:
+            return _dt.datetime.strptime(m.group(1), "%Y-%m-%d").replace(tzinfo=_dt.timezone.utc).timestamp()
+        except ValueError:
+            pass
+    return float(fallback_index)
+
+
+def _digest_cap_lines(items: list[tuple], header: str, path_note: str) -> list[str]:
+    """`items` is a list of (sort_key, one-line text) already gathered for one section; prints the best
+    DIGEST_ITEM_CAP of them under `header`, then one line always naming the file this section's items come from
+    (plus how many more there are, when some were cut), so the planner knows where to read the rest even when
+    nothing was cut. Nothing is printed for an empty section (no header with nothing under it). Each item's text is
+    passed through _digest_clean_item first, so a multi-line or very long description can't break the list."""
+    if not items:
+        return []
+    items = sorted(items, key=lambda it: it[0])
+    shown, rest = items[:DIGEST_ITEM_CAP], items[DIGEST_ITEM_CAP:]
+    out = [header] + [f"  - {_digest_clean_item(line)}" for _, line in shown]
+    if rest:
+        out.append(f"  ... and {len(rest)} more - see {path_note}")
+    else:
+        out.append(f"  ... see {path_note}")
+    return out
+
+
+def _earlier_runs(ctx, active_slug):
+    """(slug, state, path) for every OTHER run folder under .ratchet/runs/: read with _read_record so a damaged
+    state.json, or a run folder with none at all, is skipped instead of failing the brief. Never the active run,
+    and never through ctx.state()."""
+    out = []
+    try:
+        slugs = sorted(p.name for p in (ctx.ratchet / "runs").iterdir() if p.is_dir())
+    except OSError:
+        return out
+    for slug in slugs:
+        if slug == active_slug:
+            continue
+        p = ctx.ratchet / "runs" / slug / "state.json"
+        st, why = _read_record(p, missing=_ABSENT)
+        if why is not None or st is _ABSENT or not isinstance(st, dict):
+            continue
+        out.append((slug, st, p))
+    return out
+
+
+def _earlier_work_lines(ctx) -> list[str]:
+    """Everything the planner's brief shows about earlier work: the project's recent learnings, the findings
+    earlier (non-active) runs saved for later that nobody accepted yet, and the limits the user already
+    accepted (an accepted finding, or a learnings.md "Accepted limit (...)" bullet) -- most relevant to the new
+    feature first, newest after that, each section capped. A project with no earlier work of any kind gets one
+    plain line instead of empty sub-headings. Takes no lock and writes nothing."""
+    active_slug = ctx.active_slug()
+    active_feature = ""
+    if active_slug:
+        # Read with _read_record, the same tolerant path _earlier_runs uses for every OTHER run -- never
+        # ctx.state(), which verifies the chain and can die() on a mismatch; a brief must never fail to print
+        # over the active run's own record, so any problem here just leaves relevance empty.
+        st, why = _read_record(ctx.ratchet / "runs" / active_slug / "state.json", missing=_ABSENT)
+        if why is None and st is not _ABSENT and isinstance(st, dict):
+            active_feature = st.get("feature") or ""
+    relevant_to = _digest_words(active_feature)
+
+    learn_items, open_items, accepted_items = [], [], []
+    accepted_keys = set()  # "{slug}/{cp}/round-{round}/{reviewer-or-bare-id}" already shown from a state.json,
+                            # so the matching learnings.md marker line for the same finding is never shown twice
+
+    for slug, st, path in _earlier_runs(ctx, active_slug):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0
+        for cp, c in (st.get("checkpoints") or {}).items():
+            if not isinstance(c, dict):
+                continue
+            for f in c.get("deferred") or []:
+                if not isinstance(f, dict):
+                    continue
+                desc = str(f.get("description", "")).strip()
+                if not desc:
+                    continue
+                round_no = f.get("round")
+                if f.get("accepted"):
+                    who = f.get("accepted_by") or "a human"
+                    reason = str(f.get("reason", "")).strip()
+                    line = f"{cp} {_finding_key(f)} ({f.get('severity', '?')}), accepted by {who}: {desc}"
+                    if reason:
+                        line += f" - reason: {reason}"
+                    epoch = _digest_epoch(f.get("accepted_at")) or mtime
+                    recency = _digest_recency(epoch, cp, round_no)
+                    accepted_items.append((_digest_rank(_digest_words(desc), relevant_to, recency), line))
+                    accepted_keys.add(f"{slug}/{cp}/round-{round_no}/{_finding_key(f)}")
+                else:
+                    line = f"{cp} {_finding_key(f)} ({f.get('severity', '?')}): {desc}"
+                    epoch = _digest_epoch(f.get("at")) or mtime
+                    recency = _digest_recency(epoch, cp, round_no)
+                    open_items.append((_digest_rank(_digest_words(desc), relevant_to, recency), line))
+
+    for i, raw in enumerate(_learnings_bullets(ctx)):
+        m = _BULLET_HEAD_RE.match(raw)
+        rest = m.group(1) if m else raw
+        display = raw[1:].strip() if raw.startswith("-") else raw
+        recency = _digest_recency(_digest_bullet_epoch(raw, i))
+        fm = _ACCEPTED_FINDING_MARKER_RE.match(rest)
+        if fm:
+            if fm.group(1) in accepted_keys:
+                continue  # the matching finding already shown from its own run's state.json
+            accepted_items.append((_digest_rank(_digest_words(display), relevant_to, recency), display))
+        elif re.match(r"^Accepted limit\b", rest, re.I):
+            accepted_items.append((_digest_rank(_digest_words(display), relevant_to, recency), display))
+        else:
+            learn_items.append((_digest_rank(_digest_words(display), relevant_to, recency), display))
+
+    lines = _digest_cap_lines(learn_items, "Learnings:", ".ratchet/learnings.md")
+    lines += _digest_cap_lines(open_items, "Open findings (not fixed):",
+                               "each run's state.json under .ratchet/runs/")
+    lines += _digest_cap_lines(accepted_items, "Accepted limits:",
+                               "each run's state.json under .ratchet/runs/, and .ratchet/learnings.md")
+    if not lines:
+        return [DIGEST_HEADING, "There is no earlier work recorded for this project yet."]
+    return [DIGEST_HEADING] + lines
+
+
 def cmd_brief(args):
     """`brief [CPn] --role <role>`: the one place every Ratchet sub-agent's opening text comes from, so the
     orchestrator spawns a sub-agent with `ratchet.py brief CPn --role <role>` instead of retyping or half-remembering
@@ -1754,7 +1960,9 @@ def cmd_brief(args):
     checkpoint exists, before checkpoints.json even exists (that die is only reached when a CPn is given, since a
     CPn can't be looked up with no plan at all). A plan with no stated objective (approved before that rule existed)
     gets the plain NO_OBJECTIVE_NOTE instead of a crash. An unknown CPn is refused by `cp_by_id`, the same shared
-    lookup every other command uses."""
+    lookup every other command uses. The planner's brief, and only the planner's, ends with one more block: the
+    "What earlier work says" section from `_earlier_work_lines` (see there), so the plan builds on what earlier
+    work in this project already learned instead of rediscovering or contradicting it."""
     role = _normalize_role(args.role)
     if role is None:
         die(f"'{args.role}' is not a valid role for brief. Valid roles: {', '.join(ROLE_ORDER)} (or an agent name "
@@ -1773,6 +1981,9 @@ def cmd_brief(args):
     print(objective_brief(plan))
     print("")
     print(ROLE_BRIEFS[role])
+    if role == "planner":
+        print("")
+        print("\n".join(_earlier_work_lines(ctx)))
 
 
 def _final_review_lines(plan) -> list[str]:
