@@ -1690,6 +1690,91 @@ def objective_brief(plan) -> str:
     return "\n".join(lines)
 
 
+# Each Ratchet sub-agent role's own standing rules, short and plain, printed by `brief` right after the objective
+# so the orchestrator never has to remember or retype them. One dict, one source, instead of scattered strings in
+# each agent file: keep an agent's own .md file (e.g. agents/ratchet-fixer.md) worded consistently with its entry
+# here, but this dict is what every spawn prompt actually gets.
+ROLE_BRIEFS = {
+    "implementer": ("Rules: make the smallest change that makes this checkpoint's planned tests pass. Add no new "
+                     "mechanism or file beyond what this checkpoint needs. Don't run the full test suite unless "
+                     "asked; run only this checkpoint's own tests. Never edit, skip or weaken a test."),
+    "fixer": ("Rules: make the smallest change that resolves each finding you were handed. Add no new mechanism or "
+              "file unless the finding itself needs it. If a proper fix needs a redesign, stop and say so instead "
+              "of improvising one. Never weaken, skip or delete a test. Don't run the full test suite unless asked."),
+    "test-writer": ("Rules: turn the checkpoint's planned test cases into real, runnable tests tagged with their "
+                     "case ids, written before the implementation exists, so at least one fails on an assertion. "
+                     "Test behavior through public entry points, not internals. Never write a test that can't fail."),
+    "reviewer": ("Rules: judge every finding against the realistic-use bar: this project's users run a cooperative "
+                 "agent, not an attacker, and a finding must describe real harm to them in realistic, normal use, "
+                 "not a case no real user would hit. Every blocking finding (blocker or major) must say who is hurt "
+                 "and how; leave that out and it does not block. Approve only when you genuinely find nothing."),
+    "scout": ("Rules: verify the app, its tests and its dev server actually run before anyone else relies on your "
+              "report; don't guess. Record what's already green, what's already broken, and what's missing, so a "
+              "later checkpoint is never blamed for a problem that was there before the build started."),
+    "planner": ("Rules: write the plan's objective first. Slice the work into small checkpoints of increasing "
+                "complexity a human can approve in minutes. Ask a question instead of guessing on anything that "
+                "changes the plan's shape. A high-risk step needs its own risk_reason naming who could be harmed."),
+}
+
+ROLE_ORDER = ["implementer", "fixer", "test-writer", "reviewer", "scout", "planner"]
+
+# Every other agent in agents/ gets this same short generic line instead of a custom rule set: it still points the
+# agent back at the objective and the smallest-change discipline every role shares, without inventing bespoke
+# wording per agent (the fix this round deliberately keeps smaller than a custom brief for each one).
+_GENERIC_ROLE_RULES = ("Rules: follow your own agent instructions for this role. Serve the objective above. Make "
+                        "the smallest change for the job. Don't run the full test suite unless asked.")
+for _generic_role in ("behavior-reviewer", "design-system", "prototyper", "test-planner", "test-runner",
+                      "variant-writer", "visual-reviewer"):
+    ROLE_BRIEFS[_generic_role] = _GENERIC_ROLE_RULES
+
+# agents/*.md names that don't match a ROLE_BRIEFS key directly (the rest of the agents/ file stems -- adversary,
+# behavior-reviewer, checkpoint-planner, design-system, fixer, implementer, prototyper, test-planner, test-runner,
+# test-writer, variant-writer, visual-reviewer, app-scout -- already equal a ROLE_BRIEFS key once the optional
+# `ratchet-` prefix is stripped). Keep this to just the renames so `--role` accepts every agent the orchestrator
+# spawns without a bespoke rule set per agent.
+ROLE_ALIASES = {"adversary": "reviewer", "app-scout": "scout", "checkpoint-planner": "planner"}
+
+
+def _normalize_role(raw: str) -> str | None:
+    """`--role` accepts a ROLE_BRIEFS key directly, any agents/*.md file stem (with or without its `ratchet-`
+    prefix), and the ROLE_ALIASES renames for the three agents whose file name doesn't match a role name. Returns
+    None for anything else, so `cmd_brief` can refuse it with a plain message instead of argparse's own."""
+    tok = raw[len("ratchet-"):] if raw.startswith("ratchet-") else raw
+    tok = ROLE_ALIASES.get(tok, tok)
+    return tok if tok in ROLE_BRIEFS else None
+
+
+def cmd_brief(args):
+    """`brief [CPn] --role <role>`: the one place every Ratchet sub-agent's opening text comes from, so the
+    orchestrator spawns a sub-agent with `ratchet.py brief CPn --role <role>` instead of retyping or half-remembering
+    the objective and that role's rules. Prints the plan's objective exactly as `objective_brief` renders it (the
+    same text reviewer prompts already open with), then that role's own standing rules (ROLE_BRIEFS). `--role` takes
+    the agent's name (any file stem under agents/, with or without the `ratchet-` prefix) as well as the six
+    original role names; see `_normalize_role`. CPn is optional: the scout and the planner are briefed before any
+    checkpoint exists, before checkpoints.json even exists (that die is only reached when a CPn is given, since a
+    CPn can't be looked up with no plan at all). A plan with no stated objective (approved before that rule existed)
+    gets the plain NO_OBJECTIVE_NOTE instead of a crash. An unknown CPn is refused by `cp_by_id`, the same shared
+    lookup every other command uses."""
+    role = _normalize_role(args.role)
+    if role is None:
+        die(f"'{args.role}' is not a valid role for brief. Valid roles: {', '.join(ROLE_ORDER)} (or an agent name "
+            f"from agents/, with or without the 'ratchet-' prefix).")
+    ctx = Ctx(find_root())
+    plan = ctx.plan()
+    if args.cp:
+        if not plan or not plan.get("checkpoints"):
+            die("There is no plan yet. Finish planning first, then ask again.")
+        cp = cp_by_id(plan, args.cp)
+        header = f"{args.cp}: brief for the {role} — {cp.get('title', '')}".rstrip(" —")
+    else:
+        header = f"Brief for the {role} (no checkpoint yet)"
+    print(header)
+    print("")
+    print(objective_brief(plan))
+    print("")
+    print(ROLE_BRIEFS[role])
+
+
 def _final_review_lines(plan) -> list[str]:
     """What `status` (and `status --json`'s own fields, read by the human-approve question) opens the final review
     with: the objective's goal and users, then every done_means line, plain, for the user to judge against the
@@ -10888,6 +10973,12 @@ def main(argv=None):
     a = sp.add_parser("status"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_status)
     sp.add_parser("plan-summary", help="plain per-step summary of the plan, to show the user before they approve"
                   ).set_defaults(fn=cmd_plan_summary)
+    a = sp.add_parser("brief", help="print a sub-agent's opening text: the plan's objective, then that role's own "
+                                    "standing rules; start every spawn prompt with this instead of writing it by hand")
+    a.add_argument("cp", nargs="?", help="checkpoint id (optional: the scout and planner can be briefed before one exists)")
+    a.add_argument("--role", required=True, help="a role name or an agents/*.md file stem, with or without the "
+                                                 "'ratchet-' prefix (see _normalize_role)")
+    a.set_defaults(fn=cmd_brief)
     a = sp.add_parser("reviewers"); a.add_argument("cp"); a.add_argument("--json", action="store_true")
     a.set_defaults(fn=cmd_reviewers)
     a = sp.add_parser("check-in", help="print (or decide) the check-in opened when reviews drag")

@@ -55,26 +55,28 @@ Hooks (installed with the plugin, or by `install.sh --host <cli>` / `$RATCHET in
 ## Sub-agent rules
 
 - Spawn every agent below as a sub-agent. In Claude Code that's the Agent tool with `subagent_type` = the agent name. On other hosts, use their sub-agent mechanism and give it the prompt from `agents/<name>.md` in this plugin. When installed as a plugin the name is prefixed (`ratchet-loop:ratchet-implementer`), so use whichever form your agent list shows. Each one gets a fresh context window, which is the whole point.
-- Every spawn prompt includes the plan's objective (who it's for, what they want, what done means, what is out of scope) at the top, before anything else, so a sub-agent that never sees the plan file still knows what the work is for. After that it includes the `RATCHET=…` line, the run folder path, the checkpoint id, the exact files to read (checkpoint entry, test plan, open findings), and "Read .ratchet/learnings.md first." A run whose plan has no stated objective (approved before this existed) gets a plain note instead: say so, don't omit the line.
+- Every spawn prompt includes the objective: start it with the output of `$RATCHET brief CPn --role <role>` (CPn optional for the scout and planner, before any checkpoint exists), pasted at the top, before anything else, instead of writing the objective by hand. `--role` takes the agent's name — any agent in the table below, with or without its `ratchet-` prefix (`adversary` and `ratchet-adversary` both work, likewise every other row) — not only the six original role words. It prints the plan's objective (who it's for, what they want, what done means, what is out of scope, or the plain no-objective note for a run approved before that rule existed) and that role's own standing rules in one go, so a sub-agent that never sees the plan file still knows what the work is for and how it must work. After that it includes the `RATCHET=…` line, the run folder path, the checkpoint id, the exact files to read (checkpoint entry, test plan, open findings), and "Read .ratchet/learnings.md first." If `brief` exits non-zero, its output names the problem, not a prompt: fix the role name and run it again, never paste that output into a spawn.
 - **Each role has a model.** `$RATCHET models` lists the model for every role on this host (lighter roles such as writing tests use a cheaper model; planning, implementing, fixing and reviewing use the strong one). When your sub-agent tool lets you choose a model (Claude Code's Agent tool has a `model` parameter), pass it; `inherit` means use your own model, so pass nothing. If your host can't choose a model per sub-agent, every role runs on your model; say so once in the plan message.
 - Ask each agent for a **short** return value (≤15 lines: what changed, files touched, anything blocking). Never ask for full logs or diffs. Those stay on disk.
 - Run independent agents **in parallel**: send them in one message. Examples: app-scout + checkpoint-planner; the test planners for every checkpoint; the two UI reviewers; all of a round's adversarial reviewers.
 - Never implement, fix, or edit tests yourself. If you catch yourself about to, spawn the right agent instead.
 
-| Agent | Job |
-|---|---|
-| `ratchet-app-scout` | Is the app running? Stack, test runner, start command, URL, login for captures. Writes `app-scout.json` and drafts `.ratchet/standards.md` if missing |
-| `ratchet-checkpoint-planner` | Feature → `checkpoints.json` (PLAN or EXTEND mode). May return QUESTIONS |
-| `ratchet-test-planner` | One checkpoint → `tests/CPn.json` (uses the `ratchet-tdd-planner` skill) |
-| `ratchet-design-system` | Writes/updates `DESIGN.md` (uses the `ratchet-design-md` skill) |
-| `ratchet-variant-writer` | High-risk guardrail steps only: writes disguised bad variants and look-alike good code for a mistake, without seeing the check |
-| `ratchet-prototyper` | Single-file clickable HTML prototype with switchable states (uses the `ratchet-prototype` skill) |
-| `ratchet-test-writer` | Writes the planned tests. Every one must run before the build, and at least one must fail on an assertion |
-| `ratchet-implementer` | Writes the code for ONE checkpoint, or fixes behavior/UI failures |
-| `ratchet-test-runner` | Runs `$RATCHET behavior CPn` and returns a concise diagnosis |
-| `ratchet-visual-reviewer` / `ratchet-behavior-reviewer` | Isolated UI gate reviewers (normally launched by `ui_review.py`, used as sub-agents only as a fallback) |
-| `ratchet-adversary` | Assumes the code is wrong and hunts for problems against the standards (lens: `standards` or `correctness`) |
-| `ratchet-fixer` | Fixes every adversarial finding and nothing else |
+| Agent | `--role` token | Job |
+|---|---|---|
+| `ratchet-app-scout` | `scout` | Is the app running? Stack, test runner, start command, URL, login for captures. Writes `app-scout.json` and drafts `.ratchet/standards.md` if missing |
+| `ratchet-checkpoint-planner` | `planner` | Feature → `checkpoints.json` (PLAN or EXTEND mode). May return QUESTIONS |
+| `ratchet-test-planner` | `test-planner` | One checkpoint → `tests/CPn.json` (uses the `ratchet-tdd-planner` skill) |
+| `ratchet-design-system` | `design-system` | Writes/updates `DESIGN.md` (uses the `ratchet-design-md` skill) |
+| `ratchet-variant-writer` | `variant-writer` | High-risk guardrail steps only: writes disguised bad variants and look-alike good code for a mistake, without seeing the check |
+| `ratchet-prototyper` | `prototyper` | Single-file clickable HTML prototype with switchable states (uses the `ratchet-prototype` skill) |
+| `ratchet-test-writer` | `test-writer` | Writes the planned tests. Every one must run before the build, and at least one must fail on an assertion |
+| `ratchet-implementer` | `implementer` | Writes the code for ONE checkpoint, or fixes behavior/UI failures |
+| `ratchet-test-runner` | `test-runner` | Runs `$RATCHET behavior CPn` and returns a concise diagnosis |
+| `ratchet-visual-reviewer` / `ratchet-behavior-reviewer` | `visual-reviewer` / `behavior-reviewer` | Isolated UI gate reviewers (normally launched by `ui_review.py`, used as sub-agents only as a fallback) |
+| `ratchet-adversary` | `reviewer` | Assumes the code is wrong and hunts for problems against the standards (lens: `standards` or `correctness`) |
+| `ratchet-fixer` | `fixer` | Fixes every adversarial finding and nothing else |
+
+Every token above (and every one's full `ratchet-<name>` form) is accepted by `$RATCHET brief CPn --role <token>`.
 
 ## Fallback: hosts without sub-agents
 

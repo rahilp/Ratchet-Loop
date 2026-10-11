@@ -97,7 +97,9 @@ story's title; when no item in the spec states its audience, the draft leaves `u
 `FILL IN: ...` placeholder instead of inventing one, and `plan-submit` refuses any objective part that still
 starts with `FILL IN:`, naming the part, so the planner or user must fill it in before the plan is approved.
 A run whose plan was approved before this field existed keeps working with no objective at all — nothing about
-it is required retroactively.
+it is required retroactively. `ratchet.py brief CPn --role <role>` prints this same objective text, then that
+role's own standing rules; every sub-agent's spawn prompt starts with its output instead of the orchestrator
+writing the objective by hand.
 
 ```json
 {

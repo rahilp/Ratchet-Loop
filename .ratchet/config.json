@@ -66,6 +66,11 @@
     {
       "id": "claude",
       "preset": "claude"
+    },
+    {
+      "id": "copilot",
+      "preset": "copilot",
+      "model": "grok-4.7"
     }
   ],
   "test_timeout_sec": 3600,
