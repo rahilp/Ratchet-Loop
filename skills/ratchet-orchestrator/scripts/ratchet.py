@@ -2279,8 +2279,7 @@ def cmd_status_text(ctx: Ctx):
     if st.get("phase") == "awaiting_final_review":
         for line in _final_review_lines(plan):
             print(line)
-        left = [f for c in (st.get("checkpoints") or {}).values() for f in c.get("deferred") or []
-                if not f.get("accepted")]
+        left = [f for c in (st.get("checkpoints") or {}).values() for f in left_for_later(c)]
         if left:
             print(f"{len(left)} finding(s) were left for later (never accepted or fixed): run `ratchet.py "
                   "deferred` to see them.")
@@ -6975,25 +6974,69 @@ def _checkin_decisions_lines(st) -> list[str]:
     return lines
 
 
+def _deferred_groups(cps) -> dict:
+    """Groups one checkpoint's own deferred findings (never accepted ones) by `_finding_key` (reviewer/id, or the
+    bare id when no reviewer is given), keeping only the LATEST round's own copy for each key: the same reviewer
+    re-raising the same id in a later round overwrites its own earlier, stale copy here. Two findings that merely
+    share a `kind` and `file` -- a different reviewer, or a different id -- are different keys and are never
+    merged into one; each keeps its own entry."""
+    groups: dict = {}
+    for f in cps.get("deferred") or []:
+        if f.get("accepted"):
+            continue
+        k = _finding_key(f)
+        if k not in groups or (f.get("round") or 0) >= (groups[k].get("round") or 0):
+            groups[k] = f
+    return groups
+
+
+def left_for_later(cps) -> list:
+    """A checkpoint's deferred findings still left for later at the end of the run: `_deferred_groups`'s one entry
+    per finding, minus any `ratchet.py mark-fixed` has since recorded fixed. Used by `deferred`, `deferred --json`
+    and the final-review count in `status`, so all three always agree on what is still left for later."""
+    return [f for f in _deferred_groups(cps).values() if not f.get("fixed")]
+
+
+def _fixed_later(cps) -> list:
+    """The companion list to `left_for_later`: the same deduped findings, kept only when `mark-fixed` marked them
+    fixed."""
+    return [f for f in _deferred_groups(cps).values() if f.get("fixed")]
+
+
 def cmd_deferred(args):
     """Findings that were recorded instead of blocking (minor ones, and any blocker/major/unknown-severity
     finding with no user_impact), for the user to decide on at the end, PLUS, in their own section first,
     findings the user accepted while a round was blocked: these were shown to the user and agreed to on purpose,
-    with a reason and who accepted them, so they are never mixed in with ones that simply never blocked."""
+    with a reason and who accepted them, so they are never mixed in with ones that simply never blocked. A finding
+    `ratchet.py mark-fixed` recorded fixed prints in its own 'fixed later in the run' section instead of under
+    'left for later' (both sections are deduped per `left_for_later`/`_fixed_later`: a finding re-raised in a
+    later round by the same reviewer with the same id shows once, as that later round's own copy)."""
     ctx = Ctx(find_root())
     st = ctx.state()
-    rows = [(cp, f) for cp, c in (st.get("checkpoints") or {}).items() for f in c.get("deferred") or []]
+    cps_map = st.get("checkpoints") or {}
+    accepted = [(cp, f) for cp, c in cps_map.items() for f in c.get("deferred") or [] if f.get("accepted")]
+    fixed = [(cp, f) for cp, c in cps_map.items() for f in _fixed_later(c)]
+    other = [(cp, f) for cp, c in cps_map.items() for f in left_for_later(c)]
     if getattr(args, "json", False):
+        rows = accepted + fixed + other
         print(json.dumps([dict(f, checkpoint=cp) for cp, f in rows], indent=2))
         return
-    if not rows:
+    if not (accepted or fixed or other):
         print("No findings were left for later.")
         return
-    other = [(cp, f) for cp, f in rows if not f.get("accepted")]
     acc_lines = _accepted_findings_lines(st)
     if acc_lines:
         for line in acc_lines:
             print(line)
+        if fixed or other:
+            print("")
+    if fixed:
+        print(f"{len(fixed)} finding(s) were fixed later in the run (a later round reviewed the change):")
+        for cp, f in fixed:
+            where = f" ({f['file']}{':' + str(f['line']) if f.get('line') else ''})" if f.get("file") else ""
+            fx = f.get("fixed") or {}
+            print(f"- {cp} {_finding_key(f)}{where}: {f.get('description', '').strip()[:240]} "
+                  f"[fixed in round {fx.get('round')}: {fx.get('how', '')}]")
         if other:
             print("")
     if other:
@@ -7002,6 +7045,88 @@ def cmd_deferred(args):
             where = f" ({f['file']}{':' + str(f['line']) if f.get('line') else ''})" if f.get("file") else ""
             why = f" [{f['deferred_because']}]" if f.get("deferred_because") else ""
             print(f"- {cp} {_finding_key(f)}{where}: {f.get('description', '').strip()[:240]}{why}")
+
+
+def cmd_mark_fixed(args):
+    """`ratchet.py mark-fixed CPn <ref>="<how>"`: records that a finding left for later (`ratchet.py deferred`)
+    was really fixed, so the final review's own left-for-later list stops showing it (`deferred` moves it under
+    'fixed later in the run' instead). Refused outright, with nothing changed, unless BOTH: (1) the finding's own
+    file has changed since the LATEST round that raised it (same reviewer/id) -- the baseline round is the
+    highest of every round among this checkpoint's own non-accepted deferred entries for that key AND every
+    recorded adversarial round whose own open-findings.json (the round's blocking findings, read fresh off disk,
+    not just this checkpoint's deferred list) lists that same key, so a round that re-raises the finding as
+    BLOCKING, not only one that defers it again, also becomes the new baseline -- that round itself can never
+    serve as its own proof -- and (2) a later adversarial round has since been recorded whose own fingerprint
+    already matches today's version of that file -- a fix nobody reviewed again does not count, and a file that
+    never moved does not either. Also refused for a finding the user already accepted (a separate decision,
+    `ratchet.py ask accept-finding`) or a reference naming no deferred finding at all."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    cps = (st.get("checkpoints") or {}).get(args.cp)
+    if cps is None:
+        die(f"No such checkpoint {args.cp}.")
+    ref, sep, rest = args.decision.partition("=")
+    ref = ref.strip()
+    how = rest.strip()
+    if len(how) >= 2 and how[0] == how[-1] and how[0] in ("'", '"'):
+        how = how[1:-1].strip()
+    if not sep or not how:
+        die(f"{args.decision!r}: use `mark-fixed {args.cp} <ref>=\"how it was fixed\"`. Nothing was recorded.")
+    all_deferred = cps.get("deferred") or []
+    open_deferred = [d for d in all_deferred if not d.get("accepted")]
+    found, err = _resolve_finding_ref(ref, open_deferred)
+    if err:
+        die(f"{err} Nothing was recorded.")
+    if found is None:
+        accepted = [d for d in all_deferred if d.get("accepted")]
+        acc, _ = _resolve_finding_ref(ref, accepted)
+        if acc is not None:
+            die(f"{ref} was accepted by the user, not deferred (see `ratchet.py ask accept-finding`); mark-fixed "
+                "does not apply to it. Nothing was recorded.")
+        die(f"{ref} does not exist among {args.cp}'s deferred findings (`ratchet.py deferred` lists them). "
+            "Nothing was recorded.")
+    key = _finding_key(found)
+    entries = [d for d in open_deferred if _finding_key(d) == key]
+    file = found.get("file")
+    rounds = ((cps.get("gates") or {}).get("adversarial") or {}).get("rounds") or []
+    raised_rounds = [d.get("round") for d in entries if d.get("round") is not None]
+    for rr in rounds:
+        rno = rr.get("round")
+        if rno is None:
+            continue
+        raw = _read_findings_file(_adv_round_dir(ctx, args.cp, rno) / "open-findings.json")
+        if any(_finding_key(f) == key for f in raw):
+            raised_rounds.append(rno)
+    raised_round = max(raised_rounds, default=None)
+    raised_rec = next((rr for rr in rounds if rr.get("round") == raised_round), None) \
+        if raised_round is not None else None
+    if raised_round is None or not file or not raised_rec or not raised_rec.get("fingerprint"):
+        die(f"{ref} has no recorded round or file on record to check whether it was really fixed. Nothing was "
+            "recorded.")
+    cur_fp = fingerprint(ctx.root)
+    raised_fp = {"kind": "git-tree", "id": raised_rec["fingerprint"]}
+    file_norm = _norm_path(file)
+    changed_since_raise = {_norm_path(x) for x in changed_files(ctx.root, raised_fp, cur_fp)}
+    if file_norm not in changed_since_raise:
+        die(f"{ref}'s file ({file}) has not changed since round {raised_round}, the round that raised it. "
+            "mark-fixed only applies once the file has really changed. Nothing was recorded.")
+    later_round = None
+    for rr in sorted(rounds, key=lambda r: r.get("round", 0)):
+        if rr.get("round", 0) <= raised_round or not rr.get("fingerprint"):
+            continue
+        rec_fp = {"kind": "git-tree", "id": rr["fingerprint"]}
+        if file_norm not in {_norm_path(x) for x in changed_files(ctx.root, rec_fp, cur_fp)}:
+            later_round = rr["round"]
+            break
+    if later_round is None:
+        die(f"{ref}: no later review round has been recorded on the changed code since round {raised_round}. Run "
+            f"`ratchet.py reviewers {args.cp}` and record a new round first. Nothing was recorded.")
+    latest_entry = max(entries, key=lambda d: d.get("round") or 0)
+    latest_entry["fixed"] = {"round": later_round, "how": how}
+    ctx.log(st, "finding_marked_fixed", cp=args.cp, ref=key, round=later_round)
+    ctx.save_state(st)
+    ok(f"Marked {key} fixed for {args.cp} (a later round, {later_round}, reviewed the changed code). Run "
+       "`ratchet.py deferred` to see it under 'fixed later in the run'.")
 
 
 def cmd_complete(args):
@@ -11017,6 +11142,9 @@ def main(argv=None):
     a.set_defaults(fn=cmd_spec)
     a = sp.add_parser("deferred", help="findings recorded for later instead of blocking (minor, or no user_impact)")
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_deferred)
+    a = sp.add_parser("mark-fixed", help="record that a deferred finding was really fixed and reviewed again")
+    a.add_argument("cp"); a.add_argument("decision", metavar='ref="how it was fixed"')
+    a.set_defaults(fn=cmd_mark_fixed)
     sp.add_parser("next").set_defaults(fn=cmd_next)
     a = sp.add_parser("status"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_status)
     sp.add_parser("plan-summary", help="plain per-step summary of the plan, to show the user before they approve"

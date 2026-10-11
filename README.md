@@ -379,7 +379,8 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py providers [--discover] [--check [id]] [--add <id> --preset <p> --model <m>] [--remove <id>]` | agent tools that can review: find, test, add or remove them |
 | `ratchet.py models` | which model each role's sub-agent uses on this host |
 | `ratchet.py spec detect`, `spec import <openspec\|speckit\|bmad\|auto> <id>`, `spec status` | build from an OpenSpec change, Spec Kit feature or BMAD story; which scenarios are proven so far; `spec keep on\|off` records the user's answer about a running spec |
-| `ratchet.py deferred` | review findings noted for later instead of blocking (minor ones, and any blocker/major/unknown-severity one with no `user_impact`), plus, in their own section first, any findings you accepted yourself, with your reason and who accepted them |
+| `ratchet.py deferred` | review findings noted for later instead of blocking (minor ones, and any blocker/major/unknown-severity one with no `user_impact`), plus, in their own section first, any findings you accepted yourself, with your reason and who accepted them, and a 'fixed later in the run' section for ones `mark-fixed` closed |
+| `ratchet.py mark-fixed CPn <ref>="<how>"` | record that a finding left for later was really fixed: refused unless its file changed since the round that raised it AND a later round was recorded on that changed code |
 | `ratchet.py ask accept-finding CPn F1,F2`, `accept-finding CPn` | ask the user to accept named open (blocking) findings of a blocked round, with their own reason (`accept: <reason>`); record it once they reply |
 | `ratchet.py ask raise-limit CPn`, `raise-limit CPn` | ask the user to raise a blocked step's own review-round limit by one round, with their own reason (`raise: <reason>`); offered at most once per step, ever, whatever `config.json`'s `max_adversarial_rounds` is later edited to |
 | `ratchet.py triage CPn <ref>=fix:"<reason>"` / `<ref>=rebut:"<reason>"` | whenever a round blocks: decide fix or rebut for every blocking finding, even a single one, before the next round opens; never accept/defer/waive |
@@ -417,6 +418,7 @@ python3 tests/test_checkin.py
 python3 tests/test_cleanup.py
 python3 tests/test_converge.py
 python3 tests/test_dedup_unknown_model.py
+python3 tests/test_deferred_fixed.py
 python3 tests/test_docs.py
 python3 tests/test_flaky.py
 python3 tests/test_gates.py
