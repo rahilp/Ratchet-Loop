@@ -367,6 +367,7 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 |---|---|
 | `ratchet.py doctor [--json]` | which CLIs have Ratchet hooks and when each last fired |
 | `ratchet.py status [--json]`, `plan-summary` | plain-text state; the plan step by step |
+| `ratchet.py changes CPn [--json]` | read-only: which changes since the step started are docs, which are code and how many code lines changed, which test files name each changed doc, and whether `doc_test_command` is configured |
 | `ratchet.py brief [CPn] --role implementer\|fixer\|test-writer\|reviewer\|scout\|planner` | a sub-agent's opening text: the plan's objective (word for word as `plan-summary` shows it, or a plain no-objective note), then that role's own rules; the orchestrator pastes this at the top of every spawn prompt |
 | `ratchet.py view` | the viewer link (live URL if a server runs, else a `file://` link) |
 | `ratchet.py view --serve [--open]` | live page on a free port (4477 and up) at `http://127.0.0.1:<port>/` |
@@ -429,6 +430,7 @@ python3 tests/test_limits.py
 python3 tests/test_objective.py
 python3 tests/test_plan_change.py
 python3 tests/test_providers.py
+python3 tests/test_quick_path.py
 python3 tests/test_results.py
 python3 tests/test_review_objective.py
 python3 tests/test_runner.py

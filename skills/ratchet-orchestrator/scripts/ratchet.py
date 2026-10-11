@@ -150,6 +150,16 @@ DEFAULT_CONFIG = {
     "spec_archive": True,
     "spec_keep": None,              # no spec tool: keep a running spec (openspec/specs/<run>/spec.md)? None = not asked yet           # archive an OpenSpec change (merge its deltas into the specs) when the run is approved
     "regression_command": None,     # full suite run before a checkpoint can complete
+    # The quick path (`ratchet.py changes CPn`): a file matching doc_globs and not doc_exclude_globs (plus the
+    # configured design_md and standards files) counts as a doc, not code. A test file matching test_globs "names"
+    # a doc when its text contains the doc's repo-relative path or file name. doc_test_command (with a {files}
+    # placeholder) runs just those files; unset, the docs quick path is off. small_edit_lines is the line-count
+    # ceiling (git diff --numstat, added+removed) for a one-reviewer small fix.
+    "doc_globs": ["*.md", "*.mdx", "*.rst", "*.adoc"],
+    "doc_exclude_globs": ["SKILL.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", "agents/*.md"],
+    "test_globs": ["test_*", "*_test.*", "*.test.*", "*.spec.*"],
+    "doc_test_command": None,
+    "small_edit_lines": 20,
     "commit_per_checkpoint": True,
     "design_md": "DESIGN.md",
     "standards": [".ratchet/standards.md"],
@@ -477,6 +487,161 @@ def touches_ui(files: list[str], globs: list[str]) -> list[str]:
         if any(fnmatch.fnmatch(name, g) or fnmatch.fnmatch(f, g) for g in globs):
             hits.append(f)
     return hits
+
+
+# --------------------------------------------------------------------------- quick path (`ratchet.py changes`)
+
+def _glob_hit(f: str, globs: list[str]) -> bool:
+    """True when f's basename or full repo-relative path matches one of globs — touches_ui's own rule."""
+    name = os.path.basename(f)
+    return any(fnmatch.fnmatch(name, g) or fnmatch.fnmatch(f, g) for g in globs)
+
+
+def _project_files(root: Path, fp: dict) -> list[str]:
+    """Every file in fp's tree (tracked and untracked, minus .ratchet) — not just what git has staged or
+    committed — so a doc-naming test file still counts even before anyone runs `git add`."""
+    if fp.get("kind") == "git-tree":
+        r = subprocess.run(["git", "ls-tree", "-r", "--name-only", "--full-tree", fp["id"]], cwd=root,
+                           capture_output=True, text=True)
+        return [l for l in r.stdout.splitlines() if l]
+    return sorted(read_json(root / RATCHET_DIR / "manifests" / f"{fp['id']}.json", {},
+                            record="Ratchet treats it as naming no files (the fingerprint manifest cache, named "
+                                   "by its own hash)") or {})
+
+
+def _code_size(ctx: "Ctx", from_id: str, to_id: str, code_files: list[str]) -> tuple[int | None, list[str]]:
+    """git diff --numstat added+removed line count for code_files between two tree ids. Git prints "-\t-\tpath"
+    for a file it can't diff as text (binary): that size is unknown, not zero, so the total is reported as
+    `None` (never a partial sum that silently drops the unknown files) whenever any code file is uncountable.
+    Returns (total_or_None, the uncountable file paths)."""
+    if not code_files:
+        return 0, []
+    r = subprocess.run(["git", "diff", "--numstat", from_id, to_id, "--", *code_files], cwd=ctx.root,
+                       capture_output=True, text=True)
+    total, unknown = 0, []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            total += int(parts[0]) + int(parts[1])
+        except ValueError:
+            unknown.append(parts[2])  # binary file: numstat prints "-\t-\tpath"; size can't be counted
+    return (None if unknown else total), unknown
+
+
+def _tests_naming(ctx: "Ctx", cfg: dict, fp: dict, docs: list[str]) -> list[str]:
+    """Which test files (test_globs) name any of `docs` by its repo-relative path or file name (a plain
+    substring match, never guessed). Shared by both of classify_changes's ranges (base_tree and since_approval)
+    so a doc that is changed and then restored in one range, but not the other, still gets the tests that name
+    it from whichever range actually lists it as changed."""
+    if not docs:
+        return []
+    out = []
+    candidates = [t for t in _project_files(ctx.root, fp) if _glob_hit(t, cfg.get("test_globs") or [])]
+    for t in sorted(set(candidates)):
+        try:
+            text = (ctx.root / t).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(d in text or os.path.basename(d) in text for d in docs):
+            out.append(t)
+    return out
+
+
+def classify_changes(ctx: "Ctx", cp_id: str) -> dict:
+    """Read-only report of what changed since cp_id's base_tree: which files are docs (doc_globs, minus
+    doc_exclude_globs plus the configured design_md and standards files), which are code, how many code lines
+    changed in the code files (git diff --numstat, added+removed), which test files (test_globs) name a changed
+    doc by its repo-relative path or file name, and whether doc_test_command is configured at all. A code file
+    git can't diff as text (binary) makes `code_lines_changed` None and `code_lines_unknown` True: an unknown
+    size is reported plainly, never as zero, so it can never read as a small change. `since_approval` repeats
+    the same report (its own `doc_test_files` included, matched independently against its own `doc_files` so a
+    doc changed then restored in one range but not the other still gets the tests naming it from whichever
+    range actually lists it) for the narrower range from the adversarial gate's last recorded approval
+    fingerprint (when that gate has one) to now, plus a plain `docs_only`; when there is no recorded approval
+    yet (gate not required, or required but not yet passed), `approved` is False with a plain reason and the
+    rest are empty.
+    Never writes, and never gates: a locked reference file (DESIGN.md, standards) drifting since approval is
+    still just reported here as a changed file, not refused (that refusal is every other command's, not this
+    read-only report's). Which check (docs quick path, small fix, or full) applies to either range is not this
+    report's decision."""
+    st = ctx.state()
+    cps = (st.get("checkpoints") or {}).get(cp_id)
+    if cps is None:
+        die(f"{cp_id} is not a checkpoint in this run.")
+    cfg = ctx.config()
+    base = cps.get("base_tree")
+    fp = fingerprint(ctx.root)
+    files = sorted(changed_files(ctx.root, {"kind": "git-tree", "id": base}, fp)) if base else []
+    exclude = [g for g in [*(cfg.get("doc_exclude_globs") or []), cfg.get("design_md"),
+                           *(cfg.get("standards") or [])] if g]
+    doc_globs = cfg.get("doc_globs") or []
+    doc_files = [f for f in files if _glob_hit(f, doc_globs) and not _glob_hit(f, exclude)]
+    code_files = [f for f in files if f not in doc_files]
+    code_lines, code_unknown = _code_size(ctx, base, fp["id"], code_files) if base else (0, [])
+    doc_test_files = _tests_naming(ctx, cfg, fp, doc_files)
+    doc_cmd = cfg.get("doc_test_command")
+    adv = (cps.get("gates") or {}).get("adversarial") or {}
+    approval_fp = adv.get("fingerprint")
+    if not approval_fp:
+        since_approval = {
+            "approved": False,
+            "reason": ("the adversarial gate is not required for this checkpoint" if not adv.get("required")
+                      else "the adversarial gate has not been approved yet for this checkpoint"),
+            "doc_files": [], "code_files": [], "code_lines_changed": 0, "code_lines_unknown": False,
+            "doc_test_files": [], "docs_only": None,
+        }
+    else:
+        a_files = sorted(changed_files(ctx.root, approval_fp, fp))
+        a_doc_files = [f for f in a_files if _glob_hit(f, doc_globs) and not _glob_hit(f, exclude)]
+        a_code_files = [f for f in a_files if f not in a_doc_files]
+        a_lines, a_unknown = _code_size(ctx, approval_fp["id"], fp["id"], a_code_files)
+        since_approval = {
+            "approved": True,
+            "reason": None,
+            "doc_files": a_doc_files,
+            "code_files": a_code_files,
+            "code_lines_changed": a_lines,
+            "code_lines_unknown": bool(a_unknown),
+            "doc_test_files": _tests_naming(ctx, cfg, fp, a_doc_files),
+            "docs_only": len(a_code_files) == 0,
+        }
+    return {
+        "docs_only": len(code_files) == 0,
+        "doc_files": doc_files,
+        "code_files": code_files,
+        "code_lines_changed": code_lines,
+        "code_lines_unknown": bool(code_unknown),
+        "doc_test_files": doc_test_files,
+        "doc_quick_path": {"enabled": bool(doc_cmd),
+                            "reason": None if doc_cmd else "doc_test_command is not configured"},
+        "since_approval": since_approval,
+    }
+
+
+def cmd_changes(args):
+    """`ratchet.py changes CPn [--json]`: classify_changes, read-only (not in STATE_LOCKED_CMDS)."""
+    ctx = Ctx(find_root())
+    data = classify_changes(ctx, args.cp)
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2))
+        return
+    print(f"docs only: {data['docs_only']}")
+    print(f"doc files: {', '.join(data['doc_files']) or '(none)'}")
+    print(f"code files: {', '.join(data['code_files']) or '(none)'}")
+    print(f"code lines changed: {'unknown (binary code change)' if data['code_lines_unknown'] else data['code_lines_changed']}")
+    print(f"doc test files: {', '.join(data['doc_test_files']) or '(none)'}")
+    qp = data["doc_quick_path"]
+    print(f"docs quick path: {'on' if qp['enabled'] else 'off'}" + (f" ({qp['reason']})" if qp["reason"] else ""))
+    sa = data["since_approval"]
+    if not sa["approved"]:
+        print(f"since approval: not approved yet ({sa['reason']})")
+    else:
+        sa_lines = "unknown (binary code change)" if sa["code_lines_unknown"] else sa["code_lines_changed"]
+        print(f"since approval: docs only={sa['docs_only']}, doc files: {', '.join(sa['doc_files']) or '(none)'}, "
+              f"code files: {', '.join(sa['code_files']) or '(none)'}, code lines changed: {sa_lines}, "
+              f"doc test files: {', '.join(sa['doc_test_files']) or '(none)'}")
 
 
 # --------------------------------------------------------------------------- tamper evidence
@@ -1537,7 +1702,8 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "fingerprint_include", "approver", "ui_single_reviewer_ok", "min_review_timeout_sec", "test_timeout_sec",
              "host_provider", "ui_reviewers", "design_md", "max_stop_blocks", "unavailable_ttl_hours",
              "verify_transcripts", "min_review_seconds", "commit_per_checkpoint", "blocking_severities",
-             "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round", "converge_after_round"]
+             "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round", "converge_after_round",
+             "doc_globs", "doc_exclude_globs", "test_globs", "doc_test_command", "small_edit_lines"]
 
 
 def _file_sha(p: Path) -> str | None:
@@ -11019,6 +11185,9 @@ def main(argv=None):
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_deferred)
     sp.add_parser("next").set_defaults(fn=cmd_next)
     a = sp.add_parser("status"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_status)
+    a = sp.add_parser("changes", help="which changes since a checkpoint's start are docs, how many code lines "
+                       "changed, which test files name a doc, and whether the docs quick path is on")
+    a.add_argument("cp"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_changes)
     sp.add_parser("plan-summary", help="plain per-step summary of the plan, to show the user before they approve"
                   ).set_defaults(fn=cmd_plan_summary)
     a = sp.add_parser("brief", help="print a sub-agent's opening text: the plan's objective, then that role's own "
