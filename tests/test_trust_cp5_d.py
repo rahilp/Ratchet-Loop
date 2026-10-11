@@ -19,9 +19,10 @@ from pathlib import Path
 import _tmp
 import trust_helpers
 from trust_helpers import (
-    ENGINE, HAVE_PTY, check, cp3_state, cp4_find_code, cp4_pty_run, cp4_say_yes, cp4_unapproved_plan,
-    cp4x_guard_tool, cp5r12_director, cp5r8_sha, cp5v_until, cp5y_first_run_plan, cp5y_guard_bash, cp5y_load_engine,
-    cp5y_repo, cp5z_notes, cp5z_project_notes, engine_env, install, js, make_env, rx, stop_payload,
+    CP4_CODE_RE, ENGINE, HAVE_PTY, check, cp3_state, cp4_answer_correct, cp4_pty_run, cp4_say_yes,
+    cp4_unapproved_plan, cp4x_guard_tool, cp5r12_director, cp5r8_sha, cp5v_until, cp5y_first_run_plan,
+    cp5y_guard_bash, cp5y_load_engine, cp5y_repo, cp5z_notes, cp5z_project_notes, engine_env, install, js, make_env,
+    rx, stop_payload,
 )
 
 SECTIONS = []
@@ -395,18 +396,14 @@ def cp5r11_errlog(d):
     return p.read_text().splitlines() if p.exists() else []
 
 
-CP5_PROMPT_CODE_RE = re.compile(r"type this code and press Enter: (\d{4,8})(?!\d)")
-
-
-def cp5_answer_prompt_code(master, output):
-    """Types back the code from Ratchet's own prompt line only. A damaged record makes the engine print a warning
-    naming its path before the prompt, and a temp folder name can hold a run of digits (for example
-    ratchet-trust-cp4-8871g3bi): reading the first number in the output would type that back instead."""
-    m = CP5_PROMPT_CODE_RE.search(output)
-    if not m:
-        return False
-    os.write(master, (m.group(1) + "\n").encode())
-    return True
+# The code reader that types back the code from Ratchet's own prompt line only (never the first number anywhere
+# in the output - a damaged record makes the engine print a warning naming its path before the prompt, and a temp
+# folder name can hold a run of digits, e.g. ratchet-trust-cp4-8871g3bi) is shared with test_trust_cp4.py and
+# test_trust_cp5_c.py: trust_helpers.CP4_CODE_RE/cp4_find_code/cp4_answer_correct, fixed at exactly 6 digits (the
+# engine always prints exactly 6) rather than a 4-8 digit range, so the same shared cause is fixed once, not
+# copied. Kept as aliases, not copies, so there is exactly one implementation.
+CP5_PROMPT_CODE_RE = CP4_CODE_RE
+cp5_answer_prompt_code = cp4_answer_correct
 
 
 def cp5r11_accept(d, env):
@@ -923,6 +920,12 @@ SECTIONS.append(("CP5", cp5_adv_round12_restrictions_breaker_and_order))
 # The pty checks after the red snapshot read the override code from Ratchet's prompt line, never from the first
 # number in the output: a damaged record's warning names a temp path that can hold a run of digits.
 
+# The bare digit-hunting pattern CP4_CODE_RE replaced (see trust_helpers.py's comment on CP4_CODE_RE): kept here,
+# inert, only so this test can still show that a naive "any run of digits" reader gets the wrong answer in a
+# folder whose name holds digits, now that the real reader (cp4_find_code) no longer makes that mistake either.
+_OLD_NAIVE_CODE_RE = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
+
+
 def cp5_flaky_x61_prompt_code():
     print("CP5 adv round 12: the override code is read from Ratchet's prompt, never from digits in a printed path")
     r, w = os.pipe()
@@ -965,7 +968,8 @@ def cp5_flaky_x61_prompt_code():
     # mkdtemp's random part can hold its own run of digits (e.g. "zs71019a"), so the first number in the output is
     # some number from the path, not always "4321": check that, and that the path comes before Ratchet's prompt.
     prompt = CP5_PROMPT_CODE_RE.search(acc)
-    naive = cp4_find_code(acc)
+    naive_m = _OLD_NAIVE_CODE_RE.search(acc)
+    naive = naive_m.group(1) if naive_m else None
     warned_at = acc.find(str(d / ".ratchet" / "active.json"))
     check("[CP5-X61] in a project folder whose name holds a run of digits, accept-state over a damaged active.json "
           "(its warning names that path before the code) still gets the right code and writes active.json again",

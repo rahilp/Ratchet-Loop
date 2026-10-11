@@ -22,9 +22,13 @@ def cp5_regression_existing_approval_suites_still_pass():
     print("CP5: existing approval flows in test_gates.py and test_hooks_waiver.py still pass once they ask first")
 
     # --- T11: the full test_gates.py and test_hooks_waiver.py suites, run as real subprocesses, both pass in full ----
+    # 1800s (not 600s): several of these full suites can run on the same machine at once (several parallel Ratchet
+    # lanes, each spawning its own test_gates.py/test_hooks_waiver.py subprocesses), and under that contention the
+    # two suites together can take much longer than their ~6-minute quiet-machine time without anything actually
+    # being wrong.
     here = Path(__file__).resolve().parent
     for name in ("test_gates.py", "test_hooks_waiver.py"):
-        r = subprocess.run([sys.executable, str(here / name)], capture_output=True, text=True, timeout=600)
+        r = subprocess.run([sys.executable, str(here / name)], capture_output=True, text=True, timeout=1800)
         tail = (r.stdout[-1500:] + r.stderr[-1500:])
         check(f"[CP5-T11] {name} passes in full (regression guard: CP5 must not break CP1-CP4, hooks-waiver or "
               "gate-integrity behavior)", r.returncode == 0, tail)
