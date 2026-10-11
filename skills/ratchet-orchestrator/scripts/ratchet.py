@@ -1894,8 +1894,9 @@ def _related_spec_items(ctx, relevant_to: set) -> list[tuple]:
     """(sort_key, line) for every recorded spec worth telling the planner about, ranked with the same
     relevance-then-recency rule as every other digest section so no one spec tool is favoured over another:
     OpenSpec's living records under openspec/specs/ (including Ratchet's own running records written by
-    living_spec_text), a finished Spec Kit feature (every task in tasks.md ticked) and a done BMAD story (status
-    text containing "done"). An open or unfinished one is left out -- `spec detect` already covers those. Each
+    living_spec_text), a finished Spec Kit feature (every task in tasks.md ticked) and a done BMAD story (its
+    status is exactly "done", ignoring case and surrounding whitespace). An open or unfinished one is left
+    out -- `spec detect` already covers those. Each
     source is read the tolerant way (a bad or missing file is skipped, never fatal), since a brief must never
     fail to print over a spec file someone is still editing."""
     items = []

@@ -418,6 +418,7 @@ python3 tests/test_cleanup.py
 python3 tests/test_converge.py
 python3 tests/test_dedup_unknown_model.py
 python3 tests/test_digest.py
+python3 tests/test_digest_docstring.py
 python3 tests/test_digest_specs.py
 python3 tests/test_docs.py
 python3 tests/test_flaky.py
