@@ -1667,6 +1667,50 @@ def objective_problems(plan) -> list[str]:
     return errs
 
 
+def _proves_values(case) -> list:
+    """Normalize one test-plan case's "proves" field for every consumer (proves_problems, _unproven_done_means,
+    _done_means_proof): a missing value is [] (nothing to prove), a scalar int counts as [int] (the common
+    planner slip of writing "proves": 1 instead of [1]), a list is used as-is. Any other shape is not a number
+    or a list of numbers, so there is nothing valid to normalize here; plan-submit's proves_problems is the one
+    place that refuses it outright, naming the case, before plan-summary or receipt ever reads it."""
+    proves = case.get("proves")
+    if proves is None:
+        return []
+    if isinstance(proves, list):
+        return proves
+    if isinstance(proves, int) and not isinstance(proves, bool):
+        return [proves]
+    return []
+
+
+def proves_problems(ctx, plan) -> list[str]:
+    """CP3: a test-plan case's optional "proves" (the spec_ref precedent's sibling) names, 1-based, the lines
+    of the objective's done_means it proves. plan-submit refuses any number that is not really a done_means
+    line, naming the offending case; a plan with no objective or no done_means lines (objective_problems
+    already refuses that on its own) simply has nothing valid to name, so every number is refused. "proves" may
+    be a single integer (normalized to a one-item list, see _proves_values) or a list; any other shape (a
+    string, a dict, a list containing one) is refused here by name, so plan-summary and receipt never have to
+    guess at it."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    dm = obj.get("done_means") if isinstance(obj, dict) else None
+    n = len(dm) if isinstance(dm, list) else 0
+    errs = []
+    for cp in plan.get("checkpoints") or []:
+        for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
+            proves = case.get("proves")
+            if proves is None:
+                continue
+            if not isinstance(proves, list) and not (isinstance(proves, int) and not isinstance(proves, bool)):
+                errs.append(f"{case.get('id', '?')}: proves {proves!r} must be a done_means line number or a "
+                            f"list of them (objective.done_means has {n} line(s))")
+                continue
+            for p in _proves_values(case):
+                if not isinstance(p, int) or isinstance(p, bool) or p < 1 or p > n:
+                    errs.append(f"{case.get('id', '?')}: proves {p!r} is not a done_means line "
+                                f"(objective.done_means has {n} line(s))")
+    return errs
+
+
 NO_OBJECTIVE_NOTE = "no objective was stated for this run (an older plan, approved before this feature existed)"
 
 
@@ -2686,6 +2730,24 @@ def _review_preview(ctx, cfg, cp) -> tuple[list[str], bool]:
     return names, host_only
 
 
+def _unproven_done_means(ctx, plan) -> list[tuple]:
+    """[(1-based line number, its own text), ...] for every objective.done_means line that no test-plan
+    case's "proves" names, across every checkpoint. Empty when the plan has no objective or no done_means at
+    all (nothing to flag). A heads-up only, never a refusal: plan-submit's proves_problems is the gate that
+    actually blocks a bad number."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    dm = obj.get("done_means") if isinstance(obj, dict) else None
+    if not isinstance(dm, list) or not dm:
+        return []
+    proved = set()
+    for cp in plan.get("checkpoints") or []:
+        for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
+            for p in _proves_values(case):
+                if isinstance(p, int) and not isinstance(p, bool):
+                    proved.add(p)
+    return [(i, t) for i, t in enumerate(dm, 1) if i not in proved]
+
+
 def cmd_plan_summary(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -2704,6 +2766,8 @@ def cmd_plan_summary(args):
         print("Out of scope:")
         for line in obj.get("out_of_scope") or []:
             print(f"  - {line}")
+        for i, text in _unproven_done_means(ctx, plan):
+            print(f"  Heads up: done_means line {i} (\"{text}\") has no test case proving it yet.")
     for line in spec_summary_lines(ctx, plan):
         print(line)
     all_host = True
@@ -3733,7 +3797,7 @@ def cmd_plan_submit(args):
     if plan is None:
         die("checkpoints.json not found in the run folder")
     errs = (validate_plan(plan) + objective_problems(plan) + spec_plan_problems(ctx, plan)
-            + risk_reason_problems(plan.get("checkpoints", [])))
+            + risk_reason_problems(plan.get("checkpoints", [])) + proves_problems(ctx, plan))
     if errs:
         die("Plan invalid:\n  - " + "\n  - ".join(errs))
     st["phase"] = "awaiting_plan_approval"
@@ -7604,6 +7668,67 @@ def _receipt_fixed_later(st) -> list:
     return out
 
 
+def _dm_case_status(ctx, cp_id: str, case: dict, behavior_status: str | None = None) -> str:
+    """One linked test case's own state for the receipt's done-means section. A browser-layer case is never
+    run by `ratchet.py behavior`, so it always reads "checked by the UI gate". Otherwise, this checkpoint's
+    latest per-case test report in evidence (whatever report format is actually on disk, read directly rather
+    than only when the approved plan names one, so a report already written always counts) decides passed vs
+    failed vs error vs skipped. With no report, or no result for this case in it, a supported exit-code-only
+    step (tests.report none or missing) still has a recorded result at the step level: `behavior_status` (the
+    checkpoint's own gates.behavior status, passed by the caller) says so, checked by exit code only rather
+    than per case, so a developer never sees a passing step's linked line read "no result recorded yet". With
+    no per-case report and no recorded behavior-gate status either (never run), that honest "no result
+    recorded yet" still stands. A case can have more than one matching report entry (a parameterized test, or
+    repeated runs); it counts as passed only when every matching entry passed, so one failed, errored or
+    skipped instance among several still shows as failed."""
+    if case.get("layer") == "browser":
+        return "checked by the UI gate"
+    case_id = case.get("id") or ""
+    pat = _case_id_re(case_id) if case_id else None
+    for name in ("test-report.json", "test-report.xml"):
+        p = ctx.evidence(cp_id) / name
+        if p.exists():
+            pairs, why = _read_test_report(ctx, p)
+            if pairs and pat:
+                statuses = [s for n, s in pairs if pat.search(n)]
+                if statuses:
+                    # a case passes only when every matching entry passed; any failed, errored or
+                    # skipped entry means the case shows as failed, however many entries it has
+                    return "passed" if all(s == "passed" for s in statuses) else "failed"
+    if behavior_status == "passed":
+        return "step tests passed, by exit code only (not checked per case)"
+    if behavior_status == "failed":
+        return "step tests failed, by exit code only (not checked per case)"
+    return "no result recorded yet"
+
+
+def _done_means_proof(ctx, plan, cps_map: dict | None = None) -> dict | None:
+    """None when the plan has no objective.done_means at all (an older plan, approved before either existed):
+    the receipt prints NO_OBJECTIVE_NOTE instead of this section. Otherwise {"lines": [{"text", "cases":
+    [{"id", "title", "file", "status"}]}], "any_proves": bool}; "any_proves" is False only when not one case
+    anywhere in the plan names a "proves" line (an old test plan from before that field existed), so the
+    receipt can add one plain note beside every line's own "no test linked" instead of pretending it checked.
+    `cps_map` (the run state's own checkpoint-by-id dict, passed by the caller) feeds each case's checkpoint's
+    recorded behavior-gate status into _dm_case_status, so an exit-code-only step still shows its real result."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    dm = obj.get("done_means") if isinstance(obj, dict) else None
+    if not isinstance(dm, list) or not dm:
+        return None
+    lines = [{"text": t, "cases": []} for t in dm]
+    any_proves = False
+    cps_map = cps_map or {}
+    for cp in plan.get("checkpoints") or []:
+        behavior_status = (((cps_map.get(cp["id"]) or {}).get("gates") or {}).get("behavior") or {}).get("status")
+        for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
+            for p in _proves_values(case):
+                if isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= len(dm):
+                    any_proves = True
+                    lines[p - 1]["cases"].append({"id": case.get("id"), "title": case.get("title", ""),
+                                                  "file": case.get("file", ""),
+                                                  "status": _dm_case_status(ctx, cp["id"], case, behavior_status)})
+    return {"lines": lines, "any_proves": any_proves}
+
+
 def cmd_receipt(args):
     """`ratchet.py receipt` (plain markdown, or `--json`): one honest proof receipt to paste into the pull
     request. Each step's title, short commit and elapsed time, the whole run's own elapsed time (wall-clock,
@@ -7626,11 +7751,12 @@ def cmd_receipt(args):
                       "finished": status == "finished", "status": status, "elapsed_seconds": seconds,
                       "reviewers": _step_reviewer_entries(cfg, cps)})
     accepted, left, fixed = _receipt_accepted(st), _receipt_left_for_later(st), _receipt_fixed_later(st)
+    dm = _done_means_proof(ctx, plan, cps_map)
     if getattr(args, "json", False):
         data = {"run": {"elapsed_seconds": run_seconds, "finished": run_status == "finished"},
                 "steps": [{k: s[k] for k in ("id", "title", "commit", "finished", "elapsed_seconds", "reviewers")}
                          for s in steps],
-                "accepted": accepted, "left_for_later": left, "fixed_later": fixed}
+                "accepted": accepted, "left_for_later": left, "fixed_later": fixed, "done_means": dm}
         print(json.dumps(data, indent=2))
         return
     print(f"# Proof receipt: {plan.get('feature') or st.get('feature') or st.get('slug')}")
@@ -7648,6 +7774,21 @@ def cmd_receipt(args):
     run_dur = _plain_duration(run_seconds)
     run_txt = run_dur if run_status == "finished" else f"run not finished (time so far: {run_dur})"
     print(f"Whole run time: {run_txt}")
+    print("")
+    if dm is None:
+        print(f"Done-means proof: {NO_OBJECTIVE_NOTE}.")
+    else:
+        print("Done-means proof (which tests prove each objective line):")
+        for i, line in enumerate(dm["lines"], 1):
+            print(f"{i}. {line['text']}")
+            if not line["cases"]:
+                print("   - no test linked")
+            else:
+                for c in line["cases"]:
+                    print(f"   - {c['id']} {c['title']} ({c['file']}): {c['status']}")
+        if not dm["any_proves"]:
+            print("Note: this plan's tests were never linked to done_means lines (an older test plan, "
+                  "approved before the \"proves\" field existed).")
     acc_lines = _accepted_findings_lines(st)
     if acc_lines:
         print("")
