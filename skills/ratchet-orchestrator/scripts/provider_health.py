@@ -5,10 +5,12 @@ machine sees the same provider test results and benches. A provider is one entry
 it, keyed by its tool plus its model ('codex', 'opencode:opencode-go/glm-5.3'):
 
     {"<key>": {"ok": true|false, "at": "<time the last test request was SENT>", "detail": "<what came back>",
-               "bench": {"reason": "...", "since": "<time>", "until": "<time>"},
+               "bench": {"reason": "...", "since": "<time>", "until": "<time>", "quota": true},
                "claim": {"by": "<lane's token>", "since": "<time>", "until": "<time>"}}}
 
-`bench` is present only while the provider is being skipped; it ends on its own at `until`. `claim` is present only
+`bench` is present only while the provider is being skipped; it ends on its own at `until`. A bench with `quota` set
+is a provider that said it is out of credits: it waits for the reset time the provider gave (or a short re-test), a
+passing test request does not end it, and a real review that was sent after the bench began and succeeds does. `claim` is present only
 while one lane's test request is on its way: other lanes wait for its result instead of sending their own, and a
 claim whose lane never answered ends on its own at `until`. A result is dated by when its request was sent, and a
 result older than the one already recorded never replaces it, so a slow answer that lands late cannot undo a newer
@@ -21,6 +23,7 @@ lock), so two lanes recording a result at the same moment both end up saved.
 from __future__ import annotations
 
 import datetime as _dt
+import re
 
 FILE = "provider-health.json"
 TEST_KEYS = ("ok", "at", "detail")
@@ -114,12 +117,14 @@ def release(data: dict, key: str, by: str) -> dict:
 
 def record_probe(data: dict, key: str, good: bool, detail: str, sent: _dt.datetime,
                  bench_reason: str | None = None, bench_until: _dt.datetime | None = None,
-                 now: _dt.datetime | None = None, by: str | None = None) -> dict:
+                 now: _dt.datetime | None = None, by: str | None = None, quota: bool = False) -> dict:
     """Record a test request's result, dated `sent` (when the request was sent, not when it came back). A passing
     one ends a bench (a plain failure is cleared by a later pass); a failing one starts a bench to `bench_until`
     when given (`now`, default `sent`, is when it begins). A result sent before the one already recorded is
     dropped (an older pass cannot erase a newer failure, nor an older failure bench over a newer pass). Ends the
-    claim `by` holds, if any. Returns the data."""
+    claim `by` holds, if any. `quota`: the failure is a provider out of credits, so the bench is marked as a quota
+    bench: a passing result does not end a quota bench that is still running, and a later quota failure keeps the
+    later of the two end times. Returns the data."""
     now = now or sent
     prune(data, now)
     e = dict(_entry(data, key))
@@ -134,17 +139,38 @@ def record_probe(data: dict, key: str, good: bool, detail: str, sent: _dt.dateti
             data.pop(key, None)
         return data
     e.update({"ok": bool(good), "at": sent.isoformat(timespec="microseconds"), "detail": detail})
+    held_quota = live_bench(data, key, now) if (_entry(data, key).get("bench") or {}).get("quota") else None
     if good:
-        e.pop("bench", None)
+        if held_quota is None:
+            e.pop("bench", None)
     elif bench_until is not None:
-        e["bench"] = _bench(bench_reason or detail, now, bench_until)
+        if quota and held_quota is not None:
+            bench_until = max(bench_until, _time(held_quota.get("until")) or bench_until)
+        if quota or held_quota is None:
+            e["bench"] = _bench(bench_reason or detail, now, bench_until, quota)
     data[key] = e
     return data
 
 
-def _bench(reason: str, at: _dt.datetime, until: _dt.datetime) -> dict:
-    return {"reason": str(reason)[:300], "since": at.isoformat(timespec="microseconds"),
-            "until": until.isoformat(timespec="microseconds")}
+def _bench(reason: str, at: _dt.datetime, until: _dt.datetime, quota: bool = False) -> dict:
+    b = {"reason": str(reason)[:300], "since": at.isoformat(timespec="microseconds"),
+         "until": until.isoformat(timespec="microseconds")}
+    if quota:
+        b["quota"] = True
+    return b
+
+
+def end_quota_bench(data: dict, key: str, sent: _dt.datetime) -> bool:
+    """A real review by the provider succeeded: end its quota bench (a bench of any other kind stays), but only a
+    bench that began before the review was sent (`sent`): a review already under way when another lane found the
+    provider out of credits proves nothing about the reset. Returns True when a bench was ended."""
+    e = _entry(data, key)
+    b = e.get("bench")
+    began = _time(b.get("since")) if isinstance(b, dict) else None
+    if isinstance(b, dict) and b.get("quota") and began is not None and began < sent:
+        e.pop("bench", None)
+        return True
+    return False
 
 
 def clear(data: dict, key: str) -> dict:
@@ -157,3 +183,64 @@ def clear(data: dict, key: str) -> dict:
         if not e:
             data.pop(key, None)
     return data
+
+
+# ---- recognising a provider that is out of credits, from its own output ----------------------------------------
+
+_QUOTA_RE = re.compile(r"hit your usage limit|usage limit reached|out of credits", re.I)
+_RESET_RE = re.compile(r"(?:it )?will reset in", re.I)  # loose: only trusted on stderr, the CLI's own error channel
+_MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+_DATE_RE = re.compile(r"try again at\s+([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\s+"
+                      r"(\d{1,2})(?::(\d{2}))?\s*([AaPp][Mm])", re.I)
+_CLOCK_RE = re.compile(r"try again at\s+(\d{1,2})(?::(\d{2}))?\s*([AaPp][Mm])", re.I)
+_IN_RE = re.compile(r"(?:try again in|resets? in)\s+([^.\n]{0,60})", re.I)
+_UNIT_RE = re.compile(r"(\d+)\s*(days?|hours?|hrs?|minutes?|mins?|seconds?|secs?)\b", re.I)
+_UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+_TAIL_LINES = 30  # only the end of each output is read: a CLI that echoes the prompt first must not be misread
+
+
+def _hour24(hour: int, ampm: str) -> int:
+    return hour % 12 + (12 if ampm.lower() == "pm" else 0)
+
+
+def quota_failure(texts, now: _dt.datetime, retest_minutes: float = 20):
+    """If a provider's own output (`texts`: its stderr first, then its stdout and reply file, each read from its last
+    lines up) says it is out of credits (the loose "It will reset in" wording counts on stderr only, so a reply that
+    merely quotes it never benches anyone), returns (until, line): `until` is when it said it is back (UTC; "try again at <date or
+    clock time>" read in the local zone, or "in <duration>" / "It will reset in <duration>" counted from `now`), or
+    `retest_minutes` from `now` when it gave no time or one that is already past (a clock time earlier today
+    included). None when the output is not about quota."""
+    for i, text in enumerate(texts if isinstance(texts, (list, tuple)) else [texts]):
+        lines = [x for x in str(text or "").splitlines() if x.strip()][-_TAIL_LINES:]
+        hits = [x for x in lines if _QUOTA_RE.search(x) or (i == 0 and _RESET_RE.search(x))]
+        if not hits:
+            continue
+        tail = "\n".join(lines)
+        reset = _parse_reset(tail, now)
+        if reset is None or reset <= now:
+            reset = now + _dt.timedelta(minutes=float(retest_minutes))
+        return reset, hits[-1].strip()[:200]
+    return None
+
+
+def _parse_reset(text: str, now: _dt.datetime):
+    m = _DATE_RE.search(text)
+    try:
+        if m and m.group(1).lower() in _MONTHS:
+            naive = _dt.datetime(int(m.group(3)), _MONTHS.index(m.group(1).lower()) + 1, int(m.group(2)),
+                                 _hour24(int(m.group(4)), m.group(6)), int(m.group(5) or 0))
+            return naive.astimezone(_dt.timezone.utc)  # a naive time is read in the local zone (TZ)
+        m = _CLOCK_RE.search(text)
+        if m:
+            today = now.astimezone().date()
+            naive = _dt.datetime(today.year, today.month, today.day, _hour24(int(m.group(1)), m.group(3)),
+                                 int(m.group(2) or 0))
+            return naive.astimezone(_dt.timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+    m = _IN_RE.search(text)
+    if m:
+        secs = sum(int(n) * _UNIT_SECONDS[u[0].lower()] for n, u in _UNIT_RE.findall(m.group(1)))
+        if secs > 0:
+            return now + _dt.timedelta(seconds=secs)
+    return None

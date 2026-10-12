@@ -134,6 +134,7 @@ DEFAULT_CONFIG = {
     # opening another round: see "Check-in" in schemas.md section 7.
     "checkin_round": 2,
     "unavailable_ttl_hours": 6,     # an other-provider reviewer that failed (auth, quota, timeout) is skipped this long
+    "quota_retest_minutes": 20,     # a provider out of credits that gave no reset time (or one already past) is tried again after this
     "max_adversarial_rounds": 6,    # per checkpoint; after this the loop blocks and escalates
     "max_adversarial_rounds_run": 30,  # across the whole run (quota guard); then blocks and escalates
     "approver": "human",            # human | director | either  (see director-enroll)
@@ -2990,6 +2991,7 @@ def probe_provider(ctx, cfg, pv, bench=True, note: bool = True, record: bool = T
             part = part.replace(k, v)
         cmd.append(part)
     sent = _dt.datetime.now(_dt.timezone.utc)  # the result is dated by this, not by when the answer came back
+    quota_until = None  # set when the provider said it is out of credits: the time it said it is back
     try:
         r = subprocess.run(cmd, cwd=work, input=prompt if use_stdin else None, capture_output=True, text=True,
                            stdin=None if use_stdin else subprocess.DEVNULL,  # a CLI waiting on stdin must not hang
@@ -2999,6 +3001,10 @@ def probe_provider(ctx, cfg, pv, bench=True, note: bool = True, record: bool = T
         good = PROBE_TOKEN in text.replace("\n", "")
         detail = "answered the test request" if good else (
             f"exit {r.returncode}: " + ((r.stderr or r.stdout or "no output").strip().splitlines() or ["no output"])[-1][:200])
+        if not good:
+            quota = quota_failure([r.stderr, r.stdout, out_file.read_text() if out_file.exists() else ""], cfg, sent)
+            if quota:
+                quota_until, detail = quota[0], f"out of credits: {quota[1]}"
     except subprocess.TimeoutExpired:
         good, detail = False, f"no answer within {cfg.get('probe_timeout_sec', 120)}s"
     except OSError as e:
@@ -3006,16 +3012,17 @@ def probe_provider(ctx, cfg, pv, bench=True, note: bool = True, record: bool = T
     shutil.rmtree(work, ignore_errors=True)
     if not record:
         return good, detail, False
-    busy = _record_probe(ctx, pv, good, detail, bench=bench, note=note, sent=sent, by=by)
+    busy = _record_probe(ctx, pv, good, detail, bench=bench, note=note, sent=sent, by=by, quota_until=quota_until)
     return good, detail, not busy
 
 
 def _record_probe(ctx, pv, good: bool, detail: str, bench: bool = True, note: bool = True, locks=None,
-                  local_copy: bool = False, sent=None, by: str | None = None) -> list:
+                  local_copy: bool = False, sent=None, by: str | None = None, quota_until=None) -> list:
     """Record a probe's result in the shared provider health record (a failing provider is benched for every lane
     when `bench`), then clear this project's reviewer marks for a provider that passed or is not benched. `sent` is
     when the request was sent (default: now): a result older than the one already recorded is dropped. `by` is the
-    claim this lane holds on the provider, ended with the result.
+    claim this lane holds on the provider, ended with the result. `quota_until`: the provider said it is out of
+    credits and is back then: its bench is a quota bench to that time (a passing test request does not end it).
     `local_copy`: a checked `providers --add` also keeps its result in this project's own provider-status.json, as
     it always has (nothing reads that file for a decision any more). Returns the records whose write was busy, in
     the order tried (empty when every write was saved). `locks` maps a record's path to its _RecordLock the caller
@@ -3030,18 +3037,85 @@ def _record_probe(ctx, pv, good: bool, detail: str, bench: bool = True, note: bo
     at = _dt.datetime.now(_dt.timezone.utc)
     sent = sent or at
     benched = not good and bench
-    until = at + _dt.timedelta(hours=float(ctx.config().get("unavailable_ttl_hours", 6))) if benched else None
+    quota = benched and quota_until is not None
+    until = quota_until if quota else (
+        at + _dt.timedelta(hours=float(ctx.config().get("unavailable_ttl_hours", 6))) if benched else None)
     if _update_health(lambda data: phealth.record_probe(data, _health_key(pv), good, detail, sent,
-                                                        f"test request failed: {detail}", until, now=at, by=by),
+                                                        f"test request failed: {detail}", until, now=at, by=by,
+                                                        quota=quota),
                       note=note, lock=locks.get(hp)) == "busy":
         busy.append(hp)
     if not benched:
         def clear(live):
             for lens in LENSES:
-                live.pop(f"{pv['id']}-{lens}", None)
+                k = f"{pv['id']}-{lens}"
+                if not (live.get(k) or {}).get("quota"):  # a quota wait ends at its time or by a real review only
+                    live.pop(k, None)
         if _update_unavailable(ctx, clear, note=note, lock=locks.get(up)) == "busy":
             busy.append(up)
     return busy
+
+
+def quota_failure(texts, cfg, now=None):
+    """(the time the provider is back, the line that said so) when a provider's own output says it is out of credits,
+    else None (provider_health.quota_failure). A reset time it did not give, or one already past, becomes
+    quota_retest_minutes (default 20) from now."""
+    return phealth.quota_failure(texts, now or _dt.datetime.now(_dt.timezone.utc), quota_retest_minutes(cfg))
+
+
+def quota_retest_minutes(cfg) -> float:
+    """The quota_retest_minutes setting: a positive number, else a plain error naming the setting and its value (a
+    zero or negative wait would end a quota bench the moment it begins)."""
+    v = cfg.get("quota_retest_minutes", 20)
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        n = 0.0
+    if isinstance(v, bool) or not 0 < n < float("inf"):
+        die(f"quota_retest_minutes must be a positive number of minutes, but it is {json.dumps(v)}. Set it with "
+            "`ratchet.py config --set quota_retest_minutes=20`.")
+    return n
+
+
+def bench_quota(cfg, rid, reason, until) -> bool:
+    """A review by reviewer `rid` found its provider out of credits: bench the provider for every lane until `until`
+    (a datetime) in the shared record. False when it could not be saved (no provider behind `rid`, or the record's
+    lock was busy), so the caller marks the reviewer in its own project instead."""
+    key = _reviewer_health_key(cfg, rid)
+    if key is None:
+        return False
+    at = _dt.datetime.now(_dt.timezone.utc)
+    return _update_health(lambda data: phealth.record_probe(data, key, False, reason, at, reason, until, now=at,
+                                                            quota=True), note=False) != "busy"
+
+
+def review_succeeded(cfg, rid, sent, ctx=None) -> bool:
+    """A real review by `rid`, sent at `sent` (a datetime), succeeded: its provider is back, so a quota bench that
+    began before the review was sent (kept through passing test requests) ends now; a review already under way when
+    another lane found the provider out of credits does not end that newer bench. With `ctx` (the project), the
+    project's own quota marks (the fallback when the shared record was busy) for the same CLI end the same way; its
+    other marks stay. Reads first, so an ordinary review writes nothing. False when a bench could not be ended (a
+    record's lock was busy): it then ends at its own time."""
+    done = True
+    binary = reviewer_binary(cfg, rid)
+    if ctx is not None and binary:
+        def began_before(m):
+            t = phealth._time(m.get("since"))
+            return t is not None and t < sent
+
+        def clear(live):
+            for r in [r for r, m in live.items() if m.get("quota") and reviewer_binary(cfg, r) == binary
+                      and began_before(m)]:
+                live.pop(r)
+        if any(m.get("quota") and reviewer_binary(cfg, r) == binary and began_before(m)
+               for r, m in unavailable_reviewers(ctx).items()):
+            done = _update_unavailable(ctx, clear, note=False) != "busy"
+    key = _reviewer_health_key(cfg, rid)
+    entry = provider_health().get(key) if key else None
+    b = entry.get("bench") if isinstance(entry, dict) else None
+    if isinstance(b, dict) and b.get("quota"):
+        done = (_update_health(lambda data: phealth.end_quota_bench(data, key, sent), note=False) != "busy") and done
+    return done
 
 
 def probe_due(ctx, cfg, pid) -> bool:
@@ -4090,14 +4164,17 @@ def _update_unavailable(ctx, change, note: bool = True, lock=None) -> str:
     return res
 
 
-def mark_unavailable(ctx, rid, reason, hours=None, note: bool = True, lock=None):
+def mark_unavailable(ctx, rid, reason, hours=None, note: bool = True, lock=None, quota: bool = False):
     """Marks `rid` unavailable until `hours` from now (returns that time), unless unavailable-reviewers.json's lock
     is busy, when nothing is saved and this returns None (reviewer_status's --mark checks for that and dies, with
-    note=False so _update_unavailable's own stderr note does not also print). `lock`: as _update_unavailable."""
+    note=False so _update_unavailable's own stderr note does not also print). `lock`: as _update_unavailable.
+    `quota`: the mark is a wait for a provider out of credits (a passing test request does not clear it)."""
     hours = hours if hours is not None else float(ctx.config().get("unavailable_ttl_hours", 6))
     until = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=hours)).isoformat(timespec="microseconds")
-    res = _update_unavailable(ctx, lambda live: live.__setitem__(rid, {"reason": reason[:300], "since": now(),
-                                                                       "until": until}), note=note, lock=lock)
+    mark = {"reason": reason[:300], "since": now(), "until": until}
+    if quota:
+        mark["quota"] = True
+    res = _update_unavailable(ctx, lambda live: live.__setitem__(rid, mark), note=note, lock=lock)
     return None if res == "busy" else until
 
 
@@ -10089,6 +10166,8 @@ def cmd_config(args):
                 val = json.loads(v)
             except json.JSONDecodeError:
                 val = v
+            if k == "quota_retest_minutes":
+                quota_retest_minutes({k: val})
             cur = user
             parts = k.split(".")
             for p in parts[:-1]:

@@ -25,7 +25,8 @@ plus the model it runs and, when the model doesn't say it, the company). Each pr
 `ratchet.py providers --discover` finds installed agent CLIs, sends each a test request and adds what works.
 
 If the CLI is missing, or it fails (auth, quota, timeout, no parseable answer), this script marks the
-reviewer unavailable for `unavailable_ttl_hours` and exits with code 3; `ratchet.py reviewers CPn`
+reviewer unavailable for `unavailable_ttl_hours` and exits with code 3 (a provider that says it is out of credits
+is instead benched for every lane until the reset time it gave, or `quota_retest_minutes` when it gave none); `ratchet.py reviewers CPn`
 then gives that slot to the next alternative, ending with the host's own sub-agent reviewer.
 
 Placeholders in "command": {prompt_file} {prompt} {out_file} {root} {model}. With "stdin": true the prompt
@@ -406,12 +407,24 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
         for k, v in subs.items():
             part = part.replace(k, v)
         cmd.append(part)
-    def unavailable(reason):
+    def unavailable(reason, quota=None):
         # A quota/auth/outage failure takes down every reviewer that uses the same CLI.
         binary = eng.reviewer_binary(cfg, a.reviewer)
         same = [r for r in eng.roster(cfg) if eng.reviewer_binary(cfg, r) == binary] or [a.reviewer]
+        hours = None
+        if quota:  # out of credits: every lane skips this provider until it said it is back (or a short re-test)
+            reason = f"out of credits: {quota[1]}"
+            if eng.bench_quota(cfg, a.reviewer, reason, quota[0]):
+                print(f"{a.reviewer} UNAVAILABLE: {reason}\n"
+                      f"Out of credits: benched for every lane until {quota[0].strftime('%Y-%m-%dT%H:%M')}Z. Run "
+                      f"`ratchet.py reviewers {a.cp}`: its slot now goes to the next provider, or to the host's own "
+                      "sub-agents.", file=sys.stderr)
+                sys.exit(3)
+            now_ = eng._dt.datetime.now(eng._dt.timezone.utc)  # the shared record could not be saved: mark this project
+            hours = max((quota[0] - now_).total_seconds(), 60) / 3600
         for r in same:
-            until = eng.mark_unavailable(ctx, r, reason if r == a.reviewer else f"{binary} failed: {reason}")
+            until = eng.mark_unavailable(ctx, r, reason if r == a.reviewer else f"{binary} failed: {reason}",
+                                         hours=hours, quota=bool(quota))
         print(f"{a.reviewer} UNAVAILABLE: {reason}\n"
               f"Marked unavailable until {(until or 'later')[:16]}Z. Run `ratchet.py reviewers {a.cp}`: its slot now "
               "goes to the next provider, or to the host's own sub-agents.", file=sys.stderr)
@@ -425,8 +438,11 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
                     "or stdin to review changes this large")
     shown = " ".join(c if len(c) < 80 else c[:40] + "…" for c in cmd)
 
+    sent_at = []  # when each run of the CLI was started: a success only ends a quota bench that began before it
+
     def run_once():
         print(f"running {a.reviewer}: {shown}", file=sys.stderr)
+        sent_at.append(eng._dt.datetime.now(eng._dt.timezone.utc))
         try:
             # run from an empty folder, flagged as nested: the reviewer needs nothing but the prompt, can't touch
             # the project, and its CLI's own hooks must not log this prompt as if the user had typed it
@@ -471,11 +487,13 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
             # another truncation. This goes through the normal unavailable() path, same as any other real failure.
             (out.parent / f"{a.reviewer}.raw.txt").write_text(text2 + "\n--- stderr ---\n" + (r2.stderr or ""))
             tail = ((r2.stderr or "") + (r2.stdout or "")).strip().splitlines()[-1:] or [""]
-            unavailable(f"exit {r2.returncode}, no findings JSON ({tail[0][:160]})")
+            unavailable(f"exit {r2.returncode}, no findings JSON ({tail[0][:160]})",
+                        quota=eng.quota_failure([r2.stderr, text2], cfg))
     if review is None:
         (out.parent / f"{a.reviewer}.raw.txt").write_text(text + "\n--- stderr ---\n" + (r.stderr or ""))
         tail = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()[-1:] or [""]
-        unavailable(f"exit {r.returncode}, no findings JSON ({tail[0][:160]})")
+        unavailable(f"exit {r.returncode}, no findings JSON ({tail[0][:160]})",
+                    quota=eng.quota_failure([r.stderr, text], cfg))
     review = eng.clean_review_text(review)  # a cut-off emoji escape in the reply must not break signing or records
     # Stamp identity ourselves — never trust the model to echo these correctly.
     base = cps.get("base_tree")
@@ -498,6 +516,7 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
         os.replace(tmp, out)
     finally:
         tmp.unlink(missing_ok=True)
+    eng.review_succeeded(cfg, a.reviewer, sent_at[-1], ctx)  # a provider that answers is back: a quota bench ends early
     print(f"{a.reviewer}: {review['verdict']} ({len(review['findings'])} findings) → {out}")
 
 
