@@ -436,6 +436,7 @@ python3 tests/test_plan_change.py
 python3 tests/test_providers.py
 python3 tests/test_quick_path.py
 python3 tests/test_quick_path_docs.py
+python3 tests/test_quick_path_docs_step.py
 python3 tests/test_quick_path_small.py
 python3 tests/test_results.py
 python3 tests/test_review_objective.py

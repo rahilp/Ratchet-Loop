@@ -488,7 +488,7 @@ def _mutating_doc_test_command(target="src/a.js"):
     return f"{shlex.quote(sys.executable)} {shlex.quote(str(_MUTATE_SCRIPT))} {shlex.quote(target)} {{files}}"
 
 
-def _two_checkpoint_project(name, doc_cmd, regression_cmd):
+def _two_checkpoint_project(name, doc_cmd, regression_cmd, cp2_risk="low"):
     """The same two-checkpoint fixture as CP2-T08 (a CP2 test file that already exists before CP1 even starts,
     trivially true, so CP2's adversarial approval lands on the exact tree the regression command already
     passed on when CP1 completed), parameterised on `doc_test_command` and `regression_command` so the
@@ -518,9 +518,11 @@ def _two_checkpoint_project(name, doc_cmd, regression_cmd):
            "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",
            "tests": {"files": ["tests/cp1.test.js"], "command": "node --test tests/cp1.test.js"}}
     cp2 = {"id": "CP2", "title": "Step 2", "summary": "s", "done_when": ["works"],
-           "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",
+           "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": cp2_risk,
            "green_first_ok": True,
            "tests": {"files": ["tests/cp2.test.js"], "command": "node --test tests/cp2.test.js"}}
+    if cp2_risk == "high":
+        cp2["risk_reason"] = "forces a normal adversarial review round for this fixture's doc-only step"
     plan = {"feature": "x", "objective": _tmp.OBJECTIVE_MIN, "checkpoints": [cp1, cp2]}
     (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
     (run / "tests" / "CP2.json").write_text(json.dumps({"cases": [{"id": "CP2-T01", "layer": "code"}]}))
@@ -539,7 +541,7 @@ def x01_doc_edit_reviewed_in_its_own_round_is_not_labelled_unreviewed():
     message and `status` must not claim it was edited after review and not re-reviewed."""
     log = _new_log()
     regression_cmd, counter = _counting_regression_command()
-    d = _two_checkpoint_project("cp2-x01", _doc_test_command(log), regression_cmd)
+    d = _two_checkpoint_project("cp2-x01", _doc_test_command(log), regression_cmd, cp2_risk="high")
     _approve_cp1(d, "CP1")
     r = g.rx(d, "complete", "CP1")
     assert r.returncode == 0, _out(r)
@@ -555,9 +557,9 @@ def x01_doc_edit_reviewed_in_its_own_round_is_not_labelled_unreviewed():
     r = g.rx(d, "behavior", "CP2")
     assert r.returncode == 0, _out(r)
     rnd = g.open_round(d, "CP2")
-    rid = g.R0(rnd)
-    path = g.write_review(d, rnd, rid, findings=[])
-    r = g.rx(d, "adv-record", "CP2", "--reviews", path)
+    # high risk needs an approving review from every reviewer the round lists, not just one.
+    paths = [g.write_review(d, rnd, rv["id"], []) for rv in rnd["reviewers"]]
+    r = g.rx(d, "adv-record", "CP2", "--reviews", *paths)
     assert r.returncode == 0, _out(r)
     # no edit at all after CP2's own adversarial approval
     r = g.rx(d, "complete", "CP2")
@@ -598,7 +600,7 @@ def x03_doc_test_command_that_mutates_a_tracked_file_refuses_completion_suite_sk
     `_skip_full_suite`'s own doc-test run, replacing the full suite, mutates a tracked file. `complete` must
     still refuse."""
     regression_cmd, counter = _counting_regression_command()
-    d = _two_checkpoint_project("cp2-x03", _mutating_doc_test_command(), regression_cmd)
+    d = _two_checkpoint_project("cp2-x03", _mutating_doc_test_command(), regression_cmd, cp2_risk="high")
     _approve_cp1(d, "CP1")
     r = g.rx(d, "complete", "CP1")
     assert r.returncode == 0, _out(r)
@@ -614,9 +616,9 @@ def x03_doc_test_command_that_mutates_a_tracked_file_refuses_completion_suite_sk
     r = g.rx(d, "behavior", "CP2")
     assert r.returncode == 0, _out(r)
     rnd = g.open_round(d, "CP2")
-    rid = g.R0(rnd)
-    path = g.write_review(d, rnd, rid, findings=[])
-    r = g.rx(d, "adv-record", "CP2", "--reviews", path)
+    # high risk needs an approving review from every reviewer the round lists, not just one.
+    paths = [g.write_review(d, rnd, rv["id"], []) for rv in rnd["reviewers"]]
+    r = g.rx(d, "adv-record", "CP2", "--reviews", *paths)
     assert r.returncode == 0, _out(r)
     head_before = _head(d)
     # no edit at all after CP2's own adversarial approval: the post-approval doc-edit route finds nothing, only

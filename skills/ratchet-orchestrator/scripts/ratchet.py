@@ -769,6 +769,99 @@ def _small_fix_review_lines(st: dict) -> list[str]:
     return lines
 
 
+# --------------------------------------------------------------------------- docs-only step skips review (CP4)
+# When a checkpoint's own change since its base_tree (never the plan's claim -- the same real diff
+# `classify_changes` reports) is docs only, the step is not high risk, and doc_test_command is configured,
+# opening the checkpoint's adversarial review never opens a reviewer round: it runs the test files naming
+# those doc(s) instead (a failure names the test file and leaves the gate's status untouched) and, on success,
+# marks the adversarial gate passed directly, recording the skip (`docs_only_review_skip`) so the commit
+# message, `status` and the final review can all say which files were never reviewed and why. Reuses CP1's
+# `_classify_doc_code`/`_tests_naming` and CP2's `_run_doc_test_command` so the doc/code rule and the
+# doc-test-running logic never duplicate.
+
+def _docs_only_review_skip(ctx: "Ctx", st: dict, cfg: dict, cp: dict, cps: dict, cp_id: str,
+                           json_out: bool = False) -> bool:
+    """True once this call has handled the adversarial gate for a docs-only step (the caller returns without
+    opening a round); False when the normal full round still applies (code changed, high risk, a pinned
+    reviewer list, or the docs quick path is off)."""
+    if cp.get("risk", "normal") == "high" or not cfg.get("doc_test_command"):
+        return False
+    if cp.get("reviewers"):
+        return False  # the checkpoint pins its own reviewer list; that override always gets a normal full
+        # round, same as _is_small_fix_round
+    base = cps.get("base_tree")
+    if not base:
+        return False
+    fp = fingerprint(ctx.root)
+    files = sorted(changed_files(ctx.root, {"kind": "git-tree", "id": base}, fp))
+    if not files:
+        return False
+    doc_files, code_files = _classify_doc_code(cfg, files)
+    if code_files or not doc_files:
+        return False
+    doc_test_files = _tests_naming(ctx, cfg, fp, doc_files)
+    if doc_test_files:
+        dcode, dout = _run_doc_test_command(ctx, cfg, doc_test_files, ctx.evidence(cp_id) / "docs-only-review.log")
+        if dcode != 0:
+            die(f"{cp_id}: docs-only review check failed for {', '.join(doc_test_files)}:\n{_tail(dout)}", 2)
+        if fingerprint(ctx.root)["id"] != fp["id"]:
+            die("The doc test command changed files in the project. Those changes were never reviewed — find "
+                "out what wrote them (generated files? snapshots?) and either add them to .gitignore or "
+                "re-run the gates.", 2)
+    cps["gates"]["adversarial"].update(status="passed", fingerprint=fp, passed_at=now())
+    cps["docs_only_review_skip"] = {"files": doc_files, "doc_test_files": doc_test_files}
+    cps["step"] = _earliest_open_step(cps)
+    ctx.log(st, "adversarial_docs_only_skip", cp=cp_id, files=",".join(doc_files))
+    ctx.save_state(st)
+    build_viewer(ctx)
+    if json_out:
+        print(json.dumps({"checkpoint": cp_id, "docs_only_skip": {"files": doc_files,
+                                                                    "doc_test_files": doc_test_files}}, indent=2))
+    else:
+        print(f"{cp_id}: review skipped -- this step's change is docs only ({', '.join(doc_files)}); not reviewed. "
+              f"Doc test(s) run instead: {', '.join(doc_test_files) or '(no test file names these docs)'}")
+    return True
+
+
+def _docs_only_quick_path_off_note(ctx: "Ctx", cfg: dict, cp: dict, cps: dict) -> str | None:
+    """A plain note for `reviewers`' text output when this checkpoint's diff since base_tree is docs only but
+    doc_test_command is not configured, so the docs quick path is off and the normal full round still applies
+    -- visibility for why no skip happened, mirroring `changes`'s own doc_quick_path report."""
+    if cfg.get("doc_test_command") or cp.get("risk", "normal") == "high":
+        return None
+    base = cps.get("base_tree")
+    if not base:
+        return None
+    fp = fingerprint(ctx.root)
+    files = sorted(changed_files(ctx.root, {"kind": "git-tree", "id": base}, fp))
+    if not files:
+        return None
+    doc_files, code_files = _classify_doc_code(cfg, files)
+    if code_files or not doc_files:
+        return None
+    return (f"Docs quick path is off (doc_test_command is not configured): the changed file(s) "
+            f"({', '.join(doc_files)}) would otherwise skip review, so this round is the normal full review.")
+
+
+def _docs_only_skip_line(cid: str, cps: dict) -> str | None:
+    skip = cps.get("docs_only_review_skip")
+    if not skip:
+        return None
+    return (f"{cid}: review skipped because the step changed only docs ({', '.join(skip.get('files') or [])}); "
+            "not reviewed.")
+
+
+def _docs_only_skip_lines(st: dict) -> list[str]:
+    """One plain line per checkpoint whose adversarial review was skipped as docs only (CP4), naming the
+    file(s) never reviewed, for `status`, the commit message and the final review to all say the same thing."""
+    lines = []
+    for cid, c in (st.get("checkpoints") or {}).items():
+        line = _docs_only_skip_line(cid, c)
+        if line:
+            lines.append(line)
+    return lines
+
+
 # --------------------------------------------------------------------------- tamper evidence
 # ratchet.py records a hash of every file it owns after each write, in RATCHET_HOME (outside the repo and off-limits
 # to agents). A write by any other route — a helper script, an editor, a "quick fix" — is detected on the next read.
@@ -2897,6 +2990,8 @@ def cmd_status_text(ctx: Ctx):
         print(line)
     for line in _small_fix_review_lines(st):
         print(line)
+    for line in _docs_only_skip_lines(st):
+        print(line)
     w = live_wait(st)
     if w:
         print(f"Waiting on: {w['reason']} (until {w['until'][:16].replace('T', ' ')} UTC).")
@@ -3025,6 +3120,15 @@ def cmd_plan_summary(args):
           f"and kind of review count once, not twice; a round nobody reviewed yet costs nothing to replace; and "
           f"from round {converge_after + 1} on, a minor finding alone no longer blocks (it is still recorded, see "
           f"`ratchet.py deferred`).")
+    print(f"\nQuick paths: a step whose actual changes are docs only skips its review round entirely "
+          f"(the test files naming those docs run instead); once a step's review has approved, a doc edit "
+          f"made after that approval re-runs the test files naming that doc instead of opening a new review "
+          f"round; a small code fix (at or under {cfg.get('small_edit_lines', 20)} changed lines) in a step "
+          f"that is not high risk gets a one-reviewer check instead of the full round. A high-risk step, or "
+          f"any change that also touches code, always gets the normal full review and tests.")
+    if not cfg.get("doc_test_command"):
+        print("Note: doc_test_command is not configured, so the docs quick path is off right now: every step, "
+              "docs-only ones included, gets the normal full review and tests.")
     rows = dict(models_table(cfg))
     groups = {}
     for role, m in rows.items():
@@ -7741,6 +7845,9 @@ def cmd_complete(args):
         small_fix_line = _small_fix_review_line(args.cp, cps)
         if small_fix_line:
             msg += "\n" + small_fix_line
+        docs_only_skip_line = _docs_only_skip_line(args.cp, cps)
+        if docs_only_skip_line:
+            msg += "\n" + docs_only_skip_line
         commit = _commit_reviewed(ctx.root, cps.get("base_tree"), fp, msg, extra=spec_files)
         if not commit:  # nothing new to commit: a run of complete that failed after its commit left it at HEAD
             commit = _head_commit_named(ctx.root, msg)
@@ -9108,6 +9215,8 @@ def cmd_reviewers(args):
     obj_oneline = re.sub(r"\s*\n\s*", " ", objective_brief(plan))
     fp = fingerprint(ctx.root)["id"]
     g = cps["gates"]["adversarial"]
+    if g["status"] != "passed" and _docs_only_review_skip(ctx, st, cfg, cp, cps, args.cp, json_out=args.json):
+        return
     rnd = cps.get("adv_round")
     if not rnd or rnd.get("recorded") or rnd["fingerprint"] != fp:
         ci = _checkin_state(cps)
@@ -9286,6 +9395,9 @@ def cmd_reviewers(args):
     if res["small_fix"]:
         print(f"Small fix since approval (at or under {cfg.get('small_edit_lines', 20)} changed code lines): "
               "one reviewer, scoped to the files changed since approval.")
+    off_note = _docs_only_quick_path_off_note(ctx, cfg, cp, cps)
+    if off_note:
+        print(off_note)
     if isinstance(obj, dict) and obj:
         print(f"Who it's for: {obj.get('users', '')}")
         print(f"What they want: {obj.get('goal', '')}")
@@ -9356,6 +9468,7 @@ def status_json(ctx: Ctx) -> dict:
             "viewer_url": viewer_link(ctx)["url"], "viewer_live": viewer_link(ctx)["live"],
             "done": sum(1 for c in cps if c["status"] == "done"), "total": len(cps),
             "small_fix_reviews": _small_fix_review_lines(st),
+            "docs_only_review_skips": _docs_only_skip_lines(st),
             "checkpoints": cps, "updated_at": st.get("updated_at")}
 
 
