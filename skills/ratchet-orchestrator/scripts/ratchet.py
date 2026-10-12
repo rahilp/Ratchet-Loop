@@ -36,6 +36,7 @@ import os
 import re
 import unicodedata
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -629,8 +630,12 @@ class _BreakerLock:
 
     def _is_stale(self, st) -> bool:
         """Whether a lock file with this lstat() result was left by a command that stopped: a regular file older
-        than _stale_after() seconds."""
-        return stat.S_ISREG(st.st_mode) and time.time() - st.st_mtime > self._stale_after()
+        than _stale_after() seconds, or one whose owner is provably gone (_owner_gone)."""
+        return stat.S_ISREG(st.st_mode) and (time.time() - st.st_mtime > self._stale_after() or self._owner_gone())
+
+    def _owner_gone(self) -> bool:
+        """Whether the process that made the lock file is provably gone. False unless a subclass can tell."""
+        return False
 
     def _take_breaker(self, wait: float) -> bool:
         """True once this process holds the breaker file; False when another process holds it for longer than
@@ -11645,29 +11650,103 @@ def _lock_pause():
     time.sleep(0.05)
 
 
+def _lock_host() -> str:
+    """This machine's name as written into a state lock ('' when it has none or has a space in it: such a lock is
+    written without it and keeps the timed rule)."""
+    try:
+        host = socket.gethostname()
+    except OSError:
+        return ""
+    return "" if not host or re.search(r"\s", host) else host
+
+
+def _lock_where() -> tuple[str, str]:
+    """(pid namespace, boot id) of this process as written into a state lock: 'pid:[4026531836]' from
+    /proc/self/ns/pid and the contents of /proc/sys/kernel/random/boot_id. A process id means something only inside
+    one pid namespace on one boot (an agent's sandbox on Linux has its own namespace but the same machine name), so
+    a part that can't be read comes back '' and the lock is written without it (it keeps the timed rule)."""
+    if not sys.platform.startswith("linux"):
+        return "", ""
+    try:
+        ns = os.readlink("/proc/self/ns/pid")
+    except OSError:
+        ns = ""
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    except (OSError, ValueError):
+        boot = ""
+    return ("" if re.search(r"\s", ns) else ns), ("" if re.search(r"\s", boot) else boot)
+
+
+def _lock_fields(parts: list[str]) -> tuple[str, str, str, list[str]]:
+    """Split lock text words `<pid> <token> [@host] [pidns=..] [boot=..] <command...>` into (host, pid namespace,
+    boot id, the command's words); a missing field is ''."""
+    host = ns = boot = ""
+    rest = parts[2:]
+    if rest and rest[0].startswith("@"):
+        host, rest = rest[0][1:], rest[1:]
+        if rest and rest[0].startswith("pidns="):
+            ns, rest = rest[0][6:], rest[1:]
+        if rest and rest[0].startswith("boot="):
+            boot, rest = rest[0][5:], rest[1:]
+    return host, ns, boot, rest
+
+
+def _pid_is_ratchet(pid: int) -> bool | None:
+    """Whether process `pid` on this machine is a live ratchet.py command: False when it is gone (or a zombie) or is a
+    non-python program that was handed the same id; None when that can't be told (not Linux, /proc can't be read or is
+    another namespace's, an empty command line, or any python process that is not running ratchet.py: python -c,
+    python -m, a copy of the script under another name)."""
+    if pid == os.getpid():
+        return True
+    try:
+        # a mounted /proc that is another pid namespace's (a bound host /proc) says nothing about our process ids
+        if not sys.platform.startswith("linux") or int(os.readlink("/proc/self")) != os.getpid():
+            return None
+    except (OSError, ValueError):
+        return None
+    try:
+        argv = [a for a in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if a]
+        if not argv:  # a zombie is gone; a process that is not yet or no longer showing its arguments is not judged
+            return False if Path(f"/proc/{pid}/stat").read_bytes().rpartition(b")")[2].split()[:1] == [b"Z"] else None
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except OSError:
+        return None
+    if any(os.path.basename(a) == b"ratchet.py" for a in argv):
+        return True
+    return None if re.match(rb"python[0-9.]*(\.exe)?$", os.path.basename(argv[0])) else False
+
+
 class _StateLock(_BreakerLock):
     """O_CREAT|O_EXCL lock file, state.lock in the Ratchet folder (works the same on POSIX and Windows), around one
-    command. It holds the process id, a random token and the command's name. Every failure to take it (another
-    command holds it, the folder can't be written, something other than a lock file sits at that path) is retried
-    after a pause until the wait runs out, then refused with a plain message; behind a long command the wait is cut
-    short. The breaker protocol is _BreakerLock's, shared with the per-user locks: the lock file is only ever removed
+    command. Every failure to take it (another command holds it, the folder can't be written, something other than a
+    lock file sits at that path) is retried after a pause until the wait runs out, then refused with a plain message;
+    behind a long command the wait is cut short. The breaker protocol is _BreakerLock's, shared with the per-user locks: the lock file is only ever removed
     (a stale one, or an owner releasing its own) while holding a second O_EXCL file, state.lock.break, so the file
     judged stale is the file removed: two waiters can't both clear it, and none can remove a newer, live lock; a
     breaker file left by a process that died is cleared after BREAKER_STALE seconds. With `refresh`, the holder
     touches its lock while it runs, so a long, live command is never judged stale. With `create_dir` (init: the
     first command of a project), the Ratchet folder is made first, so two first inits are serialised like every
-    other command instead of both running unlocked."""
+    other command instead of both running unlocked. The lock text is `<pid> <token> @<machine> pidns=<pid namespace>
+    boot=<boot id> <command>`; on Linux, a lock whose machine, boot and pid namespace are this process's and whose
+    process is gone (or is some other non-python program) is stale at once, not after the timed limit. An older lock
+    text, one from another machine, another system than Linux, or a process that can't be told keeps the timed rule."""
 
     def __init__(self, root: Path, wait: float | None = None, cmd: str | None = None, refresh: bool = False,
                  create_dir: bool = False):
+        host = _lock_host()  # "@<this machine's name>": what lets a later command judge whether this process is gone
+        ns, boot = _lock_where() if host else ("", "")  # ... but only in the same pid namespace on the same boot
         super().__init__(root / RATCHET_DIR / "state.lock",
-                         f"{os.getpid()} {secrets.token_hex(8)}" + (f" {cmd}" if cmd else ""))
+                         f"{os.getpid()} {secrets.token_hex(8)}" + (f" @{host}" if host else "")
+                         + (f" pidns={ns}" if ns else "") + (f" boot={boot}" if boot else "") + (f" {cmd}" if cmd else ""))
         self.root = root
         self.create_dir = create_dir
         self.wait = wait
         self.refresh = refresh
         self._beat = None
         self.holder = None  # the command holding the lock at the last try (None: not known)
+        self._cleared = False  # the last try cleared a leftover lock, so the next try need not wait
 
     def _stale_after(self) -> float:
         return _lock_stale_seconds(self.root)
@@ -11687,7 +11766,28 @@ class _StateLock(_BreakerLock):
             parts = self.path.read_text(encoding="utf-8", errors="replace").split()
         except OSError:
             return None
-        return " ".join(parts[2:]) if len(parts) > 2 else None
+        rest = _lock_fields(parts)[3]  # the machine's name, pid namespace and boot id are not part of the command
+        return " ".join(rest) if rest else None
+
+    def _owner_alive(self) -> bool | None:
+        """Whether the process named in the lock text is a live ratchet.py command: False when the text says this
+        machine and that process is provably gone, True when it is live, None when that can't be told (older text,
+        another machine, not Linux, unreadable): the timed rule."""
+        try:
+            parts = self.path.read_text(encoding="utf-8", errors="replace").split()
+        except OSError:
+            return None
+        host = _lock_host()
+        ns, boot = _lock_where()
+        lhost, lns, lboot, _rest = _lock_fields(parts)
+        # the id means something only on the same machine, same boot and same pid namespace; any other or missing: unknown
+        if (len(parts) < 3 or not host or lhost != host or not ns or lns != ns or not boot or lboot != boot
+                or not parts[0].isdigit() or int(parts[0]) <= 0):
+            return None
+        return _pid_is_ratchet(int(parts[0]))
+
+    def _owner_gone(self) -> bool:
+        return self._owner_alive() is False
 
     def live_holder(self) -> str | None:
         """Who holds a live (not stale) lock right now, without waiting or changing anything; None when no command
@@ -11705,9 +11805,10 @@ class _StateLock(_BreakerLock):
         self.holder = self._holder_cmd()
         stale_after = _lock_stale_seconds(self.root)
         busy = (f"Ratchet is busy running {self.holder or 'another command'}; try again when it finishes. Nothing was "
-                f"done: another Ratchet command is still changing this run (lock file {self.path}). If no Ratchet "
-                f"command is running, the lock clears itself {int(stale_after // 60)} minutes after its command last "
-                f"refreshed it, or remove {self.path}.")
+                f"done: another Ratchet command is still changing this run (lock file {self.path}).")
+        if self._owner_alive() is not True:  # its owner can't be checked: say how an old lock goes away
+            busy += (f" If no Ratchet command is running, the lock clears itself {int(stale_after // 60)} minutes "
+                     f"after its command last refreshed it, or remove {self.path}.")
         try:
             st = os.lstat(self.path)
         except FileNotFoundError:
@@ -11720,7 +11821,9 @@ class _StateLock(_BreakerLock):
         if not self._is_stale(st):
             return busy
         try:  # judged again while holding the breaker file: nobody else can remove it meanwhile
-            self._clear_stale()
+            if self._clear_stale():
+                self._cleared = True  # gone now: the caller takes the lock at once
+                return busy
         except OSError as e:
             return self._cant(e)
         return (f"A lock file left by a Ratchet command that stopped ({self.path}) could not be cleared, so nothing "
@@ -11746,7 +11849,10 @@ class _StateLock(_BreakerLock):
                 self._start_refresh()
                 return None
             except FileExistsError:
+                self._cleared = False
                 why = self._why_busy()
+                if self._cleared:
+                    continue  # a leftover lock was just removed: take it now, whatever the wait
                 if self.holder in LONG_LOCKED_CMDS:  # it may run for many minutes: refuse rather than wait it out
                     deadline = min(deadline, start + STATE_LOCK_BUSY_WAIT_SECONDS)
             except OSError as e:
