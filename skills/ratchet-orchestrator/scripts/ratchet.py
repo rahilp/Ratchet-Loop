@@ -2610,6 +2610,87 @@ def exit_code_only_note(plan, st):
                                      if c.get("id") == st.get("current")), None))
 
 
+QUESTION_WORDS = {"approve-plan": "the plan", "human-approve": "an approval", "approve-changes": "changes to the approved plan files",
+                  "cancel": "cancelling the run", "set-review": "how often to review", "claim": "continuing the run in this chat",
+                  "hooks-waive": "building without the hooks", "ui-respec": "a change to the UI check",
+                  "choice": "a choice between options", "accept-finding": "accepting a review finding as a known limit",
+                  "raise-limit": "raising the review limit by one round"}
+
+
+GATING_QUESTIONS = ("approve-plan", "human-approve", "choice")  # while the run is at a pause or blocked
+ALWAYS_GATING_QUESTIONS = ("accept-finding", "raise-limit")  # a step whose review round blocked waits on them
+GATING_PHASES = ("awaiting_plan_approval", "awaiting_checkpoint_review", "awaiting_final_review", "blocked",
+                 "paused")
+CARRY_ON_QUESTIONS = ("cancel", "set-review", "claim", "hooks-waive", "ui-respec", "choice")
+
+
+def _question_waiter(ctx: Ctx, claim=False) -> str:
+    """Who a waiting question is put to: 'director' in a director-enrolled lane, else 'user'. Read-only: unlike
+    approval_mode it never exits and never writes a note, so a damaged enrollment file cannot break `status`; any
+    problem reading it counts as enrolled ('director'). A claim has no director action (a director cannot sign
+    it), so it is always put to the 'user'."""
+    if claim:
+        return "user"
+    try:
+        enr, why = _read_record(ctx.ratchet / "director.json", missing=None)
+        if why is not None or enr:
+            return "director"
+        data, why = _read_record(_enrolled_path())
+        if why is not None or data.get(str(ctx.root.resolve())):
+            return "director"
+        return "director" if ctx.config().get("approver", "human") == "director" else "user"
+    except Exception:
+        return "director"
+
+
+def _question_answered(ctx: Ctx, st, p) -> bool:
+    """The user has already replied in the question's own chat (the same recorded replies `ask` counts), so it is no
+    longer waiting for an answer, whether or not the agent has acted on the reply yet. Read-only: a human log that
+    can't be read or vouched for holds no reply."""
+    try:
+        return bool(_replies(ctx, st, p.get("asked_at"), p))
+    except (Exception, SystemExit):
+        return False
+
+
+def waiting_question(ctx: Ctx, st):
+    """The question that has been asked (`ratchet.py ask ...`) and not yet answered or withdrawn, or None. Read-only.
+    A question asked in an earlier phase no longer applies (as in `_asked_reply`), so it is None. In a user lane a
+    question the user has replied to is answered, so it is dropped even before the agent runs the command that
+    clears `pending`; in a director lane a chat reply answers nothing, so the question shows until `pending`
+    clears. `stops_run` says whether the run really waits for it: only the approval pauses, a blocked run's
+    questions and the accept-a-finding / raise-the-limit questions of a blocked review round do (True); the others
+    (a review-frequency or cancel question, a building-phase choice...) leave a building run building (False);
+    approve-changes and the like, and the carry-on kinds outside the building phase, are left unsaid (None)."""
+    p = st.get("pending")
+    if not isinstance(p, dict) or not p.get("action") or not p.get("asked_at"):
+        return None
+    if p.get("phase") and p["phase"] != st.get("phase"):
+        return None
+    waiting_on = _question_waiter(ctx, p["action"] == "claim")
+    if waiting_on == "user" and _question_answered(ctx, st, p):
+        return None
+    about = p.get("mode") if p["action"] in ("accept-finding", "raise-limit", "ui-respec") else None
+    stops = None
+    if p["action"] in ALWAYS_GATING_QUESTIONS or (p["action"] in GATING_QUESTIONS and st.get("phase") in GATING_PHASES):
+        stops = True
+    elif p["action"] in CARRY_ON_QUESTIONS and st.get("phase") == "building":
+        stops = False
+    return {"kind": p["action"], "since": p["asked_at"], "waiting_on": waiting_on, "about": about,
+            "stops_run": stops}
+
+
+def question_line(q):
+    """The one plain-status line for a waiting question."""
+    t = _dt.datetime.fromisoformat(q["since"]).astimezone(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    who = "the director's" if q["waiting_on"] == "director" else "the user's"
+    about = f" for {q['about']}" if q.get("about") else ""
+    tail = {True: " The run will not move until it is answered.",
+            False: " The run can carry on meanwhile."}.get(q.get("stops_run"), "")
+    return (f"Waiting for {who} answer: a question about {QUESTION_WORDS.get(q['kind'], q['kind'])}{about} "
+            f"was asked at {t}.{tail}")
+
+
 def cmd_status_text(ctx: Ctx):
     st = ctx.state()
     plan = ctx.plan() or {"checkpoints": []}
@@ -2643,6 +2724,9 @@ def cmd_status_text(ctx: Ctx):
     print(f"Run: {st['slug']}  -  {st['feature']}")
     print(f"Phase: {PHASE_PLAIN.get(st.get('phase'), st.get('phase'))}")
     print(plain_now(ctx, st, plan))
+    q = waiting_question(ctx, st)
+    if q:
+        print(question_line(q))
     cur = (st.get("checkpoints") or {}).get(st.get("current")) or {}
     if st.get("phase") == "building" and any(g.get("status") in ("stale", "invalid")
                                              for g in (cur.get("gates") or {}).values()):
@@ -9249,6 +9333,7 @@ def cmd_next(args):
     ctx = Ctx(find_root())
     st = ctx.state()
     na = next_action(ctx, st)
+    na["question"] = waiting_question(ctx, st)
     na["wait"] = live_wait(st)  # what the owner chat said it is waiting on (`ratchet.py wait`), until when
     hs = hooks_view(ctx)
     hw = hooks_warning(ctx, hs)
@@ -9493,7 +9578,7 @@ def status_json(ctx: Ctx) -> dict:
             "blocked_reason_plain": plain_reason(st.get("blocked_reason")),
             "accept_note": na.get("accept_note"),
             "awaiting_since": st.get("awaiting_since"), "approval_mode": approval_mode(ctx),
-            "wait": live_wait(st),
+            "wait": live_wait(st), "question": waiting_question(ctx, st),
             "adv_rounds_used": st.get("adv_rounds_total", 0),
             "unavailable_reviewers": unavailable_reviewers(ctx), "host_provider": detect_host(ctx.config()),
             "hooks_warning": hw, "hook_heartbeat": read_heartbeat(ctx.root),

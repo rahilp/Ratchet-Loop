@@ -316,6 +316,8 @@ If the guard or prompt hook breaks, it lets the action through and writes the er
 
 **Waiting on background work.** The stop hook normally refuses to let the agent end its turn while a gate is open, and after too many refused stops in a row without progress (`max_stop_blocks`) it halts the run for you to look at. When the agent has started reviewers or sub-agents in the background and has nothing to do until they report back, it runs `ratchet.py wait --for "<what it is waiting on>" --minutes N` first. Until that time (N is kept between 1 and 120 minutes; 30 if not given) the stop hook lets the run's own chat end its turn, and those stops are not counted as a blocked stop, so waiting never trips the safety valve. Only the chat the run belongs to can wait, and Ratchet tells which chat that is from what its own hooks saw, never from an id the agent passes in. The wait ends early as soon as a gate makes progress, or the run is paused, resumed or cancelled; after that, or once the time is up, stopping is blocked again as before. `status` and `next` show what the run is waiting on and until when. A wait lets the agent stop no more than `pause` already does; it just keeps the run going instead of pausing it.
 
+**Waiting for an answer.** When the agent has asked you (or, in a lane run by a director, the director) a question and no answer has come yet, `status` says so in one extra line: it is waiting for the answer, names the kind of question in plain words and shows when it was asked, so a waiting lane is never mistaken for one that is still building. The line only says the run will not move for the questions that really hold it up (the plan and step approvals, and the questions of a blocked run or review round); for the others (how often to review, cancelling, the hooks question, a choice while building) it says the run can carry on meanwhile. `status --json` and `next` carry the same facts as a `question` entry with `kind` (the kind of question, for example `approve-plan`), `since` (when it was asked), `waiting_on` (`user` or `director`; a claim is always `user`, because a director cannot sign it) and `stops_run`; the entry is null while nothing is waiting, and again as soon as the user has replied (even before the agent acts on the reply; a reply never drops it in a director lane, where only the director's signature clears it) or the question is withdrawn. Reading it changes nothing, and it still works when the director enrollment file is damaged.
+
 **Full requirements:** Python 3.8+, git, and Node 18+ with Playwright for checking screens. Other AI tools are optional (`claude`, `codex`, `gemini`, `copilot` and others); without them, your agent's own sub-agents do every review.
 
 ### Objective check on sub-agent launches
@@ -454,6 +456,7 @@ python3 tests/test_limits.py
 python3 tests/test_objective.py
 python3 tests/test_plan_change.py
 python3 tests/test_providers.py
+python3 tests/test_question_waiting.py
 python3 tests/test_receipt.py
 python3 tests/test_receipt_proof.py
 python3 tests/test_results.py

@@ -282,7 +282,8 @@ def main():
     rx(d, "hooks-waive")
     n2 = next_json(d)
     # "warning" is the advisory offer (install/waive); it legitimately disappears once waived, so it is excluded too
-    strip = lambda n: {k: v for k, v in n.items() if k not in ("hooks", "hooks_warning", "warning")}
+    # "question" is the waiting-question report; by design it shows the pending hooks question and clears once answered
+    strip = lambda n: {k: v for k, v in n.items() if k not in ("hooks", "hooks_warning", "warning", "question")}
     check("[CP2-T11] next has a hooks object in both states", bool(n1.get("hooks")) and bool(n2.get("hooks")), (n1, n2))
     check("[CP2-T11] the waiver shows only in the hooks object", not (n1.get("hooks") or {}).get("waived")
           and bool((n2.get("hooks") or {}).get("waived")), (n1.get("hooks"), n2.get("hooks")))
