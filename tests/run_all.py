@@ -7,6 +7,10 @@ process, several at once (half the CPU cores by default, at least 2). Each suite
 TMP point at it); a suite that leaves anything in that folder is reported as failed even when its own checks
 passed. A suite still running after --timeout seconds is stopped and reported as timed out.
 
+Each suite also gets RATCHET_RUN_ALL=1 and RATCHET_RUN_ALL_SUITES (a comma-separated list of every suite name in
+this run), so a suite that also runs other suites as subprocesses (test_trust_cp5_regression.py runs
+test_gates.py and test_hooks_waiver.py) can skip ones already covered by this run instead of running them twice.
+
 Each suite also gets a unique RATCHET_RUN_ALL_TAG in its environment, which every process it starts inherits.
 When a suite ends (passed, failed or timed out), every live process whose /proc/<pid>/environ carries that tag
 is stopped, so a background process the suite detached with setsid() and left behind does not survive it, even
@@ -43,6 +47,8 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_TIMEOUT = 900.0
 DEFAULT_TAIL = 40
 TAG_VAR = "RATCHET_RUN_ALL_TAG"
+RUN_ALL_VAR = "RATCHET_RUN_ALL"
+SUITES_VAR = "RATCHET_RUN_ALL_SUITES"
 
 
 # ---- recorded durations ------------------------------------------------------------------------------------
@@ -270,10 +276,11 @@ def read_tail(log: Path, lines: int) -> list:
 
 
 class Runner:
-    def __init__(self, root: Path, timeout: float, tail: int):
+    def __init__(self, root: Path, timeout: float, tail: int, suite_names: str = ""):
         self.root = root
         self.timeout = timeout
         self.tail = tail
+        self.suite_names = suite_names
         self.lock = threading.Lock()
         self.running: dict = {}
         self.stopping = False
@@ -286,7 +293,7 @@ class Runner:
         tag = f"{os.getpid()}-{suite.stem}-{secrets.token_hex(8)}"
         outer = os.environ.get(TAG_VAR, "").strip()
         env = dict(os.environ, TMPDIR=str(tmp), TEMP=str(tmp), TMP=str(tmp), PYTHONUNBUFFERED="1",
-                   **{TAG_VAR: f"{outer} {tag}".strip()})
+                   **{TAG_VAR: f"{outer} {tag}".strip(), RUN_ALL_VAR: "1", SUITES_VAR: self.suite_names})
         t0 = time.monotonic()
         try:
             with open(log, "wb") as out:
@@ -388,7 +395,8 @@ def main(argv=None) -> int:
     root = Path(tempfile.mkdtemp(prefix="ratchet-run-all-"))
     (root / "tmp").mkdir()
     (root / "logs").mkdir()
-    runner = Runner(root, args.timeout, args.tail)
+    suite_names = ",".join(s.name for s in order)
+    runner = Runner(root, args.timeout, args.tail, suite_names)
     results: list = []
     started = time.monotonic()
     interrupted = False
