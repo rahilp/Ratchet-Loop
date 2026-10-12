@@ -242,6 +242,19 @@ _SAFE_SLUG_RE = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]+$")  # a run folder name:
 _STATE_LOCK_HELD = False  # set by main() while this process holds the state lock for its whole command
 
 
+def config_from_user(user: dict) -> dict:
+    """The effective config for a config.json's content: the shipped defaults with the file's settings on top."""
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if user.get("review_depth") == OLD_DEFAULT_REVIEW_DEPTH:
+        user = {k: v for k, v in user.items() if k != "review_depth"}  # untouched old default: use the new one
+    for k, v in user.items():
+        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+            cfg[k].update(v)
+        else:
+            cfg[k] = v
+    return cfg
+
+
 class Ctx:
     def __init__(self, root: Path):
         self.root = root
@@ -253,16 +266,7 @@ class Ctx:
         return self.ratchet / "config.json"
 
     def config(self):
-        cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-        user = read_json(self.config_path, {}) or {}
-        if user.get("review_depth") == OLD_DEFAULT_REVIEW_DEPTH:
-            user = {k: v for k, v in user.items() if k != "review_depth"}  # untouched old default: use the new one
-        for k, v in user.items():
-            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-                cfg[k].update(v)
-            else:
-                cfg[k] = v
-        return cfg
+        return config_from_user(read_json(self.config_path, {}) or {})
 
     # --- active run
     def active_slug(self):
@@ -395,6 +399,9 @@ def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str, extra: dict | No
     paths = changed_files(root, {"kind": "git-tree", "id": base_tree}, fp)
     if not paths and not extra:
         return None
+    # the index takes repo-root-relative paths; the project folder may sit below the git root
+    pre = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=root, capture_output=True, text=True).stdout.strip()
+    top = root.joinpath(*[".."] * pre.count("/"))
     shared = []  # the .ratchet files people edit and share ride along with the checkpoint (never run state)
     for name in (".gitignore", "config.json", "standards.md", "learnings.md"):
         f = root / RATCHET_DIR / name
@@ -402,7 +409,7 @@ def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str, extra: dict | No
             oid = subprocess.run(["git", "hash-object", "-w", "--", str(f)], cwd=root, capture_output=True,
                                  text=True).stdout.strip()
             if oid:
-                shared.append((f"{RATCHET_DIR}/{name}", oid))
+                shared.append((f"{pre}{RATCHET_DIR}/{name}", oid))
     for rel, text in (extra or {}).items():  # files Ratchet itself updated after review (spec task ticks), as given
         oid = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=root, capture_output=True,
                              input=text.encode("utf-8", "surrogateescape")).stdout.decode().strip()
@@ -441,7 +448,7 @@ def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str, extra: dict | No
         new = git("commit-tree", tree, *(["-p", head] if head else []), "-m", msg).strip()
     git("update-ref", "HEAD", new, *([head] if head else []))
     # the real index now lags behind HEAD for these paths: bring just those entries up to date
-    subprocess.run(["git", "reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], cwd=root,
+    subprocess.run(["git", "reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], cwd=top,
                    capture_output=True, input="\0".join(paths + [r for r, _ in shared]).encode("utf-8", "surrogateescape"),
                    env=dict(os.environ, GIT_LITERAL_PATHSPECS="1"))
     return new[:7]
@@ -492,7 +499,7 @@ _ABSENT = object()  # pass as _read_record's `missing` to tell a file that is no
 _FRESH = object()  # _read_record's default for `missing`: a new empty record ({}, or [] for lines)
 
 
-def _read_record(path: Path, kind=dict, missing=_FRESH, lines: bool = False, tail: int | None = None):
+def _read_record(path: Path, kind=dict, missing=_FRESH, lines: bool = False, tail: int | None = None, data=None):
     """The one reader of Ratchet's records (every file under .ratchet/ and in RATCHET_HOME that the hooks or the
     engine read for state, approvals, crashes, notes, hashes, director folders, stop errors or active runs).
     Returns (data, None), or (None, why) when the file can't be read, is not valid JSON, or is not a `kind` (a JSON
@@ -500,9 +507,12 @@ def _read_record(path: Path, kind=dict, missing=_FRESH, lines: bool = False, tai
     empty record unless the caller passes its own marker. With `lines`, a JSON-lines file: (the JSON objects on its
     lines, None), skipping lines that are not one; `tail` reads only its last `tail` bytes.
     It never exits or raises, so no hook or command can crash on a damaged record: each caller fails safe on its own
-    terms (a damaged record that grants trust grants nothing), and says so with _note_unreadable."""
+    terms (a damaged record that grants trust grants nothing), and says so with _note_unreadable.
+    With `data` (bytes): parse those bytes instead of reading `path` (for a file's content taken from git)."""
     try:
-        if tail is None:
+        if data is not None:
+            raw = data
+        elif tail is None:
             raw = path.read_bytes()
         else:
             with open(path, "rb") as f:
@@ -8368,6 +8378,260 @@ def cmd_complete(args):
     print(json.dumps(next_action(ctx, st), indent=2))
 
 
+def cmd_merged(args):
+    """`merged`: between steps, after the agent merged main into the lane with git. Re-runs the earlier steps' checks
+    on the merged code and, when they pass, moves the run's and the next step's starting tree to the merge commit (so
+    reviewers and the step's commit see only that step's own changes) and makes standards, design-file and config-rule
+    changes that are exactly main's version the new approved baseline. Anything else that changed stays unapproved.
+    Approves nothing and asks nothing; ratchet never runs the merge itself."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    root, phase, cur = ctx.root, st.get("phase"), st.get("current")
+    if phase == "building" and cur:
+        if st["checkpoints"][cur].get("step") != "tests":
+            die(f"{cur} is in the middle of its work (step '{st['checkpoints'][cur].get('step')}'). Finish {cur} "
+                f"first (run it through complete), then merge main and run merged. Nothing was changed.")
+    elif phase not in ("awaiting_checkpoint_review", "awaiting_final_review"):
+        die(f"merged runs between steps, after a step is complete and before the next one starts (the run is in "
+            f"phase '{phase}'). Nothing was changed.")
+    if not _is_git(root):
+        die("merged needs a git project: it checks the merge commit. Nothing was changed.")
+
+    def git(*a):
+        return subprocess.run(["git", *a], cwd=root, capture_output=True, text=True, timeout=60)
+
+    if git("rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+        die("A merge is not finished. Resolve the conflicts, finish the merge with a commit, then run merged. "
+            "Nothing was changed.")
+    sp = git("rev-parse", "--show-prefix")
+    tl = git("rev-parse", "--show-toplevel")
+    if sp.returncode != 0 or tl.returncode != 0:
+        die("merged could not read where the project folder sits in the git repository "
+            f"({(sp.stderr + tl.stderr).strip()[:200] or 'no answer'}). Nothing was changed.")
+    # Paths here are repo-root-relative (the project folder may sit below the git root), the way git's index takes them.
+    # Every git call below that takes or returns such paths runs from the repo top through tgit, so none of them
+    # mixes them with project-relative ones. The two calls that take project-relative input (git here, git add of the
+    # fingerprint_include names) say so.
+    prefix, top = sp.stdout.strip(), Path(tl.stdout.strip())
+    run_dir = prefix + RATCHET_DIR
+
+    def tgit(*a, inp=None, env=None, text=True):
+        return subprocess.run(["git", *a], cwd=top, capture_output=True, text=text and inp is None, input=inp, env=env,
+                              timeout=60)
+
+    dirty = [ln[3:] for ln in tgit("status", "--porcelain", "--untracked-files=no", "--", prefix or ".",
+                                   f":(exclude){run_dir}").stdout.splitlines()]
+    if dirty:
+        die(f"Tracked files have edits that are not committed ({', '.join(dirty[:5])}). Undo them, or finish the "
+            "step they belong to first (committing them now would be lane work no one reviewed), then run merged. "
+            "Nothing was changed.")
+
+    parents = git("rev-list", "--parents", "-n", "1", "HEAD").stdout.split()
+    if len(parents) != 3:
+        die("HEAD is not a finished merge of main into this lane. Merge main first (git merge --no-ff main), "
+            "finish the merge, then run merged. Nothing was changed.")
+    head, p1, p2 = parents
+    tree = git("rev-parse", f"{head}^{{tree}}").stdout.strip()
+    last = next((e for e in reversed(st.get("history") or [])
+                 if e.get("event") in ("checkpoint_complete", "merged_main")), None)
+    if last and last["event"] == "merged_main" and last.get("commit") == head:
+        ok("This merge was already checked and accepted. Nothing to do.")
+        return
+    # Nothing may sit between the step's starting tree and the merge's first parent: that would be lane work no one
+    # reviewed, and moving the starting tree would hide it from the reviewers.
+    # While building, the step's starting tree is a fingerprint tree (it also holds the gitignored files named in
+    # fingerprint_include, which no commit can hold). After an earlier merge accepted in this step, compare with that
+    # merge's commit instead: its tree is what the lane's next merge starts from, hand-resolved files included.
+    from_merge = bool(phase == "building" and cur and last and last["event"] == "merged_main" and last.get("commit"))
+    if from_merge and last.get("by_hand"):
+        die("An earlier merge in this step was resolved by hand, and that resolution is still waiting for this step's "
+            "review. A second merge now would fold it into the starting tree and hide it from the reviewers. Finish "
+            f"{cur} first (run it through complete), then merge main again and run merged. Nothing was changed.")
+    ref = st["checkpoints"][cur].get("base_tree") if phase == "building" and cur and not from_merge else (
+        git("rev-parse", f"{last['commit']}^{{tree}}").stdout.strip() if last and last.get("commit") else None)
+    loose = [f for f in tgit("ls-files", "--others", "--exclude-standard", "--", prefix or ".",
+                             f":(exclude){run_dir}", *JUNK_PATHSPECS).stdout.split("\n") if f]
+    if phase == "building" and ref:   # the step's own new files (its tests) are its own changes; older ones are not
+        in_ref = set(tgit("ls-tree", "-r", "--name-only", ref).stdout.split("\n"))
+        loose = [f for f in loose if f in in_ref]
+    if loose:
+        die(f"There are files git does not track yet ({', '.join(loose[:5])}). Commit them in a reviewed step, "
+            "delete them, or add them to .git/info/exclude (not .gitignore: a new or edited .gitignore is itself "
+            "an untracked file or lane work), then run merged: otherwise the next step's reviewers and commit "
+            "would pick them up as its own changes. Nothing was changed.")
+    if ref:
+        own = [f for f in tgit("diff-tree", "-r", "--no-renames", "--name-only", ref,
+                               f"{p1}^{{tree}}").stdout.split()
+               if f != run_dir and not f.startswith(run_dir + "/")]
+        if own and phase == "building" and not from_merge:   # fingerprint-only files are not commits' work
+            gone = [f for f in own if git("cat-file", "-e", f"{p1}:{f}").returncode != 0]
+            if gone:
+                ig = tgit("check-ignore", "-z", "--stdin", text=False,
+                          inp="\0".join(gone).encode("utf-8", "surrogateescape") + b"\0")
+                skip = set(ig.stdout.decode("utf-8", "surrogateescape").split("\0"))
+                own = [f for f in own if f not in skip]
+        if own:
+            die(f"The lane has commits since the last step finished that never went through the gates "
+                f"({', '.join(own[:5])}; added, changed or removed), so merged cannot hide them from the reviewers. "
+                "Undo those commits (and the merge) with git, then merge main into the lane right after the last "
+                "step's own commit. Nothing was changed.")
+
+    # Files the agent changed while making the merge (a conflict resolved by hand, or anything the merge commit added
+    # or removed on its own) are not main's or the lane's reviewed work. They are the paths whose merged mode and
+    # content differ from git's own clean merge of the two parents. A clean automatic merge of a file both sides
+    # edited in different places is not among them. A merge made with -X or -s options may show up here too; that is
+    # safe (the files just go to the next step's review).
+    def entries(rev):
+        r = tgit("ls-tree", "-r", "-z", "--full-tree", rev, text=False)
+        if r.returncode != 0:
+            die(f"git ls-tree failed on the merge ({r.stderr.decode('utf-8', 'replace').strip()[:200]}). "
+                "Nothing was changed.")
+        out = {}
+        for rec in r.stdout.split(b"\0"):
+            if rec:
+                meta, _, path = rec.partition(b"\t")
+                mode, _, oid = meta.split(b" ")
+                out[path] = (mode, oid)
+        return out
+
+    def in_run_dir(f):
+        t = f.decode("utf-8", "replace")
+        return t == run_dir or t.startswith(run_dir + "/")
+
+    mt = git("merge-tree", "--write-tree", "--no-messages", p1, p2)
+    clean = mt.stdout.split("\n")[0].strip() if mt.returncode in (0, 1) else ""
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", clean):
+        die("merged could not work out git's own clean merge of the two parents (`git merge-tree --write-tree` "
+            f"needs git 2.38 or newer; this one said: {(mt.stderr or mt.stdout).strip()[:200] or 'nothing'}). "
+            "Update git, then run merged. Nothing was changed.")
+    e_m, e_c, e_2 = entries(head), entries(clean), entries(p2)
+    by_hand = sorted(f for f in set(e_m) | set(e_c) if e_m.get(f) != e_c.get(f) and not in_run_dir(f))
+    if by_hand and phase != "building":
+        names = ", ".join(f.decode("utf-8", "replace") for f in by_hand[:10]) + (" and more" if len(by_hand) > 10 else "")
+        die(f"This merge changed files beyond what git merges on its own ({names}): a conflict resolved by hand, or "
+            "a merge made with -X or -s options. That code has to be reviewed with a step, and none is starting "
+            f"(the run is in phase '{phase}'). Undo the merge with `git reset --keep {p1[:7]}` (not ORIG_HEAD, "
+            "which later git commands can overwrite; --keep refuses instead of discarding edits to the run's files). "
+            + ("Then get the waiting review approved, and merge main again once the next step has started. "
+               if phase == "awaiting_checkpoint_review" else
+               "Then either merge main again in a way git merges on its own, or ask the user for a step of its own "
+               "for the resolution through feedback, and merge once that step has started. ")
+            + "Nothing was changed.")
+    # The step's starting tree is built the way every step's is (a fingerprint tree): the merge's tree plus the
+    # git-ignored files named in fingerprint_include, so those never show up as the step's own change. The paths the
+    # agent resolved by hand go back to main's version on top, so they stay in the step's review.
+    base = tree
+    extra = ctx.config().get("fingerprint_include") or []
+    if by_hand or extra:
+        index_info = b"".join(b"%s %s\t%s\0" % ((e_2[f][0], e_2[f][1], f) if f in e_2 else (b"0", b"0" * len(tree), f))
+                              for f in by_hand)
+        with tempfile.TemporaryDirectory() as td:
+            env = dict(os.environ, GIT_INDEX_FILE=str(Path(td) / "index"))
+            steps = [(["git", "read-tree", tree], None, True, top)]
+            if extra:   # the names in fingerprint_include are project-relative, so this one runs from the project folder
+                steps.append((["git", "add", "-f", "--", *extra], None, False, root))   # may match nothing
+            if by_hand:
+                steps.append((["git", "update-index", "-z", "--index-info"], index_info, True, top))
+            steps.append((["git", "write-tree"], None, True, top))
+            for cmd, inp, must, cwd in steps:
+                r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, input=inp, timeout=60)
+                if r.returncode != 0 and must:
+                    die(f"git {cmd[1]} failed while preparing the next step's starting tree "
+                        f"({r.stderr.decode('utf-8', 'replace').strip()[:200]}). Nothing was changed.")
+            base = r.stdout.decode().strip()
+
+    cfg = ctx.config()
+    sha = head[:7]
+    failure = None
+    if cfg.get("regression_command"):
+        rlog = ctx.evidence("merged") / f"regression-{sha}.log"
+        code, out, _ = _run_cmd(ctx, cfg["regression_command"], rlog, cfg["test_timeout_sec"])
+        if code != 0:
+            failure = (f"The regression command ({cfg['regression_command']}) failed on the code merged from main "
+                       f"(exit {code}): an earlier behaviour broke.", out, rlog)
+    else:
+        for c in ctx.plan()["checkpoints"]:
+            if st["checkpoints"][c["id"]]["status"] != "done" or not (c.get("tests") or {}).get("command"):
+                continue
+            tlog = ctx.evidence(c["id"]) / f"merged-{sha}.log"
+            code, out, _ = _run_cmd(ctx, c["tests"]["command"], tlog, cfg["test_timeout_sec"])
+            if code != 0:
+                failure = (f"{c['id']} ({c['title']}): its tests ({c['tests']['command']}) fail on the code merged "
+                           f"from main (exit {code}).", out, tlog)
+                break
+    if failure:
+        reason, out, log = failure
+        _set_blocked(st, reason)
+        ctx.save_state(st)
+        build_viewer(ctx)
+        print(_tail(out))
+        die(f"{reason} Log: {log.relative_to(root)}. The run is stopped. To recover: undo the merge with git "
+            f"(`git reset --keep {p1[:7]}`, the merge's first parent; --keep refuses instead of discarding edits to "
+            "the run's files), fix what broke on "
+            "main or in the lane, and once the user lets the run go on (tell them; the stopped-run options apply), "
+            "merge main again and run merged. A fix committed on top of this merge does not work: merged only "
+            "accepts a merge that is HEAD. Or give the user's feedback with `ratchet.py feedback` to add a fix step.",
+            2)
+
+    # Accepted from main only where the merged file or rule is exactly main's version.
+    def main_blob(rel):
+        r = tgit("show", f"{p2}:{prefix}{rel}", text=False)
+        return r.stdout if r.returncode == 0 else None
+
+    now_, snap, accepted, still = approval_snapshot(ctx, st), st.get("approved") or {}, [], []
+    for f, h in (snap.get("files") or {}).items():
+        if now_["files"].get(f) == h:
+            continue
+        theirs, mine = main_blob(f), _file_bytes(root / f)
+        if theirs is not None and theirs == mine:
+            snap["files"][f] = now_["files"][f]
+            accepted.append(f)
+        else:
+            still.append(f"reference file {f}")
+    main_cfg = main_blob(f"{RATCHET_DIR}/config.json")
+    main_cfg = _read_record(root, data=main_cfg)[0] if main_cfg is not None else None
+    main_cfg = config_from_user(main_cfg) if main_cfg is not None else None
+    for k, h in (snap.get("rules") or {}).items():
+        if now_["rules"].get(k) == h:
+            continue
+        if main_cfg is not None and _sha(main_cfg.get(k)) == now_["rules"].get(k):
+            snap["rules"][k] = now_["rules"][k]
+            accepted.append(f"config rule '{k}'")
+        else:
+            still.append(f"config rule '{k}'")
+    if "custom_providers" in snap and snap["custom_providers"] != now_["custom_providers"]:
+        still.append("custom review commands in config 'providers'")
+    if snap.get("spec") and snap["spec"] != now_.get("spec"):
+        still.append("the spec this run was built from")
+    st["base_tree"] = base
+    if phase == "building":
+        st["checkpoints"][cur]["base_tree"] = base
+    ctx.log(st, "merged_main", commit=head, tree=tree, accepted=accepted,
+            by_hand=[f.decode("utf-8", "replace") for f in by_hand] if phase == "building" else [])
+    ctx.save_state(st)
+    build_viewer(ctx)
+    ok(f"Merge of main ({sha}) checked and accepted: earlier steps still pass on the merged code"
+       + (f"; {cur} starts from the merge, so its reviewers see only its own changes." if phase == "building"
+          else "; the next step will start from the merge."))
+    if by_hand:
+        names = [f.decode("utf-8", "replace") for f in by_hand]
+        print(f"Resolved by hand in the merge, will be reviewed with the next step: {', '.join(names[:10])}"
+              + (" and more" if len(names) > 10 else ""))
+    for a in accepted:
+        print(f"Accepted from main as the new baseline: {a}")
+    for s_ in still:
+        print(f"Still changed after approval (not exactly main's version): {s_}. Show the user what changed; "
+              "the lane cannot go on past it without their yes.")
+    print(json.dumps(next_action(ctx, st), indent=2))
+
+
+def _file_bytes(p: Path):
+    try:
+        return p.read_bytes()
+    except OSError:
+        return None
+
+
 def _earliest_open_step(cps):
     for name in ["behavior", "ui", "adversarial"]:
         g = cps["gates"][name]
@@ -11949,8 +12213,8 @@ STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "re
                      "ui-record", "adv-record", "complete", "human-approve", "feedback", "plan-extend", "pause",
                      "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
                      "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait", "accept-finding",
-                     "raise-limit", "check-in", "triage")
-LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers")  # tests, checks, a regression suite, provider probes
+                     "raise-limit", "check-in", "triage", "merged")
+LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers", "merged")  # tests, checks, a regression suite, provider probes
 # The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
 OVERRIDE_CMDS = ("approve-plan", "human-approve", "approve-changes", "cancel", "set-review", "resume", "hooks-waive",
                  "ui-respec", "choice", "feedback", "accept-state", "init")
@@ -12647,6 +12911,8 @@ def main(argv=None):
     a.set_defaults(fn=cmd_adv_record)
     a = sp.add_parser("complete"); a.add_argument("cp")
     a.set_defaults(fn=cmd_complete)
+    sp.add_parser("merged", help="between steps, after merging main into the lane: re-check earlier steps and "
+                  "accept the merge").set_defaults(fn=cmd_merged)
     a = sp.add_parser("human-approve"); a.add_argument("--director-token"); a.set_defaults(fn=cmd_human_approve)
     a = sp.add_parser("feedback"); a.add_argument("--text"); a.add_argument("--learning", action="append")
     a.add_argument("--director-token")
