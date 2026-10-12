@@ -24,8 +24,9 @@ plus the model it runs and, when the model doesn't say it, the company). Each pr
 
 `ratchet.py providers --discover` finds installed agent CLIs, sends each a test request and adds what works.
 
-If the CLI is missing, or it fails (auth, quota, timeout, no parseable answer), this script marks the
-reviewer unavailable for `unavailable_ttl_hours` and exits with code 3 (a provider that says it is out of credits
+If the CLI is missing, or it fails (auth, quota, timeout, no parseable answer), this script marks that
+provider (its tool plus model; every reviewer on the program when the program is missing or cannot start) unavailable for
+`unavailable_ttl_hours`, records it as failed in the open round so it stays out of that round, and exits with code 3 (a provider that says it is out of credits
 is instead benched for every lane until the reset time it gave, or `quota_retest_minutes` when it gave none); `ratchet.py reviewers CPn`
 then gives that slot to the next alternative, ending with the host's own sub-agent reviewer.
 
@@ -407,10 +408,18 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
         for k, v in subs.items():
             part = part.replace(k, v)
         cmd.append(part)
-    def unavailable(reason, quota=None):
-        # A quota/auth/outage failure takes down every reviewer that uses the same CLI.
+    def unavailable(reason, quota=None, program=False):
+        # A failure benches the failing provider only (its tool plus model), so GLM failing leaves Kimi, which runs
+        # through the same OpenCode program, working. A program that is missing takes down every reviewer that runs
+        # through it (`program`).
         binary = eng.reviewer_binary(cfg, a.reviewer)
-        same = [r for r in eng.roster(cfg) if eng.reviewer_binary(cfg, r) == binary] or [a.reviewer]
+        if program:
+            same = [r for r in eng.roster(cfg) if eng.reviewer_binary(cfg, r) == binary] or [a.reviewer]
+        else:
+            same = eng.same_provider_reviewers(cfg, a.reviewer)
+        # This round learns of the failure now, not when `reviewers` next runs: a test request that passes in
+        # between clears a plain bench, and must not hand the provider its slot back for the rest of the round.
+        eng.record_round_failure(ctx, cfg, a.cp, rnd["round"], same)
         hours = None
         if quota:  # out of credits: every lane skips this provider until it said it is back (or a short re-test)
             reason = f"out of credits: {quota[1]}"
@@ -449,7 +458,7 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
             rr = subprocess.run(cmd, cwd=work, input=prompt if use_stdin else None, capture_output=True, text=True,
                                stdin=None if use_stdin else subprocess.DEVNULL, timeout=a.timeout, env=env)
         except FileNotFoundError:
-            unavailable(f"'{cmd[0]}' is not installed or not on PATH")
+            unavailable(f"'{cmd[0]}' is not installed or not on PATH", program=True)
         except subprocess.TimeoutExpired:  # a hang is never retried — one timeout is enough to sideline it
             unavailable(f"timed out after {a.timeout}s")
         except OSError as e:  # the system refused to start it (E2BIG: the arguments were too large after all, ...)
@@ -457,7 +466,7 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
                 unavailable(f"the review prompt ({len(prompt):,} characters) is too large to pass to '{cmd[0]}' as a "
                             "command-line argument. Give this provider a 'command' that reads {prompt_file} or "
                             "stdin to review changes this large")
-            unavailable(f"'{cmd[0]}' could not be started: {e.strerror or e}")
+            unavailable(f"'{cmd[0]}' could not be started: {e.strerror or e}", program=True)
         tt = (out_file.read_text() if out_file.exists() else "") + "\n" + (rr.stdout or "")
         return rr, tt
 

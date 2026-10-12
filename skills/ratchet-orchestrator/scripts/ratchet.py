@@ -2879,6 +2879,16 @@ def _reviewer_health_key(cfg, rid) -> str | None:
     return _health_key(pv) if pv is not None else None
 
 
+def same_provider_reviewers(cfg, rid) -> list[str]:
+    """`rid` and every other reviewer id that runs the same provider (the same tool plus model), so one failing
+    model is benched on its own: opencode-glm failing leaves opencode-kimi, on the same program, working. A
+    reviewer with no provider identity (a hand-written command) stands alone."""
+    key = _reviewer_health_key(cfg, rid)
+    if key is None:
+        return [rid]
+    return [r for r in roster(cfg) if r == rid or _reviewer_health_key(cfg, r) == key]
+
+
 def _update_health(change, note: bool = True, lock=None) -> str:
     """Change the shared provider health record (`change(data)` edits it in place). Every lane on the machine updates
     it, so it is changed only through update_record, under its own lock (or `lock`, that lock already held by the
@@ -3087,6 +3097,33 @@ def bench_quota(cfg, rid, reason, until) -> bool:
     at = _dt.datetime.now(_dt.timezone.utc)
     return _update_health(lambda data: phealth.record_probe(data, key, False, reason, at, reason, until, now=at,
                                                             quota=True), note=False) != "busy"
+
+
+def record_round_failure(ctx, cfg, cp_id, round_no, rids) -> bool:
+    """A real review in round `round_no` of `cp_id` failed: record the provider behind each reviewer in `rids` in that
+    round's `failed_providers` at once, so a test request that passes before the next `reviewers` call (it clears a
+    plain bench) can't put the provider back in the round. Done under the state lock, like every other change to the
+    run; the round is left alone when it has moved on (another round, or already recorded). False when the lock could
+    not be had in about 10 seconds (it is tried five times, so a long command holding it briefly does not lose the record): the bench still keeps the provider out until `reviewers` records it."""
+    lock = _StateLock(ctx.root, cmd="review-failure")
+    for _ in range(5):  # behind a long command (reviewers) one try waits only ~2s; this is a short write: ~10s in all
+        if not lock.acquire():
+            break
+    else:
+        return False
+    try:
+        st = ctx.state()
+        rnd = (st.get("checkpoints", {}).get(cp_id) or {}).get("adv_round") or {}
+        if not rnd or rnd.get("round") != round_no or rnd.get("recorded"):
+            return True
+        failed = set(rnd.get("failed_providers") or [])
+        failed |= {_reviewer_health_key(cfg, r) or r for r in rids}
+        if sorted(failed) != sorted(rnd.get("failed_providers") or []):
+            rnd["failed_providers"] = sorted(failed)
+            ctx.save_state(st)
+        return True
+    finally:
+        lock.release()
 
 
 def review_succeeded(cfg, rid, sent, ctx=None) -> bool:
@@ -4250,7 +4287,7 @@ def _dup_key(spec):
             spec.get("lens"))
 
 
-def resolve_reviewers(ctx, cfg, cp, exclude=None) -> list[dict]:
+def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None) -> list[dict]:
     """Turn review slots into concrete reviewer ids for THIS round.
 
     Returns [{"id", "slot", "fallback_for": [ids skipped], "reasons": {...}}]. Other providers are
@@ -4262,6 +4299,13 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None) -> list[dict]:
     `exclude`: reviewer ids never picked even though reviewer_availability still calls them okay — a reply cut
     off mid-answer twice this round falls back only its own slot, without the long-lived unavailable_ttl_hours
     mark a genuine quota/auth/timeout failure gets (see cmd_reviewers' same-round branch).
+
+    `taken`: reviewer ids that other slots of the round already run (the surviving slots of a same-round refill).
+    They count as already chosen, so a refilled slot never repeats one of them, nor the same company, model and
+    lens under another id.
+
+    `only_slots`: slot numbers to resolve; every other slot is skipped (a same-round refill resolves only the slots it
+    replaces, so a kept slot's own pick can't use up a provider a replaced slot needs).
     """
     exclude = exclude or set()
     if cp.get("reviewers"):
@@ -4275,19 +4319,35 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None) -> list[dict]:
     roster_ = {k: v for k, v in roster_.items() if v is not None}
     risk = cp.get("risk", "normal")
     chosen, chosen_keys, out = set(), set(), []
+    for t in taken or ():
+        chosen.add(t)
+        if _dup_key(_roster_spec(cfg, t)) is not None:
+            chosen_keys.add(_dup_key(_roster_spec(cfg, t)))
     for n, slot in enumerate(slots, 1):
+        if only_slots is not None and n not in only_slots:
+            continue
         alts = expand_slot(cfg, slot)
         unknown = [a for a in alts if a not in roster_]
         if unknown:
             die(f"review_depth/checkpoint names unknown reviewer(s) {unknown}; add them under config 'providers' "
                 "or 'reviewers'.")
         if all(roster_[a].get("kind") == "command" for a in alts):
+            if not any(a not in exclude and reviewer_availability(ctx, cfg, a, risk)[0] for a in alts):
+                # every provider the slot lists is out: other working providers (same lens) before the host
+                lens = roster_[alts[0]].get("lens", "both")
+                for pv in providers(cfg):
+                    rid_ = f"{pv['id']}-{lens}"
+                    if (rid_ in roster_ and rid_ not in alts and rid_ not in exclude
+                            and reviewer_availability(ctx, cfg, rid_, risk)[0]):
+                        alts.append(rid_)
             alts += _host_fallbacks(cfg, alts[0])
         skipped, reasons, pick, candidates = [], {}, None, []
         for a in alts:
-            if a in chosen or a in exclude:
+            if a in chosen:
                 continue
             okay, why = reviewer_availability(ctx, cfg, a, risk)
+            if okay and a in exclude:
+                okay, why = False, "failed a review earlier this round"
             if okay:
                 candidates.append(a)
             else:
@@ -4318,7 +4378,7 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None) -> list[dict]:
         out.append({"id": pick, "slot": n, "vendor": spec.get("vendor"), "model": model,
                     "fallback_for": [x for x in skipped if x in alts and alts.index(x) < alts.index(pick)],
                     "reasons": reasons})
-    if not out:
+    if not out and not taken:
         die("No adversarial reviewer is available for this checkpoint — check config 'providers' and 'reviewers'.")
     return out
 
@@ -9982,23 +10042,61 @@ def cmd_reviewers(args):
         # every other reviewer on the same CLI, keep running.
         out_dir_now = _review_round_dir(ctx, args.cp, "adv", rnd["round"])
         round_cutoff = {p.name[:-len(".cutoff.json")] for p in out_dir_now.glob("*.cutoff.json")}
-        fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff)}
-        changed, swapped_in = False, []
-        for i, r in enumerate(rnd["resolved"]):
-            if (out_dir_now / f"{r['id']}.json").exists():
-                continue  # a finished review in this round is kept untouched, never re-resolved
-            okay, _why = reviewer_availability(ctx, cfg, r["id"])
-            if (not okay or r["id"] in round_cutoff) and r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
+        # A provider that failed a review in this round stays out of it, even if a later test request passes (the
+        # exclusion lives in this round's own record, so the next round starts clean).
+        failed_now = set(rnd.get("failed_providers") or [])
+        for r in rnd["resolved"]:
+            if not (out_dir_now / f"{r['id']}.json").exists() and not reviewer_availability(ctx, cfg, r["id"])[0]:
+                failed_now.add(_reviewer_health_key(cfg, r["id"]) or r["id"])
+        failed_ids = {r for r in roster(cfg) if (_reviewer_health_key(cfg, r) or r) in failed_now}
+        # A slot is refilled when it has no finished review and its reviewer is out of the round or no longer
+        # available; every other slot keeps its reviewer, and the refill never repeats one of those (same id, or the
+        # same company, model and lens under another id).
+        replace = [i for i, r in enumerate(rnd["resolved"])
+                   if not (out_dir_now / f"{r['id']}.json").exists()
+                   and (not reviewer_availability(ctx, cfg, r["id"])[0] or r["id"] in round_cutoff
+                        or r["id"] in failed_ids)]
+        keep = {r["id"] for i, r in enumerate(rnd["resolved"]) if i not in replace}
+        fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff | failed_ids,
+                                                         taken=keep,
+                                                         only_slots={rnd["resolved"][i]["slot"] for i in replace})}
+        changed, swapped_in, dropped = False, [], set()
+        newly_failed = sorted(failed_now) != sorted(rnd.get("failed_providers") or [])
+        if newly_failed:
+            rnd["failed_providers"] = sorted(failed_now)
+        for i in replace:
+            r = rnd["resolved"][i]
+            if r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
                 new_r = fresh[r["slot"]]
                 rnd["resolved"][i] = new_r
                 changed = True
                 if new_r["fallback_for"]:
                     swapped_in.append({"used": new_r["id"], "instead_of": new_r["fallback_for"], "why": new_r["reasons"]})
+            elif r["slot"] not in fresh:
+                # Every alternative is taken, down or a duplicate: the slot may not keep its failed reviewer. A host
+                # reviewer no other slot runs fills it; when none is free the slot is dropped (it runs once elsewhere).
+                busy = {x["id"] for j, x in enumerate(rnd["resolved"]) if j != i and j not in dropped}
+                host = next((h for h in _host_fallbacks(cfg, r["id"])
+                             if h not in busy and reviewer_availability(ctx, cfg, h)[0]), None)
+                changed = True
+                if host is None:
+                    dropped.add(i)
+                else:
+                    spec_h = _roster_spec(cfg, host)
+                    why = "failed a review earlier this round" if r["id"] in failed_ids else "no longer available"
+                    rnd["resolved"][i] = {"id": host, "slot": r["slot"], "vendor": spec_h.get("vendor"),
+                                          "model": ("a different model: " + " or ".join(host_model_map(cfg).get("alternates") or [])
+                                                    if spec_h.get("alt") else role_model(cfg, "ratchet-adversary")),
+                                          "fallback_for": [r["id"]], "reasons": {r["id"]: why}}
+                    swapped_in.append({"used": host, "instead_of": [r["id"]], "why": {r["id"]: why}})
+        if dropped:
+            rnd["resolved"] = [x for j, x in enumerate(rnd["resolved"]) if j not in dropped]
         if changed:
             rnd["reviewers"] = [r["id"] for r in rnd["resolved"]]
             if swapped_in:  # record the same-round swap the same shape a fresh round's own substitutions use
                 rnd["substitutions"] = (rnd.get("substitutions") or []) + swapped_in
             ctx.log(st, "reviewer_fallback", cp=args.cp, detail="re-resolved within round " + str(rnd["round"]))
+        if changed or newly_failed:
             ctx.save_state(st)
     _key, why = open_review_key(ctx, args.cp, "adv", rnd["round"], st)
     if _key is None:
