@@ -9675,6 +9675,57 @@ REDIRECT_RE = re.compile(r"(?<![0-9&])>>?\s*(?!&)(\S+)")
 # path, so `_ratchet_rel` (which needs a path separator right before `.ratchet`) misses it for a relative
 # target. This recovers the real filename so it's checked too.
 SED_W_TARGET_RE = re.compile(r"(?:^|[;{}\s]|[0-9]|\$)[wW]\s*(\S+)")
+# CP4: every OUTPUT redirect operator form bash recognises -- `>`, `>>`, `N>`, `N>>`, `&>`, `&>>`, `>|`,
+# `N>|`, and `>&word` (word not a digit or `-`, which is fd duplication, not a file) -- unlike REDIRECT_RE
+# above, which a negative lookbehind keeps from ever matching a `>` right after a digit or `&` (so `2>`,
+# `&>`, `1>`, `>&word` were invisible to it entirely). This is the one shared helper both the fast path
+# (`_provably_read_only`) and the strict path (`_guard_shell`) use to find a command's real write targets.
+OUTPUT_REDIRECT_RE = re.compile(r"(?:\d+|&)?>>?\|?(&?)\s*([^\s;&|()<>]*)")
+
+
+def _redirect_targets(seg: str, masked: str | None = None) -> list[str]:
+    """Every real (unquoted) output-redirect target named in `seg`, for every form `OUTPUT_REDIRECT_RE`
+    recognises. `masked` -- the same text with every separator character that sits inside quotes replaced
+    (see `_mask_quoted_seps`), same length and character positions as `seg` -- is scanned for the operators
+    themselves, so a `>` sitting inside a quoted jq filter, grep alternation or awk/sed script is never
+    mistaken for a real redirect; the real (unmasked) target text is always sliced back out of `seg` itself.
+    When `masked` is omitted, `seg` is scanned directly. fd duplication (`2>&1`, `>&2`) and
+    /dev/null|/dev/stdout|/dev/stderr are never targets; a `>(` process substitution's own target position
+    is always empty here (its argument characters are excluded by the target's own character class), so it
+    never appears in this list -- see `_proc_subst_targets` for that case."""
+    base = masked if masked is not None else seg
+    out = []
+    for m in OUTPUT_REDIRECT_RE.finditer(base):
+        t = seg[m.start(2):m.end(2)].strip("'\"")
+        if m.group(1) == "&" and re.fullmatch(r"\d+|-", t):
+            continue  # fd duplication: no file
+        if not t or t in ("/dev/null", "/dev/stdout", "/dev/stderr"):
+            continue
+        out.append(t)
+    return out
+
+
+PROC_SUBST_RE = re.compile(r">\(([^()]*)\)")
+
+
+def _proc_subst_targets(seg: str, masked: str | None = None) -> list[str]:
+    """Every bare (non-flag) argument of the program inside each `>(...)` process substitution in `seg`,
+    treated as that program's own write target (CP4 design item 2: `cat x > >(tee <file>)` makes `tee`'s own
+    argument `<file>` a write target exactly as a bare `tee <file>` would). Only a single, non-nested
+    substitution body is read (no parens inside it); a substitution this can't read this simply contributes
+    no targets here, which sends the whole command to the slow, fail-safe mention checks that already run
+    beside this -- never narrowing what they refuse.
+
+    `masked` -- the same quote-aware mask `_redirect_targets` takes -- is scanned for `PROC_SUBST_RE` itself,
+    exactly like that sibling function, so a `>(...)` shape sitting inside an ordinary quoted string (a note
+    or commit message quoting this very example) is never mistaken for a real process substitution (CP4
+    round-04 host-alt-standards A1); the real (unmasked) text is always sliced back out of `seg` itself."""
+    base = masked if masked is not None else seg
+    out = []
+    for m in PROC_SUBST_RE.finditer(base):
+        toks = seg[m.start(1):m.end(1)].strip().split()
+        out += [t.strip("'\"") for t in toks[1:] if not t.startswith("-")]
+    return out
 ENGINE_CALL_RE = re.compile(r"""^\s*(?:(?:\S*python3?(?:\.\d+)?|py)\s+(?:-\S+\s+)*["']?\S*(ratchet|external_review|ui_review)\.py\b"""
                             r"""|\S*node\s+(?:-\S+\s+)*["']?\S*capture\.mjs\b)""")
 NESTED_AGENT_RE = re.compile(r"(^|[\s;&|(/])(claude|gemini|copilot)(?![\w.-])[^;&|\n]*\s(-p|--print|--prompt)\b"
@@ -10111,7 +10162,6 @@ RO_KEYWORDS = {"while", "until", "if", "then", "else", "elif", "do", "done", "fi
 RO_WRAP = {"sudo", "env", "command", "exec", "time", "nice", "nohup"}
 RO_FIND_WRITE_RE = re.compile(r"(?:^|\s)-(?:delete|fprint0?|fprintf|fls|ok|okdir)\b")
 RO_FIND_EXEC_RE = re.compile(r"(?:^|\s)-(?:exec|execdir)\s+(\S+)")
-RO_REDIRECT_RE = re.compile(r"(\d*|&)>>?\|?(&?)\s*([^\s;&|()<>]*)")
 RO_SEP_RE = re.compile(r"\$\(|<\(|>\(|`|\(|\)|(?<!\\);|&&|\|\||\||\n|&")
 GIT_CMD_START_RE = re.compile(r"\bgit\s+(?:commit|tag|notes|merge)\b")
 # -m/--message, or a combined short-flag cluster ending in m (-am, -qm, -sm, ...): git commit takes several
@@ -10266,6 +10316,54 @@ def _ro_awk_script(raw: str) -> str | None:
     return None
 
 
+def _uniq_operands(args: list) -> list:
+    """uniq's own positional operands from `args` (its arguments, program name already removed): a bare
+    `-` (the conventional stdin/stdout placeholder) counts as one even though it starts with "-"; -f/-s/-w
+    (skip-fields/skip-chars/check-chars) and their attached/`=`/separate numeric values are skipped, not
+    counted. Shared by the fast path's `_ro_prog_ok` and the loop check's `_loop_body_stage_writes` so both
+    treat uniq's arguments the same way (CP4 round-02 X2/A2/C3: a second, drifted copy had dropped the bare
+    `-` fix in the loop check)."""
+    bare, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-f", "-s", "-w"):
+            i += 2
+        elif re.match(r"^--(skip-fields|skip-chars|check-chars)=", a):
+            i += 1
+        elif re.fullmatch(r"--(skip-fields|skip-chars|check-chars)", a):
+            i += 2
+        else:
+            if not a.startswith("-") or a == "-":
+                bare.append(a)
+            i += 1
+    return bare
+
+
+_REDIR_OP_RE = re.compile(r"^(?:\d*|&)(?:<<<|<<|<|>>|>\||>)$")
+_REDIR_ATTACHED_RE = re.compile(r"^(?:\d*|&)(?:<<<|<<|<|>>|>\||>)\S+$")
+
+
+def _strip_redirect_args(args: list) -> list:
+    """`args` (already whitespace-split shell words) with every input/output redirection removed: a bare
+    operator token (`<`, `<<`, `<<<`, `>`, `>>`, `>|`, with an optional leading fd digits or `&`) together
+    with the word right after it, and an operator glued directly onto its own target in one token
+    (`<file`, `2>file`). Without this, a redirect sharing a statement with a program's own operands (`uniq
+    - "$f" < /tmp/new.json`) gets its target miscounted as one of that program's positional arguments (CP4
+    round-02 A2: `<` was being read as uniq's second operand instead of `"$f"`)."""
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if _REDIR_OP_RE.match(a):
+            i += 2
+            continue
+        if _REDIR_ATTACHED_RE.match(a):
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
 def _ro_prog_ok(words: list, cwd: str, maybe_inside: bool, has_subst: bool = False, raw: str | None = None) -> bool:
     """Is this one piece's leading program (after stripping shell keywords, a leading VAR=, and a wrapper
     word) one this fast path can prove reads only, used in a form with no write flag or unresolved
@@ -10283,22 +10381,10 @@ def _ro_prog_ok(words: list, cwd: str, maybe_inside: bool, has_subst: bool = Fal
     if p == "sort":
         return not any(re.match(r"^-[A-Za-z]*o|^--o", a) for a in args)
     if p == "uniq":
-        # -f/-s/-w (skip-fields/skip-chars/check-chars) each take a numeric value, as a separate argument or
-        # attached with `=`; that value is not a file and must not be miscounted as one.
-        bare, i = [], 0
-        while i < len(args):
-            a = args[i]
-            if a in ("-f", "-s", "-w"):
-                i += 2
-            elif re.match(r"^--(skip-fields|skip-chars|check-chars)=", a):
-                i += 1
-            elif re.fullmatch(r"--(skip-fields|skip-chars|check-chars)", a):
-                i += 2
-            else:
-                if not a.startswith("-"):
-                    bare.append(a)
-                i += 1
-        return len(bare) <= 1
+        # CP4: a bare `-` (the conventional stdin/stdout placeholder) counts as an operand too, even though
+        # it starts with "-" -- without this, `uniq - <target>` looked like a single-operand (read-only)
+        # call. `_uniq_operands` is shared with the loop check so both count uniq's arguments the same way.
+        return len(_uniq_operands(args)) <= 1
     if p == "awk":
         # only -F<sep> (attached, or as its own argument with the separator in the next one); no -i/-f/-v/
         # --inplace or any other option; no bare `var=value` operand; the script itself (the first bare
@@ -10390,6 +10476,14 @@ def _mask_quoted_seps(s: str) -> str | None:
             j, has_live = i + 1, False
             while j < n and s[j] != '"':
                 if s[j] == "\\" and j + 1 < n:
+                    # CP4 round-05 B1: a backslash-escaped separator (`\|` in a grep/sed BRE alternation) is
+                    # still inert quoted text, not live shell syntax, so mask BOTH the backslash and the
+                    # escaped character itself (not skip past them unmasked) when the escaped character is
+                    # one of the separator set -- otherwise a double-quoted `"a\|b"` left its own `|`
+                    # unmasked and got split like a real pipe.
+                    if s[j + 1] in "|;&()`$>\n":
+                        out[j] = "x"
+                        out[j + 1] = "x"
                     j += 2
                     continue
                 if s[j] == "`" or s.startswith("$(", j):
@@ -10405,6 +10499,94 @@ def _mask_quoted_seps(s: str) -> str | None:
     return "".join(out)
 
 
+def _mask_quoted_text(s: str) -> str | None:
+    """Like `_mask_quoted_seps`, but blanks EVERY character inside a quoted span (not only the separator set),
+    so a whole-word search for a shell keyword -- `_loop_write_problem`'s search for the loop-closing `done`
+    -- never matches that word sitting inside a quoted jq filter or echoed string (CP4 round-04 A1: `jq
+    '.phase="done"' "$f"` or `echo "all done" > "$f"` used to end the loop body early, right at the quoted
+    `done`, before the real write that follows it). Same length/position contract and the same None-on-live-
+    double-quoted-substitution escape as `_mask_quoted_seps`; see that function's own docstring."""
+    out, i, n = list(s), 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = i + 1
+            while j < n and s[j] != "'":
+                out[j] = "x"
+                j += 1
+            i = j + 1
+        elif c == '"':
+            j, has_live = i + 1, False
+            while j < n and s[j] != '"':
+                if s[j] == "\\" and j + 1 < n:
+                    # CP4 round-05 B1: blank the escaped pair too (this function blanks everything inside
+                    # quotes anyway), matching `_mask_quoted_seps`'s own fix for the same escape-skip gap.
+                    out[j] = "x"
+                    out[j + 1] = "x"
+                    j += 2
+                    continue
+                if s[j] == "`" or s.startswith("$(", j):
+                    has_live = True
+                out[j] = "x"
+                j += 1
+            if has_live:
+                return None
+            i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _mask_quoted_text_coarse(s: str) -> str:
+    """Like `_mask_quoted_text`, but never gives up: a double-quoted span that holds a live `$(...)`/backtick
+    substitution is blanked right along with the rest of that span's characters instead of making the whole
+    call return None. Same length/position contract (every character inside a single- or double-quoted span
+    becomes 'x', the quote characters themselves stay put) -- this is the coarse stand-in the loop checks
+    (`_normalize_loop_seps`, `_loop_write_problem`'s own loop-head match) fall back to precisely when
+    `_mask_quoted_text`/`_mask_quoted_seps` bail on that live substitution, so a loop whose body merely
+    stamps a `$(date)`/`$(basename ...)` into its own output is still structurally recognised as a loop (CP4
+    round-06 A1/C1/X1/X2: the old `_loop_write_problem_fallback` gave up on this entirely and scanned raw,
+    unmasked text for writer-program words instead, which both missed real writes like a quoted-substitution
+    `sed -i`/`uniq`/python write and flagged quoted DATA -- a writer-program word sitting inside a grep
+    pattern or echoed string -- as if it were a command)."""
+    out, i, n = list(s), 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = i + 1
+            while j < n and s[j] != "'":
+                out[j] = "x"
+                j += 1
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and s[j] != '"':
+                if s[j] == "\\" and j + 1 < n:
+                    out[j] = "x"
+                    out[j + 1] = "x"
+                    j += 2
+                    continue
+                out[j] = "x"
+                j += 1
+            i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _strip_group_prefix(tok: str) -> str:
+    """`tok` with any leading subshell/grouping/negation characters (`(`, `{`, `!`) removed, so the common
+    `(cd DIR && ...)` subshell idiom's first word reads as `cd`, not `(cd`. Shared by every cd/pushd/popd
+    tracker below (CP4 round-04 A3: all of them missed this form, a regression from main)."""
+    return tok.lstrip("({!")
+
+
 def _cmd_only_safe_cds(cmd: str) -> bool:
     """True when `cmd` carries no cd/pushd/popd this fast path can't fully account for: no popd at all (its
     target directory depends on an earlier pushd this function doesn't track), and every cd/pushd target is a
@@ -10416,6 +10598,8 @@ def _cmd_only_safe_cds(cmd: str) -> bool:
     this function can't vouch for this way makes the whole command fall back to the slow, fail-safe path."""
     for seg in _segments(cmd):
         toks = _ro_strip_words(seg.strip().split())
+        if toks:
+            toks[0] = _strip_group_prefix(toks[0])
         if not toks or toks[0] not in ("cd", "pushd", "popd"):
             continue
         if toks[0] == "popd":
@@ -10619,6 +10803,13 @@ def _provably_read_only(cmd: str, cwd: str) -> bool:
     masked = _mask_quoted_seps(cmd)
     if masked is None:
         return False
+    # CP4 round-04 host-alt-standards A1: a `>(` process substitution OUTSIDE quotes anywhere makes this
+    # command not provably read-only, whatever program sits inside it or where its target resolves -- the
+    # slow, fail-safe mention check judges it instead (see `_proc_subst_targets`). Checked on `masked`, not
+    # raw `cmd`, so a `>(...)` shape sitting inside an ordinary quoted string (a note or commit message
+    # quoting this very example) is never mistaken for a real one and sent needlessly to that slower path.
+    if ">(" in masked:
+        return False
     # One all-or-nothing fact about the whole command (never a position-by-position walk -- see
     # `_cmd_only_safe_cds`'s own comment for why): a relative redirect, cp destination, or unrecognised
     # program's piece can only be proven to run outside .ratchet/ when the session's own cwd already is, AND
@@ -10626,12 +10817,10 @@ def _provably_read_only(cmd: str, cwd: str) -> bool:
     # command is "unsafe" for every relative target in it, command-wide, and falls back to the slow,
     # fail-safe mention check below.
     cmd_unsafe = _ratchet_rel(cwd, "") is not None or not _cmd_only_safe_cds(cmd)
-    for m in RO_REDIRECT_RE.finditer(masked):
-        t = cmd[m.start(3):m.end(3)].strip("'\"")  # the real (unmasked) target text, quotes kept until here
-        if m.group(2) == "&" and re.fullmatch(r"\d+|-", t):
-            continue  # fd duplication (2>&1, >&2): no file
-        if t in ("/dev/null", "/dev/stdout", "/dev/stderr"):
-            continue
+    # CP4: `_redirect_targets` (shared with the strict path's own scan in `_guard_shell`) replaces this
+    # function's own former inline use of RO_REDIRECT_RE, so both paths recognise every redirect operator
+    # form (`>`, `>>`, `N>`, `N>>`, `&>`, `&>>`, `>|`, `N>|`, `>&word`) the same way.
+    for t in _redirect_targets(cmd, masked):
         if _ro_bad_target(t, cwd, cmd_unsafe):
             return False
     # Split on statement separators only outside quotes: a pipe inside a jq filter, a grep -E alternation or
@@ -10686,6 +10875,8 @@ def _cmd_has_unresolved_cd(cmd: str) -> bool:
     false refusals on ordinary commands (npm test, make, git push) after an everyday `cd "$REPO"`/`cd -`."""
     for seg in _segments(cmd):
         toks = _ro_strip_words(seg.strip().split())
+        if toks:
+            toks[0] = _strip_group_prefix(toks[0])
         if not toks or toks[0] not in ("cd", "pushd"):
             continue
         target = toks[1].strip("'\"") if len(toks) > 1 else ""
@@ -10694,10 +10885,250 @@ def _cmd_has_unresolved_cd(cmd: str) -> bool:
     return False
 
 
+def _cmd_cd_names_ratchet(cmd: str) -> bool:
+    """True when some cd/pushd segment in `cmd` has a literal (resolvable) target whose text names
+    .ratchet/. Used only by the loop-write check's own narrow 'inside .ratchet' signal (CP4 round-02
+    X1/A3/C1): an ordinary relative cd to an unrelated directory (`cd docs`) must not count as inside, so
+    this never reuses `_cmd_only_safe_cds`'s broader 'this fast path can't fully vouch for this cd' signal,
+    which is also False for that harmless case."""
+    for seg in _segments(cmd):
+        toks = _ro_strip_words(seg.strip().split())
+        if toks:
+            toks[0] = _strip_group_prefix(toks[0])
+        if not toks or toks[0] not in ("cd", "pushd"):
+            continue
+        target = toks[1].strip("'\"") if len(toks) > 1 else ""
+        if target and _ratchet_rel(target, "") is not None:
+            return True
+    return False
+
+
+# CP4 design item 4: a `while`/`until ...; do ... done` or `for VAR in LIST; do ... done` loop whose own
+# input (a pipe into the while/until, a `< file`/`< <(...)` redirect after its `done`, or the for-list
+# itself) names a .ratchet path, or whose session's/command's own cd state is already inside .ratchet/, and
+# whose body (any stage, see `_loop_body_segments`) writes anything at all, is refused -- whatever the
+# writer program, whatever its arguments, and whether or not it even touches a loop variable. Check-in
+# decision (CP4 round 2): the earlier per-argument, loop-variable-as-destination analysis (`_loop_vars`,
+# `_loop_var_is_destination`, `_loop_body_writes_via_var`) kept leaking narrower and narrower cases each
+# review round, so this is deliberately simpler and stricter -- a loop that reads run files in its input and
+# writes ANYTHING in its body is refused; there is no longer a "this write's source/destination happens not
+# to be the loop variable" exemption. Narrow and line-shaped on purpose (a single, non-nested loop per
+# match, `do`/`done` as plain words, a loop header's own newline before `do` normalised to a `;` first) --
+# not a general shell parser; a loop shaped some other way simply isn't matched here and is left to the rest
+# of this guard's existing mention-based checks.
+LOOP_HEAD_RE = re.compile(
+    r"(?P<sep>^|[;&|\n])\s*(?:(?:while|until)\s+(?P<cond>.+?)|"
+    r"for\s+(?P<fvar>[A-Za-z_]\w*)\s+in\s+(?P<flist>[^;\n]+?))\s*;\s*do\b", re.S)
+# writer programs: whatever arguments they're given, each of these changes a file it's pointed at, so any of
+# them appearing in a loop body stage (see `_loop_body_stage_writes`) is a write, with no per-argument
+# source/destination analysis.
+LOOP_WRITER_PROGS = {"rm", "rmdir", "touch", "truncate", "tee", "chmod", "chown", "cp", "mv", "ln", "install",
+                      "dd", "sponge"}
+
+
+def _normalize_loop_seps(cmd: str) -> str:
+    """`cmd` with every newline that sits outside single/double quotes replaced by `;`, same length and
+    position as `cmd` (see `_mask_quoted_seps`, whose masked newlines mark exactly the ones inside quotes),
+    so `LOOP_HEAD_RE` only ever has to recognise a `;`-separated loop header, whether the agent wrote
+    `while ...; do` on one line or `while ...`/`do` split across several. Falls back to the coarse mask
+    (`_mask_quoted_text_coarse`, which never gives up) when `_mask_quoted_seps` itself gives up (a
+    double-quoted span with a live substitution) -- CP4 round-06: giving up here used to mean "skip the
+    whole loop check, hand the command to a crude raw-text fallback instead", which both missed real writes
+    and flagged quoted writer-program words as if they were commands. The coarse mask still tells us exactly
+    which newlines sit inside a quoted span (blanked, so no longer `\\n`) versus outside it (left alone), so
+    this never needs to give up at all.
+
+    A newline that follows an unquoted trailing `|`, `&` or `&&`/`||` (skipping only spaces/tabs in between)
+    feeds the next line into the SAME statement -- it is not a new statement at all, so it is left as plain
+    whitespace instead (CP4 round-04 A2: converting it to `;` turned `find ... |\\nwhile read f; do ... done`
+    into `... |;while ...`, which made `;`, not `|`, the separator `LOOP_HEAD_RE` captured, so the pipe-input
+    test below never saw the pipe)."""
+    masked = _mask_quoted_seps(cmd)
+    if masked is None:
+        masked = _mask_quoted_text_coarse(cmd)
+    out = list(cmd)
+    for i, ch in enumerate(masked):
+        if ch == "\n":  # an outside-quotes newline: _mask_quoted_seps leaves these alone, masking only ones
+            j = i - 1
+            while j >= 0 and masked[j] in " \t":
+                j -= 1
+            if j >= 0 and masked[j] in "|&":
+                out[i] = " "  # feeds the next line into this same pipeline/list: not a statement separator
+                continue
+            out[i] = ";"  # that sit inside quotes (to "x") -- see that function's own docstring.
+    return "".join(out)
+
+
+_LOOP_BODY_SEP_RE = re.compile(r"\|\||&&|;|\||&|\n")
+
+
+def _loop_body_segments(body: str) -> list:
+    """`body` split on every top-level `;`, `&&`, `||`, `|`, bare `&`, or newline -- quote-aware via
+    `_mask_quoted_seps` (same split `_segments` already gives the rest of this guard, with a bare `&` added
+    too), so every pipeline/statement stage of a loop body is checked on its own, not just the first stage
+    before a `|` (CP4 round-02 A1/C2: `cat /tmp/new.json | tee "$f"` is two stages; the first is read-only,
+    the second is the real write, and the old `[;\\n]`-only split never looked past the first)."""
+    masked = _mask_quoted_seps(body)
+    if masked is None:
+        return [p for p in _LOOP_BODY_SEP_RE.split(body) if p.strip()]
+    # CP4 round-04 minor A4: a `>|` (or `N>|`) clobber redirect is a single operator, not a pipe into a
+    # second stage -- mask its own `|` character here the same way a quoted one already is (same length, so
+    # positions stay aligned), so the split below never splits a write like `echo x >| "$f"` into a harmless-
+    # looking `echo x >` stage and a second stage that loses the operator and its own real target.
+    masked = re.sub(r">\|", ">x", masked)
+    parts, pos = [], 0
+    for sm in _LOOP_BODY_SEP_RE.finditer(masked):
+        parts.append(body[pos:sm.start()])
+        pos = sm.end()
+    parts.append(body[pos:])
+    return [p for p in parts if p.strip()]
+
+
+def _loop_body_stage_writes(seg: str) -> bool:
+    """True when loop body stage `seg` writes anything, whatever its own arguments (CP4 round-02 check-in
+    SIMPLIFY decision: the earlier per-argument, loop-variable-as-destination analysis kept leaking narrower
+    cases every round, so this no longer asks whether a write's source or destination happens to be the
+    loop's own variable -- any writer program or any output redirect in the stage is enough). An output
+    redirect is safe only when its target is a literal absolute path outside .ratchet/ with no `$` (fd
+    duplication and /dev/null are never targets at all -- see `_redirect_targets`)."""
+    masked = _mask_quoted_seps(seg)
+    # CP4 round-03 A1: a `>(...)` process substitution hides its own write target from `_redirect_targets`
+    # by design (its argument characters are excluded from the target's own character class -- see that
+    # function's docstring), so `cat SRC > >(tee "$f")` inside a loop body was judged read-only. Any `>(`
+    # outside quotes in a loop body stage counts as a write outright, the same rule `_provably_read_only`
+    # already applies at the top level.
+    if ">(" in (masked if masked is not None else seg):
+        return True
+    # CP4 round-03 X1: pass the quote-aware mask into `_redirect_targets`, matching the other two call
+    # sites (`_provably_read_only` and the strict path in `_guard_shell`), so a `>` sitting inside a quoted
+    # jq filter or grep pattern (`jq '.count > 0'`, `grep -c 'a=>b'`) is never mistaken for a real redirect.
+    for t in _redirect_targets(seg, masked):
+        tt = t.strip("'\"")
+        if "$" in tt or "`" in tt or not os.path.isabs(os.path.expanduser(tt)) or _ratchet_rel(tt, "") is not None:
+            return True
+    prog, _ = _program(seg)
+    if prog in LOOP_WRITER_PROGS:
+        return True
+    if prog in ("sed", "perl") and re.search(r"(?:^|\s)(-[A-Za-z]*i\b|--in-place\b)", seg):
+        return True
+    if prog in ("awk", "gawk") and re.search(r"(?:^|\s)-i\b", seg):
+        return True
+    if re.fullmatch(r"python[0-9.]*|py|node", prog) and WRITE_CODE_RE.search(seg):
+        return True
+    if prog == "uniq":
+        # CP4 round-02 A2/C3: strip any redirect sharing this statement (`uniq - "$f" < /tmp/new.json`)
+        # before counting uniq's own operands with the same shared helper `_ro_prog_ok` uses, so a bare
+        # `-` is counted and a redirect target is never mistaken for uniq's own second operand.
+        return len(_uniq_operands(_strip_redirect_args(seg.split()[1:]))) >= 2
+    return False
+
+
+def _loop_write_problem(cmd: str, cwd: str) -> bool:
+    """True when `cmd` holds a loop `LOOP_HEAD_RE` recognises whose input/list names a .ratchet path (or
+    whose own cd state is already inside .ratchet/) and whose body (any stage `_loop_body_segments` finds)
+    writes anything at all (see `_loop_body_stage_writes`). Check-in decision (CP4 round 2): there is no
+    longer any "this write doesn't touch the loop variable" exemption -- a loop proven to read run files is
+    refused the moment any stage of its body writes anything.
+
+    CP4 round-06 SIMPLIFY (deletes the old `_loop_write_problem_fallback`): a live `$(...)`/backtick
+    substitution inside a double-quoted span anywhere in `cmd` no longer sends this whole check to a crude,
+    unmasked text scan for writer-program words -- that scan both missed real writes (a `sed -i`/`uniq`/
+    python write paired with an unrelated `$(date)` stamp elsewhere in the same loop) and flagged quoted DATA
+    as if it were a command (a writer-program word sitting inside a grep pattern or echoed string). Instead,
+    `_normalize_loop_seps` and the loop-head match below fall back to the coarse mask
+    (`_mask_quoted_text_coarse`, which never gives up) so this one loop checker always runs the same
+    structural walk; only the quote mask gets cruder when a live substitution is present."""
+    norm = _normalize_loop_seps(cmd)
+    # CP4 round-02 X1/A3/C1: "inside .ratchet" here means only the session's own cwd is inside .ratchet/,
+    # or this command carries a cd/pushd whose literal target names .ratchet, or one whose target can't be
+    # resolved at all ($var, `-`, a substitution) -- never "any cd `_cmd_only_safe_cds` can't fully prove
+    # absolute-and-safe", which is also true of a perfectly ordinary relative cd to an unrelated directory
+    # (`cd docs`) and would refuse that loop for no reason connected to .ratchet/ at all.
+    cwd_inside = (_ratchet_rel(cwd, "") is not None or _cmd_cd_names_ratchet(cmd) or _cmd_has_unresolved_cd(cmd))
+    # CP4 round-05 A2: match the loop head on a fully quote-blanked copy of `norm` (same contract
+    # `_redirect_targets`/`_proc_subst_targets` already use elsewhere), not on `norm` itself -- otherwise a
+    # `|`/`while ... do ... done` shape sitting inside a quoted echo/printf argument (plain documentation
+    # text, never real shell syntax) was read as a genuine loop header and body. Real text for every group is
+    # still sliced out of `norm` itself by position, since masking never changes length or position.
+    head_mask = _mask_quoted_text(norm)
+    if head_mask is None:
+        # CP4 round-06: `norm` itself still carries the live substitution verbatim (masking never changes
+        # the real text, only normalizes separators), so the precise mask gives up here too -- fall back to
+        # the coarse one (never None) instead of scanning raw, unmasked text.
+        head_mask = _mask_quoted_text_coarse(norm)
+    for m in LOOP_HEAD_RE.finditer(head_mask):
+        rest = norm[m.end():]
+        # CP4 round-04 A1: find the loop's closing `done` on quote-masked text (see `_mask_quoted_text`), and
+        # only as a whole word right after a statement separator (`;`, `&`, a newline -- already normalised
+        # to `;` above -- or the very start of `rest`), so a `done` sitting inside a quoted jq filter or
+        # echoed string (`jq '.phase="done"' "$f"`, `echo "all done" > "$f"`) is never mistaken for the real
+        # loop end. Falls back to the plain (unmasked) text only when masking itself gives up (a double-
+        # quoted span with a live substitution), same fail-safe default as every other caller of the mask.
+        rest_masked = _mask_quoted_text(rest)
+        hay = rest_masked if rest_masked is not None else rest
+        done_m = re.search(r"(?:^|[;&\n])\s*(done)\b", hay, re.S)
+        if not done_m:
+            continue
+        body = rest[:done_m.start(1)]
+        if m.group("fvar"):
+            flist = norm[m.start("flist"):m.end("flist")] if m.group("flist") is not None else ""
+            input_ok = cwd_inside or bool(RATCHET_TOKEN_RE.search(flist))
+        else:
+            before = norm[:m.start("sep")]
+            input_ok = cwd_inside or (m.group("sep") == "|" and bool(RATCHET_TOKEN_RE.search(before)))
+            if not input_ok:
+                tail = rest[done_m.end(1):]
+                redir_m = re.match(r"\s*<\s*(<\(.*?\)|\S+)", tail)
+                input_ok = bool(redir_m and RATCHET_TOKEN_RE.search(redir_m.group(1)))
+        if input_ok and any(_loop_body_stage_writes(seg) for seg in _loop_body_segments(body)):
+            return True
+    return False
+
+
+def _mask_subst_free_spans(raw: str) -> str:
+    """`raw` with the spans a `$(`/backtick substitution check should ignore replaced by inert text: every
+    single-quoted span (`_mask_quoted_seps` already blanks a backtick/$ there, since bash never expands
+    either inside single quotes) and the body of any heredoc whose delimiter is itself quoted (`<<'EOF'`,
+    `<<"EOF"`, `<<-'EOF'`) -- bash never expands that body either. A Markdown backtick in a quoted brief or
+    heredoc, or a literal `$(...)` example quoted in a commit message, is therefore not a real command
+    substitution. A double-quoted span and an unquoted-delimiter heredoc body are left exactly as they are:
+    the shell still expands those, so a `$(`/backtick there must still count.
+
+    Falls back to `raw` itself when `_mask_quoted_seps` gives up (a double-quoted span elsewhere in the
+    command holds a live substitution) -- that case is still refused correctly, because `raw` itself still
+    carries the unmasked `$(`/backtick. Same length and position as `raw`, so the mention test run against
+    `raw` and the substitution test run against this result always agree on where each character sits."""
+    masked = _mask_quoted_seps(raw)
+    out = list(masked if masked is not None else raw)
+    for m in HEREDOC_RE.finditer(raw):
+        if not m.group(1):
+            continue  # unquoted delimiter: bash still expands this body
+        lines = m.group(0).split("\n")
+        body = "\n".join(lines[1:-1])
+        body_start = m.start(0) + len(lines[0]) + 1
+        for k in range(body_start, body_start + len(body)):
+            out[k] = "x"
+    return "".join(out)
+
+
 def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
     raw = cmd
-    if INTERPRETER_RE.search(raw):  # heredoc bodies fed to an interpreter are code, not data: check what they touch
+    if HEREDOC_RE.search(raw):
         for m, _sep_pos, prefix, body in _heredoc_py_pieces(raw):
+            # CP4 round-05 B2/S1: a heredoc is also code when the INTERPRETER it's fed to comes AFTER the
+            # heredoc operator on the same opening line (`cat <<'EOF' | python3`, `cat <<'EOF' | bash`), not
+            # only when it comes before (`python3 <<EOF`). `m.group(3)` is `HEREDOC_RE`'s own capture of the
+            # rest of that opening line (already holds the `| python3`/`| bash`); check it the same way as
+            # `prefix`, the text before the heredoc.
+            trailer = m.group(3) or ""
+            if not INTERPRETER_RE.search(prefix) and not INTERPRETER_RE.search(trailer):
+                # CP4 round-04 host-alt-correctness A1: this heredoc's own feeding program (`prefix`, the
+                # command text right before it, or `trailer`, the text piping it onward) isn't an
+                # interpreter, so its body is data, not code -- even when some OTHER word in the command
+                # (including a bare interpreter name sitting inside this same heredoc's own body, which is
+                # plain prose) happens to match INTERPRETER_RE. A `cat > file << EOF` heredoc whose body
+                # merely mentions "sh"/"python"/... in prose stays data here.
+                continue
             if _is_ro_python_heredoc(prefix, body):
                 # same rule `_strip_safe_python_heredocs` uses below to prove this heredoc reads only: a bare
                 # python/python3 invocation whose body holds no write marker. Let it skip this earlier
@@ -10732,6 +11163,30 @@ def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
                 "yourself would forge a user message or a gate event.")
     if DANGEROUS_GIT_RE.search(cmd):
         return "RATCHET GUARD: this git command would delete or stash Ratchet's run state (ignored files)."
+    # CP4 (director decision, round 6): a command substitution ($(...) or a backtick, quoted or not) can hide a
+    # write inside what looks like a read, and this guard does not parse shells well enough to see through it.
+    # Fail closed with no parsing: a command that names Ratchet's run folder at all (the same RATCHET_TOKEN_RE
+    # mention test used elsewhere, applied to the raw, untouched command text) and contains `$(` or a backtick
+    # anywhere is refused outright, before the loop check and the read-only fast path below ever run. A command
+    # that never mentions .ratchet is untouched by this check.
+    # CP4 round 7 (director decision): bash never expands a `$(`/backtick that sits inside a single-quoted
+    # span, or inside the body of a heredoc whose own delimiter is quoted (<<'EOF', <<"EOF", <<-'EOF') -- so a
+    # Markdown brief, a quoted heredoc example or a single-quoted commit message that merely mentions a run
+    # path in backticks is not a real substitution. `_mask_subst_free_spans` blanks exactly those two inert
+    # spans (and only falls back to `raw` unmasked when it can't, which still refuses correctly); a `$(` or
+    # backtick that is unquoted, inside double quotes, or inside an unquoted-delimiter heredoc body still
+    # counts. The mention test above still runs on `raw` itself, unchanged.
+    subst_text = _mask_subst_free_spans(raw)
+    if RATCHET_TOKEN_RE.search(raw) and ("$(" in subst_text or "`" in subst_text):
+        return ("RATCHET GUARD: this command names Ratchet's run folder and contains a command substitution "
+                "($(...) or backticks). Run the substitution as its own command first, then use its result in "
+                "a separate command.")
+    if _loop_write_problem(cmd, cwd):
+        return ("RATCHET GUARD: this loop reads Ratchet's run files and writes inside its own body. Gate "
+                "state, evidence, approvals and config are owned by ratchet.py — use its commands instead. "
+                "Inside such a loop, only a redirect to a literal absolute path outside .ratchet/ with no $ "
+                "is safe, for example cat \"$f\" >> /tmp/summary.txt; tee, cp, mv, rm, sponge and other "
+                "writer programs are refused in the body whatever their arguments.")
     if _provably_read_only(cmd, cwd):
         return None
     base_deny = ("RATCHET GUARD: this command could change Ratchet's run state (.ratchet/). Gate state, evidence, "
@@ -10739,7 +11194,7 @@ def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
                  "adv-record / complete / config) instead. To read run files, use cat, jq, grep, head/tail, "
                  "sed -n or awk without -i; python and other programs that name a run path are refused.")
     cwd_inside = _ratchet_rel(cwd, "") is not None
-    cmd_inside = any(re.match(r"^\s*(cd|pushd)\s+\S*\.ratchet", seg, re.I) for seg in _segments(cmd))
+    cmd_inside = any(re.match(r"^\s*[({!]*\s*(cd|pushd)\s+\S*\.ratchet", seg, re.I) for seg in _segments(cmd))
     if cwd_inside:
         # the fast path above already let through anything it can prove reads only, cd included; reaching
         # here means this command isn't provably read-only, and the session's shell is already inside
@@ -10757,6 +11212,12 @@ def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
         if re.fullmatch(r"\s*(export\s+)?[A-Za-z_]\w*=\S*\s*", seg):
             continue  # a bare assignment writes nothing; its uses were expanded above
         prog, sub = _program(seg)
+        # CP4 round-06: `for X in LIST` runs nothing by itself (LIST is never executed here) -- the same rule
+        # `_ro_prog_ok` already gives the precise path. Reached only when this command's own live substitution
+        # elsewhere (not in this segment) sent the whole command to this slow path; without this, a for-loop
+        # whose list names a run path (an ordinary read-only diagnostic) was refused on that mention alone.
+        if prog == "for":
+            continue
         mentions = RATCHET_TOKEN_RE.findall(seg)
         if prog == "sed":
             mentions += [t.strip("'\"") for t in SED_W_TARGET_RE.findall(seg) if ".ratchet" in t.lower()]
@@ -10772,8 +11233,12 @@ def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
         # quoted literal path into a run file (`jq ... > ".ratchet/runs/hk/state.json"`) is judged on its real
         # path, not left unresolved by the quote characters. A target that still holds `$` or a backtick after
         # unquoting stays unresolvable, same as before (it never matched a literal .ratchet path either way).
-        targets = [t.strip("'\"") for t in REDIRECT_RE.findall(seg)
-                   if t.strip("'\"") not in ("/dev/null", "/dev/stderr", "/dev/stdout")]
+        # CP4: `_redirect_targets` recognises every operator form (`>`, `>>`, `N>`, `N>>`, `&>`, `&>>`, `>|`,
+        # `N>|`, `>&word`), not just the plain `>`/`>>` the old REDIRECT_RE-based list caught; `_proc_subst_targets`
+        # adds a `>(...)` process substitution's own inner program's arguments (`tee <file>`) as write targets
+        # too, exactly as a bare call to that program would get.
+        seg_masked = _mask_quoted_seps(seg)
+        targets = _redirect_targets(seg, seg_masked) + _proc_subst_targets(seg, seg_masked)
         # an earlier cd/pushd in this command whose target can't be resolved at all leaves this redirect's own
         # relative target unproven -- but only the target itself is judged on that, never the broad mentions/
         # inside skip below (that broad use is what caused ordinary commands with no .ratchet mention at all,
@@ -10783,10 +11248,10 @@ def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
         if not mentions and not inside and not unresolved_target:
             continue
         if ENGINE_CALL_RE.match(seg):
-            if not REDIRECT_RE.search(seg):
+            if not targets:
                 continue  # ratchet.py / reviewer scripts write their own files
-        for t in mentions + REDIRECT_RE.findall(seg):
-            if prog in READ_ONLY_PROGRAMS and t not in REDIRECT_RE.findall(seg):
+        for t in mentions + targets:
+            if prog in READ_ONLY_PROGRAMS and t not in targets:
                 continue  # reading a review is fine
             why = _owner_problem(t, cwd, who)
             if why:

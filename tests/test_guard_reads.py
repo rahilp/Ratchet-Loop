@@ -716,12 +716,16 @@ def x18_run_folder_found_via_substitution_or_cwd_read_allowed():
     env = make_env("claude")
     d = hk_project(env)
     run = d / ".ratchet" / "runs" / "hk"
+    # Director decision (CP4 round 6): a command naming the run folder with $( or a backtick is refused, so
+    # "RUN=$(find ...) && cat" moved from allowed to refused below.
+    r = guard_bash(d, env, 'RUN=$(find .ratchet/runs -maxdepth 1 -type d -name hk) && cat "$RUN/state.json"')
+    check("[CP2-X18] a run folder found via an unquoted multi-word $(...) capture is refused (exit 2) because "
+          "it names the run folder and contains a command substitution", r.returncode == 2,
+          (r.returncode, r.stderr, r.stdout))
     bad = allow_table(d, env, [
-        ("RUN=$(find ...) && cat", 'RUN=$(find .ratchet/runs -maxdepth 1 -type d -name hk) && cat "$RUN/state.json"'),
         ("cat run file redirected to /tmp", "cat .ratchet/runs/hk/state.json > /tmp/y"),
     ])
-    check("[CP2-X18] a run folder found via an unquoted multi-word $(...) capture, then read, and a plain read "
-          "redirected to /tmp, are both allowed (exit 0)", bad == [], bad)
+    check("[CP2-X18] a plain read redirected to /tmp is allowed (exit 0)", bad == [], bad)
     bad_cwd = []
     for label, cmd in [("cat", "cat state.json"), ("ls", "ls")]:
         r = guard_bash_cwd(d, env, cmd, run)
