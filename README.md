@@ -264,6 +264,8 @@ Round 1 of a step always asks every reviewer. After that, review gets cheaper on
 
 Tests and regression suites occasionally fail for reasons that have nothing to do with the code: a slow machine, a timing hiccup, a test that touches the network. If the test command (or, at `complete`, the full regression suite) fails once and then passes on one immediate automatic re-run, Ratchet marks it **flaky** and lets it through without spending an attempt — once per step for the tests, and once for the whole run for the regression suite. A second flaky-looking failure, or two failures in a row, is never forgiven: it counts as a real failure like always. `status`, the evidence folder (both the failing and the passing log are kept) and the final review all say plainly which steps passed only after a flaky retry.
 
+**Run `complete` in the background.** `complete` runs the whole regression suite, which can take up to `test_timeout_sec` (15 minutes by default) per run, and after a failure it may run the suite a second time, so up to about twice that; an agent's tool timeout can cut a foreground call off partway. When `complete` is not noted as a background call, it prints a warning on stderr first, before any slow work, that a tool timeout could cut it off and that it should be run in the background instead; the warning never changes what `complete` does or its exit status.
+
 The same idea applies to another company's reviewer: if its reply is cut off mid-answer (an incomplete JSON object, not a real error), that reviewer is retried once before anything is held against it. If the retried call is cut off again too, only that reviewer's own slot falls back to the next alternative for this round — the provider isn't sidelined for hours the way a genuine quota, login or timeout failure is, and any review another reviewer already finished in the round is kept untouched. A reviewer that is really unavailable (not installed, signed out, out of quota, or timed out) is still skipped exactly as before, with no retry wasted on it.
 
 ### Staying aimed at real users
@@ -440,6 +442,7 @@ python3 tests/test_ci_export_docs.py
 python3 tests/test_ci_export_shapes.py
 python3 tests/test_ci_export_write.py
 python3 tests/test_cleanup.py
+python3 tests/test_complete_foreground.py
 python3 tests/test_converge.py
 python3 tests/test_dedup_unknown_model.py
 python3 tests/test_deferred_fixed.py

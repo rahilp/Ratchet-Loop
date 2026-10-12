@@ -3348,12 +3348,14 @@ def _note_fresh(note) -> bool:
             and bool(note["session"]) and fresh < str(note.get("at", "")) <= _in_a_minute())
 
 
-def _note_engine_call(root: Path, cmd: str, session: str | None):
-    """Guard hook: for every `ratchet.py init` / `ask` / `wait` call `cmd` really runs, note which chat is about
-    to run it here, with its exact arguments. Best effort; never blocks the call."""
+def _note_engine_call(root: Path, cmd: str, session: str | None, tool_input: dict | None = None):
+    """Guard hook: for every `ratchet.py init` / `ask` / `wait` / `complete` call `cmd` really runs, note which chat
+    is about to run it here, with its exact arguments. A `complete` note also carries the host's run_in_background
+    and timeout for the call (`bg`, `timeout`), which `complete` reads to warn about a foreground run. Best effort;
+    never blocks the call."""
     if not session:
         return
-    calls = [a for a in _engine_invocations(cmd) if _engine_subcommand(a) in ("init", "ask", "wait")]
+    calls = [a for a in _engine_invocations(cmd) if _engine_subcommand(a) in ("init", "ask", "wait", "complete")]
     if not calls:
         return
     try:
@@ -3363,7 +3365,12 @@ def _note_engine_call(root: Path, cmd: str, session: str | None):
             for argv in calls:
                 key = f"{root.resolve()}|{_engine_subcommand(argv)}"
                 kept = [x for x in (notes.get(key) if isinstance(notes.get(key), list) else []) if _note_fresh(x)]
-                notes[key] = kept + [{"session": session, "argv": argv, "at": now()}]
+                note = {"session": session, "argv": argv, "at": now()}
+                if _engine_subcommand(argv) == "complete":
+                    ti = tool_input if isinstance(tool_input, dict) else {}
+                    note["bg"] = ti.get("run_in_background") is True
+                    note["timeout"] = ti.get("timeout") if isinstance(ti.get("timeout"), (int, float)) else None
+                notes[key] = kept + [note]
             return notes
         # can't be had: note nothing (the owner rules without a note apply); damaged (a crash mid-write, say): no
         # note in it counts, and this write replaces it
@@ -3373,10 +3380,11 @@ def _note_engine_call(root: Path, cmd: str, session: str | None):
         pass
 
 
-def _noted_session(root: Path, which: str) -> str | None:
+def _noted_session(root: Path, which: str, whole: bool = False):
     """The chat the guard hook saw run exactly this `ratchet.py <which> ...` call (same arguments) in this project in
     the last ENGINE_NOTE_SECONDS. A matching note is used up; stale or malformed notes are dropped. None when there
-    is no such note, or when more than one chat noted the same call (Ratchet can't tell which one this is)."""
+    is no such note, or when more than one chat noted the same call (Ratchet can't tell which one this is).
+    whole=True gives the whole note (a dict) instead of just its chat."""
     mine = list(_ENGINE_ARGV) if _ENGINE_ARGV is not None else list(sys.argv[1:])
     try:
         p = _engine_notes_path()
@@ -3405,7 +3413,8 @@ def _noted_session(root: Path, which: str) -> str | None:
     except Exception:
         return None
     sessions = {x["session"] for x in match}
-    return sessions.pop() if len(sessions) == 1 else None
+    note = match[-1] if len(sessions) == 1 else None
+    return note if whole or note is None else note["session"]
 
 
 def cmd_init(args):
@@ -7911,6 +7920,21 @@ def cmd_receipt(args):
         print("No findings were accepted, left for later or fixed later in this run.")
 
 
+def _warn_if_foreground(ctx, cfg):
+    """complete runs the whole regression suite. Unless the guard hook noted that the host runs this exact call in
+    the background, say first (stderr, flushed) that a tool timeout could cut it off. No note, or a note that does
+    not say, counts as foreground. Never changes what complete does."""
+    note = _noted_session(ctx.root, "complete", whole=True)
+    if note and note.get("bg") is True:
+        return
+    secs = int(cfg.get("test_timeout_sec") or DEFAULT_CONFIG["test_timeout_sec"])
+    span = f"{secs // 60} minutes" if secs >= 120 else f"{secs} seconds"
+    print(f"WARNING: a tool timeout could cut this complete call off. It runs the whole regression suite, which "
+          f"can take up to {span}, and after a failure it may run the suite a second time, so up to about "
+          f"twice that. Run it in the background instead (run_in_background), then wait for it to "
+          f"finish.", file=sys.stderr, flush=True)
+
+
 def cmd_complete(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -7918,6 +7942,8 @@ def cmd_complete(args):
     _expect_step(cps, ["complete"], args.cp)
     cp = cp_by_id(ctx.plan(), args.cp)
     cfg = ctx.config()
+    if cfg.get("regression_command"):
+        _warn_if_foreground(ctx, cfg)
     fp = fingerprint(ctx.root)
     problems, stale = [], []
     for name in ["behavior", "ui", "adversarial"]:
@@ -10953,7 +10979,7 @@ def decide_guard(n: dict) -> tuple[bool, str]:
         why = _guard_shell(cmd, cwd, who)
         if why:
             return True, why
-        _note_engine_call(root, cmd, n.get("session"))  # which chat runs `init` / `ask` / `wait` here (_noted_session)
+        _note_engine_call(root, cmd, n.get("session"), n.get("input"))  # which chat runs `init` / `ask` / `wait` / `complete` here (_noted_session)
     if who["enforce"] and not n.get("agent_type") and _run_phase(root) == "building" and _orchestrator_edit(n, root):
         return True, ORCH_EDIT_MSG
     if n["kind"] == "write":
