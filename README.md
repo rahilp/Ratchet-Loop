@@ -437,6 +437,7 @@ python3 tests/test_quick_path.py
 python3 tests/test_quick_path_docs.py
 python3 tests/test_results.py
 python3 tests/test_review_objective.py
+python3 tests/test_run_all_dedupe.py
 python3 tests/test_runner.py
 python3 tests/test_signing.py
 python3 tests/test_specs.py
