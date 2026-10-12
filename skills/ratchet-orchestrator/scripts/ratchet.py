@@ -51,6 +51,7 @@ VIEWER_TEMPLATE = SKILL_DIR / "assets" / "viewer.html"
 sys.path.insert(0, str(SCRIPT_DIR))
 _dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True  # never litter the installed plugin with __pycache__
 import spec_sources as specsrc  # noqa: E402
+import provider_health as phealth  # noqa: E402
 sys.dont_write_bytecode = _dwb
 
 GATES = ["behavior", "ui", "adversarial", "human"]
@@ -2839,10 +2840,79 @@ def _status_path(ctx):
 
 
 _STATUS_DAMAGED = "Ratchet treats every provider as not yet tested"
+_HEALTH_DAMAGED = "Ratchet treats every provider as not yet tested and rebuilds it from the next test results"
+_PROBE_CLAIM_SLACK = 30.0  # seconds a test-request claim lasts beyond the request's own timeout (and a waiter waits)
+_HEALTH_LOCK_WAIT = 20.0  # seconds every writer of provider-health.json waits for its lock (a lost result costs every lane)
 
 
-def provider_status(ctx) -> dict:
-    return read_json(_status_path(ctx), {}, record=_STATUS_DAMAGED) or {}
+def _health_path() -> Path:
+    """The shared provider health record: one per-user file (provider_health.py), the same for every project."""
+    return ratchet_home() / phealth.FILE
+
+
+def provider_health() -> dict:
+    """Every provider's last test result and bench, as every lane on this machine sees it."""
+    return read_json(_health_path(), {}, record=_HEALTH_DAMAGED) or {}
+
+
+def _health_key(pv) -> str:
+    """The provider's one key in the shared record: its tool plus its model. A hand-written command provider has no
+    preset, so its program is its tool (and its id tells two providers run through one program apart)."""
+    tool = pv.get("preset") or Path(provider_binary(pv) or str(pv.get("id"))).name
+    label = pv.get("model")
+    if not label and not pv.get("preset") and pv.get("id") not in (None, tool):
+        label = pv["id"]
+    return phealth.entry_key(tool, label)
+
+
+def _reviewer_health_key(cfg, rid) -> str | None:
+    """The shared-record key of the provider behind reviewer `rid` (or of provider id `rid` itself); None for a
+    host sub-agent or a hand-written reviewer that has no provider."""
+    pv = provider_by_id(cfg, rid)
+    if pv is None:
+        spec = _roster_spec(cfg, rid) or {}
+        if spec.get("provider"):
+            pv = provider_by_id(cfg, spec["provider"])
+        elif spec.get("kind") == "command" and spec.get("preset"):
+            return phealth.entry_key(spec["preset"], spec.get("model"))
+    return _health_key(pv) if pv is not None else None
+
+
+def _update_health(change, note: bool = True, lock=None) -> str:
+    """Change the shared provider health record (`change(data)` edits it in place). Every lane on the machine updates
+    it, so it is changed only through update_record, under its own lock (or `lock`, that lock already held by the
+    caller); a damaged one holds nothing and is rebuilt. Waits longer for the lock than most records
+    (_HEALTH_LOCK_WAIT): a result lost here makes every lane test, or keep using, a provider that is out. Returns update_record's result; a caller that
+    must not claim the change was saved checks for "busy" and refuses with _die_record_busy (note=False)."""
+    p = _health_path()
+
+    def fn(data):
+        change(data)
+        return data
+    res = update_record(p, fn, lock=lock, damaged=_HEALTH_DAMAGED, pretty=True, wait=_HEALTH_LOCK_WAIT)
+    if res == "busy" and note:
+        _note_record_busy(p, "this provider check")
+    return res
+
+
+def provider_bench(cfg, rid) -> dict | None:
+    """The live bench ({reason, since, until}) of the provider behind reviewer `rid`, as every lane sees it."""
+    key = _reviewer_health_key(cfg, rid)
+    if key is None:
+        return None
+    return phealth.live_bench(provider_health(), key, _dt.datetime.now(_dt.timezone.utc))
+
+
+def shared_unavailable(cfg) -> dict:
+    """Every roster reviewer whose provider is benched in the shared health record, as {reviewer id: {reason, since,
+    until}}: the same shape as unavailable-reviewers.json, so `status --json` shows a provider any lane benched."""
+    data, at, out = provider_health(), _dt.datetime.now(_dt.timezone.utc), {}
+    for rid in roster(cfg):
+        key = _reviewer_health_key(cfg, rid)
+        bench = phealth.live_bench(data, key, at) if key else None
+        if bench:
+            out[rid] = {k: bench.get(k) for k in ("reason", "since", "until")}
+    return out
 
 
 def _note_record_busy(p: Path, lost: str):
@@ -2872,8 +2942,9 @@ def _die_record_busy(p: Path, lost: str):
 
 
 def _update_provider_status(ctx, change, note: bool = True, lock=None) -> str:
-    """Change provider-status.json (`change(data)` edits it in place). More than one command can update it (a probe
-    run by `reviewers`, `providers --add`), so it is changed only through update_record, under its own lock (or
+    """Change provider-status.json (`change(data)` edits it in place). Only `providers --add` writes it now (nothing
+    reads it for a decision; the shared provider-health.json does that), but it can still be updated by two
+    commands at once, so it is changed only through update_record, under its own lock (or
     `lock`, that lock already held by the caller); a damaged one holds no result and is replaced. Returns
     update_record's result. A caller that must not then claim the change was saved checks for "busy" itself and
     refuses with _die_record_busy, passing note=False so this does not also print a stderr note for the same busy
@@ -2890,15 +2961,18 @@ def _update_provider_status(ctx, change, note: bool = True, lock=None) -> str:
     return res
 
 
-def probe_provider(ctx, cfg, pv, bench=True, note: bool = True, record: bool = True) -> tuple[bool, str, bool]:
+def probe_provider(ctx, cfg, pv, bench=True, note: bool = True, record: bool = True,
+                   by: str | None = None) -> tuple[bool, str, bool]:
     """Send a tiny request through the provider exactly as a review would go, and record the result (_record_probe:
-    provider-status.json, then unavailable-reviewers.json).
+    the shared provider-health.json, then this project's unavailable-reviewers.json), dated when the request was
+    sent; `by` is the claim this lane holds on the provider (probe_shared), ended with the result.
     Returns (good, detail, saved): `saved` is False when either of those writes could not be made because its lock
     was busy (True when both were saved, or when nothing was sent because the provider has no command or isn't
     installed, so there was nothing to record). Every recording caller is best effort and leaves note=True, so a
     stderr line speaks for a busy write. A caller that must not claim anything was saved unless all of it was (a
     checked `providers --add`) passes record=False (nothing is written, and `saved` is False once a request was
-    sent), then takes both records' locks itself and calls _record_probe."""
+    sent), then takes the three records' locks (provider-status, provider-health, unavailable-reviewers) itself and
+    calls _record_probe."""
     cmd_t, use_stdin = provider_command(pv)
     if not cmd_t:
         return False, "no command", True
@@ -2915,6 +2989,7 @@ def probe_provider(ctx, cfg, pv, bench=True, note: bool = True, record: bool = T
         for k, v in subs.items():
             part = part.replace(k, v)
         cmd.append(part)
+    sent = _dt.datetime.now(_dt.timezone.utc)  # the result is dated by this, not by when the answer came back
     try:
         r = subprocess.run(cmd, cwd=work, input=prompt if use_stdin else None, capture_output=True, text=True,
                            stdin=None if use_stdin else subprocess.DEVNULL,  # a CLI waiting on stdin must not hang
@@ -2931,28 +3006,36 @@ def probe_provider(ctx, cfg, pv, bench=True, note: bool = True, record: bool = T
     shutil.rmtree(work, ignore_errors=True)
     if not record:
         return good, detail, False
-    busy = _record_probe(ctx, pv, good, detail, bench=bench, note=note)
+    busy = _record_probe(ctx, pv, good, detail, bench=bench, note=note, sent=sent, by=by)
     return good, detail, not busy
 
 
-def _record_probe(ctx, pv, good: bool, detail: str, bench: bool = True, note: bool = True, locks=None) -> list:
-    """Record a probe's result: provider-status.json, then unavailable-reviewers.json (bench every lens of a
-    failing provider when `bench`, else clear its benched entries). Returns the records whose write was busy, in
+def _record_probe(ctx, pv, good: bool, detail: str, bench: bool = True, note: bool = True, locks=None,
+                  local_copy: bool = False, sent=None, by: str | None = None) -> list:
+    """Record a probe's result in the shared provider health record (a failing provider is benched for every lane
+    when `bench`), then clear this project's reviewer marks for a provider that passed or is not benched. `sent` is
+    when the request was sent (default: now): a result older than the one already recorded is dropped. `by` is the
+    claim this lane holds on the provider, ended with the result.
+    `local_copy`: a checked `providers --add` also keeps its result in this project's own provider-status.json, as
+    it always has (nothing reads that file for a decision any more). Returns the records whose write was busy, in
     the order tried (empty when every write was saved). `locks` maps a record's path to its _RecordLock the caller
-    already holds: a caller that takes both first can't have one written and then find the other busy."""
+    already holds: a caller that takes them all first can't have one written and then find another busy."""
     locks = locks or {}
-    sp, up = _status_path(ctx), _unavailable_path(ctx)
+    hp, sp, up = _health_path(), _status_path(ctx), _unavailable_path(ctx)
     busy = []
-    if _update_provider_status(ctx, lambda data: data.__setitem__(pv["id"], {"ok": good, "at": now(),
-                                                                          "detail": detail}),
-                               note=note, lock=locks.get(sp)) == "busy":
+    if local_copy and _update_provider_status(
+            ctx, lambda data: data.__setitem__(pv["id"], {"ok": good, "at": now(), "detail": detail}),
+            note=note, lock=locks.get(sp)) == "busy":
         busy.append(sp)
-    if not good and bench:
-        for lens in LENSES:
-            if mark_unavailable(ctx, f"{pv['id']}-{lens}", f"test request failed: {detail}", note=note,
-                                lock=locks.get(up)) is None and up not in busy:
-                busy.append(up)
-    else:
+    at = _dt.datetime.now(_dt.timezone.utc)
+    sent = sent or at
+    benched = not good and bench
+    until = at + _dt.timedelta(hours=float(ctx.config().get("unavailable_ttl_hours", 6))) if benched else None
+    if _update_health(lambda data: phealth.record_probe(data, _health_key(pv), good, detail, sent,
+                                                        f"test request failed: {detail}", until, now=at, by=by),
+                      note=note, lock=locks.get(hp)) == "busy":
+        busy.append(hp)
+    if not benched:
         def clear(live):
             for lens in LENSES:
                 live.pop(f"{pv['id']}-{lens}", None)
@@ -2962,12 +3045,50 @@ def _record_probe(ctx, pv, good: bool, detail: str, bench: bool = True, note: bo
 
 
 def probe_due(ctx, cfg, pid) -> bool:
-    if not cfg.get("probe_providers", True):
+    """Whether provider `pid` needs a test request now: not while any lane's recent test passed (inside
+    probe_ttl_minutes) or while the provider is benched (it is tried again when the bench ends)."""
+    pv = provider_by_id(cfg, pid)
+    if not cfg.get("probe_providers", True) or pv is None:
         return False
-    st = provider_status(ctx).get(pid) or {}
-    t = _parse_iso(st.get("at"))
-    fresh = t and (_dt.datetime.now(_dt.timezone.utc) - t).total_seconds() < 60 * float(cfg.get("probe_ttl_minutes", 120))
-    return not (st.get("ok") and fresh)
+    key, at, data = _health_key(pv), _dt.datetime.now(_dt.timezone.utc), provider_health()
+    if phealth.live_bench(data, key, at):
+        return False
+    return not phealth.fresh_ok(data, key, at, float(cfg.get("probe_ttl_minutes", 120)))
+
+
+def probe_shared(ctx, cfg, pv) -> tuple[bool, str]:
+    """The automatic test request before a review round relies on provider `pv`: one lane sends it, the others use
+    its result. Under the shared record's lock this looks at the record again and either finds a fresh pass or a
+    bench (use it, send nothing), finds another lane's live claim (wait for that lane's result, polling, no longer
+    than the claim lasts, then look again), or takes the claim itself and sends the request (probe_provider records
+    the result and ends the claim; a claim whose lane died ends on its own). When the record's lock can't be had or
+    the wait runs out, it sends its own request as it always did. Returns (good, detail)."""
+    key, by = _health_key(pv), f"{os.getpid()}-{secrets.token_hex(4)}"
+    timeout = float(cfg.get("probe_timeout_sec", 120))
+    ttl = float(cfg.get("probe_ttl_minutes", 120))
+    hold = timeout + _PROBE_CLAIM_SLACK  # the claim outlives the request: it starts a little after, and lands after
+    give_up = time.monotonic() + hold
+    while time.monotonic() < give_up:
+        got = []
+        res = _update_health(lambda data: got.append(phealth.claim(data, key, by, _dt.datetime.now(_dt.timezone.utc),
+                                                                   ttl, hold)), note=False)
+        if res == "busy":
+            break
+        what, _claim = got[0]
+        if what == "claimed":
+            try:
+                return probe_provider(ctx, cfg, pv, by=by)[:2]
+            finally:  # an early return (no command, not installed) records nothing: don't hold the claim
+                _update_health(lambda data: phealth.release(data, key, by), note=False)  # busy: ends at its `until`
+        if what in ("fresh", "benched"):
+            e = provider_health().get(key)
+            e = e if isinstance(e, dict) else {}
+            return bool(e.get("ok")) and what == "fresh", str(e.get("detail") or "")
+        while time.monotonic() < give_up:  # another lane's request is on its way
+            time.sleep(0.5)
+            if phealth.live_claim(provider_health(), key, _dt.datetime.now(_dt.timezone.utc)) is None:
+                break
+    return probe_provider(ctx, cfg, pv)[:2]
 
 
 def _write_providers(ctx, plist):
@@ -3100,22 +3221,25 @@ def cmd_providers(args):
                 _die_record_busy(p, f"{args.add}'s old status entry was not cleared and it was not added")
         else:
             # A refused add changes nothing: a failed test request records nothing (an older provider with this id
-            # keeps its own status), and a passing one is recorded only once both records' locks are held, so a
-            # busy lock on either leaves provider-status.json, unavailable-reviewers.json and config.json as they were
+            # keeps its own status), and a passing one is recorded only once all three records' locks are held, so
+            # a busy lock on any leaves provider-status.json, provider-health.json, unavailable-reviewers.json and
+            # config.json as they were
+            sent = _dt.datetime.now(_dt.timezone.utc)
             good, detail = probe_provider(ctx, cfg, pv, record=False)[:2]
             if not good:
                 die(f"{args.add} didn't pass the test request ({detail}). Not added. Fix the command or model and "
                     "try again (or add --no-check to add it anyway).")
             busy, locks = None, {}
             with contextlib.ExitStack() as stack:
-                for rec in (_status_path(ctx), _unavailable_path(ctx)):
-                    lk = stack.enter_context(_RecordLock(rec))
+                for rec in (_status_path(ctx), _health_path(), _unavailable_path(ctx)):
+                    lk = stack.enter_context(_RecordLock(rec, _HEALTH_LOCK_WAIT if rec == _health_path() else 5.0))
                     if not lk.held:
                         busy = rec
                         break
                     locks[rec] = lk
                 if busy is None:
-                    left = _record_probe(ctx, pv, good, detail, bench=False, note=False, locks=locks)
+                    left = _record_probe(ctx, pv, good, detail, bench=False, note=False, locks=locks,
+                                         local_copy=True, sent=sent)
                     busy = left[0] if left else None
             if busy is not None:
                 _die_record_busy(busy, f"nothing was changed and {args.add} was not added")
@@ -3142,11 +3266,12 @@ def cmd_providers(args):
                 continue
             if shutil.which(provider_binary(pv) or "") and company:
                 probe_provider(ctx, cfg, pv)
-    status = provider_status(ctx)
+    status = provider_health()
     rows = []
     for pv in plist:
         company = provider_company(pv)
-        st_ = status.get(pv["id"]) or {}
+        st_ = status.get(_health_key(pv))
+        st_ = st_ if isinstance(st_, dict) else {}
         installed = bool(shutil.which(provider_binary(pv) or ""))
         if company == host:
             state = "same company as this agent, so not used as an independent reviewer"
@@ -3154,7 +3279,7 @@ def cmd_providers(args):
             state = "needs a model (which company's model it runs is unknown)"
         elif not installed:
             state = f"not installed ('{provider_binary(pv)}' not found)"
-        elif not st_:
+        elif "ok" not in st_:
             state = "installed, not tested yet"
         else:
             state = ("working" if st_.get("ok") else "failing") + f": {st_.get('detail')} ({str(st_.get('at'))[:16]}Z)"
@@ -3998,6 +4123,8 @@ def reviewer_availability(ctx, cfg, rid, risk=None) -> tuple[bool, str]:
     if not binary or not shutil.which(binary):
         return False, f"'{binary or spec.get('preset')}' CLI not installed"
     down = unavailable_reviewers(ctx).get(rid) if ctx else None
+    if down is None:  # a provider another lane found failing is out here too, until its bench ends
+        down = provider_bench(cfg, rid)
     if down:
         return False, f"failed recently ({down['reason']}); retry after {down['until'][:16]}Z"
     return True, f"{binary} on PATH"
@@ -9720,7 +9847,7 @@ def cmd_reviewers(args):
             if not due:
                 break
             for pid in due:
-                good, detail, _saved = probe_provider(ctx, cfg, provider_by_id(cfg, pid))
+                good, detail = probe_shared(ctx, cfg, provider_by_id(cfg, pid))
                 print(f"  checked {pid}: {'working' if good else 'not usable now (' + detail + ')'}", file=sys.stderr)
             resolved = resolve_reviewers(ctx, cfg, cp)
         # Narrow after round 1: when the round being replaced was recorded (it blocked) and was itself NOT
@@ -9852,6 +9979,9 @@ def cmd_reviewer_status(args):
     ctx = Ctx(find_root())
     cfg = ctx.config()
     if args.reset:
+        key = _reviewer_health_key(cfg, args.reset)
+        if key and _update_health(lambda data: phealth.clear(data, key), note=False) == "busy":
+            _die_record_busy(_health_path(), f"{args.reset}'s shared bench was not cleared")
         p = _unavailable_path(ctx)
         if _update_unavailable(ctx, lambda live: live.pop(args.reset, None), note=False) == "busy":
             _die_record_busy(p, f"{args.reset} was not reset")
@@ -9897,7 +10027,8 @@ def status_json(ctx: Ctx) -> dict:
             "awaiting_since": st.get("awaiting_since"), "approval_mode": approval_mode(ctx),
             "wait": live_wait(st),
             "adv_rounds_used": st.get("adv_rounds_total", 0),
-            "unavailable_reviewers": unavailable_reviewers(ctx), "host_provider": detect_host(ctx.config()),
+            "unavailable_reviewers": {**shared_unavailable(ctx.config()), **unavailable_reviewers(ctx)},
+            "host_provider": detect_host(ctx.config()),
             "hooks_warning": hw, "hook_heartbeat": read_heartbeat(ctx.root),
             "hooks": hs, "hook_errors": hook_errors_view(ctx.root, hs.get("host", "unknown")),
             "viewer_url": viewer_link(ctx)["url"], "viewer_live": viewer_link(ctx)["live"],

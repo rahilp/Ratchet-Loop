@@ -32,10 +32,11 @@ SECTIONS = []
 
 _CP5R13_SHARED_PATHS = {"_markers_path", "_enrolled_path", "_director_folders_path", "_stop_errors_path",
                         "_chain_path", "_engine_notes_path", "_status_path", "_unavailable_path", "_heartbeat_path",
-                        "_hook_env_path"}
+                        "_hook_env_path", "_health_path"}
 _CP5R13_SHARED_NAMES = {"active-runs.json", "enrolled.json", "director-folders.json", "stop-errors.json",
                         "file-hashes.json", "engine-call-sessions.json", "provider-status.json",
-                        "unavailable-reviewers.json", "hook-heartbeat.json", "hook-env.json"}
+                        "unavailable-reviewers.json", "hook-heartbeat.json", "hook-env.json",
+                        "provider-health.json"}
 _CP5R13_WRITE_OK = {
     "update_record": "the one read-modify-write of a shared record, under its lock",
     "write_json": "a facade over _write_record",
@@ -302,6 +303,11 @@ def cp5_adv_round13_shared_record_lock():
                                   lambda: m._update_provider_status(ctx, lambda d: d.__setitem__("y", {"ok": True}))])
         got = cp5r13_json(a / ".ratchet" / "provider-status.json") or {}
         lost["provider-status.json"] = (errs, not {"x", "y"} <= set(got))
+        errs = cp5r13_interleave(m, m._health_path(),
+                                 [lambda: m._update_health(lambda d: d.__setitem__("x", {"ok": True})),
+                                  lambda: m._update_health(lambda d: d.__setitem__("y", {"ok": True}))])
+        got = cp5r13_json(m._health_path()) or {}
+        lost["provider-health.json"] = (errs, not {"x", "y"} <= set(got))
         fa, fb = a / "f.txt", b / "f.txt"
         fa.write_text("a")
         fb.write_text("b")
@@ -540,10 +546,10 @@ _CP5R17_DISCARD_OK = {
     ("_heartbeat", "update_record"): "liveness only: a skipped beat makes a hook look less healthy until its next run",
     ("_reset_stop_errors", "update_record"): "a counter reset: a missed reset only lets stop refuse a little longer",
     ("_stop_error", "update_record"): "a counter: when it can't be saved this refusal still counts as one more",
+    ("probe_shared", "_update_health"):
+        "ending the claim after the request: a busy lock only leaves the claim until it expires on its own, which is safe",
     ("cmd_providers", "probe_provider"):
         "--check/--discover only report the result, and probe_provider's own stderr note says when it wasn't saved",
-    ("cmd_reviewers", "probe_provider"):
-        "picks reviewers from what was saved; probe_provider's own stderr note says when a result wasn't saved",
 }
 
 

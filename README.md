@@ -248,6 +248,8 @@ Each step has a risk level, which you see in the plan. Risk decides how many rev
 
 At the start of each run the agent checks which AI tools are installed and sends each one a tiny test request. A tool that's signed out or out of credit gets skipped for six hours, and the next one takes its place. When nothing else works, the host's own sub-agents fill the slot so the build never stalls. On a high-risk step that can mean fewer distinct reviewers than four. Substitutions are logged, the plan and viewer say who reviewed each round, and you're told up front if every review will come from the same company that did the build.
 
+What Ratchet learns about a provider is kept once per user, not once per project: the test results and the benches (a bench is "skip this provider until it is due back") live in one file, `provider-health.json`, in Ratchet's per-user folder (`RATCHET_HOME`), and every project and every lane on your machine reads and updates the same one. When one lane finds a provider failing, every other lane skips it too without sending its own test request; when one lane finds it working, the others don't test it again inside the usual re-test window (`probe_ttl_minutes`); when several lanes need the same untested provider at the same moment, one of them sends the test request and the others wait for its answer instead of sending their own, and a late answer never replaces a newer one; when a bench ends, the next lane to need the provider tests it again. Lanes recording results at the same moment all end up saved. Clearing a provider's reviewer with `reviewer-status --reset` clears its bench for every lane. A reviewer your agent marked unavailable by hand (`reviewer-status --mark`) is a per-project choice and stays in that project. If the file is damaged, Ratchet says so and rebuilds it from the next test results. The old per-project `provider-status.json` is ignored, which costs one fresh test request per provider.
+
 For OpenCode specifically, discovery goes further on its own: it reads OpenCode's own model list and picks one capable flat-rate model from a company other than yours (never your own company, never a model it can't map to a company, never a small or preview variant), testing it before adding it — no hand-written `providers --add` needed. Oh My Pi (omp) is discovered and labelled the same way as OpenCode: when it's installed and signed in, discovery reads its model catalog (`omp models --json`) the same way and picks a capable flat-rate model (for example GLM through an OpenCode Go subscription reached via omp) before adding it, with no hand-written `providers --add` either. Anything per-use or of unknown cost, from either tool (OpenCode Zen, OpenRouter, an unlisted provider) is never sent a request, not even that test one; it's listed instead, naming the exact tool, provider and model, each one saying it costs money (or that its cost is unknown and so treated as paid) and that you must be asked, by name, before it is ever used — the agent asks you directly, in plain words, before it ever uses one, using the listing's `add_model` id (the full `<provider>/<model>`, not the shorter name shown to you) for both the question and the add that follows it. That question (`ratchet.py ask paid-provider <tool> <model>`) only ever moves forward on one exact reply naming the model, never the plain "yes" that answers every other question; nothing is sent to that model, not even the one-off test request, until you give it, and it only covers that one tool and model. Pi (preset `pi`) has no such model lister yet, so it's listed under the tools that need a model picked by hand, the same as Copilot or Cursor.
 
 Each role also gets its own model. Planning, coding, fixing and reviewing use a strong model. Lighter jobs like planning tests use a cheaper one, and running tests the cheapest. You can change this in `.ratchet/config.json`.
@@ -350,6 +352,7 @@ ratchet-loop/
 │   │   ├── SKILL.md
 │   │   ├── scripts/ratchet.py         state engine: checkpoints, gates, fingerprints, evidence, viewer, hooks
 │   │   ├── scripts/spec_sources.py    reads OpenSpec, Spec Kit and BMAD files; ticks tasks back
+│   │   ├── scripts/provider_health.py the shared provider test results and benches (provider-health.json)
 │   │   ├── assets/viewer.html         checkpoint viewer (plan review + live progress)
 │   │   └── references/schemas.md      every file format
 │   ├── ratchet-tdd-planner/           plan tests before code
@@ -391,7 +394,7 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py pause --reason "..."`, `resume [--claim]`, `cancel` | pause, resume, cancel (resume-claim and cancel are asked about first) |
 | `ratchet.py wait --for "..." [--minutes N]` | the run's own chat waits on background reviewers or sub-agents: until then (default 30 minutes, 1 to 120) it may end its turn without a blocked stop |
 | `ratchet.py set-review end\|each\|none` | how often you check in |
-| `ratchet.py reviewer-status [--reset <id>]` | the host, who is available, and retrying one early |
+| `ratchet.py reviewer-status [--reset <id>]` | the host, who is available, and retrying one early (`--reset` clears that provider's shared bench for every lane) |
 | `ratchet.py providers [--discover] [--check [id]] [--add <id> --preset <p> --model <m>] [--remove <id>]` | agent tools that can review: find, test, add or remove them. `--check` also accepts a reviewer name such as `codex-correctness`; an unknown name is refused with the list of known provider ids. A per-use or unknown-cost model (`providers --discover --json`'s `paid_options`) needs `ask paid-provider` answered first; `--add` for one refuses, with no request sent, until it is |
 | `ratchet.py ask paid-provider <tool> <model>` | ask the user whether to spend money on a per-use or unknown-cost model before it is ever used; only their own exact reply, `pay per use: <model>`, counts (never the usual yes words), and only then does `providers --add` send the one test request and add it |
 | `ratchet.py models` | which model each role's sub-agent uses on this host |
@@ -461,6 +464,7 @@ python3 tests/test_objective.py
 python3 tests/test_plan_change.py
 python3 tests/test_providers.py
 python3 tests/test_quota_check.py
+python3 tests/test_quota_shared.py
 python3 tests/test_receipt.py
 python3 tests/test_receipt_proof.py
 python3 tests/test_results.py
