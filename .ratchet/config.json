@@ -71,6 +71,16 @@
       "id": "copilot",
       "preset": "copilot",
       "model": "grok-4.7"
+    },
+    {
+      "id": "opencode-glm",
+      "preset": "opencode",
+      "model": "opencode-go/glm-5.3"
+    },
+    {
+      "id": "opencode-kimi",
+      "preset": "opencode",
+      "model": "opencode-go/kimi-k3"
     }
   ],
   "test_timeout_sec": 3600,

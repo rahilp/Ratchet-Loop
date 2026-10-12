@@ -238,6 +238,8 @@ Each step has a risk level, which you see in the plan. Risk decides how many rev
 
 At the start of each run the agent checks which AI tools are installed and sends each one a tiny test request. A tool that's signed out or out of credit gets skipped for six hours, and the next one takes its place. When nothing else works, the host's own sub-agents fill the slot so the build never stalls. On a high-risk step that can mean fewer distinct reviewers than four. Substitutions are logged, the plan and viewer say who reviewed each round, and you're told up front if every review will come from the same company that did the build.
 
+For OpenCode specifically, discovery goes further on its own: it reads OpenCode's own model list and picks one capable flat-rate model from a company other than yours (never your own company, never a model it can't map to a company, never a small or preview variant), testing it before adding it — no hand-written `providers --add` needed. Anything per-use or of unknown cost (OpenCode Zen, OpenRouter, an unlisted provider) is never sent a request, not even that test one; it's listed instead, naming the exact tool, provider and model, each one saying it costs money (or that its cost is unknown and so treated as paid) and that you must be asked, by name, before it is ever used — the agent asks you directly, in plain words, before it ever uses one.
+
 Each role also gets its own model. Planning, coding, fixing and reviewing use a strong model. Lighter jobs like planning tests use a cheaper one, and running tests the cheapest. You can change this in `.ratchet/config.json`.
 
 ### Later rounds cost less
@@ -420,6 +422,7 @@ python3 tests/test_dedup_unknown_model.py
 python3 tests/test_digest.py
 python3 tests/test_digest_docstring.py
 python3 tests/test_digest_specs.py
+python3 tests/test_discover.py
 python3 tests/test_docs.py
 python3 tests/test_flaky.py
 python3 tests/test_gates.py

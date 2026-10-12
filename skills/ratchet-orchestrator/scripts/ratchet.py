@@ -2994,6 +2994,7 @@ def cmd_providers(args):
         rows.append({"id": pv["id"], "company": company, "model": pv.get("model"), "installed": installed,
                      "ok": bool(st_.get("ok")) and company not in (None, host), "state": state})
     found = []
+    paid_options = []
     if args.discover:
         known = {provider_binary(pv) for pv in plist}
         for name, pr in PRESETS.items():
@@ -3010,10 +3011,45 @@ def cmd_providers(args):
                 else:
                     rows.append({"id": name, "company": pr["company"], "model": None, "installed": True, "ok": False,
                                  "state": f"installed but failing: {detail}"})
-            elif not pr["company"]:
+            elif not pr["company"] and name not in MODEL_LISTERS:
                 found.append(name)
+            elif not pr["company"]:
+                lines = _list_tool_models(name)
+                if not lines:
+                    found.append(name)
+                    continue
+                have = {r["company"] for r in rows if r.get("ok")}
+                picked = _pick_capable_listed_model(lines, host, have)
+                if picked:
+                    pv = {"id": f"{name}-{_model_family(_listed_model_name(picked))}", "preset": name,
+                          "model": picked, "cost": "flat"}
+                    good, detail, _saved = probe_provider(ctx, cfg, pv)
+                    if good:
+                        plist.append(pv)
+                        _write_providers(ctx, plist)
+                        rows.append({"id": pv["id"], "company": company_of_model(picked), "model": picked,
+                                     "installed": True, "ok": True, "cost": "flat",
+                                     "state": "working: added (flat-rate)"})
+                    else:
+                        rows.append({"id": pv["id"], "company": company_of_model(picked), "model": picked,
+                                     "installed": True, "ok": False, "cost": "flat",
+                                     "state": f"a flat-rate {name} model failed its test request: {detail}"})
+                else:
+                    # Every listed line was same-company, unmappable or a small/preview variant: nothing to
+                    # probe, but the tool is still installed and signed in, so keep it reachable by hand.
+                    found.append(name)
+                for (provider, company), group_lines in _paid_candidate_groups(lines, host).items():
+                    rep = _paid_pick(group_lines)
+                    if not rep:
+                        continue
+                    cost = _listed_model_cost(rep)
+                    label = "costs money per use" if cost == "per-use" else "cost unknown, treated as paid"
+                    paid_options.append({"tool": name, "provider": provider,
+                                         "model": _listed_model_name(rep), "cost": cost,
+                                         "text": f"{label}; ask the developer before this is used."})
     if args.json:
-        print(json.dumps({"host": host, "providers": rows, "needs_model": found}, indent=2))
+        print(json.dumps({"host": host, "providers": rows, "needs_model": found, "paid_options": paid_options},
+                         indent=2))
         return
     print(f"This agent runs on: {host}.")
     for r in rows:
@@ -3022,6 +3058,8 @@ def cmd_providers(args):
         print(f"  + {name:<10} {'?':<10} installed; it can run several companies' models. Pick a capable model from "
               f"a company other than {host} (the tool's own help lists them), then: "
               f"ratchet.py providers --add {name} --preset {name} --model <model>")
+    for p in paid_options:
+        print(f"  $ {p['tool']}/{p['provider']} {p['model']}: {p['text']}")
     if not any(r["ok"] for r in rows):
         print(f"No working provider from another company: reviews will come from {host}'s own models.")
 
@@ -3395,6 +3433,185 @@ def company_of_model(model) -> str | None:
         if re.search(rx, m):
             return company
     return None
+
+
+# A multi-company preset (today: opencode) can list what it can reach without spending anything, so discovery
+# can pick a capable other-company model itself instead of leaving it to "needs_model". MODEL_LISTERS: preset
+# name -> the read-only command that prints "provider/model" lines, one per line. PROVIDER_COST: the service
+# namespace before a listed model's first "/" -> "flat" (a subscription already paid for) or "per-use" (billed
+# per request); a namespace missing from this table is unknown and is treated as paid, never probed without the
+# developer's OK. Both are small fixed tables, not a live price lookup (out of scope for this checkpoint).
+MODEL_LISTERS = {
+    "opencode": (["opencode", "models"], 20),
+}
+PROVIDER_COST = {
+    "opencode-go": "flat",     # OpenCode Go: flat-rate subscription
+    "opencode": "per-use",     # OpenCode Zen: billed per request
+    "openrouter": "per-use",   # OpenRouter: billed per request
+}
+# When more than one other-company flat model is available, these families win: GLM and Kimi have been this
+# project's working reviewers so far. A short ordered tuple of name substrings, not a live quality ranking;
+# any company whose models don't match one just ties at "no preference" and falls back to the existing
+# "no working reviewer yet, then listing order" rule.
+FAMILY_PREFERENCE = ("glm", "kimi")
+# Words that mark a listed model as never-pick, whatever picker is asking: a speed/preview/open-weight
+# sibling of a company's flagship (flash, mini, nano, lite, small, haiku, free, preview, oss, gemma) or a
+# model that cannot write a text review at all (guard: safety classifier; image/vision: image generation;
+# embed/tts/audio: not a chat model). A table, not one hand-built regex, so it stays easy to extend. Matched
+# as a name token with _B/_E (so "5-small-2603" matches but "smaller-than-life" as a whole word wouldn't
+# apply here since these are name tokens, not prose) and prefixes included: "[a-z]*" after the word lets a
+# suffix like "flashx" or "liteweight" still match on its "flash"/"lite" prefix.
+REJECT_WORDS = ("flash", "mini", "nano", "lite", "small", "haiku", "free", "preview", "oss", "gemma",
+                "guard", "image", "vision", "embed", "tts", "audio")
+_REJECT_VARIANT_RX = re.compile(_B + r"(?:" + "|".join(REJECT_WORDS) + r")[a-z]*" + _E)
+
+
+def _is_rejected_variant(line: str) -> bool:
+    return bool(_REJECT_VARIANT_RX.search(line.lower()))
+
+
+def _is_model_line(line: str) -> bool:
+    """True for a line shaped like 'provider/model' (non-empty text on both sides of the first '/'), the
+    shape every real model-listing command prints, one per line. A banner, warning or table line on stdout
+    has no such shape and is never a model candidate, flat or paid."""
+    provider, sep, rest = line.partition("/")
+    return bool(sep) and bool(provider.strip()) and bool(rest.strip())
+
+
+def _list_tool_models(preset_name) -> list[str]:
+    """Run a multi-company preset's read-only model-listing command and return its 'provider/model' lines,
+    dropping any line that isn't shaped like one. A listing failure (not installed, times out, non-zero
+    exit, no output, or output with no line shaped like 'provider/model') is just an empty list: the caller
+    falls back to today's needs_model line, never a crash and never a garbage candidate."""
+    spec = MODEL_LISTERS.get(preset_name)
+    if not spec:
+        return []
+    cmd, timeout = spec
+    if not shutil.which(cmd[0]):
+        return []
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if r.returncode != 0:
+        return []
+    lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    return [ln for ln in lines if _is_model_line(ln)]
+
+
+def _listed_model_cost(line: str) -> str:
+    """flat / per-use / unknown for one listed 'provider/model' line, by its service namespace (PROVIDER_COST).
+    Missing from the table means unknown, treated as paid."""
+    return PROVIDER_COST.get(line.split("/", 1)[0], "unknown")
+
+
+def _listed_model_name(line: str) -> str:
+    """The model name shown to the developer for a listed line, its service namespace stripped: 'opencode/
+    gpt-5.1-codex' -> 'gpt-5.1-codex', 'openrouter/z-ai/glm-5' -> 'z-ai/glm-5' (only the first '/' is removed)."""
+    return line.split("/", 1)[1] if "/" in line else line
+
+
+def _model_family(model_name: str) -> str:
+    """The short family name used to build a new provider id ('glm-5.3' -> 'glm'): the first non-numeric token
+    of the model name, so 'opencode-glm' reads naturally next to 'opencode-glm-flash' etc."""
+    for part in re.split(r"[^a-z0-9]+", model_name.lower()):
+        if part and not part[0].isdigit():
+            return part
+    return "model"
+
+
+def _family_rank(line: str) -> int:
+    """Where a listed line's model name falls in FAMILY_PREFERENCE (0 = most preferred); a name matching
+    none of the preferred families ranks after all of them, at len(FAMILY_PREFERENCE)."""
+    name = line.lower()
+    for i, fam in enumerate(FAMILY_PREFERENCE):
+        if fam in name:
+            return i
+    return len(FAMILY_PREFERENCE)
+
+
+def _model_version_key(model_name: str) -> tuple:
+    """The "newest version" ranking key, shared by every picker that compares a company's models
+    (_best_capable_line, used by both the flat auto-pick and each paid entry): every number in the model
+    name (after the namespace), as a flat tuple of per-component integers, so '5.10' sorts above '5.9'
+    (comparing them as floats would do the opposite). A number stuck to a unit letter ('120b', '31b', a
+    parameter count) is dropped, and so is a date-shaped number (a lone 4-digit group such as '2507' or
+    '2603', or a 6-8 digit date) -- neither is a version, and left in, a date reliably outranks a real,
+    smaller version number."""
+    stripped = re.sub(r"\d+(?:\.\d+)?[bmkt](?=$|[^a-z0-9])", "", model_name, flags=re.I)
+    stripped = re.sub(r"(?<!\d)\d{4}(?!\d)|(?<!\d)\d{6,8}(?!\d)", "", stripped)
+    return tuple(int(p) for n in re.findall(r"\d+(?:\.\d+)?", stripped) for p in n.split("."))
+
+
+def _best_capable_line(lines) -> str | None:
+    """The one line among a single company's listed lines that discovery may offer as a reviewer, flat or
+    paid: this is the ONE shared ranking used by both the flat auto-pick and each paid entry, so a company
+    is never offered a weaker model one way than the other. A line matching the reject-words table
+    (_is_rejected_variant) is never a candidate, full stop -- there is no fallback to a rejected line, so a
+    company whose only listed models are all rejected variants is simply not offered, flat or paid. Among
+    the survivors, the highest real version wins (_model_version_key); there is no further tie-break (in
+    particular, no name-length tie-break: a longer, suffixed name must never win just by being longer).
+    None if every line was rejected."""
+    survivors = [ln for ln in lines if not _is_rejected_variant(ln)]
+    if not survivors:
+        return None
+    return max(survivors, key=lambda line: _model_version_key(_listed_model_name(line)))
+
+
+def _pick_capable_listed_model(lines, host, have_companies=()) -> str | None:
+    """The one listed 'provider/model' line discovery may itself test and add: flat-rate, a company Ratchet's
+    patterns recognise (company_of_model) that isn't the host's own, and capable (_best_capable_line). An
+    unknown company or an unknown/per-use cost is never a candidate here. Prefers a company with no working
+    reviewer yet (`have_companies`), then the preferred family order (FAMILY_PREFERENCE), then falls back to
+    listing order; within one company, _best_capable_line picks the representative."""
+    by_company: dict[str, list[str]] = {}
+    for line in lines:
+        if _listed_model_cost(line) != "flat":
+            continue
+        company = company_of_model(line)
+        if not company or company == host:
+            continue
+        by_company.setdefault(company, []).append(line)
+    reps = {c: _best_capable_line(ls) for c, ls in by_company.items()}
+    reps = {c: rep for c, rep in reps.items() if rep}
+    if not reps:
+        return None
+    order = list(reps)
+    company = min(order, key=lambda c: (
+        c in have_companies, min(_family_rank(ln) for ln in by_company[c]), order.index(c)))
+    return reps[company]
+
+
+def _paid_candidate_groups(lines, host) -> dict:
+    """Non-flat ('per-use' or unknown-cost) listed lines, grouped by (provider namespace, company), so a
+    provider with many listed models (hundreds of OpenRouter lines, say) collapses to one representative
+    per company instead of flooding paid_options. The host's own company is dropped (never offered as a
+    paid option to pay for a model the host already runs for free). In a namespace PROVIDER_COST already
+    prices (a known paid service such as opencode/ or openrouter/), a model whose company Ratchet can't map
+    is skipped: Ratchet never uses an unknown-company model as a reviewer, so naming one here would just ask
+    the developer to pay for something the engine would then refuse. A namespace PROVIDER_COST doesn't know
+    at all (an unlisted provider) still lists its unmappable models as before, grouped under "", so an
+    unknown provider isn't silently dropped."""
+    groups: dict[tuple[str, str], list[str]] = {}
+    for line in lines:
+        if _listed_model_cost(line) == "flat":
+            continue
+        namespace = line.split("/", 1)[0]
+        company = company_of_model(line) or ""
+        if company and company == host:
+            continue
+        if not company and namespace in PROVIDER_COST:
+            continue
+        groups.setdefault((namespace, company), []).append(line)
+    return groups
+
+
+def _paid_pick(group_lines) -> str | None:
+    """The one line from a (provider, company) group to show as that group's paid option: the same shared
+    ranking the flat picker uses (_best_capable_line), so a paid entry is never named for a model the flat
+    picker itself would have rejected. None if the whole group was rejected variants, in which case the
+    caller must show no paid option for that group rather than suggest paying for a rejected model."""
+    return _best_capable_line(group_lines)
 
 
 def providers(cfg) -> list[dict]:
