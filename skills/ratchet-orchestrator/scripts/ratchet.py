@@ -3124,7 +3124,18 @@ def cmd_providers(args):
         ok(f"Added provider {args.add} ({provider_company(pv)}, {_plain_model(pv.get('model'))}). It can now review.")
         return
     if args.discover or args.check:
-        targets = [pv for pv in plist if not args.check or args.check in ("all", pv["id"])]
+        want = args.check
+        if want and want != "all" and not any(pv["id"] == want for pv in plist):
+            # a reviewer name is <provider id>-<lens>: test that reviewer's provider only
+            for lens in ("correctness", "standards", "both"):
+                if want.endswith("-" + lens) and any(pv["id"] == want[:-len(lens) - 1] for pv in plist):
+                    want = want[:-len(lens) - 1]
+                    break
+            else:
+                die(f"'{args.check}' is not a known provider or reviewer name. Known provider ids: "
+                    f"{', '.join(pv['id'] for pv in plist) or 'none'}. A reviewer name is a provider id plus a lens, "
+                    "for example codex-correctness (lens: correctness, standards or both).")
+        targets = [pv for pv in plist if not want or want in ("all", pv["id"])]
         for pv in targets:
             company = provider_company(pv)
             if company == host:
@@ -12583,7 +12594,7 @@ def main(argv=None):
     a.add_argument("--director-token"); a.set_defaults(fn=cmd_approve_changes)
     a = sp.add_parser("providers", help="list, test (--check/--discover) and register (--add) other agent CLIs")
     a.add_argument("--discover", action="store_true", help="find installed agent CLIs, test them, add what works")
-    a.add_argument("--check", nargs="?", const="all", help="send a test request to one provider (or all)")
+    a.add_argument("--check", nargs="?", const="all", help="send a test request to one provider, a reviewer name such as codex-correctness, or all")
     a.add_argument("--add", metavar="ID"); a.add_argument("--preset"); a.add_argument("--command")
     a.add_argument("--stdin", action="store_true"); a.add_argument("--model"); a.add_argument("--company")
     a.add_argument("--for-risk", help="comma list of risks it may review (default all)")
