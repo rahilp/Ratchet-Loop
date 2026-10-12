@@ -702,6 +702,73 @@ def _doc_edit_status_lines(st: dict) -> list[str]:
     return lines
 
 
+# --------------------------------------------------------------------------- small-fix one-reviewer round (CP3)
+# After a checkpoint's adversarial gate has a clean, approved round, a small code fix made since that approval
+# (since_approval.code_lines_changed, the same measurement classify_changes/`changes --json` reports, at or
+# under config small_edit_lines) in a step that is not high risk opens its next review round with exactly one
+# reviewer instead of the step's normal full set, told to look only at the file(s) changed since approval
+# (review_rules' existing focus_files mechanism for round > 1 — unchanged). A fix over the limit, a code change
+# of unknown size (binary), or any fix in a high-risk step still opens the normal full round; a doc-only edit is
+# never downgraded here (docs_only stays on CP2's zero-reviewer quick path at `complete`, which runs before
+# `reviewers` would ever be called for it). `cmd_reviewers` sets `small_fix` on the round it opens;
+# `cmd_adv_record` records who did it on the checkpoint (`small_fix_review`) once that round is approved, so the
+# commit message and `status` can both say the fix was reviewed as a small fix by one reviewer, naming it.
+# The size is measured against the checkpoint's last FULL (non-small-fix) approval, not simply the gate's latest
+# one, so several small fixes in a row still add up: `cmd_adv_record` only updates `last_full_review_fingerprint`
+# on a full-round approval, never on a small-fix one, so the baseline stays put across a run of small fixes.
+
+def _is_small_fix_round(ctx: "Ctx", cfg: dict, cp_id: str, cp: dict, cps: dict, g: dict) -> bool:
+    if cp.get("risk", "normal") == "high":
+        return False
+    if cp.get("reviewers"):
+        return False  # the checkpoint pins its own reviewer list; that override always gets a normal full round
+    full_fp = cps.get("last_full_review_fingerprint")
+    if not full_fp:
+        return False  # no FULL-round approval recorded yet to measure a fix against (a user accept sets the
+        # gate fingerprint but never last_full_review_fingerprint, so it does not qualify): a "stale" status,
+        # set by `complete` once it detects the fix, does not disqualify it -- the approval itself still stands
+    fp = fingerprint(ctx.root)
+    files = sorted(changed_files(ctx.root, full_fp, fp))
+    doc_files, code_files = _classify_doc_code(cfg, files)
+    if not code_files:
+        return False  # nothing but docs changed since the last full review: not this round's concern
+    code_lines, code_unknown = _code_size(ctx, full_fp["id"], fp["id"], code_files)
+    if code_unknown:
+        return False
+    return code_lines <= cfg.get("small_edit_lines", 20)
+
+
+def _small_fix_reviewers(ctx: "Ctx", cfg: dict, cp: dict, exclude=None) -> list[dict] | None:
+    """Resolve a small-fix round's reviewer the one way it is ever allowed to be resolved: review_depth["low"],
+    accepted only when it comes back as exactly one both-lens reviewer. Used both when a small-fix round opens
+    and when cmd_reviewers re-resolves an already-open small-fix round (CP3 round-04 fix: the re-resolution
+    branch used to fall back to the step's own, possibly single-lens, risk instead of this). Returns None when
+    low-risk resolution can't produce a single both-lens reviewer, so the caller falls back to a normal round."""
+    low_resolved = resolve_reviewers(ctx, cfg, dict(cp, risk="low"), exclude=exclude)
+    if len(low_resolved) == 1 and (_roster_spec(cfg, low_resolved[0]["id"]) or {}).get("lens") == "both":
+        return low_resolved
+    return None
+
+
+def _small_fix_review_line(cid: str, cps: dict) -> str | None:
+    sf = cps.get("small_fix_review")
+    if not sf:
+        return None
+    who = sf.get("reviewer") or "a reviewer"
+    return f"{cid}: round {sf.get('round')} was reviewed as a small fix by one reviewer ({who})."
+
+
+def _small_fix_review_lines(st: dict) -> list[str]:
+    """One plain line per checkpoint whose last approved adversarial round was a one-reviewer small-fix review,
+    naming that reviewer, for `status` and the commit message to say the same thing about the same round."""
+    lines = []
+    for cid, c in (st.get("checkpoints") or {}).items():
+        line = _small_fix_review_line(cid, c)
+        if line:
+            lines.append(line)
+    return lines
+
+
 # --------------------------------------------------------------------------- tamper evidence
 # ratchet.py records a hash of every file it owns after each write, in RATCHET_HOME (outside the repo and off-limits
 # to agents). A write by any other route — a helper script, an editor, a "quick fix" — is detected on the next read.
@@ -2827,6 +2894,8 @@ def cmd_status_text(ctx: Ctx):
     for line in _accepted_findings_lines(st):
         print(line)
     for line in _doc_edit_status_lines(st):
+        print(line)
+    for line in _small_fix_review_lines(st):
         print(line)
     w = live_wait(st)
     if w:
@@ -6286,6 +6355,13 @@ def cmd_adv_record(args):
             "fix-list.json, re-run behavior (and UI if visible code changed), then re-run the adversaries."
             + (f" {ci_note}" if ci_note else ""), 2)
     g.update(status="passed", fingerprint=fp, passed_at=now(), evidence=str(dest.relative_to(ctx.root)))
+    if rnd.get("small_fix"):  # CP3: approved as a one-reviewer small-fix round -- named for the commit/status
+        cps["small_fix_review"] = {"round": rnd["round"], "reviewer": (rnd.get("reviewers") or [None])[0]}
+    else:
+        cps.pop("small_fix_review", None)
+        # CP3: anchor for `_is_small_fix_round` -- only a FULL round's approval moves this, so a run of small
+        # fixes keeps measuring against the same baseline and their sizes add up.
+        cps["last_full_review_fingerprint"] = fp
     cps["step"] = _earliest_open_step(cps)
     ctx.log(st, "adversarial_approved", cp=args.cp, round=g["attempts"])
     ctx.save_state(st)
@@ -7662,6 +7738,9 @@ def cmd_complete(args):
         if cps.get("doc_edits_unreviewed"):
             msg += ("\nDocs edited after review and not re-reviewed (doc quick path): "
                     + ", ".join(cps["doc_edits_unreviewed"]))
+        small_fix_line = _small_fix_review_line(args.cp, cps)
+        if small_fix_line:
+            msg += "\n" + small_fix_line
         commit = _commit_reviewed(ctx.root, cps.get("base_tree"), fp, msg, extra=spec_files)
         if not commit:  # nothing new to commit: a run of complete that failed after its commit left it at HEAD
             commit = _head_commit_named(ctx.root, msg)
@@ -9079,6 +9158,20 @@ def cmd_reviewers(args):
                 if narrowed_resolved:
                     resolved = narrowed_resolved
                     narrow_now = True
+        # CP3: a small fix made since the checkpoint's last FULL review opens with exactly one reviewer, told
+        # (via review_rules' existing focus_files, below) to look only at what changed since that approval. That
+        # one reviewer must still cover both lenses, so it is resolved the same way a low-risk step's single
+        # reviewer is (review_depth["low"], an any-both/host-both slot), never the step's own (possibly
+        # single-lens) first slot. The override is only used, and small_fix only set, when that resolution
+        # actually comes back as exactly one both-lens reviewer -- a customized review_depth["low"] (two slots,
+        # or a single-lens id) falls back to the step's normal full round instead of mislabeling it.
+        small_fix = _is_small_fix_round(ctx, cfg, args.cp, cp, cps, g)
+        if small_fix:
+            low_resolved = _small_fix_reviewers(ctx, cfg, cp)
+            if low_resolved is not None:
+                resolved = low_resolved
+            else:
+                small_fix = False
         g["attempts"] += 1
         st["adv_rounds_total"] = int(st.get("adv_rounds_total", 0)) + 1
         prev = rnd["round"] if rnd else 0
@@ -9100,7 +9193,7 @@ def cmd_reviewers(args):
         else:
             prev_round_tree = rnd["fingerprint"] if rnd else None
         rnd = {"round": prev + 1, "nonce": secrets.token_hex(8), "fingerprint": fp, "opened_at": now(),
-               "reviewers": [r["id"] for r in resolved], "narrowed": narrow_now,
+               "reviewers": [r["id"] for r in resolved], "narrowed": narrow_now, "small_fix": small_fix,
                "prev_round_tree": prev_round_tree,
                "substitutions": [{"used": r["id"], "instead_of": r["fallback_for"], "why": r["reasons"]}
                                  for r in resolved if r["fallback_for"]],
@@ -9121,15 +9214,33 @@ def cmd_reviewers(args):
         # every other reviewer on the same CLI, keep running.
         out_dir_now = _review_round_dir(ctx, args.cp, "adv", rnd["round"])
         round_cutoff = {p.name[:-len(".cutoff.json")] for p in out_dir_now.glob("*.cutoff.json")}
-        fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff)}
         changed = False
-        for i, r in enumerate(rnd["resolved"]):
-            if (out_dir_now / f"{r['id']}.json").exists():
-                continue  # a finished review in this round is kept untouched, never re-resolved
-            okay, _why = reviewer_availability(ctx, cfg, r["id"])
-            if (not okay or r["id"] in round_cutoff) and r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
-                rnd["resolved"][i] = fresh[r["slot"]]
-                changed = True
+        if rnd.get("small_fix"):
+            # A small-fix round's one reviewer must always cover both lenses, so re-resolve it the same way
+            # the round was opened (_small_fix_reviewers), never via the step's own (possibly single-lens)
+            # risk. When that can't produce a both-lens replacement, this stops being a small-fix round.
+            cur = rnd["resolved"][0]
+            if not (out_dir_now / f"{cur['id']}.json").exists():  # a finished review is kept untouched
+                okay, _why = reviewer_availability(ctx, cfg, cur["id"])
+                if not okay or cur["id"] in round_cutoff:
+                    replacement = _small_fix_reviewers(ctx, cfg, cp, exclude=round_cutoff)
+                    if replacement is not None:
+                        if replacement[0]["id"] != cur["id"]:
+                            rnd["resolved"] = replacement
+                            changed = True
+                    else:
+                        rnd["small_fix"] = False
+                        rnd["resolved"] = resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff)
+                        changed = True
+        else:
+            fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff)}
+            for i, r in enumerate(rnd["resolved"]):
+                if (out_dir_now / f"{r['id']}.json").exists():
+                    continue  # a finished review in this round is kept untouched, never re-resolved
+                okay, _why = reviewer_availability(ctx, cfg, r["id"])
+                if (not okay or r["id"] in round_cutoff) and r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
+                    rnd["resolved"][i] = fresh[r["slot"]]
+                    changed = True
         if changed:
             rnd["reviewers"] = [r["id"] for r in rnd["resolved"]]
             ctx.log(st, "reviewer_fallback", cp=args.cp, detail="re-resolved within round " + str(rnd["round"]))
@@ -9163,6 +9274,7 @@ def cmd_reviewers(args):
            "risk": cp.get("risk", "normal"), "round": rnd["round"], "fingerprint": fp,
            "review_rules": rules, "focus_files": sorted(focus) if focus is not None else None,
            "round_nonce": rnd["nonce"], "output_dir": str(out_dir), "narrowed": rnd.get("narrowed", False),
+           "small_fix": rnd.get("small_fix", False),
            "fixes_md": str(fixes) if rnd["round"] > 1 else None,
            "run_rounds_used": st.get("adv_rounds_total", 0), "run_rounds_cap": cfg["max_adversarial_rounds_run"],
            "reviewers": rows}
@@ -9171,6 +9283,9 @@ def cmd_reviewers(args):
         return
     print(f"{args.cp} risk={res['risk']} round={rnd['round']} fingerprint={fp[:12]} nonce={rnd['nonce']} "
           f"(run rounds {res['run_rounds_used']}/{res['run_rounds_cap']})")
+    if res["small_fix"]:
+        print(f"Small fix since approval (at or under {cfg.get('small_edit_lines', 20)} changed code lines): "
+              "one reviewer, scoped to the files changed since approval.")
     if isinstance(obj, dict) and obj:
         print(f"Who it's for: {obj.get('users', '')}")
         print(f"What they want: {obj.get('goal', '')}")
@@ -9240,6 +9355,7 @@ def status_json(ctx: Ctx) -> dict:
             "hooks": hs, "hook_errors": hook_errors_view(ctx.root, hs.get("host", "unknown")),
             "viewer_url": viewer_link(ctx)["url"], "viewer_live": viewer_link(ctx)["live"],
             "done": sum(1 for c in cps if c["status"] == "done"), "total": len(cps),
+            "small_fix_reviews": _small_fix_review_lines(st),
             "checkpoints": cps, "updated_at": st.get("updated_at")}
 
 

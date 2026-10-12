@@ -31,6 +31,8 @@ Each checkpoint has a `risk` (`low` / `normal` / `high`, set by the planner). Ri
 
 **Duplicate slots run once.** When two slots would resolve to the same company, model and lens (the same reviewer under a different id), the second one collapses: it runs once, and `adv-record`'s approval message shows the real number of reviewers it needed — "all 1 reviewer(s)", not the two configured slots — so the loop's own bookkeeping never counts one review twice.
 
+**Small fix after approval.** Once this gate has a clean, approved round, a small code fix since then (about `small_edit_lines` changed lines or fewer, not a doc-only edit, not in a high-risk checkpoint — see the orchestrator skill) makes `reviewers` open the next round with exactly one reviewer, scoped to the files changed since approval, instead of the risk's usual full set; it still counts toward both round caps and still needs the step's tests and the full suite at `complete`.
+
 ## What blocks
 - **Severity bar by risk** (config `blocking_severities`). On a **low-risk** checkpoint only blocker and major findings block; minor ones are recorded for later (`ratchet.py deferred`) and shown to the user at the final review. Normal and high risk: every finding blocks.
 - **Later rounds look at what changed** (config `scope_later_rounds`). From round 2 on, a minor finding only blocks if it is in code changed since the previous round; blocker and major findings block anywhere. This keeps each round from turning into a fresh review of everything.
