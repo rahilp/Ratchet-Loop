@@ -207,7 +207,7 @@ You don't need any of this to use Ratchet. It's here if you want to know why the
 
 | # | Gate | What has to be true | How it's enforced |
 |---|---|---|---|
-| 1 | **Tests** | Tests written *before* the code all run, and at least one fails on an assertion, then all pass | Ratchet runs the tests itself, checks none were deleted, and reads each planned test's own result, so a test that crashed, was skipped or never ran doesn't count (a step whose tests can't report results one by one is checked by exit code only, and `status` says so). A planned test that already passes before the code exists is not caught by this check. Planned tests are frozen after their first failing run: changing one needs your OK. This is a structural check, not a proof |
+| 1 | **Tests** | Tests written *before* the code all run, and at least one fails on an assertion, then all pass | Ratchet runs the tests itself, checks none were deleted, and reads each planned test's own result, so a test that crashed, was skipped or never ran doesn't count (a step whose tests can't report results one by one is checked by exit code only, and `status` says so). A planned test that already passes before the code exists is not caught by this check. Planned tests are frozen after their first failing run: changing one needs your OK, and so does changing anything a planned test uses (a helper, a `setUp`, a fixture, an import or constant at the top of the file) or a test that was in the file before the run started. A Python test your agent adds during the run (one that is not a planned case and that no planned case uses, even through other code) can be changed or removed freely, with no question (only in a test file that holds a planned case id, and only when no other Python file in the project mentions its name, so a shared helper file stays locked; only the project's own files are checked, with `.gitignore` respected, so a virtualenv is not read); it can't take over the name of a planned test or of anything one uses. That stays true after an approve-changes re-snapshot. Outside Python the limit is plainer: an extra (unplanned) test written before the red run stays frozen with the rest of the file, and a test appended after red is free only until the next approve-changes re-snapshot. This is a structural check, not a proof |
 | 2 | **Looks right** | The screen matches the design or the old screen, in the same state | Two separate reviewers compare screenshots and list every difference; any fixable difference blocks |
 | 3 | **Review** | Reviewers try to break the code and find nothing serious | Reviewers keep going until none of them has a blocking finding on the current code. A review counts only when the review script signed it for that round, or the host's own reviewer sub-agent wrote it (see below) |
 | 4 | **You** | You try it and say yes | Only a real message from you counts |
@@ -457,6 +457,7 @@ python3 tests/test_hooks.py
 python3 tests/test_hooks_status.py
 python3 tests/test_hooks_waiver.py
 python3 tests/test_install.py
+python3 tests/test_lane_added_tests.py
 python3 tests/test_limits.py
 python3 tests/test_objective.py
 python3 tests/test_plan_change.py

@@ -1760,10 +1760,14 @@ ROLE_BRIEFS = {
                      "asked; run only this checkpoint's own tests. Never edit, skip or weaken a test."),
     "fixer": ("Rules: make the smallest change that resolves each finding you were handed. Add no new mechanism or "
               "file unless the finding itself needs it. If a proper fix needs a redesign, stop and say so instead "
-              "of improvising one. Never weaken, skip or delete a test. Don't run the full test suite unless asked."),
+              "of improvising one. Never weaken, skip or delete a planned test, a test that existed before "
+              "the run, or anything a planned test uses; a Python test this lane added that no planned test uses may be "
+              "adjusted. Don't run the full test suite unless asked."),
     "test-writer": ("Rules: turn the checkpoint's planned test cases into real, runnable tests tagged with their "
                      "case ids, written before the implementation exists, so at least one fails on an assertion. "
-                     "Test behavior through public entry points, not internals. Never write a test that can't fail."),
+                     "Test behavior through public entry points, not internals. Never write a test that can't fail. "
+                     "An extra Python test you add that no planned test uses may be adjusted later; planned "
+                     "tests, what they use and tests from before the run stay locked."),
     "reviewer": ("Rules: judge every finding against the realistic-use bar: this project's users run a cooperative "
                  "agent, not an attacker, and a finding must describe real harm to them in realistic, normal use, "
                  "not a case no real user would hit. Every blocking finding (blocker or major) must say who is hurt "
@@ -4869,26 +4873,13 @@ def _py_start(n) -> int:
     return min([n.lineno] + [d.lineno for d in n.decorator_list])
 
 
-def _py_frozen(old: str, new: str, ids) -> list[str] | None:
-    """The structural freeze for a Python test file (None when the red snapshot is not Python). Each planned case
-    id belongs to the innermost def or class around it (or right after its comment line); that definition, with its
-    decorators and its enclosing classes' decorators, must be unchanged (compared as ast.dump) and no later
-    definition in its scope may reuse its name. An id found in no def or class at all (only in a header comment,
-    say) makes the file's top-level code the test:
-    each old top-level statement must still be there, unchanged and in order, and no old def or class name may be
-    defined again. New tests and helpers may be added anywhere else."""
-    try:
-        t_old = ast.parse(old)
-    except (SyntaxError, ValueError):
-        return None
-    try:
-        t_new = ast.parse(new)
-    except (SyntaxError, ValueError) as e:
-        return [f"it no longer parses as Python ({type(e).__name__}), so its planned tests can't be checked"]
-    lines = old.splitlines()
-    defs = list(_py_defs(t_old.body))
+def _py_place(lines, defs, ids):
+    """Where each planned case id sits, the one way the freeze reads it (shared by the freeze and by the lane-added
+    test check, so the two never disagree). Each id belongs to the innermost def or class around it (or right after
+    its comment line). Returns ({def path: first case id}, ids found in no def or class at all, ids found at least
+    once outside every def or class)."""
     starts = {_py_start(n): (p, n) for p, n in defs}
-    units, module_ids = {}, []
+    units, module_ids, loose_ids = {}, [], []
     for cid in ids:
         pat, placed, loose = _case_id_re(cid), False, False
         for no, line in enumerate(lines, 1):
@@ -4906,8 +4897,30 @@ def _py_frozen(old: str, new: str, ids) -> list[str] | None:
                 placed = True
             else:
                 loose = True
+        if loose:
+            loose_ids.append(cid)
         if loose and not placed:  # only an id found in no def or class makes the top-level code the test
             module_ids.append(cid)
+    return units, module_ids, loose_ids
+
+
+def _py_frozen(old: str, new: str, ids) -> list[str] | None:
+    """The structural freeze for a Python test file (None when the red snapshot is not Python). Each planned case
+    id belongs to the innermost def or class around it (or right after its comment line); that definition, with its
+    decorators and its enclosing classes' decorators, must be unchanged (compared as ast.dump) and no later
+    definition in its scope may reuse its name. An id found in no def or class at all (only in a header comment,
+    say) makes the file's top-level code the test:
+    each old top-level statement must still be there, unchanged and in order, and no old def or class name may be
+    defined again. New tests and helpers may be added anywhere else."""
+    try:
+        t_old = ast.parse(old)
+    except (SyntaxError, ValueError):
+        return None
+    try:
+        t_new = ast.parse(new)
+    except (SyntaxError, ValueError) as e:
+        return [f"it no longer parses as Python ({type(e).__name__}), so its planned tests can't be checked"]
+    units, module_ids, _loose = _py_place(old.splitlines(), list(_py_defs(t_old.body)), ids)
     out = []
 
     def count(tree, nodes, name):
@@ -5038,6 +5051,298 @@ def _frozen_test_problems(rel: str, old: str, new: str, ids) -> list[str]:
     return _text_frozen(old, new, ids) if got is None else got
 
 
+# --- tests the lane added: free to change after red (Python files only) -----------------------------------------
+# A top-level def (or a test method in a class) is free when it was not in the file as the run started (the run's
+# base tree), is no planned case of any step, and no planned case uses it, directly or through other code. Free defs
+# are cut out of both the red snapshot and the file now before the usual freeze checks run, so those checks stay
+# exactly as strict on everything else. Freedom comes from the base tree and the plan, never from the latest
+# snapshot, so an approve-changes re-snapshot does not freeze a lane-added test.
+_PY_IMPLICIT = frozenset({
+    "setUp", "tearDown", "setUpClass", "tearDownClass", "setUpModule", "tearDownModule", "load_tests", "setup",
+    "teardown", "setup_module", "teardown_module", "setup_function", "teardown_function", "setup_method",
+    "teardown_method", "setup_class", "teardown_class", "conftest"})
+
+
+def _all_planned_ids(ctx):
+    plan = ctx.plan() or {}
+    return [c["id"] for cp in plan.get("checkpoints") or [] for c in _planned_cases(ctx, cp["id"])]
+
+
+def _base_file_text(ctx, st, rel):
+    """The file as it was when the run started: its text, "" when the file did not exist then, or None when the base
+    can't be read (no git, no base tree, tree gone). None means nothing in the file counts as lane-added."""
+    tree = st.get("base_tree")
+    if not tree or not re.fullmatch(r"[0-9a-f]{40,64}", str(tree)) or not _is_git(ctx.root):
+        return None
+    try:
+        t = subprocess.run(["git", "cat-file", "-t", tree], cwd=ctx.root, capture_output=True, text=True, timeout=30)
+        if t.returncode != 0 or t.stdout.strip() != "tree":
+            return None
+        # The tree is the whole repo's, so a Ratchet root below the repo root needs the repo-relative path.
+        pre = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=ctx.root, capture_output=True, text=True,
+                             timeout=30)
+        if pre.returncode != 0:
+            return None
+        path = f"{pre.stdout.strip()}{rel}"
+        ls = subprocess.run(["git", "ls-tree", "--full-tree", tree, "--", path], cwd=ctx.root, capture_output=True,
+                            text=True, timeout=30)
+        if ls.returncode != 0:
+            return None
+        if not ls.stdout.strip():
+            return ""  # the file really was not there when the run started
+        r = subprocess.run(["git", "cat-file", "blob", f"{tree}:{path}"], cwd=ctx.root, capture_output=True,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
+
+
+def _py_uses(node, loads=False) -> set:
+    """Every name a piece of code could use: names, attributes, parameter names, imported names and string
+    constants that look like names (a fixture asked for by string). Over-counting only locks more, never less.
+    With `loads`, a name the code only assigns (a Store) is not counted."""
+    out = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name):
+            if not (loads and isinstance(n.ctx, ast.Store)):
+                out.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            out.add(n.attr)
+        elif isinstance(n, ast.arg):
+            out.add(n.arg)
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.isidentifier():
+            out.add(n.value)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            out.update((a.asname or a.name).split(".")[0] for a in n.names)
+    return out
+
+
+def _py_top_names(tree) -> set:
+    names = {nm for nm, _ in _py_scope_items(tree.body)}
+    for s in ast.walk(tree):
+        if isinstance(s, (ast.Import, ast.ImportFrom)):
+            names.update((a.asname or a.name).split(".")[0] for a in s.names)
+    return names
+
+
+def _py_deco_kw(n, key):
+    """The keyword arguments named `key` in a def's decorators (such as autouse=True or name="cart")."""
+    return [k for d in n.decorator_list for k in ast.walk(d) if isinstance(k, ast.keyword) and k.arg == key]
+
+
+def _py_aliases(n):
+    """The def's own name plus any fixture name= alias in its decorators."""
+    return [n.name] + [k.value.value for k in _py_deco_kw(n, "name")
+                       if isinstance(k.value, ast.Constant) and isinstance(k.value.value, str)]
+
+
+def _other_py_index(ctx):
+    """{word: set of project .py files naming it} over the project's own .py files (git ls-files: tracked plus
+    untracked, .gitignore respected; nothing under a dependency, build or dot folder), or None when git cannot list
+    them (the caller then locks everything: Ratchet never walks the tree instead)."""
+    try:
+        r = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "*.py"],
+                           cwd=ctx.root, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    index = {}
+    for raw in r.stdout.split(b"\0"):
+        f = os.path.normpath(os.fsdecode(raw))
+        parts = Path(f).parts
+        if not raw or any(d in FINGERPRINT_EXCLUDES or d.startswith(".") for d in parts[:-1]):
+            continue
+        try:
+            text = (Path(ctx.root) / f).read_text(errors="replace")
+        except OSError:
+            continue
+        for w in set(re.findall(r"\w+", text)):
+            index.setdefault(w, set()).add(f)
+    return index
+
+
+def _py_free_defs(ctx, st, rel, old):
+    """(free top-level def names, free (class, test method) pairs, names a planned case reaches) in the red snapshot
+    `old` of file `rel`. Any doubt locks: when nothing is free the names come back as None (the caller then guards
+    every def and class name), and a file where a planned case id sits outside every def (module data, a header
+    docstring, a comment not directly above a def) is not touched at all, exactly as the freeze reads it."""
+    none = (set(), set(), None)
+    base = _base_file_text(ctx, st, rel)
+    if base is None or os.path.basename(rel) == "conftest.py" or not any(_case_id_re(i).search(old) for i in _all_planned_ids(ctx)):
+        return none  # a file with no planned case id in it (a shared helper file) keeps the whole-file freeze
+    try:
+        t_old = ast.parse(old)
+        t_base = ast.parse(base)
+    except (SyntaxError, ValueError):
+        return none
+    base_names, base_members = _py_top_names(t_base), set()
+    for s in t_base.body:
+        if isinstance(s, ast.ClassDef):
+            base_members.update((s.name, nm) for nm, _ in _py_scope_items(s.body))
+    defs = list(_py_defs(t_old.body))
+    units, _module_ids, loose = _py_place(old.splitlines(), defs, _all_planned_ids(ctx))
+    if loose:
+        return none
+    by_path = dict(defs)
+    planned = [by_path[p] for p in units]
+
+    def span(n):
+        return _py_start(n), n.end_lineno or n.lineno
+
+    def has_planned(n):  # n holds a planned node, or sits inside one (every method of a planned class)
+        a, b = span(n)
+        return any((a <= span(p)[0] and span(p)[1] <= b) or (span(p)[0] <= a and b <= span(p)[1]) for p in planned)
+
+    def special(n):  # an autouse fixture or a pytest_ hook (they run for planned tests unnamed), or a name we can't read
+        return bool(_py_deco_kw(n, "autouse")) or n.name.startswith("pytest_") or any(not (isinstance(k.value, ast.Constant) and
+                                                           isinstance(k.value.value, str))
+                                                      for k in _py_deco_kw(n, "name"))
+
+    src_defs, src_top, locked_tops = [], [], set()  # code whose names a planned test (or the run) leans on
+    for s in t_old.body:
+        if not isinstance(s, _PY_DEFS):
+            src_top.append(s)
+            continue
+        if has_planned(s):
+            locked_tops.add(s.name)
+            if isinstance(s, ast.ClassDef):  # the class's setUp and helpers count, its other tests do not
+                src_defs += s.bases + s.keywords + s.decorator_list
+                for m in s.body:
+                    if not (isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and m.name.lower().startswith("test")
+                            and not has_planned(m)):
+                        src_defs.append(m)
+            else:
+                src_defs.append(s)
+        elif special(s):
+            src_defs.append(s)
+        if isinstance(s, ast.ClassDef):
+            src_defs += [m for m in s.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and special(m)]
+    by_name = {}
+    for nm, n in _py_scope_items(t_old.body):
+        if isinstance(n, _PY_DEFS):
+            for alias in _py_aliases(n):
+                by_name.setdefault(alias, []).append(n)
+
+    def closure(sources, loads):  # every name reachable from the sources, through the defs of those names
+        reach, todo = set(), set(_PY_IMPLICIT).union(*[_py_uses(x, loads) for x in sources])
+        while todo:
+            nm = todo.pop()
+            if nm in reach:
+                continue
+            reach.add(nm)
+            for n in by_name.get(nm, []):
+                todo |= _py_uses(n, loads) - reach
+        return reach
+
+    reach = closure(src_defs + src_top, False)  # what no lane-added def may be: used by a planned case or top-level code
+    reached = closure(src_defs, True)  # the names a planned case reads (an assignment may not rebind these)
+
+    skip, found = os.path.normpath(rel), []  # found: the index, built once and only when a def needs it
+
+    def named_elsewhere(alias):  # another project .py file names it as a whole word (no index: assume it does)
+        if not found:
+            found.append(_other_py_index(ctx))
+        if found[0] is None or not re.fullmatch(r"\w+", alias):
+            return True
+        return any(f != skip for f in found[0].get(alias, ()))
+
+    def plain(n):  # a def nothing outside the lane can lean on, and no other .py file mentions by name
+        return (not any(a in reach for a in _py_aliases(n)) and n.name not in _PY_IMPLICIT and not has_planned(n)
+                and not special(n) and not any(named_elsewhere(a) for a in _py_aliases(n)))
+
+    items = [nm for nm, _ in _py_scope_items(t_old.body)]
+    free_top = {s.name for s in t_old.body if isinstance(s, _PY_DEFS) and s.name not in base_names
+                and s.name not in locked_tops and plain(s) and items.count(s.name) == 1}
+    free_meth = set()
+    for s in t_old.body:
+        if isinstance(s, ast.ClassDef) and s.name not in free_top:
+            inner = [nm for nm, _ in _py_scope_items(s.body)]
+            cand = {m.name for m in s.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and m.name.lower().startswith("test") and (s.name, m.name) not in base_members
+                    and plain(m) and inner.count(m.name) == 1}
+            if len(cand) < len(s.body):  # a class is never left with an empty body
+                free_meth |= {(s.name, nm) for nm in cand}
+    return free_top, free_meth, reached | locked_tops | {p.name for p in planned}
+
+
+def _py_strip(text, free_top, free_meth):
+    """`text` without the free defs (and the comment lines right above them), or None when it doesn't parse."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+    lines = text.splitlines(keepends=True)
+    drop = set()
+
+    def cut(n):
+        a = _py_start(n)
+        while a > 1 and lines[a - 2].lstrip().startswith("#"):
+            a -= 1
+        drop.update(range(a, (n.end_lineno or n.lineno) + 1))
+
+    for s in tree.body:
+        if isinstance(s, _PY_DEFS) and s.name in free_top:
+            cut(s)
+        elif isinstance(s, ast.ClassDef):
+            for m in s.body:
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and (s.name, m.name) in free_meth:
+                    cut(m)
+    out = "".join(l for i, l in enumerate(lines, 1) if i not in drop)
+    try:
+        ast.parse(out)
+    except (SyntaxError, ValueError):
+        return None
+    return out
+
+
+def _py_without_free(ctx, st, rel, old, new):
+    """(old, new, names a planned case reaches) with the lane's free defs cut out of both; the texts are unchanged
+    when there are none or anything is unclear (the names are None when the analysis was not possible)."""
+    free_top, free_meth, locked = _py_free_defs(ctx, st, rel, old)
+    if not (free_top or free_meth):
+        return old, new, locked
+    a, b = _py_strip(old, free_top, free_meth), _py_strip(new, free_top, free_meth)
+    return (a, b, locked) if a is not None and b is not None else (old, new, locked)
+
+
+def _py_name_reuse(old, new, locked=None):
+    """Why `new` defines again a name `old` defines in the same scope, so that the later definition would replace
+    the earlier one; None when it doesn't. Top-level scope and every class body. A def or class of any name counts;
+    a plain assignment counts only for a name a planned case reaches (`locked`) or a name that is also a def or
+    class in that scope, so rebinding an ordinary variable in a test the lane added stays allowed."""
+    try:
+        t_old, t_new = ast.parse(old), ast.parse(new)
+    except (SyntaxError, ValueError):
+        return None
+
+    def stores(n, nm):  # n is an assignment that binds the plain name nm
+        return isinstance(n, (ast.Assign, ast.AnnAssign)) and any(
+            isinstance(x, ast.Name) and x.id == nm and isinstance(x.ctx, ast.Store)
+            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]) for x in ast.walk(t))
+
+    def counts(body, watch):
+        c = {}
+        for nm, n in _py_scope_items(body):
+            if isinstance(n, _PY_DEFS) or (nm in watch and stores(n, nm)):
+                c[nm] = c.get(nm, 0) + 1
+        return c
+
+    scopes = [("", t_old.body, t_new.body)]
+    for path, n in _py_defs(t_old.body):
+        if isinstance(n, ast.ClassDef):
+            got = _py_lookup(t_new, path)
+            if got:
+                scopes.append((".".join(x for x, _ in path) + ".", n.body, got[-1].body))
+    for pre, b_old, b_new in scopes:
+        watch = (locked or set()) | {nm for nm, n in _py_scope_items(b_old) if isinstance(n, _PY_DEFS)}
+        c_old, c_new = counts(b_old, watch), counts(b_new, watch)
+        again = next((nm for nm in c_old if c_new.get(nm, 0) > c_old[nm]), None)
+        if again is not None:
+            return f"{pre}{again} is defined again since the red run (the later definition replaces it)"
+    return None
+
+
 def weakened_tests(ctx, st) -> list[str]:
     cur = st.get("current")
     cps = (st.get("checkpoints") or {}).get(cur) or {}
@@ -5054,7 +5359,11 @@ def weakened_tests(ctx, st) -> list[str]:
         if new is None:
             out.append(f"test file {rel} (lines changed or removed since the red run)")
             continue
+        if rel.endswith(".py"):  # tests this lane added are cut out of both sides first (see _py_free_defs)
+            old, new, locked = _py_without_free(ctx, st, rel, old, new)
         frozen = _frozen_test_problems(rel, old, new, ids)
+        if not frozen and rel.endswith(".py"):
+            frozen = [w] if (w := _py_name_reuse(old, new, locked)) else []
         if frozen:
             # Non-Python messages (_text_frozen) already carry whatever guidance applies (the approve-changes
             # note only when a planned test itself is at risk); only Python messages (_py_frozen) need it added.
