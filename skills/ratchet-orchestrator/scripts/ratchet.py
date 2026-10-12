@@ -34,6 +34,7 @@ import secrets
 import json
 import os
 import re
+import shlex
 import unicodedata
 import shutil
 import stat
@@ -155,7 +156,9 @@ DEFAULT_CONFIG = {
     # a doc when its text contains the doc's repo-relative path or file name. doc_test_command (with a {files}
     # placeholder) runs just those files; unset, the docs quick path is off. small_edit_lines is the line-count
     # ceiling (git diff --numstat, added+removed) for a one-reviewer small fix.
-    "doc_globs": ["*.md", "*.mdx", "*.rst", "*.adoc"],
+    # .mdx is left out by default because it can hold real JSX code (Next.js pages, Docusaurus, Storybook);
+    # a project whose .mdx files are prose only can add "*.mdx" to its own doc_globs.
+    "doc_globs": ["*.md", "*.rst", "*.adoc"],
     "doc_exclude_globs": ["SKILL.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", "agents/*.md"],
     "test_globs": ["test_*", "*_test.*", "*.test.*", "*.spec.*"],
     "doc_test_command": None,
@@ -492,9 +495,13 @@ def touches_ui(files: list[str], globs: list[str]) -> list[str]:
 # --------------------------------------------------------------------------- quick path (`ratchet.py changes`)
 
 def _glob_hit(f: str, globs: list[str]) -> bool:
-    """True when f's basename or full repo-relative path matches one of globs — touches_ui's own rule."""
+    """True when f's basename or full repo-relative path matches one of globs — touches_ui's own rule. A
+    directory-shaped glob (one containing "/", e.g. "agents/*.md") also matches at any depth below the repo
+    root (e.g. "apps/bot/agents/x.md"), not only directly under a root-level directory of that name, so a
+    per-package instruction-file layout is a normal, expected match rather than a silent gap."""
     name = os.path.basename(f)
-    return any(fnmatch.fnmatch(name, g) or fnmatch.fnmatch(f, g) for g in globs)
+    return any(fnmatch.fnmatch(name, g) or fnmatch.fnmatch(f, g) or ("/" in g and fnmatch.fnmatch(f, "*/" + g))
+               for g in globs)
 
 
 def _project_files(root: Path, fp: dict) -> list[str]:
@@ -574,11 +581,7 @@ def classify_changes(ctx: "Ctx", cp_id: str) -> dict:
     base = cps.get("base_tree")
     fp = fingerprint(ctx.root)
     files = sorted(changed_files(ctx.root, {"kind": "git-tree", "id": base}, fp)) if base else []
-    exclude = [g for g in [*(cfg.get("doc_exclude_globs") or []), cfg.get("design_md"),
-                           *(cfg.get("standards") or [])] if g]
-    doc_globs = cfg.get("doc_globs") or []
-    doc_files = [f for f in files if _glob_hit(f, doc_globs) and not _glob_hit(f, exclude)]
-    code_files = [f for f in files if f not in doc_files]
+    doc_files, code_files = _classify_doc_code(cfg, files)
     code_lines, code_unknown = _code_size(ctx, base, fp["id"], code_files) if base else (0, [])
     doc_test_files = _tests_naming(ctx, cfg, fp, doc_files)
     doc_cmd = cfg.get("doc_test_command")
@@ -594,8 +597,7 @@ def classify_changes(ctx: "Ctx", cp_id: str) -> dict:
         }
     else:
         a_files = sorted(changed_files(ctx.root, approval_fp, fp))
-        a_doc_files = [f for f in a_files if _glob_hit(f, doc_globs) and not _glob_hit(f, exclude)]
-        a_code_files = [f for f in a_files if f not in a_doc_files]
+        a_doc_files, a_code_files = _classify_doc_code(cfg, a_files)
         a_lines, a_unknown = _code_size(ctx, approval_fp["id"], fp["id"], a_code_files)
         since_approval = {
             "approved": True,
@@ -642,6 +644,62 @@ def cmd_changes(args):
         print(f"since approval: docs only={sa['docs_only']}, doc files: {', '.join(sa['doc_files']) or '(none)'}, "
               f"code files: {', '.join(sa['code_files']) or '(none)'}, code lines changed: {sa_lines}, "
               f"doc test files: {', '.join(sa['doc_test_files']) or '(none)'}")
+
+
+# --------------------------------------------------------------------------- doc quick path at `complete` (CP2)
+# Doc edits made after a gate's own approval never reopen a review round: when every file changed since that
+# gate's recorded fingerprint is a doc (the one doc/code split in `_classify_doc_code`, also used by
+# classify_changes above so the two can never disagree) and doc_test_command is configured, `cmd_complete` runs
+# just the test files naming those docs instead of marking the gate stale. The same rule also lets a passing
+# full suite stay valid across a doc-only edit (`_skip_full_suite`), and every doc edit skipped this way is
+# recorded on the checkpoint (`doc_edits_unreviewed`) so the commit message, `status` and the final review can
+# all say so.
+
+def _classify_doc_code(cfg: dict, files: list[str]) -> tuple[list[str], list[str]]:
+    """The one doc/code split (doc_globs, minus doc_exclude_globs plus the configured design_md and standards
+    files) for an arbitrary file list. `classify_changes` above and `cmd_complete`'s quick path both call this
+    so what counts as a doc can never drift between the read-only report and the gate that skips review."""
+    exclude = [g for g in [*(cfg.get("doc_exclude_globs") or []), cfg.get("design_md"),
+                           *(cfg.get("standards") or [])] if g]
+    doc_globs = cfg.get("doc_globs") or []
+    doc_files = [f for f in files if _glob_hit(f, doc_globs) and not _glob_hit(f, exclude)]
+    code_files = [f for f in files if f not in doc_files]
+    return doc_files, code_files
+
+
+def _run_doc_test_command(ctx: "Ctx", cfg: dict, files: list[str], log_path: Path) -> tuple[int, str]:
+    """Runs doc_test_command with its {files} placeholder filled in by `files` (shlex-quoted, space-joined),
+    logged the same way _run_cmd logs regression_command. Returns (exit code, combined stdout+stderr)."""
+    cmd = cfg["doc_test_command"].replace("{files}", " ".join(shlex.quote(f) for f in files))
+    code, out, _ = _run_cmd(ctx, cmd, log_path, cfg["test_timeout_sec"])
+    return code, out
+
+
+def _skip_full_suite(ctx: "Ctx", cfg: dict, st: dict, fp: dict) -> tuple[bool, list[str]]:
+    """(True, the doc files involved) when regression_command already passed on a tree recorded at
+    st['regression_passed_fp'] that differs from `fp` only in docs (and doc_test_command is configured), so
+    `complete` can run just those docs' naming tests instead of the full suite again. (False, []) when there is
+    no recorded pass yet, the doc quick path is off, or anything that changed since is code."""
+    passed_fp = st.get("regression_passed_fp")
+    if not passed_fp or not cfg.get("doc_test_command"):
+        return False, []
+    changed = [f for f in changed_files(ctx.root, passed_fp, fp)
+              if f != RATCHET_DIR and not f.startswith(RATCHET_DIR + "/")]
+    if not changed:
+        return True, []
+    doc_files, code_files = _classify_doc_code(cfg, changed)
+    return (not code_files), doc_files
+
+
+def _doc_edit_status_lines(st: dict) -> list[str]:
+    """One plain line per checkpoint whose doc edit(s) after review were never re-reviewed (CP2's quick path),
+    for `status`, the commit message and the final review to all say the same thing about the same files."""
+    lines = []
+    for cid, c in (st.get("checkpoints") or {}).items():
+        docs = c.get("doc_edits_unreviewed")
+        if docs:
+            lines.append(f"{cid}: edited after review and not re-reviewed (doc quick path): {', '.join(docs)}.")
+    return lines
 
 
 # --------------------------------------------------------------------------- tamper evidence
@@ -2767,6 +2825,8 @@ def cmd_status_text(ctx: Ctx):
     if note:
         print(note)
     for line in _accepted_findings_lines(st):
+        print(line)
+    for line in _doc_edit_status_lines(st):
         print(line)
     w = live_wait(st)
     if w:
@@ -7461,6 +7521,14 @@ def cmd_complete(args):
     cfg = ctx.config()
     fp = fingerprint(ctx.root)
     problems, stale = [], []
+    doc_edits = set()  # CP2 doc quick path: files found doc-only since behavior or adversarial passed, used only
+    # to pick which doc tests replace the staleness check -- never, on its own, a "not re-reviewed" record.
+    doc_edits_unreviewed_now = set()  # only files the ADVERSARIAL gate's own diff found doc-only: that gate's
+    # approval is the review the commit message/status/final review claim, so only this set is ever folded into
+    # cps["doc_edits_unreviewed"]. A file the behavior branch finds doc-only (to avoid the staleness block and
+    # help pick doc tests) is never added here on its own -- the adversarial round may since have reviewed and
+    # approved that exact edit (behavior always passes before the adversarial round opens). When the
+    # adversarial gate isn't required, this set stays empty and nothing is recorded as unreviewed from here.
     for name in ["behavior", "ui", "adversarial"]:
         g = cps["gates"][name]
         if not g["required"]:
@@ -7481,6 +7549,10 @@ def cmd_complete(args):
         if not changed:
             continue
         if name == "behavior":
+            doc_files, code_files = _classify_doc_code(cfg, changed)
+            if not code_files and cfg.get("doc_test_command"):
+                doc_edits.update(doc_files)
+                continue
             problems.append(f"code changed since behavior passed ({len(changed)} files) → re-run ratchet.py behavior {args.cp}")
             stale.append(name)
         elif name == "ui":
@@ -7489,6 +7561,11 @@ def cmd_complete(args):
                 problems.append(f"UI files changed since UI review ({', '.join(ui_changed[:5])}) → re-run ratchet-ui-compare")
                 stale.append(name)
         elif name == "adversarial":
+            doc_files, code_files = _classify_doc_code(cfg, changed)
+            if not code_files and cfg.get("doc_test_command"):
+                doc_edits.update(doc_files)
+                doc_edits_unreviewed_now.update(doc_files)
+                continue
             problems.append("code changed since adversarial approval → adversaries must review the final code")
             stale.append(name)
     if problems:
@@ -7499,7 +7576,45 @@ def cmd_complete(args):
         ctx.log(st, "complete_rejected", cp=args.cp, stale=stale)
         ctx.save_state(st)
         die(f"{args.cp} cannot complete:\n  - " + "\n  - ".join(problems), 2)
-    if cfg.get("regression_command"):
+    if doc_edits:
+        # CP2 doc quick path: every file changed since behavior/adversarial passed is a doc, so neither gate was
+        # marked stale above. Run only the test files that name those docs (never the full suite for this); a
+        # failure here leaves the gates' status exactly as it was and commits nothing, same as any other failed
+        # check below.
+        doc_test_files = _tests_naming(ctx, cfg, fp, sorted(doc_edits))
+        if doc_test_files:
+            dcode, dout = _run_doc_test_command(ctx, cfg, doc_test_files, ctx.evidence(args.cp) / "doc-tests.log")
+            if dcode != 0:
+                die(f"{args.cp} cannot complete: a doc test failed for the doc edit(s) made after review "
+                    f"({', '.join(sorted(doc_edits))}):\n  - " + "\n  - ".join(doc_test_files) + f"\n{_tail(dout)}", 2)
+            if fingerprint(ctx.root)["id"] != fp["id"]:
+                die("The doc test command changed files in the project. Those changes were never reviewed — find "
+                    "out what wrote them (generated files? snapshots?) and either add them to .gitignore or "
+                    "re-run the gates.", 2)
+        # Only files the ADVERSARIAL gate's own diff found doc-only (`doc_edits_unreviewed_now`) are ever
+        # recorded as "not re-reviewed": a file the behavior branch alone found doc-only may since have been
+        # reviewed and approved in the adversarial round itself, so it is never recorded here just for that.
+        if doc_edits_unreviewed_now:
+            cps["doc_edits_unreviewed"] = sorted(set(cps.get("doc_edits_unreviewed") or []) | doc_edits_unreviewed_now)
+        ctx.log(st, "doc_quick_path", cp=args.cp, files=sorted(doc_edits), tests=doc_test_files)
+    skip_full, full_doc_files = _skip_full_suite(ctx, cfg, st, fp) if cfg.get("regression_command") else (False, [])
+    if skip_full:
+        # Already passed on a tree that differs from now only in docs: run just those docs' naming tests
+        # instead of the full suite again. `full_doc_files` only selects which tests replace the full suite; it
+        # is never added to `doc_edits_unreviewed` (a file here may already have gone through, and passed, its
+        # own gate's normal adversarial round, so it was never actually skipped from review).
+        full_doc_tests = _tests_naming(ctx, cfg, fp, full_doc_files) if full_doc_files else []
+        if full_doc_tests:
+            dcode, dout = _run_doc_test_command(ctx, cfg, full_doc_tests,
+                                                ctx.evidence(args.cp) / "doc-tests-full-suite.log")
+            if dcode != 0:
+                die(f"{args.cp} cannot complete: the full suite already passed on a tree that differs only in "
+                    f"docs, but a doc test failed for {', '.join(full_doc_tests)}:\n{_tail(dout)}", 2)
+            if fingerprint(ctx.root)["id"] != fp["id"]:
+                die("The doc test command changed files in the project. Those changes were never reviewed — find "
+                    "out what wrote them (generated files? snapshots?) and either add them to .gitignore or "
+                    "re-run the gates.", 2)
+    if cfg.get("regression_command") and not skip_full:
         code, out, _ = _run_cmd(ctx, cfg["regression_command"], ctx.evidence(args.cp) / "regression.log",
                                 cfg["test_timeout_sec"])
         if code != 0 and not st.get("regression_flaky_used"):
@@ -7519,6 +7634,7 @@ def cmd_complete(args):
         if fingerprint(ctx.root)["id"] != fp["id"]:
             die("The regression command changed files in the project. Those changes were never reviewed — find out "
                 "what wrote them (generated files? snapshots?) and either add them to .gitignore or re-run the gates.", 2)
+        st["regression_passed_fp"] = fp
     if cp.get("guardrail"):
         probs = verify_guardrail(ctx, st, cp, cps, fp, cfg)
         if probs:
@@ -7543,6 +7659,9 @@ def cmd_complete(args):
             f"{n}={cps['gates'][n]['status']}" for n in ["behavior", "ui", "adversarial"])
         if cp.get("spec_refs"):
             msg += "\nSpec: " + ", ".join(_as_list(cp["spec_refs"]))[:600]
+        if cps.get("doc_edits_unreviewed"):
+            msg += ("\nDocs edited after review and not re-reviewed (doc quick path): "
+                    + ", ".join(cps["doc_edits_unreviewed"]))
         commit = _commit_reviewed(ctx.root, cps.get("base_tree"), fp, msg, extra=spec_files)
         if not commit:  # nothing new to commit: a run of complete that failed after its commit left it at HEAD
             commit = _head_commit_named(ctx.root, msg)

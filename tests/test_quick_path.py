@@ -448,5 +448,124 @@ def _write_report_with_fix_tests():
 write_report = _write_report_with_fix_tests
 
 
+# ------------------------------------------------------------------------------------------------ CP2 adversarial
+# round 1 fix-round tests: appended after the CP1 fix-round block above, which is left untouched. Same inline
+# pattern: run below, before `main()` (which only knows about the original TESTS list), so their pass/fail still
+# folds into this file's overall PASS/FAIL totals and exit code.
+import ast  # noqa: E402  (new top-level import, added outside any planned test, for the AST check below)
+
+
+def x07_nested_directory_agents_md_excluded_at_any_depth():
+    """[CP1-X07] A directory-shaped doc_exclude_globs entry like "agents/*.md" must exclude a matching file at
+    any depth, not only directly under a root-level "agents/" folder (CP1-T04's case), so a normal per-package
+    instruction-file layout (e.g. apps/bot/agents/x.md) is never misclassified as a doc."""
+    d = _fixture_project("cp1-x07")
+    (d / "apps" / "bot" / "agents").mkdir(parents=True, exist_ok=True)
+    (d / "apps" / "bot" / "agents" / "x.md").write_text("# Agent\n\nedited agent text.\n")
+    r, data = run_changes(d)
+    check("[CP1-X07] `changes CP1` exits 0 (read-only report)", r.returncode == 0, r.stdout + r.stderr)
+    check("[CP1-X07] the change is reported as touching code, not docs only", data.get("docs_only") is False, data)
+    check("[CP1-X07] apps/bot/agents/x.md never appears in the doc files",
+          "apps/bot/agents/x.md" not in (data.get("doc_files") or []), data)
+    check("[CP1-X07] apps/bot/agents/x.md appears in the code files",
+          "apps/bot/agents/x.md" in (data.get("code_files") or []), data)
+
+
+def x08_classify_changes_reuses_the_shared_doc_code_split_helper():
+    """[CP1-X08] `classify_changes` must call the one shared `_classify_doc_code` helper for its doc/code
+    split rather than re-deriving its own copy of the rule, so `ratchet.py changes` and `ratchet.py complete`
+    can never disagree about what counts as a doc."""
+    src = g.ENGINE.read_text(encoding="utf-8")
+    tree = ast.parse(src, filename=str(g.ENGINE))
+    fn = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "classify_changes"), None)
+    check("[CP1-X08] classify_changes is found in ratchet.py", fn is not None, "classify_changes not found")
+    called = {c.func.id for c in ast.walk(fn) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)} if fn else set()
+    check("[CP1-X08] classify_changes calls the shared _classify_doc_code helper for its doc/code split",
+          "_classify_doc_code" in called, sorted(called))
+
+
+FIX_TESTS2 = [
+    ("CP1-X07", x07_nested_directory_agents_md_excluded_at_any_depth),
+    ("CP1-X08", x08_classify_changes_reuses_the_shared_doc_code_split_helper),
+]
+
+for _cid, _fn in FIX_TESTS2:
+    CASE_STATUS.setdefault(_cid, True)
+    try:
+        _fn()
+    except Exception as _e:  # a crash still counts as a result for this case, never a silent drop
+        FAIL += 1
+        CASE_STATUS[_cid] = False
+        CASE_MESSAGES.setdefault(_cid, []).append(f"crashed: {_e}")
+        print(f"  ✗ [{_cid}] CRASHED: {_e}")
+        traceback.print_exc()
+
+
+def _write_report_with_fix_tests2():
+    """Same as `_write_report_with_fix_tests` above, but over `[*TESTS, *FIX_TESTS, *FIX_TESTS2]`. Rebinds the
+    module-level `write_report` name again (looked up by `main()` only at call time, below)."""
+    path = os.environ.get("RATCHET_TEST_REPORT")
+    if not path:
+        return
+    cases = [{"id": cid, "status": "passed" if CASE_STATUS.get(cid, False) else "failed",
+              "message": "" if CASE_STATUS.get(cid, False) else "; ".join(CASE_MESSAGES.get(cid, []))[:300]}
+             for cid, _ in [*TESTS, *FIX_TESTS, *FIX_TESTS2]]
+    with open(path, "w") as f:
+        json.dump({"cases": cases}, f)
+
+
+write_report = _write_report_with_fix_tests2
+
+
+# ------------------------------------------------------------------------------------------------ CP2 adversarial
+# round 3 fix-round test: appended after the FIX_TESTS2 block above, which is left untouched. Same inline
+# pattern, numbering continuing from CP1-X08 above: run below, before `main()` (which only knows about the
+# original TESTS list), so its pass/fail still folds into this file's overall PASS/FAIL totals and exit code.
+
+def x09_mdx_is_not_a_doc_by_default():
+    """[CP1-X09] MDX routinely carries executable JSX (Next.js pages, Docusaurus, Storybook), so a changed
+    .mdx file must be reported as code, not a doc, under the default doc_globs."""
+    d = _fixture_project("cp1-x09")
+    (d / "docs" / "page.mdx").write_text("export const meta = { title: 'Page' };\n\n# Page\n")
+    r, data = run_changes(d)
+    check("[CP1-X09] `changes CP1` exits 0 (read-only report)", r.returncode == 0, r.stdout + r.stderr)
+    check("[CP1-X09] docs/page.mdx is not reported as a doc file",
+          "docs/page.mdx" not in (data.get("doc_files") or []), data)
+    check("[CP1-X09] docs/page.mdx is reported as a code file",
+          "docs/page.mdx" in (data.get("code_files") or []), data)
+
+
+FIX_TESTS3 = [
+    ("CP1-X09", x09_mdx_is_not_a_doc_by_default),
+]
+
+for _cid, _fn in FIX_TESTS3:
+    CASE_STATUS.setdefault(_cid, True)
+    try:
+        _fn()
+    except Exception as _e:  # a crash still counts as a result for this case, never a silent drop
+        FAIL += 1
+        CASE_STATUS[_cid] = False
+        CASE_MESSAGES.setdefault(_cid, []).append(f"crashed: {_e}")
+        print(f"  ✗ [{_cid}] CRASHED: {_e}")
+        traceback.print_exc()
+
+
+def _write_report_with_fix_tests3():
+    """Same as `_write_report_with_fix_tests2` above, but over `[*TESTS, *FIX_TESTS, *FIX_TESTS2, *FIX_TESTS3]`.
+    Rebinds the module-level `write_report` name again (looked up by `main()` only at call time, below)."""
+    path = os.environ.get("RATCHET_TEST_REPORT")
+    if not path:
+        return
+    cases = [{"id": cid, "status": "passed" if CASE_STATUS.get(cid, False) else "failed",
+              "message": "" if CASE_STATUS.get(cid, False) else "; ".join(CASE_MESSAGES.get(cid, []))[:300]}
+             for cid, _ in [*TESTS, *FIX_TESTS, *FIX_TESTS2, *FIX_TESTS3]]
+    with open(path, "w") as f:
+        json.dump({"cases": cases}, f)
+
+
+write_report = _write_report_with_fix_tests3
+
+
 if __name__ == "__main__":
     main()
