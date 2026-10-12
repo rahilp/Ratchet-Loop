@@ -1667,6 +1667,50 @@ def objective_problems(plan) -> list[str]:
     return errs
 
 
+def _proves_values(case) -> list:
+    """Normalize one test-plan case's "proves" field for every consumer (proves_problems, _unproven_done_means,
+    _done_means_proof): a missing value is [] (nothing to prove), a scalar int counts as [int] (the common
+    planner slip of writing "proves": 1 instead of [1]), a list is used as-is. Any other shape is not a number
+    or a list of numbers, so there is nothing valid to normalize here; plan-submit's proves_problems is the one
+    place that refuses it outright, naming the case, before plan-summary or receipt ever reads it."""
+    proves = case.get("proves")
+    if proves is None:
+        return []
+    if isinstance(proves, list):
+        return proves
+    if isinstance(proves, int) and not isinstance(proves, bool):
+        return [proves]
+    return []
+
+
+def proves_problems(ctx, plan) -> list[str]:
+    """CP3: a test-plan case's optional "proves" (the spec_ref precedent's sibling) names, 1-based, the lines
+    of the objective's done_means it proves. plan-submit refuses any number that is not really a done_means
+    line, naming the offending case; a plan with no objective or no done_means lines (objective_problems
+    already refuses that on its own) simply has nothing valid to name, so every number is refused. "proves" may
+    be a single integer (normalized to a one-item list, see _proves_values) or a list; any other shape (a
+    string, a dict, a list containing one) is refused here by name, so plan-summary and receipt never have to
+    guess at it."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    dm = obj.get("done_means") if isinstance(obj, dict) else None
+    n = len(dm) if isinstance(dm, list) else 0
+    errs = []
+    for cp in plan.get("checkpoints") or []:
+        for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
+            proves = case.get("proves")
+            if proves is None:
+                continue
+            if not isinstance(proves, list) and not (isinstance(proves, int) and not isinstance(proves, bool)):
+                errs.append(f"{case.get('id', '?')}: proves {proves!r} must be a done_means line number or a "
+                            f"list of them (objective.done_means has {n} line(s))")
+                continue
+            for p in _proves_values(case):
+                if not isinstance(p, int) or isinstance(p, bool) or p < 1 or p > n:
+                    errs.append(f"{case.get('id', '?')}: proves {p!r} is not a done_means line "
+                                f"(objective.done_means has {n} line(s))")
+    return errs
+
+
 NO_OBJECTIVE_NOTE = "no objective was stated for this run (an older plan, approved before this feature existed)"
 
 
@@ -2561,8 +2605,7 @@ def cmd_status_text(ctx: Ctx):
     if st.get("phase") == "awaiting_final_review":
         for line in _final_review_lines(plan):
             print(line)
-        left = [f for c in (st.get("checkpoints") or {}).values() for f in c.get("deferred") or []
-                if not f.get("accepted")]
+        left = [f for c in (st.get("checkpoints") or {}).values() for f in left_for_later(c)]
         if left:
             print(f"{len(left)} finding(s) were left for later (never accepted or fixed): run `ratchet.py "
                   "deferred` to see them.")
@@ -2687,6 +2730,24 @@ def _review_preview(ctx, cfg, cp) -> tuple[list[str], bool]:
     return names, host_only
 
 
+def _unproven_done_means(ctx, plan) -> list[tuple]:
+    """[(1-based line number, its own text), ...] for every objective.done_means line that no test-plan
+    case's "proves" names, across every checkpoint. Empty when the plan has no objective or no done_means at
+    all (nothing to flag). A heads-up only, never a refusal: plan-submit's proves_problems is the gate that
+    actually blocks a bad number."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    dm = obj.get("done_means") if isinstance(obj, dict) else None
+    if not isinstance(dm, list) or not dm:
+        return []
+    proved = set()
+    for cp in plan.get("checkpoints") or []:
+        for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
+            for p in _proves_values(case):
+                if isinstance(p, int) and not isinstance(p, bool):
+                    proved.add(p)
+    return [(i, t) for i, t in enumerate(dm, 1) if i not in proved]
+
+
 def cmd_plan_summary(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -2705,6 +2766,8 @@ def cmd_plan_summary(args):
         print("Out of scope:")
         for line in obj.get("out_of_scope") or []:
             print(f"  - {line}")
+        for i, text in _unproven_done_means(ctx, plan):
+            print(f"  Heads up: done_means line {i} (\"{text}\") has no test case proving it yet.")
     for line in spec_summary_lines(ctx, plan):
         print(line)
     all_host = True
@@ -3734,7 +3797,7 @@ def cmd_plan_submit(args):
     if plan is None:
         die("checkpoints.json not found in the run folder")
     errs = (validate_plan(plan) + objective_problems(plan) + spec_plan_problems(ctx, plan)
-            + risk_reason_problems(plan.get("checkpoints", [])))
+            + risk_reason_problems(plan.get("checkpoints", [])) + proves_problems(ctx, plan))
     if errs:
         die("Plan invalid:\n  - " + "\n  - ".join(errs))
     st["phase"] = "awaiting_plan_approval"
@@ -7257,25 +7320,69 @@ def _checkin_decisions_lines(st) -> list[str]:
     return lines
 
 
+def _deferred_groups(cps) -> dict:
+    """Groups one checkpoint's own deferred findings (never accepted ones) by `_finding_key` (reviewer/id, or the
+    bare id when no reviewer is given), keeping only the LATEST round's own copy for each key: the same reviewer
+    re-raising the same id in a later round overwrites its own earlier, stale copy here. Two findings that merely
+    share a `kind` and `file` -- a different reviewer, or a different id -- are different keys and are never
+    merged into one; each keeps its own entry."""
+    groups: dict = {}
+    for f in cps.get("deferred") or []:
+        if f.get("accepted"):
+            continue
+        k = _finding_key(f)
+        if k not in groups or (f.get("round") or 0) >= (groups[k].get("round") or 0):
+            groups[k] = f
+    return groups
+
+
+def left_for_later(cps) -> list:
+    """A checkpoint's deferred findings still left for later at the end of the run: `_deferred_groups`'s one entry
+    per finding, minus any `ratchet.py mark-fixed` has since recorded fixed. Used by `deferred`, `deferred --json`
+    and the final-review count in `status`, so all three always agree on what is still left for later."""
+    return [f for f in _deferred_groups(cps).values() if not f.get("fixed")]
+
+
+def _fixed_later(cps) -> list:
+    """The companion list to `left_for_later`: the same deduped findings, kept only when `mark-fixed` marked them
+    fixed."""
+    return [f for f in _deferred_groups(cps).values() if f.get("fixed")]
+
+
 def cmd_deferred(args):
     """Findings that were recorded instead of blocking (minor ones, and any blocker/major/unknown-severity
     finding with no user_impact), for the user to decide on at the end, PLUS, in their own section first,
     findings the user accepted while a round was blocked: these were shown to the user and agreed to on purpose,
-    with a reason and who accepted them, so they are never mixed in with ones that simply never blocked."""
+    with a reason and who accepted them, so they are never mixed in with ones that simply never blocked. A finding
+    `ratchet.py mark-fixed` recorded fixed prints in its own 'fixed later in the run' section instead of under
+    'left for later' (both sections are deduped per `left_for_later`/`_fixed_later`: a finding re-raised in a
+    later round by the same reviewer with the same id shows once, as that later round's own copy)."""
     ctx = Ctx(find_root())
     st = ctx.state()
-    rows = [(cp, f) for cp, c in (st.get("checkpoints") or {}).items() for f in c.get("deferred") or []]
+    cps_map = st.get("checkpoints") or {}
+    accepted = [(cp, f) for cp, c in cps_map.items() for f in c.get("deferred") or [] if f.get("accepted")]
+    fixed = [(cp, f) for cp, c in cps_map.items() for f in _fixed_later(c)]
+    other = [(cp, f) for cp, c in cps_map.items() for f in left_for_later(c)]
     if getattr(args, "json", False):
+        rows = accepted + fixed + other
         print(json.dumps([dict(f, checkpoint=cp) for cp, f in rows], indent=2))
         return
-    if not rows:
+    if not (accepted or fixed or other):
         print("No findings were left for later.")
         return
-    other = [(cp, f) for cp, f in rows if not f.get("accepted")]
     acc_lines = _accepted_findings_lines(st)
     if acc_lines:
         for line in acc_lines:
             print(line)
+        if fixed or other:
+            print("")
+    if fixed:
+        print(f"{len(fixed)} finding(s) were fixed later in the run (a later round reviewed the change):")
+        for cp, f in fixed:
+            where = f" ({f['file']}{':' + str(f['line']) if f.get('line') else ''})" if f.get("file") else ""
+            fx = f.get("fixed") or {}
+            print(f"- {cp} {_finding_key(f)}{where}: {f.get('description', '').strip()[:240]} "
+                  f"[fixed in round {fx.get('round')}: {fx.get('how', '')}]")
         if other:
             print("")
     if other:
@@ -7284,6 +7391,424 @@ def cmd_deferred(args):
             where = f" ({f['file']}{':' + str(f['line']) if f.get('line') else ''})" if f.get("file") else ""
             why = f" [{f['deferred_because']}]" if f.get("deferred_because") else ""
             print(f"- {cp} {_finding_key(f)}{where}: {f.get('description', '').strip()[:240]}{why}")
+
+
+def cmd_mark_fixed(args):
+    """`ratchet.py mark-fixed CPn <ref>="<how>"`: records that a finding left for later (`ratchet.py deferred`)
+    was really fixed, so the final review's own left-for-later list stops showing it (`deferred` moves it under
+    'fixed later in the run' instead). Refused outright, with nothing changed, unless BOTH: (1) the finding's own
+    file has changed since the LATEST round that raised it (same reviewer/id) -- the baseline round is the
+    highest of every round among this checkpoint's own non-accepted deferred entries for that key AND every
+    recorded adversarial round whose own open-findings.json (the round's blocking findings, read fresh off disk,
+    not just this checkpoint's deferred list) lists that same key, so a round that re-raises the finding as
+    BLOCKING, not only one that defers it again, also becomes the new baseline -- that round itself can never
+    serve as its own proof -- and (2) a later adversarial round has since been recorded whose own fingerprint
+    already matches today's version of that file -- a fix nobody reviewed again does not count, and a file that
+    never moved does not either. Also refused for a finding the user already accepted (a separate decision,
+    `ratchet.py ask accept-finding`) or a reference naming no deferred finding at all."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    cps = (st.get("checkpoints") or {}).get(args.cp)
+    if cps is None:
+        die(f"No such checkpoint {args.cp}.")
+    ref, sep, rest = args.decision.partition("=")
+    ref = ref.strip()
+    how = rest.strip()
+    if len(how) >= 2 and how[0] == how[-1] and how[0] in ("'", '"'):
+        how = how[1:-1].strip()
+    if not sep or not how:
+        die(f"{args.decision!r}: use `mark-fixed {args.cp} <ref>=\"how it was fixed\"`. Nothing was recorded.")
+    all_deferred = cps.get("deferred") or []
+    open_deferred = [d for d in all_deferred if not d.get("accepted")]
+    found, err = _resolve_finding_ref(ref, open_deferred)
+    if err:
+        die(f"{err} Nothing was recorded.")
+    if found is None:
+        accepted = [d for d in all_deferred if d.get("accepted")]
+        acc, _ = _resolve_finding_ref(ref, accepted)
+        if acc is not None:
+            die(f"{ref} was accepted by the user, not deferred (see `ratchet.py ask accept-finding`); mark-fixed "
+                "does not apply to it. Nothing was recorded.")
+        die(f"{ref} does not exist among {args.cp}'s deferred findings (`ratchet.py deferred` lists them). "
+            "Nothing was recorded.")
+    key = _finding_key(found)
+    entries = [d for d in open_deferred if _finding_key(d) == key]
+    file = found.get("file")
+    rounds = ((cps.get("gates") or {}).get("adversarial") or {}).get("rounds") or []
+    raised_rounds = [d.get("round") for d in entries if d.get("round") is not None]
+    for rr in rounds:
+        rno = rr.get("round")
+        if rno is None:
+            continue
+        raw = _read_findings_file(_adv_round_dir(ctx, args.cp, rno) / "open-findings.json")
+        if any(_finding_key(f) == key for f in raw):
+            raised_rounds.append(rno)
+    raised_round = max(raised_rounds, default=None)
+    raised_rec = next((rr for rr in rounds if rr.get("round") == raised_round), None) \
+        if raised_round is not None else None
+    if raised_round is None or not file or not raised_rec or not raised_rec.get("fingerprint"):
+        die(f"{ref} has no recorded round or file on record to check whether it was really fixed. Nothing was "
+            "recorded.")
+    cur_fp = fingerprint(ctx.root)
+    raised_fp = {"kind": "git-tree", "id": raised_rec["fingerprint"]}
+    file_norm = _norm_path(file)
+    changed_since_raise = {_norm_path(x) for x in changed_files(ctx.root, raised_fp, cur_fp)}
+    if file_norm not in changed_since_raise:
+        die(f"{ref}'s file ({file}) has not changed since round {raised_round}, the round that raised it. "
+            "mark-fixed only applies once the file has really changed. Nothing was recorded.")
+    later_round = None
+    for rr in sorted(rounds, key=lambda r: r.get("round", 0)):
+        if rr.get("round", 0) <= raised_round or not rr.get("fingerprint"):
+            continue
+        rec_fp = {"kind": "git-tree", "id": rr["fingerprint"]}
+        if file_norm not in {_norm_path(x) for x in changed_files(ctx.root, rec_fp, cur_fp)}:
+            later_round = rr["round"]
+            break
+    if later_round is None:
+        die(f"{ref}: no later review round has been recorded on the changed code since round {raised_round}. Run "
+            f"`ratchet.py reviewers {args.cp}` and record a new round first. Nothing was recorded.")
+    latest_entry = max(entries, key=lambda d: d.get("round") or 0)
+    latest_entry["fixed"] = {"round": later_round, "how": how}
+    ctx.log(st, "finding_marked_fixed", cp=args.cp, ref=key, round=later_round)
+    ctx.save_state(st)
+    ok(f"Marked {key} fixed for {args.cp} (a later round, {later_round}, reviewed the changed code). Run "
+       "`ratchet.py deferred` to see it under 'fixed later in the run'.")
+
+
+# ---- receipt: one honest proof receipt to paste into the pull request, at the end of a run -----------------
+
+def _plain_duration(seconds) -> str:
+    """A wall-clock span as a plain duration ('4h 17m', '38m'): never cost, never tokens, just time."""
+    seconds = max(0, int(seconds or 0))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if days or hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _elapsed_seconds(a_iso, b_iso) -> int:
+    return max(0, int(_iso(b_iso) - _iso(a_iso)))
+
+
+def _step_reviewed_tree(cps) -> str | None:
+    """The git-tree id Ratchet recorded as reviewed for this checkpoint: its adversarial gate's own `fingerprint`
+    once that gate has passed, else the last adversarial round's own `fingerprint` (what that round actually
+    looked at), else None when no round has ever opened."""
+    g = (cps.get("gates") or {}).get("adversarial") or {}
+    fp = g.get("fingerprint")
+    if isinstance(fp, dict) and fp.get("id"):
+        return fp["id"]
+    rounds = g.get("rounds") or []
+    if rounds:
+        last_fp = rounds[-1].get("fingerprint")
+        if isinstance(last_fp, dict):
+            return last_fp.get("id")
+        if last_fp:
+            return last_fp
+    return None
+
+
+def _step_commit(ctx, cps) -> str | None:
+    """The short commit id to show for a checkpoint: its own recorded `commit` field (the one `complete` makes)
+    when there is one, else the one commit -- if any -- whose own git tree is exactly the tree Ratchet recorded
+    as reviewed for this step (`_step_reviewed_tree`: the step's passed adversarial gate, or else its last
+    adversarial round). Covers the one case `complete` itself leaves with no `commit` of its own even though
+    commit_per_checkpoint is on: the code was already committed by some other means (directly, by the user or
+    agent -- the accepted same-user limit) before `complete` ran, so there was nothing left for Ratchet's own
+    commit to add. Never guesses from commit dates or a time window (an ordinary manual commit made mid-step
+    that the reviewed tree does not match is never shown), so a step with no recorded commit and no commit whose
+    tree matches what was actually reviewed still says 'no commit recorded'."""
+    commit = cps.get("commit")
+    if commit:
+        return commit
+    tree = _step_reviewed_tree(cps)
+    if not tree or not _is_git(ctx.root):
+        return None
+    r = subprocess.run(["git", "log", "--format=%H %T"], cwd=ctx.root, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    for line in r.stdout.splitlines():
+        sha, _, cur_tree = line.partition(" ")
+        if cur_tree == tree:
+            return sha[:7]
+    return None
+
+
+def _step_elapsed(cps) -> tuple:
+    """(status, seconds) for one checkpoint: 'finished' (started_at..completed_at), 'not finished' (started_at..now,
+    the step is still mid-build) or 'not started' (no started_at yet: this step was never reached)."""
+    started = cps.get("started_at")
+    completed = cps.get("completed_at")
+    if not started:
+        return "not started", 0
+    if completed:
+        return "finished", _elapsed_seconds(started, completed)
+    return "not finished", _elapsed_seconds(started, now())
+
+
+def _run_elapsed(st) -> tuple:
+    """(status, seconds) for the whole run: 'finished' once the run-level 'approved' history event exists
+    (created_at..that event's own timestamp, the latest one if it is ever logged more than once), else 'not
+    finished' (created_at..now: time so far, never a final total presented as if the run had ended)."""
+    created = st.get("created_at")
+    if not created:
+        return "not finished", 0
+    approved_at = None
+    for h in st.get("history") or []:
+        if h.get("event") == "approved":
+            approved_at = h.get("at")  # the latest one wins when logged more than once
+    if approved_at:
+        return "finished", _elapsed_seconds(created, approved_at)
+    return "not finished", _elapsed_seconds(created, now())
+
+
+def _round_reviewer_entries(cfg, rnd_record: dict) -> list:
+    """One entry per reviewer this round actually recorded (the round's own 'reviewers' list, the final set after
+    any mid-round swap): {"round", "id", "host_fallback", "replaced", "reason"}. A host sub-agent reviewer
+    ('kind': 'agent' on the roster) is always marked `host_fallback`; its `reason` comes from the round's own
+    `substitutions` (cmd_reviewers' fallback record, fresh-round or the same-round re-resolve this checkpoint also
+    fills in) when one names it, else 'reason not recorded' -- never invented, never left blank -- including when
+    the round carries no `substitutions` key at all (a round recorded before that field existed). When today's
+    roster has nothing for this id (removed or renamed since this round ran), `host_fallback` is decided from the
+    recorded id's own naming convention (every host sub-agent id starts with "host-") instead of defaulting to
+    false, so a roster edit made later in the run never hides a real host-company fallback or its reason.
+
+    `reviewers` holds plain string ids while a round is still open (cmd_reviewers' own shape, including its
+    same-round re-resolve branch, before adv-record ever runs) and dicts ({"id", "vendor", "model"}) once that
+    round is recorded; either shape is accepted here. `substitutions` already carries the same `{"used",
+    "instead_of", "why"}` records for a pending round (built from its own `resolved` list) as for a recorded one,
+    so the lookup below needs no separate pending-round path."""
+    subs = rnd_record.get("substitutions")
+    by_used: dict = {}
+    if isinstance(subs, list):
+        for s in subs:
+            by_used.setdefault(s.get("used"), []).append(s)
+    out = []
+    for r in rnd_record.get("reviewers") or []:
+        rid = r if isinstance(r, str) else r.get("id")
+        spec = _roster_spec(cfg, rid) or {}
+        if spec:
+            host_fallback = spec.get("kind") == "agent"
+        else:
+            # Today's roster has nothing for this id (a custom host-agent reviewer renamed or removed since
+            # this round ran): fall back to the recorded id's own naming convention instead of calling it an
+            # outside reviewer. Every host sub-agent id this engine ever hands out starts with "host-".
+            host_fallback = bool(rid) and rid.startswith("host-")
+        replaced, reason = [], None
+        if host_fallback:
+            why = {}
+            for m in by_used.get(rid) or []:
+                for x in m.get("instead_of") or []:
+                    if x not in replaced:
+                        replaced.append(x)
+                why.update(m.get("why") or {})
+            if why:
+                reason = next(iter(why.values())) if len(why) == 1 else \
+                    "; ".join(f"{k}: {v}" for k, v in why.items())
+            else:
+                reason = "reason not recorded"
+        out.append({"round": rnd_record.get("round"), "id": rid, "host_fallback": host_fallback,
+                    "replaced": replaced, "reason": reason})
+    return out
+
+
+def _step_reviewer_entries(cfg, cps) -> list:
+    """Every recorded round's reviewers, plus the checkpoint's own currently-open round (`adv_round`) when one
+    exists and adv-record has not recorded it yet -- so a receipt asked for while a round is pending (or just
+    re-resolved mid-round) still honestly names its reviewers instead of silently omitting the step's own
+    in-progress round."""
+    rounds = ((cps.get("gates") or {}).get("adversarial") or {}).get("rounds") or []
+    out = []
+    for rnd_record in rounds:
+        out += _round_reviewer_entries(cfg, rnd_record)
+    pending = cps.get("adv_round")
+    if pending and not pending.get("recorded"):
+        out += _round_reviewer_entries(cfg, pending)
+    return out
+
+
+def _reviewer_line(e: dict) -> str:
+    if not e["host_fallback"]:
+        return f"  - round {e['round']}: {e['id']}"
+    if e["replaced"]:
+        return (f"  - round {e['round']}: {e['id']} - host's own company standing in, instead of "
+                f"{', '.join(e['replaced'])} ({e['reason']})")
+    return f"  - round {e['round']}: {e['id']} - host's own company fallback ({e['reason']})"
+
+
+def _receipt_accepted(st) -> list:
+    # "id" stays the finding's own bare id (the --json contract); "reviewer" is carried alongside it so two
+    # reviewers who independently picked the same bare id within one checkpoint can still be told apart
+    # (the qualified `_finding_key(f)` form the markdown prints uses exactly these two fields).
+    return [{"checkpoint": cp, "id": f.get("id"), "reviewer": f.get("reviewer"), "severity": f.get("severity"),
+             "description": f.get("description"), "reason": f.get("reason"),
+             "accepted_by": f.get("accepted_by") or "human"}
+            for cp, c in (st.get("checkpoints") or {}).items() for f in c.get("deferred") or [] if f.get("accepted")]
+
+
+def _receipt_left_for_later(st) -> list:
+    return [{"checkpoint": cp, "id": f.get("id"), "reviewer": f.get("reviewer"), "description": f.get("description"),
+             "deferred_because": f.get("deferred_because")}
+            for cp, c in (st.get("checkpoints") or {}).items() for f in left_for_later(c)]
+
+
+def _receipt_fixed_later(st) -> list:
+    out = []
+    for cp, c in (st.get("checkpoints") or {}).items():
+        for f in _fixed_later(c):
+            fx = f.get("fixed") or {}
+            out.append({"checkpoint": cp, "id": f.get("id"), "reviewer": f.get("reviewer"),
+                        "description": f.get("description"), "round": fx.get("round"), "how": fx.get("how")})
+    return out
+
+
+def _dm_case_status(ctx, cp_id: str, case: dict, behavior_status: str | None = None) -> str:
+    """One linked test case's own state for the receipt's done-means section. A browser-layer case is never
+    run by `ratchet.py behavior`, so it always reads "checked by the UI gate". Otherwise, this checkpoint's
+    latest per-case test report in evidence (whatever report format is actually on disk, read directly rather
+    than only when the approved plan names one, so a report already written always counts) decides passed vs
+    failed vs error vs skipped. With no report, or no result for this case in it, a supported exit-code-only
+    step (tests.report none or missing) still has a recorded result at the step level: `behavior_status` (the
+    checkpoint's own gates.behavior status, passed by the caller) says so, checked by exit code only rather
+    than per case, so a developer never sees a passing step's linked line read "no result recorded yet". With
+    no per-case report and no recorded behavior-gate status either (never run), that honest "no result
+    recorded yet" still stands. A case can have more than one matching report entry (a parameterized test, or
+    repeated runs); it counts as passed only when every matching entry passed, so one failed, errored or
+    skipped instance among several still shows as failed."""
+    if case.get("layer") == "browser":
+        return "checked by the UI gate"
+    case_id = case.get("id") or ""
+    pat = _case_id_re(case_id) if case_id else None
+    for name in ("test-report.json", "test-report.xml"):
+        p = ctx.evidence(cp_id) / name
+        if p.exists():
+            pairs, why = _read_test_report(ctx, p)
+            if pairs and pat:
+                statuses = [s for n, s in pairs if pat.search(n)]
+                if statuses:
+                    # a case passes only when every matching entry passed; any failed, errored or
+                    # skipped entry means the case shows as failed, however many entries it has
+                    return "passed" if all(s == "passed" for s in statuses) else "failed"
+    if behavior_status == "passed":
+        return "step tests passed, by exit code only (not checked per case)"
+    if behavior_status == "failed":
+        return "step tests failed, by exit code only (not checked per case)"
+    return "no result recorded yet"
+
+
+def _done_means_proof(ctx, plan, cps_map: dict | None = None) -> dict | None:
+    """None when the plan has no objective.done_means at all (an older plan, approved before either existed):
+    the receipt prints NO_OBJECTIVE_NOTE instead of this section. Otherwise {"lines": [{"text", "cases":
+    [{"id", "title", "file", "status"}]}], "any_proves": bool}; "any_proves" is False only when not one case
+    anywhere in the plan names a "proves" line (an old test plan from before that field existed), so the
+    receipt can add one plain note beside every line's own "no test linked" instead of pretending it checked.
+    `cps_map` (the run state's own checkpoint-by-id dict, passed by the caller) feeds each case's checkpoint's
+    recorded behavior-gate status into _dm_case_status, so an exit-code-only step still shows its real result."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    dm = obj.get("done_means") if isinstance(obj, dict) else None
+    if not isinstance(dm, list) or not dm:
+        return None
+    lines = [{"text": t, "cases": []} for t in dm]
+    any_proves = False
+    cps_map = cps_map or {}
+    for cp in plan.get("checkpoints") or []:
+        behavior_status = (((cps_map.get(cp["id"]) or {}).get("gates") or {}).get("behavior") or {}).get("status")
+        for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
+            for p in _proves_values(case):
+                if isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= len(dm):
+                    any_proves = True
+                    lines[p - 1]["cases"].append({"id": case.get("id"), "title": case.get("title", ""),
+                                                  "file": case.get("file", ""),
+                                                  "status": _dm_case_status(ctx, cp["id"], case, behavior_status)})
+    return {"lines": lines, "any_proves": any_proves}
+
+
+def cmd_receipt(args):
+    """`ratchet.py receipt` (plain markdown, or `--json`): one honest proof receipt to paste into the pull
+    request. Each step's title, short commit and elapsed time, the whole run's own elapsed time (wall-clock,
+    including any time spent waiting on you; never cost or tokens), who reviewed each step (a host-company
+    fallback marked as such, with why when Ratchet recorded it), the findings you accepted with their reason, and
+    findings left for later or fixed later in the run (CP1's own `left_for_later`/`_fixed_later` rule, so this
+    always agrees with `ratchet.py deferred` and `status`)."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    cfg = ctx.config()
+    plan = ctx.plan() or {"checkpoints": []}
+    cps_map = st.get("checkpoints") or {}
+    run_status, run_seconds = _run_elapsed(st)
+    steps = []
+    for cp in plan.get("checkpoints") or []:
+        cid = cp.get("id")
+        cps = cps_map.get(cid) or {}
+        status, seconds = _step_elapsed(cps)
+        steps.append({"id": cid, "title": cp.get("title", "?"), "commit": _step_commit(ctx, cps),
+                      "finished": status == "finished", "status": status, "elapsed_seconds": seconds,
+                      "reviewers": _step_reviewer_entries(cfg, cps)})
+    accepted, left, fixed = _receipt_accepted(st), _receipt_left_for_later(st), _receipt_fixed_later(st)
+    dm = _done_means_proof(ctx, plan, cps_map)
+    if getattr(args, "json", False):
+        data = {"run": {"elapsed_seconds": run_seconds, "finished": run_status == "finished"},
+                "steps": [{k: s[k] for k in ("id", "title", "commit", "finished", "elapsed_seconds", "reviewers")}
+                         for s in steps],
+                "accepted": accepted, "left_for_later": left, "fixed_later": fixed, "done_means": dm}
+        print(json.dumps(data, indent=2))
+        return
+    print(f"# Proof receipt: {plan.get('feature') or st.get('feature') or st.get('slug')}")
+    print("")
+    print("Steps (time is wall-clock, including any time spent waiting on you):")
+    for s in steps:
+        commit_txt = s["commit"] or "no commit recorded"
+        dur_txt = _plain_duration(s["elapsed_seconds"])
+        time_txt = dur_txt if s["finished"] else (
+            "not started" if s["status"] == "not started" else f"not finished (time so far: {dur_txt})")
+        print(f"- {s['id']} {s['title']}: commit {commit_txt}, time {time_txt}")
+        for e in s["reviewers"]:
+            print(_reviewer_line(e))
+    print("")
+    run_dur = _plain_duration(run_seconds)
+    run_txt = run_dur if run_status == "finished" else f"run not finished (time so far: {run_dur})"
+    print(f"Whole run time: {run_txt}")
+    print("")
+    if dm is None:
+        print(f"Done-means proof: {NO_OBJECTIVE_NOTE}.")
+    else:
+        print("Done-means proof (which tests prove each objective line):")
+        for i, line in enumerate(dm["lines"], 1):
+            print(f"{i}. {line['text']}")
+            if not line["cases"]:
+                print("   - no test linked")
+            else:
+                for c in line["cases"]:
+                    print(f"   - {c['id']} {c['title']} ({c['file']}): {c['status']}")
+        if not dm["any_proves"]:
+            print("Note: this plan's tests were never linked to done_means lines (an older test plan, "
+                  "approved before the \"proves\" field existed).")
+    acc_lines = _accepted_findings_lines(st)
+    if acc_lines:
+        print("")
+        for line in acc_lines:
+            print(line)
+    if fixed:
+        print("")
+        print(f"{len(fixed)} finding(s) fixed later in the run (a later round reviewed the change):")
+        for f in fixed:
+            print(f"- {f['checkpoint']} {_finding_key(f)}: {(f.get('description') or '').strip()[:240]} "
+                  f"[fixed in round {f.get('round')}: {f.get('how', '')}]")
+    if left:
+        print("")
+        print(f"{len(left)} finding(s) left for later (they did not block):")
+        for f in left:
+            why = f" [{f['deferred_because']}]" if f.get("deferred_because") else ""
+            print(f"- {f['checkpoint']} {_finding_key(f)}: {(f.get('description') or '').strip()[:240]}{why}")
+    if not (acc_lines or fixed or left):
+        print("")
+        print("No findings were accepted, left for later or fixed later in this run.")
 
 
 def cmd_complete(args):
@@ -8837,16 +9362,21 @@ def cmd_reviewers(args):
         out_dir_now = _review_round_dir(ctx, args.cp, "adv", rnd["round"])
         round_cutoff = {p.name[:-len(".cutoff.json")] for p in out_dir_now.glob("*.cutoff.json")}
         fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff)}
-        changed = False
+        changed, swapped_in = False, []
         for i, r in enumerate(rnd["resolved"]):
             if (out_dir_now / f"{r['id']}.json").exists():
                 continue  # a finished review in this round is kept untouched, never re-resolved
             okay, _why = reviewer_availability(ctx, cfg, r["id"])
             if (not okay or r["id"] in round_cutoff) and r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
-                rnd["resolved"][i] = fresh[r["slot"]]
+                new_r = fresh[r["slot"]]
+                rnd["resolved"][i] = new_r
                 changed = True
+                if new_r["fallback_for"]:
+                    swapped_in.append({"used": new_r["id"], "instead_of": new_r["fallback_for"], "why": new_r["reasons"]})
         if changed:
             rnd["reviewers"] = [r["id"] for r in rnd["resolved"]]
+            if swapped_in:  # record the same-round swap the same shape a fresh round's own substitutions use
+                rnd["substitutions"] = (rnd.get("substitutions") or []) + swapped_in
             ctx.log(st, "reviewer_fallback", cp=args.cp, detail="re-resolved within round " + str(rnd["round"]))
             ctx.save_state(st)
     _key, why = open_review_key(ctx, args.cp, "adv", rnd["round"], st)
@@ -11299,6 +11829,12 @@ def main(argv=None):
     a.set_defaults(fn=cmd_spec)
     a = sp.add_parser("deferred", help="findings recorded for later instead of blocking (minor, or no user_impact)")
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_deferred)
+    a = sp.add_parser("mark-fixed", help="record that a deferred finding was really fixed and reviewed again")
+    a.add_argument("cp"); a.add_argument("decision", metavar='ref="how it was fixed"')
+    a.set_defaults(fn=cmd_mark_fixed)
+    a = sp.add_parser("receipt", help="one proof receipt to paste into the pull request: steps, time, reviewers, "
+                                      "accepted/left-for-later/fixed-later findings")
+    a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_receipt)
     sp.add_parser("next").set_defaults(fn=cmd_next)
     a = sp.add_parser("status"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_status)
     sp.add_parser("plan-summary", help="plain per-step summary of the plan, to show the user before they approve"

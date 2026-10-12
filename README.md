@@ -264,6 +264,10 @@ Every reviewer's prompt, and every builder, fixer and test-writer's brief, opens
 
 Reviewers can go back and forth for a while on a hard step. Ratchet itself watches for that, not the agent: once a step blocks a second round in a row, or a kind of finding the agent hadn't seen yet shows up a second time in a file an earlier round already flagged, it pauses before another round and makes the agent check in against the plan's own goal. The agent never decides this alone: it spawns a fresh strong-model reviewer with the objective, the open findings and the round history, which recommends narrowing or changing the step (simplify), asking you to accept the open findings as a known limit (only your own reply does that; the agent can't wave them through itself), or stopping to ask you how to wrap up. Separately, once a round blocks, the agent has to decide fix or rebut for every remaining open finding, however many, with a one-line reason, before it can open another round; a disputed finding it chose to rebut is shown to the next round's reviewers, who either drop it or press it again with a clearer case for who it would actually hurt. The final review, when everything is built, opens the same way: your goal, who it's for, and each thing "done" was supposed to mean, listed plainly for you to judge against the evidence, not claimed as met just because the checkpoints finished.
 
+### Pasting a proof receipt into the pull request
+
+Once you say yes to the final review's approval question, the agent runs `human-approve` and then runs `ratchet.py receipt`, pasting its finished markdown straight into that same wrap-up message (you never run `ratchet.py` yourself): one honest receipt to paste into the pull request. Each step's title, short commit and elapsed time, plus the whole run's own elapsed time — wall-clock, including any time spent waiting on you, never cost or tokens. Who reviewed each step and its rounds, with a review by the host's own sub-agent marked as such and why an outside reviewer was skipped, when Ratchet recorded that reason (otherwise it says plainly that the reason wasn't recorded). The findings you accepted, with your reason; the ones still left for later; and the ones `mark-fixed` closed later in the run. A step with no commit says so plainly ("no commit recorded") instead of guessing; because the receipt is only pasted after approval, its run total is always the finished total, never a time-so-far guess. The receipt also lists every line of the plan's objective ("done means") next to the test case(s) that prove it — id, title, file and whether it passed — so a line with no case naming it reads plainly "no test linked" instead of a made-up pass. `ratchet.py receipt --json` prints the same facts as data, for anything that wants to read them.
+
 ### Mistakes that keep coming back
 
 Reviewers label every finding with the kind of mistake it is. When the same kind shows up a second time, the agent offers to turn it into an automatic check, like a lint rule or an architecture test. Say yes and the check is built as its own small step, through every gate. Before it counts, Ratchet runs it against a deliberately bad example and against the real code where the mistake was found. It has to catch both and pass on today's code. For high-risk mistakes (security, data, money), a separate writer who never sees the check first writes disguised versions of the mistake, and the check has to catch those too. If a reviewer later finds a case the check missed, Ratchet strengthens it automatically and tells you.
@@ -379,7 +383,9 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py providers [--discover] [--check [id]] [--add <id> --preset <p> --model <m>] [--remove <id>]` | agent tools that can review: find, test, add or remove them |
 | `ratchet.py models` | which model each role's sub-agent uses on this host |
 | `ratchet.py spec detect`, `spec import <openspec\|speckit\|bmad\|auto> <id>`, `spec status` | build from an OpenSpec change, Spec Kit feature or BMAD story; which scenarios are proven so far; `spec keep on\|off` records the user's answer about a running spec |
-| `ratchet.py deferred` | review findings noted for later instead of blocking (minor ones, and any blocker/major/unknown-severity one with no `user_impact`), plus, in their own section first, any findings you accepted yourself, with your reason and who accepted them |
+| `ratchet.py deferred` | review findings noted for later instead of blocking (minor ones, and any blocker/major/unknown-severity one with no `user_impact`), plus, in their own section first, any findings you accepted yourself, with your reason and who accepted them, and a 'fixed later in the run' section for ones `mark-fixed` closed |
+| `ratchet.py mark-fixed CPn <ref>="<how>"` | record that a finding left for later was really fixed: refused unless its file changed since the round that raised it AND a later round was recorded on that changed code |
+| `ratchet.py receipt [--json]` | one proof receipt to paste into the pull request at the final review: each step's title, commit and elapsed time, the run's own elapsed time (no cost or tokens), who reviewed each step (host-company fallbacks marked, with why when recorded), findings accepted, left for later or fixed later in the run, and every objective done-means line next to the test case(s) that prove it (or "no test linked") |
 | `ratchet.py ask accept-finding CPn F1,F2`, `accept-finding CPn` | ask the user to accept named open (blocking) findings of a blocked round, with their own reason (`accept: <reason>`); record it once they reply |
 | `ratchet.py ask raise-limit CPn`, `raise-limit CPn` | ask the user to raise a blocked step's own review-round limit by one round, with their own reason (`raise: <reason>`); offered at most once per step, ever, whatever `config.json`'s `max_adversarial_rounds` is later edited to |
 | `ratchet.py triage CPn <ref>=fix:"<reason>"` / `<ref>=rebut:"<reason>"` | whenever a round blocks: decide fix or rebut for every blocking finding, even a single one, before the next round opens; never accept/defer/waive |
@@ -417,6 +423,7 @@ python3 tests/test_checkin.py
 python3 tests/test_cleanup.py
 python3 tests/test_converge.py
 python3 tests/test_dedup_unknown_model.py
+python3 tests/test_deferred_fixed.py
 python3 tests/test_digest.py
 python3 tests/test_digest_docstring.py
 python3 tests/test_digest_specs.py
@@ -432,6 +439,8 @@ python3 tests/test_limits.py
 python3 tests/test_objective.py
 python3 tests/test_plan_change.py
 python3 tests/test_providers.py
+python3 tests/test_receipt.py
+python3 tests/test_receipt_proof.py
 python3 tests/test_results.py
 python3 tests/test_review_objective.py
 python3 tests/test_run_all_dedupe.py
