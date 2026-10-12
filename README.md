@@ -187,7 +187,7 @@ If a hand-written workflow already exists at that path, Ratchet never replaces i
 
 **Is it expensive?** It uses more AI time than letting the agent just write code, because it checks the work. Ratchet tries to keep that down: low-risk steps get one reviewer, and small nitpicks are noted for you at the end instead of starting another round of review.
 
-**Do I need other AI tools installed?** No. Without them, reviews come from your own agent's company, using a different model when it can. With another company's tool installed and signed in, or with its API key set (Codex, Gemini, Copilot, Cursor, OpenCode and others), that tool reviews first. A second company tends to catch things the first one misses.
+**Do I need other AI tools installed?** No. Without them, reviews come from your own agent's company, using a different model when it can. With another company's tool installed and signed in, or with its API key set (Codex, Gemini, Copilot, Cursor, OpenCode, Oh My Pi (omp), Pi and others), that tool reviews first. A second company tends to catch things the first one misses.
 
 **The agent says the hooks aren't working.** Close the CLI, open it again in the same folder, and say "Set up Ratchet and continue". Still not working? Ask it to check that Ratchet's hooks are installed for this CLI and install them if not.
 
@@ -240,13 +240,15 @@ The model running your agent is called the host. It could be Claude, GPT, Gemini
 
 So for every review, Ratchet tries these in order:
 
-1. A model from another company, through any AI tool installed on your machine that works (Codex, Gemini, Claude, Copilot, Cursor, OpenCode, or a command you add).
+1. A model from another company, through any AI tool installed on your machine that works (Codex, Gemini, Claude, Copilot, Cursor, OpenCode, Oh My Pi (omp), Pi, or a command you add).
 2. A different model from the same company, for example Sonnet reviewing work done by Opus.
 3. The same model that did the work, only if nothing else is available.
 
 Each step has a risk level, which you see in the plan. Risk decides how many reviewers look (one for low, two for normal, four for high). It never changes who gets asked first. On low-risk steps, only serious findings block. `normal` is the default risk; a `high`-risk step also has to say which users could be harmed and how if it's gotten wrong (`risk_reason`) — a new plan with a high-risk step that doesn't say so is refused before you ever see it, naming the step.
 
 At the start of each run the agent checks which AI tools are installed and sends each one a tiny test request. A tool that's signed out or out of credit gets skipped for six hours, and the next one takes its place. When nothing else works, the host's own sub-agents fill the slot so the build never stalls. On a high-risk step that can mean fewer distinct reviewers than four. Substitutions are logged, the plan and viewer say who reviewed each round, and you're told up front if every review will come from the same company that did the build.
+
+For OpenCode specifically, discovery goes further on its own: it reads OpenCode's own model list and picks one capable flat-rate model from a company other than yours (never your own company, never a model it can't map to a company, never a small or preview variant), testing it before adding it — no hand-written `providers --add` needed. Oh My Pi (omp) is discovered and labelled the same way as OpenCode: when it's installed and signed in, discovery reads its model catalog (`omp models --json`) the same way and picks a capable flat-rate model (for example GLM through an OpenCode Go subscription reached via omp) before adding it, with no hand-written `providers --add` either. Anything per-use or of unknown cost, from either tool (OpenCode Zen, OpenRouter, an unlisted provider) is never sent a request, not even that test one; it's listed instead, naming the exact tool, provider and model, each one saying it costs money (or that its cost is unknown and so treated as paid) and that you must be asked, by name, before it is ever used — the agent asks you directly, in plain words, before it ever uses one, using the listing's `add_model` id (the full `<provider>/<model>`, not the shorter name shown to you) for both the question and the add that follows it. That question (`ratchet.py ask paid-provider <tool> <model>`) only ever moves forward on one exact reply naming the model, never the plain "yes" that answers every other question; nothing is sent to that model, not even the one-off test request, until you give it, and it only covers that one tool and model. Pi (preset `pi`) has no such model lister yet, so it's listed under the tools that need a model picked by hand, the same as Copilot or Cursor.
 
 Each role also gets its own model. Planning, coding, fixing and reviewing use a strong model. Lighter jobs like planning tests use a cheaper one, and running tests the cheapest. You can change this in `.ratchet/config.json`.
 
@@ -390,7 +392,8 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py wait --for "..." [--minutes N]` | the run's own chat waits on background reviewers or sub-agents: until then (default 30 minutes, 1 to 120) it may end its turn without a blocked stop |
 | `ratchet.py set-review end\|each\|none` | how often you check in |
 | `ratchet.py reviewer-status [--reset <id>]` | the host, who is available, and retrying one early |
-| `ratchet.py providers [--discover] [--check [id]] [--add <id> --preset <p> --model <m>] [--remove <id>]` | agent tools that can review: find, test, add or remove them |
+| `ratchet.py providers [--discover] [--check [id]] [--add <id> --preset <p> --model <m>] [--remove <id>]` | agent tools that can review: find, test, add or remove them. A per-use or unknown-cost model (`providers --discover --json`'s `paid_options`) needs `ask paid-provider` answered first; `--add` for one refuses, with no request sent, until it is |
+| `ratchet.py ask paid-provider <tool> <model>` | ask the user whether to spend money on a per-use or unknown-cost model before it is ever used; only their own exact reply, `pay per use: <model>`, counts (never the usual yes words), and only then does `providers --add` send the one test request and add it |
 | `ratchet.py models` | which model each role's sub-agent uses on this host |
 | `ratchet.py spec detect`, `spec import <openspec\|speckit\|bmad\|auto> <id>`, `spec status` | build from an OpenSpec change, Spec Kit feature or BMAD story; which scenarios are proven so far; `spec keep on\|off` records the user's answer about a running spec |
 | `ratchet.py deferred` | review findings noted for later instead of blocking (minor ones, and any blocker/major/unknown-severity one with no `user_impact`), plus, in their own section first, any findings you accepted yourself, with your reason and who accepted them, and a 'fixed later in the run' section for ones `mark-fixed` closed |
@@ -442,6 +445,9 @@ python3 tests/test_deferred_fixed.py
 python3 tests/test_digest.py
 python3 tests/test_digest_docstring.py
 python3 tests/test_digest_specs.py
+python3 tests/test_discover.py
+python3 tests/test_discover_omp.py
+python3 tests/test_discover_paid.py
 python3 tests/test_docs.py
 python3 tests/test_flaky.py
 python3 tests/test_gates.py

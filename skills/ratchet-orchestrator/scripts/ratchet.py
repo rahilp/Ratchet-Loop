@@ -2976,6 +2976,82 @@ def _write_providers(ctx, plist):
     write_json(ctx.config_path, user)
 
 
+def _paid_provider_reply(model) -> str:
+    """The one exact reply that pays for a per-use (or unknown-cost) model, named in `ask paid-provider`'s
+    question. Never a generic listed yes (APPROVAL_REPLIES): this spends the developer's money, so the reply
+    must name the model it pays for, the same rule the learnings set for hooks-waive and accept-finding."""
+    return f"pay per use: {model}"
+
+
+def _needs_paid_ok(pv) -> str | None:
+    """'per-use' / 'unknown' when this `--add`'ed provider's model is billed per use (or its cost is
+    unknown, treated the same way) and so needs the developer's OK before it is probed; None when the
+    preset has no model lister (the cost check doesn't apply to it, e.g. a hand-written --command) or the
+    model is flat-rate."""
+    preset = pv.get("preset")
+    model = pv.get("model")
+    if not preset or preset not in MODEL_LISTERS or not model:
+        return None
+    cost = _listed_model_cost(model)
+    return cost if cost != "flat" else None
+
+
+def _paid_ok_refusal(tool, model) -> str:
+    return (f"{model} (via {tool}) costs money per use (or its cost is unknown, which Ratchet treats the same "
+            "way), including this one test request, so it was not added and nothing was sent to it. Ask the "
+            f"developer first: run `ratchet.py ask paid-provider {tool} {model}`, show them the question it "
+            "prints word for word, and wait for their exact reply before adding it.")
+
+
+def _consume_paid_ok(ctx, st, pv) -> str:
+    """The developer's one exact reply to `ask paid-provider <tool> <model>` for this exact tool and model,
+    consumed once (`providers --add` is state-locked whenever it may need this, so nothing else can spend it
+    at the same time). Dies, with nothing added and no request sent, when no such reply is on record, when
+    this lane is director-enrolled (a chat reply never counts as the developer's own OK to spend money, the
+    same rule as every other approval here), or when another question overtook this one before it was
+    answered."""
+    tool, model = pv.get("preset"), pv.get("model")
+    if approval_mode(ctx) == "director":
+        die(f"{model} (via {tool}) costs money per use (or its cost is unknown, treated the same way), and "
+            "this lane is director-enrolled: a chat reply here never counts as the developer's own OK to "
+            "spend money (unlike every other approval, paid-provider takes no director token). Nothing was "
+            "added and nothing was sent to it. The developer must give this OK themselves, in a lane that "
+            "isn't director-enrolled.")
+    p = st.get("pending") or {}
+    refusal = _paid_ok_refusal(tool, model)
+    if p.get("action") != "paid-provider" or p.get("tool") != tool or p.get("model") != model:
+        die(refusal)
+    if p.get("overtook"):
+        _clear_pending(st)
+        ctx.log(st, "paid_provider_unclear", tool=tool, model=model)
+        ctx.save_state(st)
+        die(f"This question was printed while another one (shall I "
+            f"{_question_what(p['overtook'], p.get('overtook_mode'))}?) was still waiting for the user's first "
+            "reply, so their reply could be meant for either. Nothing was added. Run `ratchet.py ask "
+            f"paid-provider {tool} {model}` again on its own.")
+    msgs = _replies(ctx, st, p.get("asked_at"), p)
+    if not msgs:
+        die(refusal)
+    entry = msgs[0]  # only the first reply after the question answers it
+    reply = entry.get("prompt", "")
+    exact = _paid_provider_reply(model)
+    if reply.strip().casefold() != exact.strip().casefold():
+        _spend_question(ctx, st, reply)
+        die(f"The user's first reply after the paid-provider question was not the exact reply \"{exact}\" (it "
+            f"was \"{reply[:120]}\"). Nothing was added. If they still want this, run `ratchet.py ask "
+            f"paid-provider {tool} {model}` again and show them the question word for word.")
+    if ctx.config().get("verify_transcripts", True):
+        good, why = _transcript_ok(entry, p.get("asked_at"))
+        if not good:
+            _spend_question(ctx, st, reply)
+            die(f"Couldn't confirm that reply came from the user ({why}). Nothing was added. Run `ratchet.py "
+                f"ask paid-provider {tool} {model}` again and ask them to reply again in this chat.")
+    _clear_pending(st)
+    ctx.log(st, "paid_provider_ok", tool=tool, model=model)
+    ctx.save_state(st)
+    return entry.get("at") or now()
+
+
 def cmd_providers(args):
     ctx = Ctx(find_root())
     ctx.ratchet.mkdir(exist_ok=True)
@@ -3011,6 +3087,12 @@ def cmd_providers(args):
         if not provider_company(pv):
             die(f"Can't tell which company's model '{args.add}' runs. Give --model (a model name from that tool) "
                 "or --company.")
+        paid_cost = _needs_paid_ok(pv)
+        if paid_cost:
+            # Never probed, checked or not, without the developer's own exact yes to THIS tool and model first
+            # (the paid-provider question); this runs before any request is sent, flat-rate adds are unaffected.
+            pv["paid_ok_at"] = _consume_paid_ok(ctx, ctx.state(), pv)
+            pv["cost"] = "per-use"
         if args.no_check:
             # an earlier result was about whatever had this id before
             p = _status_path(ctx)
@@ -3068,6 +3150,7 @@ def cmd_providers(args):
         rows.append({"id": pv["id"], "company": company, "model": pv.get("model"), "installed": installed,
                      "ok": bool(st_.get("ok")) and company not in (None, host), "state": state})
     found = []
+    paid_options = []
     if args.discover:
         known = {provider_binary(pv) for pv in plist}
         for name, pr in PRESETS.items():
@@ -3084,10 +3167,51 @@ def cmd_providers(args):
                 else:
                     rows.append({"id": name, "company": pr["company"], "model": None, "installed": True, "ok": False,
                                  "state": f"installed but failing: {detail}"})
-            elif not pr["company"]:
+            elif not pr["company"] and name not in MODEL_LISTERS:
                 found.append(name)
+            elif not pr["company"]:
+                lines, fmt, raw = _list_tool_models(name)
+                if fmt == "json" and raw:
+                    try:
+                        catalog = json.loads(raw)
+                    except (ValueError, TypeError):
+                        catalog = None
+                    lines = _model_catalog_lines(catalog) if isinstance(catalog, dict) else []
+                if not lines:
+                    found.append(name)
+                    continue
+                have = {r["company"] for r in rows if r.get("ok")}
+                picked = _pick_capable_listed_model(lines, host, have)
+                if picked:
+                    pv = {"id": f"{name}-{_model_family(_listed_model_name(picked))}", "preset": name,
+                          "model": picked, "cost": "flat"}
+                    good, detail, _saved = probe_provider(ctx, cfg, pv)
+                    if good:
+                        plist.append(pv)
+                        _write_providers(ctx, plist)
+                        rows.append({"id": pv["id"], "company": company_of_model(picked), "model": picked,
+                                     "installed": True, "ok": True, "cost": "flat",
+                                     "state": "working: added (flat-rate)"})
+                    else:
+                        rows.append({"id": pv["id"], "company": company_of_model(picked), "model": picked,
+                                     "installed": True, "ok": False, "cost": "flat",
+                                     "state": f"a flat-rate {name} model failed its test request: {detail}"})
+                else:
+                    # Every listed line was same-company, unmappable or a small/preview variant: nothing to
+                    # probe, but the tool is still installed and signed in, so keep it reachable by hand.
+                    found.append(name)
+                for (provider, company), group_lines in _paid_candidate_groups(lines, host).items():
+                    rep = _paid_pick(group_lines)
+                    if not rep:
+                        continue
+                    cost = _listed_model_cost(rep)
+                    label = "costs money per use" if cost == "per-use" else "cost unknown, treated as paid"
+                    paid_options.append({"tool": name, "provider": provider,
+                                         "model": _listed_model_name(rep), "add_model": rep, "cost": cost,
+                                         "text": f"{label}; ask the developer before this is used."})
     if args.json:
-        print(json.dumps({"host": host, "providers": rows, "needs_model": found}, indent=2))
+        print(json.dumps({"host": host, "providers": rows, "needs_model": found, "paid_options": paid_options},
+                         indent=2))
         return
     print(f"This agent runs on: {host}.")
     for r in rows:
@@ -3096,6 +3220,8 @@ def cmd_providers(args):
         print(f"  + {name:<10} {'?':<10} installed; it can run several companies' models. Pick a capable model from "
               f"a company other than {host} (the tool's own help lists them), then: "
               f"ratchet.py providers --add {name} --preset {name} --model <model>")
+    for p in paid_options:
+        print(f"  $ {p['tool']}/{p['provider']} {p['model']}: {p['text']}")
     if not any(r["ok"] for r in rows):
         print(f"No working provider from another company: reviews will come from {host}'s own models.")
 
@@ -3433,6 +3559,10 @@ PRESETS = {
                "command": ["cursor-agent", "-p", "{prompt}", "--output-format", "text", "--trust", "--mode", "ask"]},
     "opencode": {"bin": "opencode", "company": None, "stdin": False, "model_flag": ["-m"], "model_at": 2,
                  "command": ["opencode", "run", "{prompt}"]},
+    "omp": {"bin": "omp", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
+            "command": ["omp", "-p", "--no-session", "{prompt}"]},
+    "pi": {"bin": "pi", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
+           "command": ["pi", "-p", "--no-session", "{prompt}"]},
 }
 SHIPPED_DEFAULT_HISTORY = {"review_depth": [OLD_DEFAULT_REVIEW_DEPTH], "reviewers": [OLD_DEFAULT_REVIEWERS]}
 PRESET_BINARIES = {k: v["bin"] for k, v in PRESETS.items()}
@@ -3469,6 +3599,217 @@ def company_of_model(model) -> str | None:
         if re.search(rx, m):
             return company
     return None
+
+
+# A multi-company preset (today: opencode, omp) can list what it can reach without spending anything, so discovery
+# can pick a capable other-company model itself instead of leaving it to "needs_model". MODEL_LISTERS: preset
+# name -> the read-only command that prints "provider/model" lines, one per line. PROVIDER_COST: the service
+# namespace before a listed model's first "/" -> "flat" (a subscription already paid for) or "per-use" (billed
+# per request); a namespace missing from this table is unknown and is treated as paid, never probed without the
+# developer's OK. Both are small fixed tables, not a live price lookup (out of scope for this checkpoint).
+MODEL_LISTERS = {
+    "opencode": (["opencode", "models"], 20),
+    "omp": (["omp", "models", "--json"], 20, "json"),
+}
+PROVIDER_COST = {
+    "opencode-go": "flat",     # OpenCode Go: flat-rate subscription
+    "opencode": "per-use",     # OpenCode Zen: billed per request
+    "openrouter": "per-use",   # OpenRouter: billed per request
+    "openai-codex": "flat",    # Codex via omp: the developer's own signed-in subscription, already paid for
+}
+# When more than one other-company flat model is available, these families win: GLM and Kimi have been this
+# project's working reviewers so far. A short ordered tuple of name substrings, not a live quality ranking;
+# any company whose models don't match one just ties at "no preference" and falls back to the existing
+# "no working reviewer yet, then listing order" rule.
+FAMILY_PREFERENCE = ("glm", "kimi")
+# Words that mark a listed model as never-pick, whatever picker is asking: a speed/preview/open-weight
+# sibling of a company's flagship (flash, mini, nano, lite, small, haiku, free, preview, oss, gemma) or a
+# model that cannot write a text review at all (guard: safety classifier; image/vision: image generation;
+# embed/tts/audio: not a chat model). A table, not one hand-built regex, so it stays easy to extend. Matched
+# as a name token with _B/_E (so "5-small-2603" matches but "smaller-than-life" as a whole word wouldn't
+# apply here since these are name tokens, not prose) and prefixes included: "[a-z]*" after the word lets a
+# suffix like "flashx" or "liteweight" still match on its "flash"/"lite" prefix.
+REJECT_WORDS = ("flash", "mini", "nano", "lite", "small", "haiku", "free", "preview", "oss", "gemma",
+                "guard", "image", "vision", "embed", "tts", "audio")
+_REJECT_VARIANT_RX = re.compile(_B + r"(?:" + "|".join(REJECT_WORDS) + r")[a-z]*" + _E)
+
+
+def _is_rejected_variant(line: str) -> bool:
+    return bool(_REJECT_VARIANT_RX.search(line.lower()))
+
+
+def _is_model_line(line: str) -> bool:
+    """True for a line shaped like 'provider/model' (non-empty text on both sides of the first '/'), the
+    shape every real model-listing command prints, one per line. A banner, warning or table line on stdout
+    has no such shape and is never a model candidate, flat or paid."""
+    provider, sep, rest = line.partition("/")
+    return bool(sep) and bool(provider.strip()) and bool(rest.strip())
+
+
+def _model_catalog_lines(data) -> list[str]:
+    """Pull 'provider/model' lines out of an already-parsed {"models": [{"provider": ..., "id": ...,
+    "selector": "<provider>/<id>"}, ...]} catalog (omp's `models --json` shape). Falls back to building
+    "<provider>/<id>" when a model has no selector of its own. A shape without a usable models list, or no
+    line shaped like 'provider/model', is just an empty list, the same contract as the plain-lines listing.
+    Takes already-parsed data, never text: the one place that may parse that text into JSON is
+    cmd_providers, the only caller of _list_tool_models (see _CP5R11_JSON_PARSE in test_trust_cp5_d.py)."""
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return []
+    lines = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        sel = m.get("selector")
+        if not sel:
+            provider, mid = m.get("provider"), m.get("id")
+            sel = f"{provider}/{mid}" if provider and mid else None
+        if sel and _is_model_line(str(sel)):
+            lines.append(str(sel))
+    return lines
+
+
+def _list_tool_models(preset_name) -> tuple[list[str], str, str]:
+    """Run a multi-company preset's read-only model-listing command. Returns (lines, fmt, raw).
+    When the MODEL_LISTERS entry names the "lines" format, `lines` already holds its 'provider/model' lines
+    (dropping any line that isn't shaped like one) and `raw` is "". When it names the "json" format (omp's
+    catalog), `lines` is [] and `raw` carries the raw stdout text for the caller (cmd_providers) to parse
+    with _model_catalog_lines, because cmd_providers is the sanctioned place to parse JSON that is not one
+    of Ratchet's own records. A listing failure (not installed, times out, non-zero exit, no output) is
+    just ([], fmt, ""): the caller falls back to today's needs_model line, never a crash and never a
+    garbage candidate."""
+    spec = MODEL_LISTERS.get(preset_name)
+    if not spec:
+        return [], "lines", ""
+    cmd, timeout = spec[0], spec[1]
+    fmt = spec[2] if len(spec) > 2 else "lines"
+    if not shutil.which(cmd[0]):
+        return [], fmt, ""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return [], fmt, ""
+    if r.returncode != 0:
+        return [], fmt, ""
+    if fmt == "json":
+        return [], fmt, r.stdout or ""
+    lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    return [ln for ln in lines if _is_model_line(ln)], fmt, ""
+
+
+def _listed_model_cost(line: str) -> str:
+    """flat / per-use / unknown for one listed 'provider/model' line, by its service namespace (PROVIDER_COST).
+    Missing from the table means unknown, treated as paid."""
+    return PROVIDER_COST.get(line.split("/", 1)[0], "unknown")
+
+
+def _listed_model_name(line: str) -> str:
+    """The model name shown to the developer for a listed line, its service namespace stripped: 'opencode/
+    gpt-5.1-codex' -> 'gpt-5.1-codex', 'openrouter/z-ai/glm-5' -> 'z-ai/glm-5' (only the first '/' is removed)."""
+    return line.split("/", 1)[1] if "/" in line else line
+
+
+def _model_family(model_name: str) -> str:
+    """The short family name used to build a new provider id ('glm-5.3' -> 'glm'): the first non-numeric token
+    of the model name, so 'opencode-glm' reads naturally next to 'opencode-glm-flash' etc."""
+    for part in re.split(r"[^a-z0-9]+", model_name.lower()):
+        if part and not part[0].isdigit():
+            return part
+    return "model"
+
+
+def _family_rank(line: str) -> int:
+    """Where a listed line's model name falls in FAMILY_PREFERENCE (0 = most preferred); a name matching
+    none of the preferred families ranks after all of them, at len(FAMILY_PREFERENCE)."""
+    name = line.lower()
+    for i, fam in enumerate(FAMILY_PREFERENCE):
+        if fam in name:
+            return i
+    return len(FAMILY_PREFERENCE)
+
+
+def _model_version_key(model_name: str) -> tuple:
+    """The "newest version" ranking key, shared by every picker that compares a company's models
+    (_best_capable_line, used by both the flat auto-pick and each paid entry): every number in the model
+    name (after the namespace), as a flat tuple of per-component integers, so '5.10' sorts above '5.9'
+    (comparing them as floats would do the opposite). A number stuck to a unit letter ('120b', '31b', a
+    parameter count) is dropped, and so is a date-shaped number (a lone 4-digit group such as '2507' or
+    '2603', or a 6-8 digit date) -- neither is a version, and left in, a date reliably outranks a real,
+    smaller version number."""
+    stripped = re.sub(r"\d+(?:\.\d+)?[bmkt](?=$|[^a-z0-9])", "", model_name, flags=re.I)
+    stripped = re.sub(r"(?<!\d)\d{4}(?!\d)|(?<!\d)\d{6,8}(?!\d)", "", stripped)
+    return tuple(int(p) for n in re.findall(r"\d+(?:\.\d+)?", stripped) for p in n.split("."))
+
+
+def _best_capable_line(lines) -> str | None:
+    """The one line among a single company's listed lines that discovery may offer as a reviewer, flat or
+    paid: this is the ONE shared ranking used by both the flat auto-pick and each paid entry, so a company
+    is never offered a weaker model one way than the other. A line matching the reject-words table
+    (_is_rejected_variant) is never a candidate, full stop -- there is no fallback to a rejected line, so a
+    company whose only listed models are all rejected variants is simply not offered, flat or paid. Among
+    the survivors, the highest real version wins (_model_version_key); there is no further tie-break (in
+    particular, no name-length tie-break: a longer, suffixed name must never win just by being longer).
+    None if every line was rejected."""
+    survivors = [ln for ln in lines if not _is_rejected_variant(ln)]
+    if not survivors:
+        return None
+    return max(survivors, key=lambda line: _model_version_key(_listed_model_name(line)))
+
+
+def _pick_capable_listed_model(lines, host, have_companies=()) -> str | None:
+    """The one listed 'provider/model' line discovery may itself test and add: flat-rate, a company Ratchet's
+    patterns recognise (company_of_model) that isn't the host's own, and capable (_best_capable_line). An
+    unknown company or an unknown/per-use cost is never a candidate here. Prefers a company with no working
+    reviewer yet (`have_companies`), then the preferred family order (FAMILY_PREFERENCE), then falls back to
+    listing order; within one company, _best_capable_line picks the representative."""
+    by_company: dict[str, list[str]] = {}
+    for line in lines:
+        if _listed_model_cost(line) != "flat":
+            continue
+        company = company_of_model(line)
+        if not company or company == host:
+            continue
+        by_company.setdefault(company, []).append(line)
+    reps = {c: _best_capable_line(ls) for c, ls in by_company.items()}
+    reps = {c: rep for c, rep in reps.items() if rep}
+    if not reps:
+        return None
+    order = list(reps)
+    company = min(order, key=lambda c: (
+        c in have_companies, min(_family_rank(ln) for ln in by_company[c]), order.index(c)))
+    return reps[company]
+
+
+def _paid_candidate_groups(lines, host) -> dict:
+    """Non-flat ('per-use' or unknown-cost) listed lines, grouped by (provider namespace, company), so a
+    provider with many listed models (hundreds of OpenRouter lines, say) collapses to one representative
+    per company instead of flooding paid_options. The host's own company is dropped (never offered as a
+    paid option to pay for a model the host already runs for free). In a namespace PROVIDER_COST already
+    prices (a known paid service such as opencode/ or openrouter/), a model whose company Ratchet can't map
+    is skipped: Ratchet never uses an unknown-company model as a reviewer, so naming one here would just ask
+    the developer to pay for something the engine would then refuse. A namespace PROVIDER_COST doesn't know
+    at all (an unlisted provider) still lists its unmappable models as before, grouped under "", so an
+    unknown provider isn't silently dropped."""
+    groups: dict[tuple[str, str], list[str]] = {}
+    for line in lines:
+        if _listed_model_cost(line) == "flat":
+            continue
+        namespace = line.split("/", 1)[0]
+        company = company_of_model(line) or ""
+        if company and company == host:
+            continue
+        if not company and namespace in PROVIDER_COST:
+            continue
+        groups.setdefault((namespace, company), []).append(line)
+    return groups
+
+
+def _paid_pick(group_lines) -> str | None:
+    """The one line from a (provider, company) group to show as that group's paid option: the same shared
+    ranking the flat picker uses (_best_capable_line), so a paid entry is never named for a model the flat
+    picker itself would have rejected. None if the whole group was rejected variants, in which case the
+    caller must show no paid option for that group rather than suggest paying for a rejected model."""
+    return _best_capable_line(group_lines)
 
 
 def providers(cfg) -> list[dict]:
@@ -4260,6 +4601,9 @@ ASKED_APPROVALS = ("approve-plan", "human-approve", "cancel", "set-review", "app
 
 
 def _ask_cmd(action, mode=None, eng="ratchet.py") -> str:
+    if action == "paid-provider" and mode and ":" in mode:
+        tool, model = mode.split(":", 1)  # `mode` is stored as "tool:model"; the real command takes two args
+        return f"`{eng} ask paid-provider {tool} {model}`"
     return f"`{eng} ask {action}{' ' + mode if mode else ''}`"
 
 
@@ -4267,6 +4611,10 @@ def _question_what(action, mode=None) -> str:
     """The question `ask <action>` put to the user, in the words it used ("shall I <this>?")."""
     if action == "set-review":
         return f"change how often they review to: {REVIEW_MODE_WORDS.get(mode, mode)}"
+    if action == "paid-provider" and mode and ":" in mode:
+        tool, model = mode.split(":", 1)
+        return (f"use {tool}'s {model} (costs money per use, or whose cost is unknown, treated the same way) "
+                "for reviews instead of only flat-rate ones")
     return ASKABLE.get(action, action)
 
 
@@ -4299,13 +4647,12 @@ def _spend_question(ctx, st, reply=""):
 def _asked_reply(ctx, st, action, p):
     """The user's answer to the question `ask <action>` printed, or die. Only their first reply after it counts."""
     want = p.get("action")
-    mode_txt = f" {p['mode']}" if p.get("mode") else ""
     if want != action:
         if want:
             what = _question_what(want, p.get("mode"))
             die(f"A different question is waiting for the user's answer: shall I {what}? Their reply answers THAT "
-                f"question, not this one. If they said yes to it, run `ratchet.py {PENDING_COMMAND.get(want, want)}"
-                f"{mode_txt}`. If they said no or moved on, run `ratchet.py ask withdraw`. Then print this question "
+                f"question, not this one. If they said yes to it, run `ratchet.py {_pending_followup(want, p.get('mode'))}"
+                "`. If they said no or moved on, run `ratchet.py ask withdraw`. Then print this question "
                 f"with {_ask_cmd(action)}, show it to them word for word, and wait for their reply.")
         die(f"Ratchet has not asked the user this question yet, so no reply counts as their answer. Run "
             f"{_ask_cmd(action)}, show them the question it prints word for word, and end your turn. Only their first "
@@ -8216,12 +8563,26 @@ ASKABLE = {"approve-plan": "start building the plan as it is",
            "accept-finding": "accept the open finding(s) named above as a known limit, with your own reason, instead "
                              "of running another review round",
            "raise-limit": "raise this step's review-round limit by one round, with your own reason, so the "
-                          "reviewers can keep going (offered at most once per step, ever)"}
+                          "reviewers can keep going (offered at most once per step, ever)",
+           "paid-provider": "use a provider that costs money per use (or whose cost is unknown, treated the "
+                            "same way) for reviews, named above, instead of only flat-rate ones"}
 # the command that carries out a "yes" to each question
 PENDING_COMMAND = {"approve-plan": "approve-plan", "human-approve": "human-approve", "approve-changes": "approve-changes", "cancel": "cancel", "set-review": "set-review",
                    "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec", "choice": "choice",
                    "accept-finding": "accept-finding", "raise-limit": "raise-limit"}
 REVIEW_MODE_WORDS = {"end": "only at the end", "each": "after every step", "none": "never (fully autonomous)"}
+
+
+def _pending_followup(action, mode=None) -> str:
+    """The real command that carries out a developer's yes to a waiting question, for the re-ask/overtaken
+    hints that build it from PENDING_COMMAND and the question's mode. paid-provider's mode is "tool:model"
+    (joined only for display/comparison); its real follow-up needs them as separate --preset/--model flags
+    and an id for the new provider, not PENDING_COMMAND's plain command-plus-mode form."""
+    if action == "paid-provider" and mode and ":" in mode:
+        tool, model = mode.split(":", 1)
+        return f"providers --add <id> --preset {tool} --model {model}"
+    cmd = PENDING_COMMAND.get(action, action)
+    return cmd + (f" {mode}" if mode else "")
 
 
 def cmd_ask(args):
@@ -8250,7 +8611,10 @@ def cmd_ask(args):
         die("ask accept-finding needs the finding ids to accept, e.g. `ratchet.py ask accept-finding CP2 F1,F2`")
     if args.action == "raise-limit" and not (args.mode and args.mode in (st.get("checkpoints") or {})):
         die("ask raise-limit needs the checkpoint id, e.g. `ratchet.py ask raise-limit CP2`")
-    if args.action not in ("set-review", "ui-respec", "accept-finding", "raise-limit") and args.mode:
+    if args.action == "paid-provider" and not (args.mode and getattr(args, "ids", None)):
+        die("ask paid-provider needs the tool and model, e.g. `ratchet.py ask paid-provider opencode "
+            "openrouter/z-ai/glm-5`")
+    if args.action not in ("set-review", "ui-respec", "accept-finding", "raise-limit", "paid-provider") and args.mode:
         die(f"ask {args.action} takes no extra value")
     _bind_owner(ctx, st, args.action, asker)
     if args.action == "raise-limit":
@@ -8259,6 +8623,8 @@ def cmd_ask(args):
         return _ask_choice(ctx, st, args)
     if args.action == "accept-finding":
         return _ask_accept_finding(ctx, st, args)
+    if args.action == "paid-provider":
+        return _ask_paid_provider(ctx, st, args)
     detail = ""
     if args.action == "approve-changes":
         # integrity_problems (via approval_snapshot/_plan_hash) no longer raises KeyError for a checkpoint
@@ -8373,7 +8739,7 @@ def _overtake(ctx, st, action, mode, asker=None) -> dict:
     if not answered and action in ("approve-plan", "human-approve"):
         die(f"A different question is still waiting for the user's first reply: shall I "
             f"{_question_what(oa, old.get('mode'))}? One reply can't answer two questions. Get that one answered "
-            f"(if they say yes, run `ratchet.py {PENDING_COMMAND.get(oa, oa)}{' ' + old['mode'] if old.get('mode') else ''}`"
+            f"(if they say yes, run `ratchet.py {_pending_followup(oa, old.get('mode'))}`"
             ") or run `ratchet.py ask withdraw` if you no longer need it, then ask this question on its own.")
     ctx.log(st, "question_overtaken", action=oa, mode=old.get("mode"), by=action, answered=answered)
     if answered:
@@ -8623,6 +8989,31 @@ def _ask_accept_finding(ctx, st, args):
           "limit, with their reason, instead of running another review round? To accept them, their reply must be "
           "exactly: accept: <their reason>. Only their first reply counts, and only that exact form (starting with "
           "\"accept: \") accepts them; any other reply accepts nothing.")
+    print(ASK_ALONE)
+
+
+def _ask_paid_provider(ctx, st, args):
+    """`ask paid-provider <tool> <model>`: the developer's OK to spend money on this one model, through
+    `providers --add`, the next time it is run for this exact tool and model. This spends real money (a
+    per-use request, or an unknown-cost one treated the same way), so it needs its own exact reply naming the
+    model (_paid_provider_reply), never the generic listed-yes words used for every other question."""
+    tool, model = args.mode, args.ids
+    overtook = _overtake(ctx, st, "paid-provider", f"{tool}:{model}")
+    asked = now()
+    st["pending"] = {"action": "paid-provider", "mode": f"{tool}:{model}", "tool": tool, "model": model,
+                     "asked_at": asked, "prev_awaiting": st.get("awaiting_since"),
+                     "session": _asking_session(ctx, st, "paid-provider"), **overtook}
+    st["awaiting_since"] = asked
+    ctx.log(st, "question_asked", action="paid-provider", mode=f"{tool}:{model}")
+    ctx.save_state(st)
+    if overtook:
+        print(_not_asked_text(f"`ratchet.py ask paid-provider {tool} {model}`", overtook))
+        return
+    exact = _paid_provider_reply(model)
+    print(f"ASK THE USER: {tool}'s model {model} costs money per use (or its cost is unknown, which Ratchet "
+          "treats the same way), including one small test request right now to check it works, before it is "
+          f"ever used for a review. Shall I use it? Only one exact reply agrees: reply exactly \"{exact}\". Any "
+          "other reply means no.")
     print(ASK_ALONE)
 
 
@@ -10412,7 +10803,7 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                f"`{eng} resume --claim` only if their first reply after it is one of the listed yes "
                                "replies. Otherwise leave the run alone and do what they asked.")
             if p.get("action") and p["action"] != "hooks-waive":
-                cmd = PENDING_COMMAND.get(p["action"], p["action"]) + (" " + p["mode"] if p.get("mode") else "")
+                cmd = _pending_followup(p["action"], p.get("mode"))
                 what = _question_what(p["action"], p.get("mode"))
                 again = _ask_cmd(p["action"], p.get("mode"), eng=eng)
                 asked_in = _question_session(st, p)
@@ -10440,6 +10831,16 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                    "already answered it, so this later message is not their answer: it does NOT "
                                    "approve the plan, a checkpoint or anything else. If you still need their yes, "
                                    f"print the question again ({again}).")
+                if p["action"] == "paid-provider":
+                    # This question's own exact reply (never the generic listed-yes words: it spends money).
+                    exact = _paid_provider_reply(p.get("model") or "")
+                    matched = n["prompt"].strip().casefold() == exact.strip().casefold()
+                    verdict = (f"It is the exact reply (\"{exact}\")" if matched
+                               else f"It is NOT the exact reply (\"{exact}\"), so it approves nothing")
+                    return False, (f"[ratchet] This reply answers your waiting question: shall I {what}? {verdict}. "
+                                   f"Only after that exact reply run `{eng} {cmd}` (pick an id for the new provider); "
+                                   f"otherwise run `{eng} ask withdraw` and do what they asked. This reply does NOT "
+                                   "approve the plan, a checkpoint or anything else.")
                 verdict = ("It is one of the listed yes replies" if is_listed_yes(n["prompt"])
                            else "It is NOT one of the listed yes replies, so it approves nothing")
                 if p["action"] in ("approve-plan", "human-approve"):
@@ -11525,7 +11926,8 @@ STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "re
                      "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
                      "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait", "accept-finding",
                      "raise-limit", "check-in", "triage")
-LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers")  # tests, checks, a regression suite, provider probes
+LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers", "providers")  # tests, checks, a regression suite,
+                                                                               # provider probes (--add included)
 # The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
 OVERRIDE_CMDS = ("approve-plan", "human-approve", "approve-changes", "cancel", "set-review", "resume", "hooks-waive",
                  "ui-respec", "choice", "feedback", "accept-state", "init")
@@ -11542,6 +11944,11 @@ def _changes_state(args) -> bool:
         return bool(getattr(args, "offered", None))
     if args.cmd == "spec":
         return getattr(args, "spec_cmd", None) in ("import", "keep")
+    if args.cmd == "providers":
+        # --add is the only form that can consume the developer's one-time paid-provider OK (_consume_paid_ok)
+        # and send a real test request; locking it the same way every other question-consuming command is
+        # locked means two `providers --add` calls for the same tool/model never both spend that one OK.
+        return bool(getattr(args, "add", None))
     return args.cmd in STATE_LOCKED_CMDS
 
 
@@ -12137,10 +12544,12 @@ def main(argv=None):
     a.add_argument("--claim", action="store_true"); a.set_defaults(fn=cmd_resume)
     a = sp.add_parser("ask", help="record and print the question you're about to ask the user (needed before approve-plan, "
                                   "human-approve, cancel, set-review, approve-changes, hooks-waive, resume --claim, "
-                                  "ui-respec, accept-finding)")
+                                  "ui-respec, accept-finding, paid-provider)")
     a.add_argument("action", choices=list(ASKABLE) + ["withdraw"])
-    a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec/accept-finding: the checkpoint id")
-    a.add_argument("ids", nargs="?", help="accept-finding: the finding ids to accept, comma-separated (e.g. F1,F2)")
+    a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec/accept-finding: the checkpoint "
+                                           "id; paid-provider: the tool (preset)")
+    a.add_argument("ids", nargs="?", help="accept-finding: the finding ids to accept, comma-separated (e.g. F1,F2); "
+                                          "paid-provider: the exact model name")
     a.add_argument("--options", help="choice: the option letters, e.g. A,B,C")
     a.add_argument("--guardrail", action="append", metavar="LETTER=KIND",
                    help="choice: picking LETTER adds a guardrail step (an automatic check) for this kind of finding")
