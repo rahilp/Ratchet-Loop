@@ -2263,6 +2263,107 @@ def new_cp_state(cp):
 
 # --------------------------------------------------------------------------- next action
 
+MERGED_FIRST = ("A merge of main landed in this lane that Ratchet has not checked yet. Run ratchet.py merged first: "
+                "it re-runs the earlier steps' tests on the merged code and keeps main's changes out of this step's "
+                "review. Nothing was changed.")
+
+
+SECOND_MERGE = ("An earlier merge of main in this step was resolved by hand, and that resolution is still waiting for "
+                "this step's review, so a second merge cannot be accepted yet.")
+
+
+def _same_commit(short, full) -> bool:
+    return bool(short) and bool(full) and str(full).startswith(str(short))
+
+
+def _fast_forwarded(g, last, ref, since=None):
+    """The short id HEAD stood at before a `git merge` / `git pull` of this run fast-forwarded it (no merge commit),
+    else "". Read from HEAD's reflog, newest first, back to the commit the last finished step or accepted merge
+    made, or to the commit whose tree is the step's starting tree (`ref`), or to a reflog entry that was made before
+    the run was created (`since`, a unix time; the entry's own time, which is when HEAD moved, never a commit's date:
+    main's tip is often older than the run). The entry's own text tells a merge or pull fast-forward from anything
+    else. The oldest fast-forward in that stretch wins. None when the reflog cannot be read (the caller then flags,
+    the safe side)."""
+    r = g("log", "-g", "--date=unix", "--format=%H%x09%T%x09%gs%x09%gd", "HEAD")
+    log = r.stdout.splitlines()
+    if r.returncode != 0 or not log:
+        return None
+    old = ""
+    for i, line in enumerate(log):
+        h, tree, subj, sel = (line.split("\t", 3) + ["", "", ""])[:4]
+        when = re.search(r"@\{(\d+)\}$", sel)
+        if _same_commit(last and last.get("commit"), h) or tree == ref or (
+                since is not None and when and int(when.group(1)) < since):
+            break
+        if subj.endswith(": Fast-forward") and subj.startswith(("merge", "pull")) and i + 1 < len(log):
+            old = log[i + 1].split("\t")[0][:7]
+    return old
+
+
+def _merge_unaccepted(ctx: Ctx, st: dict) -> str:
+    """The refusal text when HEAD holds main's changes that `merged` has not accepted, else "". Either HEAD is a merge
+    commit made during this run (not the last commit a step finished or `merged` accepted), or a fast-forward of this
+    run left HEAD on main's commits with no merge commit; and in both cases HEAD's tree differs from the step's
+    starting tree in something added, changed or removed outside the run folder (a removed git-ignored file is left
+    out: it is what a file named in fingerprint_include looks like). A lane that never merges gets "". Any doubt
+    gets ""."""
+    try:
+        cur = st.get("current")
+        ref = ((st.get("checkpoints") or {}).get(cur) or {}).get("base_tree") if cur else None
+        if st.get("phase") != "building" or not ref:
+            return ""
+        g = lambda *a: subprocess.run(["git", *a], cwd=ctx.root, capture_output=True, text=True, timeout=30)
+        parts = g("rev-list", "--parents", "-n", "1", "HEAD").stdout.split()
+        if len(parts) not in (2, 3):
+            return ""
+        last = next((e for e in reversed(st.get("history") or [])
+                     if e.get("event") in ("checkpoint_complete", "merged_main")), None)
+        if _same_commit(last and last.get("commit"), parts[0]):
+            return ""
+        old = ""
+        if len(parts) == 3:
+            made = _dt.datetime.fromisoformat(g("show", "-s", "--format=%cI", "HEAD").stdout.strip())
+            if made < _dt.datetime.fromisoformat(st["created_at"]) - _dt.timedelta(seconds=2):
+                return ""
+        else:
+            old = _fast_forwarded(g, last, ref, int(_dt.datetime.fromisoformat(st["created_at"]).timestamp()))
+            if old == "":
+                return ""
+        prefix = g("rev-parse", "--show-prefix").stdout.strip() + RATCHET_DIR + "/"
+        top = g("rev-parse", "--show-toplevel").stdout.strip()
+        diff = g("diff-tree", "-r", "--no-renames", "--name-only", "--diff-filter=ACMRT", ref, f"{parts[0]}^{{tree}}")
+        gone = g("diff-tree", "-r", "--no-renames", "--name-only", "--diff-filter=D", ref, f"{parts[0]}^{{tree}}")
+        if diff.returncode != 0 or gone.returncode != 0:
+            return ""
+        changed = any(f and not f.startswith(prefix) for f in diff.stdout.split("\n"))
+        names = [f for f in gone.stdout.split("\n") if f and not f.startswith(prefix)]
+        start = old or (parts[1] if len(parts) == 3 else "") or (last or {}).get("commit") or ""
+        if names:   # a path that was not in the commit HEAD stood at when the step began was only uncommitted then
+            tracked = g("ls-tree", "-r", "--full-tree", "--name-only", start) if start else None
+            there = set(tracked.stdout.split("\n")) if tracked is not None and tracked.returncode == 0 else set()
+            names = [f for f in names if f in there]
+        if names and not changed:
+            ig = subprocess.run(["git", "check-ignore", "-z", "--stdin"], cwd=top, capture_output=True, text=True,
+                                input="\0".join(names) + "\0", timeout=30)
+            changed = bool(set(names) - set(ig.stdout.split("\0")))
+        if not changed:
+            return ""
+        if old is None:
+            return MERGED_FIRST
+        if old:
+            return (f"Main was fast-forwarded into this lane (HEAD moved on from {old} with no merge commit), so "
+                    "Ratchet cannot tell main's changes from this step's own and its reviewers would see them as "
+                    f"the step's work. Undo it with `git reset --keep {old}`, merge again with `git merge --no-ff "
+                    "main` (use `git fetch`, then `git merge --no-ff <branch>`, instead of `git pull`), then run "
+                    "ratchet.py merged. Nothing was changed.")
+        if last and last["event"] == "merged_main" and last.get("by_hand"):
+            return (SECOND_MERGE + f" Undo this second merge with `git reset --keep {parts[1][:7]}` (its first "
+                    "parent), finish this step through complete, then merge main again. Nothing was changed.")
+        return MERGED_FIRST
+    except Exception:
+        return ""
+
+
 def next_action(ctx: Ctx, st=None, compute_accept_note: bool = True) -> dict:
     """`compute_accept_note=False` skips `_blocked_accept_note` (and the working-tree fingerprint it can trigger
     via `_code_changed_since_round`) for callers that never read `accept_note` from the result: the Stop hook
@@ -2345,6 +2446,9 @@ def next_action(ctx: Ctx, st=None, compute_accept_note: bool = True) -> dict:
                          f"variants in {gr['variants_dir']}/bad and look-alike good code in {gr['variants_dir']}/good; "
                          "then " + msgs["tests"].split(": ", 1)[1])
     na = {"phase": phase, "checkpoint": cur, "step": step, "action": msgs.get(step, step), "stop_ok": False}
+    held = _merge_unaccepted(ctx, st) if step == "tests" else ""
+    if held:
+        na["action"] = "First: " + held + " Then: " + na["action"]
     reps = repeat_candidates(ctx, st) if approval_mode(ctx) != "director" else []
     if reps:
         na["guardrail_candidates"] = reps
@@ -4619,6 +4723,9 @@ def cmd_tests_written(args):
     st = ctx.state()
     cps = _cur(ctx, st, args.cp)
     _expect_step(cps, ["tests", "red"], args.cp)
+    held = _merge_unaccepted(ctx, st)
+    if held:
+        die(held)
     cp = cp_by_id(ctx.plan(), args.cp)
     if not cp["gates"].get("behavior"):
         cps["step"] = "implement"
@@ -8446,7 +8553,8 @@ def cmd_merged(args):
     if from_merge and last.get("by_hand"):
         die("An earlier merge in this step was resolved by hand, and that resolution is still waiting for this step's "
             "review. A second merge now would fold it into the starting tree and hide it from the reviewers. Finish "
-            f"{cur} first (run it through complete), then merge main again and run merged. Nothing was changed.")
+            f"{cur} first (run it through complete), then merge main again and run merged. To get out now, undo the "
+            f"second merge with `git reset --keep {p1[:7]}` (its first parent). Nothing was changed.")
     ref = st["checkpoints"][cur].get("base_tree") if phase == "building" and cur and not from_merge else (
         git("rev-parse", f"{last['commit']}^{{tree}}").stdout.strip() if last and last.get("commit") else None)
     loose = [f for f in tgit("ls-files", "--others", "--exclude-standard", "--", prefix or ".",
@@ -11517,6 +11625,66 @@ def _brief_guard(n: dict, root: Path) -> str | None:
             f"output of `$RATCHET brief {cp} --role {role}`, then the rest of the prompt.")
 
 
+MERGE_SHARED = {f"{RATCHET_DIR}/{f}" for f in ("config.json", "standards.md", "learnings.md", ".gitignore")}
+MERGE_MID_STEP = ("RATCHET GUARD: finish this step before merging main. A merge in the middle of a step would mix "
+                  "main's changes into the step's own work and into what its reviewers see. Run the step through "
+                  "`complete`, then merge main, then run `ratchet.py merged`.")
+
+MERGE_AGAIN = ("RATCHET GUARD: finish this step before merging main again. An earlier merge in this step was resolved "
+               "by hand and its resolution is still waiting for this step's review, so Ratchet cannot accept a second "
+               "merge yet. Run the step through `complete`, then merge main, then run `ratchet.py merged`.")
+
+
+def _merge_rule(cmd: str, cwd: str, root: Path) -> tuple[str, str | None]:
+    """The merge rule, as (command for the other guard checks, refusal or None). In the middle of a step `git merge`
+    and `git pull` are refused (finishing or aborting a merge already begun is not). Between steps, while a merge is in
+    progress, a plain git add / checkout / commit that touches only Ratchet's shared files is let through by handing
+    the other checks `true` in its place. Any other command is returned unchanged. Fails open to 'unchanged'."""
+    try:
+        segs = _segments(cmd)
+        info = [_program(s) for s in segs]
+        merge = [i[0] == "git" and i[1] in ("merge", "pull") and not re.search(r"--(abort|continue|quit)\b", s)
+                 for s, i in zip(segs, info)]
+        shared = [i[0] == "git" and i[1] in ("add", "checkout", "commit") and not re.search(r"[<>$`()]", s)
+                  and bool(RATCHET_TOKEN_RE.search(s)) for s, i in zip(segs, info)]
+        if not any(merge) and not any(shared):
+            return cmd, None
+        ctx = Ctx(root)
+        if not (ctx.ratchet / "active.json").exists():
+            return cmd, None
+        st, _why = _read_record(ctx.state_path())
+        phase, cur = (st or {}).get("phase"), (st or {}).get("current")
+        g = lambda *a: subprocess.run(["git", *a], cwd=root, capture_output=True, text=True, timeout=20)
+        merging = g("rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0
+        if phase in ("awaiting_checkpoint_review", "awaiting_final_review"):
+            between = True
+        elif phase == "building" and cur and st["checkpoints"][cur].get("step") == "tests":
+            r = g("status", "--porcelain", "--", ".", f":(exclude){RATCHET_DIR}", *JUNK_PATHSPECS)
+            between = r.returncode == 0 and not any(ln for ln in r.stdout.splitlines()
+                                                    if not merging or ln.startswith("??"))
+        else:
+            between = False
+        if phase == "building" and not between and any(merge):
+            return cmd, MERGE_MID_STEP
+        last = next((e for e in reversed((st or {}).get("history") or [])
+                     if e.get("event") in ("checkpoint_complete", "merged_main")), None)
+        if phase == "building" and any(merge) and last and last["event"] == "merged_main" and last.get("by_hand"):
+            return cmd, MERGE_AGAIN
+        if not (between and merging and any(shared)):
+            return cmd, None
+        out, changed = [], False
+        for s, sh in zip(segs, shared):
+            rel = [os.path.relpath(os.path.normpath(os.path.join(cwd, t.strip("'\""))), root).replace("\\", "/")
+                   for t in RATCHET_TOKEN_RE.findall(s)]
+            if sh and rel and all(r in MERGE_SHARED for r in rel):
+                out, changed = out + ["true"], True
+            else:
+                out.append(s)
+        return (" ; ".join(out) if changed else cmd), None
+    except Exception:
+        return cmd, None
+
+
 def decide_guard(n: dict) -> tuple[bool, str]:
     cmd, cwd = n["command"], n["cwd"]
     if not _is_director_session():
@@ -11549,7 +11717,8 @@ def decide_guard(n: dict) -> tuple[bool, str]:
         marks = isinstance(read_heartbeat(root).get("agent_marks"), dict)
     who = {"enforce": marks and _host_names_subagent(n["host"]), "agent_type": n.get("agent_type")}
     if n["kind"] == "shell" and cmd:
-        why = _guard_shell(cmd, cwd, who)
+        gcmd, why = _merge_rule(cmd, cwd, root)
+        why = why or _guard_shell(gcmd, cwd, who)
         if why:
             return True, why
         _note_engine_call(root, cmd, n.get("session"), n.get("input"))  # which chat runs `init` / `ask` / `wait` / `complete` here (_noted_session)
