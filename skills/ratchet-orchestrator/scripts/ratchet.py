@@ -862,6 +862,20 @@ def _docs_only_skip_lines(st: dict) -> list[str]:
     return lines
 
 
+# ----------------------------------------------------------- a full review clears skipped-review notes (CP5)
+# A record that a step's review was skipped or lightened (CP2's doc_edits_unreviewed, CP3's small_fix_review,
+# CP4's docs_only_review_skip) says less review happened than the step's history actually shows once a later
+# FULL round (every reviewer the step's own risk names) is recorded approved. `cmd_adv_record` calls this once,
+# on that full-round-approval branch only, next to where it sets `last_full_review_fingerprint` -- a small-fix
+# approval or a docs-only skip never clears any of these (they are not a full round), and a round that is not
+# approved is never reached here at all.
+
+def _clear_lighter_review_records(cps: dict) -> None:
+    cps.pop("docs_only_review_skip", None)
+    cps.pop("doc_edits_unreviewed", None)
+    cps.pop("small_fix_review", None)
+
+
 # --------------------------------------------------------------------------- tamper evidence
 # ratchet.py records a hash of every file it owns after each write, in RATCHET_HOME (outside the repo and off-limits
 # to agents). A write by any other route — a helper script, an editor, a "quick fix" — is detected on the next read.
@@ -6462,10 +6476,11 @@ def cmd_adv_record(args):
     if rnd.get("small_fix"):  # CP3: approved as a one-reviewer small-fix round -- named for the commit/status
         cps["small_fix_review"] = {"round": rnd["round"], "reviewer": (rnd.get("reviewers") or [None])[0]}
     else:
-        cps.pop("small_fix_review", None)
         # CP3: anchor for `_is_small_fix_round` -- only a FULL round's approval moves this, so a run of small
         # fixes keeps measuring against the same baseline and their sizes add up.
         cps["last_full_review_fingerprint"] = fp
+        # CP5: this full round's own approval supersedes every lighter-review note recorded before it.
+        _clear_lighter_review_records(cps)
     cps["step"] = _earliest_open_step(cps)
     ctx.log(st, "adversarial_approved", cp=args.cp, round=g["attempts"])
     ctx.save_state(st)
