@@ -3096,7 +3096,13 @@ def cmd_providers(args):
             elif not pr["company"] and name not in MODEL_LISTERS:
                 found.append(name)
             elif not pr["company"]:
-                lines = _list_tool_models(name)
+                lines, fmt, raw = _list_tool_models(name)
+                if fmt == "json" and raw:
+                    try:
+                        catalog = json.loads(raw)
+                    except (ValueError, TypeError):
+                        catalog = None
+                    lines = _model_catalog_lines(catalog) if isinstance(catalog, dict) else []
                 if not lines:
                     found.append(name)
                     continue
@@ -3479,6 +3485,10 @@ PRESETS = {
                "command": ["cursor-agent", "-p", "{prompt}", "--output-format", "text", "--trust", "--mode", "ask"]},
     "opencode": {"bin": "opencode", "company": None, "stdin": False, "model_flag": ["-m"], "model_at": 2,
                  "command": ["opencode", "run", "{prompt}"]},
+    "omp": {"bin": "omp", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
+            "command": ["omp", "-p", "--no-session", "{prompt}"]},
+    "pi": {"bin": "pi", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
+           "command": ["pi", "-p", "--no-session", "{prompt}"]},
 }
 SHIPPED_DEFAULT_HISTORY = {"review_depth": [OLD_DEFAULT_REVIEW_DEPTH], "reviewers": [OLD_DEFAULT_REVIEWERS]}
 PRESET_BINARIES = {k: v["bin"] for k, v in PRESETS.items()}
@@ -3517,7 +3527,7 @@ def company_of_model(model) -> str | None:
     return None
 
 
-# A multi-company preset (today: opencode) can list what it can reach without spending anything, so discovery
+# A multi-company preset (today: opencode, omp) can list what it can reach without spending anything, so discovery
 # can pick a capable other-company model itself instead of leaving it to "needs_model". MODEL_LISTERS: preset
 # name -> the read-only command that prints "provider/model" lines, one per line. PROVIDER_COST: the service
 # namespace before a listed model's first "/" -> "flat" (a subscription already paid for) or "per-use" (billed
@@ -3525,11 +3535,13 @@ def company_of_model(model) -> str | None:
 # developer's OK. Both are small fixed tables, not a live price lookup (out of scope for this checkpoint).
 MODEL_LISTERS = {
     "opencode": (["opencode", "models"], 20),
+    "omp": (["omp", "models", "--json"], 20, "json"),
 }
 PROVIDER_COST = {
     "opencode-go": "flat",     # OpenCode Go: flat-rate subscription
     "opencode": "per-use",     # OpenCode Zen: billed per request
     "openrouter": "per-use",   # OpenRouter: billed per request
+    "openai-codex": "flat",    # Codex via omp: the developer's own signed-in subscription, already paid for
 }
 # When more than one other-company flat model is available, these families win: GLM and Kimi have been this
 # project's working reviewers so far. A short ordered tuple of name substrings, not a live quality ranking;
@@ -3560,25 +3572,55 @@ def _is_model_line(line: str) -> bool:
     return bool(sep) and bool(provider.strip()) and bool(rest.strip())
 
 
-def _list_tool_models(preset_name) -> list[str]:
-    """Run a multi-company preset's read-only model-listing command and return its 'provider/model' lines,
-    dropping any line that isn't shaped like one. A listing failure (not installed, times out, non-zero
-    exit, no output, or output with no line shaped like 'provider/model') is just an empty list: the caller
-    falls back to today's needs_model line, never a crash and never a garbage candidate."""
+def _model_catalog_lines(data) -> list[str]:
+    """Pull 'provider/model' lines out of an already-parsed {"models": [{"provider": ..., "id": ...,
+    "selector": "<provider>/<id>"}, ...]} catalog (omp's `models --json` shape). Falls back to building
+    "<provider>/<id>" when a model has no selector of its own. A shape without a usable models list, or no
+    line shaped like 'provider/model', is just an empty list, the same contract as the plain-lines listing.
+    Takes already-parsed data, never text: the one place that may parse that text into JSON is
+    cmd_providers, the only caller of _list_tool_models (see _CP5R11_JSON_PARSE in test_trust_cp5_d.py)."""
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return []
+    lines = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        sel = m.get("selector")
+        if not sel:
+            provider, mid = m.get("provider"), m.get("id")
+            sel = f"{provider}/{mid}" if provider and mid else None
+        if sel and _is_model_line(str(sel)):
+            lines.append(str(sel))
+    return lines
+
+
+def _list_tool_models(preset_name) -> tuple[list[str], str, str]:
+    """Run a multi-company preset's read-only model-listing command. Returns (lines, fmt, raw).
+    When the MODEL_LISTERS entry names the "lines" format, `lines` already holds its 'provider/model' lines
+    (dropping any line that isn't shaped like one) and `raw` is "". When it names the "json" format (omp's
+    catalog), `lines` is [] and `raw` carries the raw stdout text for the caller (cmd_providers) to parse
+    with _model_catalog_lines, because cmd_providers is the sanctioned place to parse JSON that is not one
+    of Ratchet's own records. A listing failure (not installed, times out, non-zero exit, no output) is
+    just ([], fmt, ""): the caller falls back to today's needs_model line, never a crash and never a
+    garbage candidate."""
     spec = MODEL_LISTERS.get(preset_name)
     if not spec:
-        return []
-    cmd, timeout = spec
+        return [], "lines", ""
+    cmd, timeout = spec[0], spec[1]
+    fmt = spec[2] if len(spec) > 2 else "lines"
     if not shutil.which(cmd[0]):
-        return []
+        return [], fmt, ""
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
-        return []
+        return [], fmt, ""
     if r.returncode != 0:
-        return []
+        return [], fmt, ""
+    if fmt == "json":
+        return [], fmt, r.stdout or ""
     lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
-    return [ln for ln in lines if _is_model_line(ln)]
+    return [ln for ln in lines if _is_model_line(ln)], fmt, ""
 
 
 def _listed_model_cost(line: str) -> str:
