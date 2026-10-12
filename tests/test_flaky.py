@@ -1007,6 +1007,9 @@ def x11_all_cutoff_markers_round_is_free_replace():
     cut_env = tp.env_with(cut_bin)
     d = g.project("cp6-x11", extra_cp={"risk": "normal"})
     g.rx(d, "config", "--set", 'providers=[{"id":"codex","preset":"codex"}]', env=good_env)
+    # Keep round 2 a full two-slot round: disable the small-fix one-reviewer path (CP3) so this
+    # test still covers two cutoff slots.
+    g.rx(d, "config", "--set", "small_edit_lines=0", env=good_env)
     g.approve_plan(d)
     g.to_adversarial(d)
     rnd1 = tp.open_round(d, good_env)

@@ -261,6 +261,7 @@ Round 1 of a step always asks every reviewer. After that, review gets cheaper on
 - **A replaced round that nobody reviewed yet is free.** If the code changes again before any reviewer wrote a review, re-opening the round doesn't use up any of your review budget. Once a review has been written, though, that round counts, whether or not it was ever recorded.
 - **On a big diff, what changed since the last reviewed round comes first.** When a step's diff is too large to hand a reviewer whole, the files changed since the last round a reviewer actually saw come first; anything still left out after that is named by file, not just a character count, so a reviewer always sees what's new since it last looked, and knows by name what it didn't see.
 - **Small issues stop blocking after a couple of rounds.** Serious findings always block, every round. A minor one — a nit, a style note — blocks for the first couple of rounds (`converge_after_round` in config, default 2; so round 3 on), after which it's simply recorded for the final review instead of starting another round over it.
+- **A small fix after approval gets one reviewer, covering both lenses.** Once a step's adversarial gate has approved, a code fix at or under `small_edit_lines` (default 20 changed lines, measured since the last full multi-reviewer approval so several small fixes in a row still add up to a full round) opens its next round with a single reviewer who checks both standards and correctness, instead of the step's whole reviewer set — unless the step is high risk, which always keeps the full round. The commit message and `status` say when a round was reviewed this way, and by whom.
 
 ### One flaky failure doesn't cost you anything
 
@@ -383,6 +384,7 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 |---|---|
 | `ratchet.py doctor [--json]` | which CLIs have Ratchet hooks and when each last fired |
 | `ratchet.py status [--json]`, `plan-summary` | plain-text state; the plan step by step |
+| `ratchet.py changes CPn [--json]` | read-only: which changes since the step started are docs, which are code and how many code lines changed, which test files name each changed doc, and whether `doc_test_command` is configured |
 | `ratchet.py brief [CPn] --role implementer\|fixer\|test-writer\|reviewer\|scout\|planner` | a sub-agent's opening text: the plan's objective (word for word as `plan-summary` shows it, or a plain no-objective note), then that role's own rules; the orchestrator pastes this at the top of every spawn prompt. For the planner, it also ends with a "What earlier work says" section: recent learnings, findings earlier runs saved for later and nobody accepted yet, and limits the user already accepted, most relevant first then newest, each part capped with a count and a pointer to the full file (`.ratchet/learnings.md`, or a run's `state.json` under `.ratchet/runs/`). It also lists the related recorded specs for the parts being changed (OpenSpec, including Ratchet's own running records; finished Spec Kit features; done BMAD stories), each with its title, a one-line purpose and its path; no earlier work at all gets one plain line instead |
 | `ratchet.py view` | the viewer link (live URL if a server runs, else a `file://` link) |
 | `ratchet.py view --serve [--open]` | live page on a free port (4477 and up) at `http://127.0.0.1:<port>/` |
@@ -460,6 +462,11 @@ python3 tests/test_limits.py
 python3 tests/test_objective.py
 python3 tests/test_plan_change.py
 python3 tests/test_providers.py
+python3 tests/test_quick_path.py
+python3 tests/test_quick_path_docs.py
+python3 tests/test_quick_path_docs_step.py
+python3 tests/test_quick_path_records.py
+python3 tests/test_quick_path_small.py
 python3 tests/test_receipt.py
 python3 tests/test_receipt_proof.py
 python3 tests/test_results.py
