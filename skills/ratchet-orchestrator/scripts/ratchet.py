@@ -9914,7 +9914,24 @@ DANGEROUS_GIT_RE = re.compile(r"\bgit\s+(clean\b[^;&|\n]*\s-[a-zA-Z]*[xX]|stash\
 
 
 def _segments(cmd: str) -> list[str]:
-    return [p for p in re.split(r"\|\||&&|;|\||\n", cmd) if p.strip()]
+    """`cmd` split on top-level `;`/`&&`/`||`/`|`/newline -- never inside a single- or double-quoted span, the
+    same quote masking `_mask_quoted_seps` gives the fast path, so a `;` inside a python one-liner's own code
+    or a `|` inside a jq filter is never mistaken for a statement boundary and split away from the mention it
+    sits next to (CP3 round-01: a python -c argument's own `;` used to split `pathlib.Path(x).open('w')` into
+    its own segment, which then read as a bare `VAR=value` shell assignment with no spaces in it and was
+    skipped by `_guard_shell`'s own-nothing-to-check rule, missing the `.ratchet` mention inside it entirely).
+    Falls back to the old, quote-blind split only when `_mask_quoted_seps` gives up (a double-quoted span
+    holding a live $(...)/backtick -- see its own docstring); every caller already treats more segments as
+    fail-safe, never fewer, so that fallback never allows something this quote-aware split would have caught."""
+    masked = _mask_quoted_seps(cmd)
+    if masked is None:
+        return [p for p in re.split(r"\|\||&&|;|\||\n", cmd) if p.strip()]
+    parts, pos = [], 0
+    for sm in re.finditer(r"\|\||&&|;|\||\n", masked):
+        parts.append(cmd[pos:sm.start()])
+        pos = sm.end()
+    parts.append(cmd[pos:])
+    return [p for p in parts if p.strip()]
 
 
 def _program(seg: str) -> tuple[str, str]:
@@ -10342,13 +10359,14 @@ def _ro_prog_ok(words: list, cwd: str, maybe_inside: bool, has_subst: bool = Fal
 
 
 def _mask_quoted_seps(s: str) -> str | None:
-    """`s` with every | ; & ( ) ` $ > that sits inside a single-quoted span, or inside a double-quoted span
-    that holds no live substitution, replaced by 'x', so the statement split and redirect scan below can keep
-    using plain regexes without themselves being quote-aware, yet a quoted pipe, ampersand or `>` (a jq
-    filter, a grep alternation, an awk -F separator, a `>` inside a single-quoted awk/sed script) is never
-    mistaken for a statement separator or a real redirect. Length and every other character's position are
-    unchanged, so offsets found in the result line up exactly with `s` and the real (unmasked) text can still
-    be sliced out of `s` itself.
+    """`s` with every | ; & ( ) ` $ > and newline that sits inside a single-quoted span, or inside a
+    double-quoted span that holds no live substitution, replaced by 'x', so the statement split and redirect
+    scan below can keep using plain regexes without themselves being quote-aware, yet a quoted pipe,
+    ampersand, `>` (a jq filter, a grep alternation, an awk -F separator, a `>` inside a single-quoted
+    awk/sed script) or a newline (a python -c argument's own code spread over several lines, CP3 round-02) is
+    never mistaken for a statement separator or a real redirect. Length and every other character's position
+    are unchanged, so offsets found in the result line up exactly with `s` and the real (unmasked) text can
+    still be sliced out of `s` itself.
 
     A double-quoted span may itself hold a live `$(...)` or backtick substitution, which the shell still runs
     at the time this statement executes -- its own `|`/`;`/`&`/`>` are real shell syntax for that inner
@@ -10364,7 +10382,7 @@ def _mask_quoted_seps(s: str) -> str | None:
         if c == "'":
             j = i + 1
             while j < n and s[j] != "'":
-                if s[j] in "|;&()`$>":
+                if s[j] in "|;&()`$>\n":
                     out[j] = "x"
                 j += 1
             i = j + 1
@@ -10376,7 +10394,7 @@ def _mask_quoted_seps(s: str) -> str | None:
                     continue
                 if s[j] == "`" or s.startswith("$(", j):
                     has_live = True
-                if s[j] in "|;&()`$>":
+                if s[j] in "|;&()`$>\n":
                     out[j] = "x"
                 j += 1
             if has_live:
@@ -10409,6 +10427,178 @@ def _cmd_only_safe_cds(cmd: str) -> bool:
         if not os.path.isabs(target) or _ratchet_rel(target, "") is not None:
             return False
     return True
+
+
+# CP3: python/python3 is a reader too, but only in a few forms this fast path can prove never write -- a
+# `-c` one-liner, a bare-interpreter heredoc, or `-m json.tool` with at most one input file and no output
+# file -- and only when the code/body itself holds none of PY_WRITE_MARKER_RE's markers and no write-mode
+# open call. A write-mode open call is judged by one simple, fail-safe, whole-code rule rather than by
+# parsing any call's argument positions (round-03 found that position-aware parsing missed a mode sitting
+# next to a nested call, such as `open(Path('.ratchet/runs/x/state.json'), 'w')`, because excluding
+# parentheses from the matched arguments text also excluded the nested call's own parentheses, hiding the
+# mode that followed them): if the code contains an open-style call opener at all (`open(`, `.open(`,
+# `io.open(`, `codecs.open(`, `os.open(`, `os.fdopen(`) and anywhere in the code there is a quoted string
+# literal (a single or double quote, an optional one- or two-character b/r/f prefix, closed by the same
+# quote) whose whole content is made only of the characters r, w, a, x, b, t and + and holds at least one w,
+# a, x or +, the code counts as a write -- fail-safe, so a mode-shaped literal is enough by itself, even one
+# that is only assigned to a variable rather than proven to be that particular call's own mode argument. A
+# `mode=` keyword followed by something other than a quote (a variable, an expression) counts as a write
+# too, the same fail-safe way. A read with no mode, or with a mode literal made only of r/b/t characters
+# (`'r'`, `'rb'`, `'rt'`), still passes. This intentionally no longer tracks which argument of which call a
+# mode literal belongs to (the argument-splitting code that did this is gone with it): a non-literal,
+# non-`mode=` positional mode argument (`open(file, some_var)`) is not specially caught here any more and
+# relies on this same literal/opener rule and on PY_WRITE_MARKER_RE instead -- see CP3 round-03's fixes.md
+# for why this is the accepted, documented trade for closing the nested-call gap with the smallest change.
+# Anything this rule doesn't resolve as a write simply isn't flagged by it, which sends the whole command to
+# the slow, fail-safe path below exactly as before this checkpoint -- never widening what that path refuses.
+PY_PROG_RE = re.compile(r"^python[0-9.]*$|^py$")
+PY_SAFE_FLAGS = {"-B", "-E", "-I", "-s", "-u"}
+PY_HEREDOC_PREFIX_RE = re.compile(r"^(?:\S*/)?(?:python[0-9.]*|py)(?:\s*-)?$")
+PY_WRITE_MARKER_RE = re.compile(
+    r"\.write\(|\.writelines\(|write_text\(|write_bytes\(|json\.dump\(|pickle\.dump|"
+    r"os\.remove|os\.unlink|os\.rename|os\.replace|os\.rmdir|os\.removedirs|os\.makedirs|"
+    r"os\.mkdir|os\.truncate|os\.system|os\.popen|os\.exec|os\.spawn|os\.fdopen|shutil\.|subprocess|"
+    r"\.touch\(|\.unlink\(|\.rename\(|\.replace\(|\.mkdir\(|\.rmdir\(|\.symlink_to\(|\.hardlink_to\(|"
+    r"\.writerow\(|\.writerows\(|"
+    r"\bexec\(|\beval\(|__import__|importlib|getattr\(\s*os\b|sys\.stdout\s*=|\bfile\s*=|"
+    r"fileinput|inplace\s*=|os\.chmod|\.chmod\(|os\.(?:sym)?link\(|"
+    r"O_(?:WRONLY|RDWR|TRUNC|CREAT|APPEND)"
+)
+PY_OPEN_CALL_OPENER_RE = re.compile(
+    r"(?<![\w.])open\(|\bio\.open\(|\bcodecs\.open\(|\bos\.open\(|\bos\.fdopen\(|\.open\("
+)
+PY_MODE_LITERAL_RE = re.compile(r"""(?<![\w])[bBrRfF]{0,2}(['"])([rwaxbt+]+)\1""")
+PY_MODE_KWARG_NONLITERAL_RE = re.compile(r"""mode\s*=\s*(?!['"])""")
+# round-05: PY_WRITE_MARKER_RE only matched dotted uses (`os.remove`, `shutil.`, ...), so importing one of
+# these modules under a plain or aliased name and calling it undotted (`from os import remove; remove(...)`,
+# `import os as o; o.remove(...)`) passed this fast path. These two checks close that class, staying a text
+# deny-list and fail-safe like the rest of this file. PY_FROM_IMPORT_RE finds every `from <module> import
+# <names>` clause naming one of os/os.path/shutil/subprocess/pathlib/io/fileinput/tempfile; is_write below
+# treats each as a write except the four read-only shapes named in CP3 round-05's finding: `from os import
+# path`, `from os.path import ...` (any names), `from pathlib import Path` alone, and `from pathlib import
+# PurePath` alone. PY_IMPORT_AS_WRITE_RE and PY_IMPORT_PLAIN_WRITE_RE cover `import os/shutil/subprocess as
+# ...` (aliased, so the module's own dotted name never appears again) and bare `import shutil`/`import
+# subprocess` (so an unused or not-yet-dotted import of either is still a write); plain `import os` with no
+# alias stays a read, since `os.path...` usage is already a dotted marker on its own.
+PY_FROM_IMPORT_RE = re.compile(
+    r"\bfrom\s+(os\.path|os|shutil|subprocess|pathlib|io|fileinput|tempfile)\s+import\s+([^\n;#]+)"
+)
+PY_IMPORT_AS_WRITE_RE = re.compile(r"\bimport\s+(?:os|shutil|subprocess)\s+as\b")
+PY_IMPORT_PLAIN_WRITE_RE = re.compile(r"\bimport\s+(?:shutil|subprocess)\b")
+
+
+def _py_from_import_is_write(module: str, names: str) -> bool:
+    """True when a `from <module> import <names>` clause (matched by PY_FROM_IMPORT_RE) counts as a write for
+    this fast path. `from os.path import ...` is always a read, whatever names it imports. `from os import
+    path` (that single name, alone) is a read; any other name or combination from `os` is a write. `from
+    pathlib import Path` or `from pathlib import PurePath` (either, alone) is a read; any other name or
+    combination from `pathlib` is a write. Everything from shutil, subprocess, io, fileinput or tempfile is a
+    write, with no exemption."""
+    names = names.strip()
+    if module == "os.path":
+        return False
+    if module == "os":
+        return names != "path"
+    if module == "pathlib":
+        return names not in ("Path", "PurePath")
+    return True
+
+
+def _py_code_has_write_marker(code: str) -> bool:
+    """True when `code` (a python -c argument or heredoc body) holds any marker this fast path treats as a
+    write: see PY_WRITE_MARKER_RE's own comment for the full list, plus (only when the code also holds an
+    open-style call opener: `open(`, `.open(`, `io.open(`, `codecs.open(`, `os.open(`, `os.fdopen(`) either a
+    quoted mode literal made only of r/w/a/x/b/t/+ characters that holds a w, a, x or +, found anywhere in
+    the code, or a `mode=` keyword whose value is not a quoted literal at all; plus any `from <module>
+    import <names>` clause PY_FROM_IMPORT_RE finds that _py_from_import_is_write judges a write, any aliased
+    `import os/shutil/subprocess as ...` (PY_IMPORT_AS_WRITE_RE), and any bare `import shutil`/`import
+    subprocess` (PY_IMPORT_PLAIN_WRITE_RE). See the block comment above PY_PROG_RE for why this is a
+    whole-code, fail-safe rule rather than an argument-position-aware one."""
+    if PY_WRITE_MARKER_RE.search(code):
+        return True
+    if PY_IMPORT_AS_WRITE_RE.search(code) or PY_IMPORT_PLAIN_WRITE_RE.search(code):
+        return True
+    for m in PY_FROM_IMPORT_RE.finditer(code):
+        if _py_from_import_is_write(m.group(1), m.group(2)):
+            return True
+    if not PY_OPEN_CALL_OPENER_RE.search(code):
+        return False
+    if PY_MODE_KWARG_NONLITERAL_RE.search(code):
+        return True
+    for m in PY_MODE_LITERAL_RE.finditer(code):
+        if any(ch in m.group(2) for ch in "wax+"):
+            return True
+    return False
+
+
+def _ro_python_ok(piece: str) -> bool:
+    """Is this one piece's python/python3 call one of the forms this fast path can prove reads only: `-c` with
+    exactly one code argument (and no options besides -B/-E/-I/-s/-u), or `-m json.tool` with at most one
+    input file and no output-file argument -- and only when that code holds no PY_WRITE_MARKER_RE / open()-
+    mode marker. Any other shape (another module, extra args, an unreadable quote) returns False."""
+    words = _shell_words(piece)
+    if words is None:
+        return False
+    cmds = _simple_commands(words)
+    if len(cmds) != 1:
+        return False
+    toks = _ro_strip_words(cmds[0])
+    if not toks or not PY_PROG_RE.match(os.path.basename(toks[0])):
+        return False
+    args = toks[1:]
+    i = 0
+    while i < len(args) and args[i] in PY_SAFE_FLAGS:
+        i += 1
+    args = args[i:]
+    if args[:1] == ["-c"]:
+        return len(args) == 2 and not _py_code_has_write_marker(args[1])
+    if args[:2] == ["-m", "json.tool"]:
+        return len(args) - 2 <= 1
+    return False
+
+
+def _heredoc_py_pieces(cmd: str):
+    """Yield (match, sep_pos, prefix, body) for every heredoc in `cmd`, where `prefix` is the command text
+    immediately before it (back to the previous statement separator) and `body` is its text between the
+    opening and closing markers. Shared by `_strip_safe_python_heredocs` and `_guard_shell`'s own-run-state
+    check, so both agree on what "fed to a bare python/python3 invocation" means."""
+    pos = 0
+    for m in HEREDOC_RE.finditer(cmd):
+        sep_pos = pos - 1
+        for c in ";&|\n(":
+            p = cmd.rfind(c, pos, m.start())
+            if p > sep_pos:
+                sep_pos = p
+        prefix = cmd[sep_pos + 1:m.start()].strip()
+        lines = m.group(0).split("\n")
+        body = "\n".join(lines[1:-1])
+        yield m, sep_pos, prefix, body
+        pos = m.end()
+
+
+def _is_ro_python_heredoc(prefix: str, body: str) -> bool:
+    """True when `prefix` (the command text right before a heredoc) is a bare python/python3 invocation (no
+    other option, no script file) and `body` holds no PY_WRITE_MARKER_RE / open()-mode marker -- the rule
+    that lets a heredoc be treated as a proven read, shared by `_strip_safe_python_heredocs` and
+    `_guard_shell`'s own-run-state check below."""
+    return bool(PY_HEREDOC_PREFIX_RE.match(prefix)) and not _py_code_has_write_marker(body)
+
+
+def _strip_safe_python_heredocs(cmd: str) -> str:
+    """`cmd` with every heredoc fed to a bare `python3`/`python3 -` invocation (no other option, no script
+    file) replaced by a harmless `true` when its body holds no PY_WRITE_MARKER_RE / open()-mode marker, so the
+    piece-by-piece scan below never has to treat that body's own lines as separate shell statements. A
+    heredoc fed to anything else, or whose body does hold a marker, is left completely untouched here -- it
+    falls through to the existing, unchanged strict checks exactly as it did before this checkpoint."""
+    out, pos = [], 0
+    for m, sep_pos, prefix, body in _heredoc_py_pieces(cmd):
+        if not _is_ro_python_heredoc(prefix, body):
+            continue  # not a bare, proven-read-only python heredoc: leave it (and its body) for the strict checks
+        out.append(cmd[pos:sep_pos + 1])
+        out.append(" true")
+        pos = m.end()
+    out.append(cmd[pos:])
+    return "".join(out)
 
 
 def _provably_read_only(cmd: str, cwd: str) -> bool:
@@ -10454,8 +10644,11 @@ def _provably_read_only(cmd: str, cwd: str) -> bool:
         parts.append(cmd[pos:sm.start()])
         pos = sm.end()
     parts.append(cmd[pos:])
-    flat = "\n".join(parts)
-    for piece in flat.split("\n"):
+    # Iterate `parts` directly -- do not rejoin with "\n" and re-split, which used to be a no-op (every
+    # separator, including a quoted newline, used to end a part) but would now re-shred a part that carries a
+    # real newline preserved from inside its own quotes (CP3 round-02: a python -c argument's own line
+    # breaks), undoing the quote-aware split just performed above.
+    for piece in parts:
         words = re.sub(r"(\d*|&)>>?\|?&?\s*\S*|<\s*\S*", " ", piece).split()
         words = [w for w in words if w.strip("'\"")]
         if not words:
@@ -10466,6 +10659,12 @@ def _provably_read_only(cmd: str, cwd: str) -> bool:
         prog = os.path.basename(words2[0])
         if prog in ("cd", "pushd", "popd"):
             continue  # already accounted for, command-wide, in `cmd_unsafe` above
+        if PY_PROG_RE.match(prog):
+            # python's own read-only-ness never depends on cwd/cd (it's proven from the code/args alone), so
+            # this is judged on its own, same as the cd/pushd/popd branch above -- see `_ro_python_ok`.
+            if not _ro_python_ok(piece):
+                return False
+            continue
         if prog != "for" and prog not in RO_TABLE:
             # an unrecognised program: only provably safe when this piece is a plain top-level statement (no
             # keyword/assignment/wrapper stripped off it -- a loop or conditional body can carry an unseen
@@ -10498,7 +10697,14 @@ def _cmd_has_unresolved_cd(cmd: str) -> bool:
 def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
     raw = cmd
     if INTERPRETER_RE.search(raw):  # heredoc bodies fed to an interpreter are code, not data: check what they touch
-        for m in HEREDOC_RE.finditer(raw):
+        for m, _sep_pos, prefix, body in _heredoc_py_pieces(raw):
+            if _is_ro_python_heredoc(prefix, body):
+                # same rule `_strip_safe_python_heredocs` uses below to prove this heredoc reads only: a bare
+                # python/python3 invocation whose body holds no write marker. Let it skip this earlier
+                # run-state refusal so a read-only full-path open() on a run file isn't blocked before that
+                # pass-through ever runs. A write marker, or any other interpreter (bash, node, ...), still
+                # falls through to the checks below exactly as before.
+                continue
             for t in RATCHET_TOKEN_RE.findall(m.group(0)):
                 if not _write_allowed(t, cwd):
                     return ("RATCHET GUARD: this script touches Ratchet's run state (.ratchet/). Gate state, evidence, "
@@ -10507,6 +10713,14 @@ def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
                 why = _owner_problem(t, cwd, who)
                 if why:
                     return why
+    # CP3: a bare python3/python3 - heredoc whose body holds no write marker is swapped for a harmless `true`
+    # here, before `_expand` below drops every heredoc body as data -- `_provably_read_only` never sees the
+    # original heredoc syntax at all, so this must run first. The RATCHET_TOKEN mention check just above now
+    # skips the same proven-read-only heredocs (see `_is_ro_python_heredoc`), so a full-path read of a run
+    # file in one of those heredocs reaches this substitution instead of being refused there; any heredoc
+    # that doesn't qualify (a write marker, or fed to bash/sh/node/...) is still refused there first, exactly
+    # as before.
+    cmd = _strip_safe_python_heredocs(cmd)
     cmd = _expand(cmd)
     cmd = _blank_commit_messages(cmd)
     if NESTED_AGENT_RE.search(cmd):
