@@ -849,7 +849,7 @@ TESTS.append(("CP2-X04", x04_accepted_section_never_lists_left_for_later))
 def _mismatched_tree_commit_run(name):
     """[CP2-X05] fixture: `commit_per_checkpoint` off, so `complete` never records a commit of its own for CP1.
     While CP1 is still mid-step (its behavior implementation written but deliberately left uncommitted), an
-    ordinary, unrelated commit is made — a real commit, with a real sha, landing inside the step's own
+    ordinary, unrelated commit is made: a real commit, with a real sha, landing inside the step's own
     started_at..completed_at window. Because CP1's own uncommitted implementation is never committed, the tree
     Ratchet actually reviews for CP1 never matches this mid-step commit's own tree, so there is no commit
     anywhere whose tree equals what was reviewed."""
@@ -887,7 +887,7 @@ TESTS.append(("CP2-X05", x05_mismatched_tree_commit_not_shown))
 
 def _pending_round_midswap(name):
     """[CP2-X06] fixture: normal-risk CP1 whose round 1 opens with codex-standards/codex-correctness genuinely
-    available (mirroring `_host_fallback_midround`), but — unlike that fixture — `adv-record` is never run: the
+    available (mirroring `_host_fallback_midround`), but, unlike that fixture, `adv-record` is never run: the
     round stays open (pending) the whole time, first fresh then after both reviewers are marked unavailable and
     the SAME round is re-resolved (cmd_reviewers' own same-round branch), so `cps["adv_round"]["reviewers"]`
     stays a plain list of string ids throughout, exactly the shape a receipt asked for mid-round must handle."""

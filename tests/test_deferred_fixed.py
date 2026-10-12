@@ -21,7 +21,7 @@ way every suite in this repo drives the engine (see test_limits.py, which reuses
 Every fixture here builds a CP1 of `risk: "low"` (test_gates.project()'s own default), where
 `blocking_severities.low == ["blocker", "major"]` (DEFAULT_CONFIG): a `minor` finding is always recorded for
 later, never blocking, the moment it is reviewed, with a single required reviewer each round (`review_depth.low
-== ["any-both"]`) — so a round always records cleanly (`adv-record` exits 0) and the checkpoint reaches its
+== ["any-both"]`), so a round always records cleanly (`adv-record` exits 0) and the checkpoint reaches its
 `complete` step after the very first round. `ratchet.py reviewers`/`adv-record` both accept a checkpoint already
 at its `complete` step (re-reviewing code edited after completion), which is how every fixture below opens a
 later round on changed code without needing to drive the review through repeated blocking rounds first; a
