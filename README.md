@@ -171,13 +171,23 @@ The spec says what to build. Ratchet makes sure it was actually built. Every sce
 
 No spec tool? That's fine. The plan you approve is the spec. After your first finished feature, the agent will ask once if you'd like it to keep a simple record of what's been built: one file per feature, with each rule linked to the test that proves it. Yes or no, it remembers your answer.
 
+## CI export
+
+> Ask your agent to set up CI.
+
+That's all you say. Ratchet writes a GitHub Actions workflow that keeps the mechanical checks this run relied on running on every push and pull request: your project's regression or test command, plus every automatic check saved from a guardrail step, in that order.
+
+The AI review gates (adversarial review, UI review and human review) do not run in CI. CI machines don't have the agent CLIs and credentials those gates need, so those stay something a person or an agent runs, not a CI job.
+
+If a hand-written workflow already exists at that path, Ratchet never replaces it. It tells the agent so, and the agent can show you the file instead of writing it.
+
 ## Common questions
 
 **How long does it take?** A small feature usually takes tens of minutes, with the agent working by itself. Bigger ones take longer. You don't have to watch.
 
 **Is it expensive?** It uses more AI time than letting the agent just write code, because it checks the work. Ratchet tries to keep that down: low-risk steps get one reviewer, and small nitpicks are noted for you at the end instead of starting another round of review.
 
-**Do I need other AI tools installed?** No. Without them, reviews come from your own agent's company, using a different model when it can. With another company's tool installed and signed in, or with its API key set (Codex, Gemini, Copilot, Cursor, OpenCode and others), that tool reviews first. A second company tends to catch things the first one misses.
+**Do I need other AI tools installed?** No. Without them, reviews come from your own agent's company, using a different model when it can. With another company's tool installed and signed in, or with its API key set (Codex, Gemini, Copilot, Cursor, OpenCode, Oh My Pi (omp), Pi and others), that tool reviews first. A second company tends to catch things the first one misses.
 
 **The agent says the hooks aren't working.** Close the CLI, open it again in the same folder, and say "Set up Ratchet and continue". Still not working? Ask it to check that Ratchet's hooks are installed for this CLI and install them if not.
 
@@ -230,13 +240,15 @@ The model running your agent is called the host. It could be Claude, GPT, Gemini
 
 So for every review, Ratchet tries these in order:
 
-1. A model from another company, through any AI tool installed on your machine that works (Codex, Gemini, Claude, Copilot, Cursor, OpenCode, or a command you add).
+1. A model from another company, through any AI tool installed on your machine that works (Codex, Gemini, Claude, Copilot, Cursor, OpenCode, Oh My Pi (omp), Pi, or a command you add).
 2. A different model from the same company, for example Sonnet reviewing work done by Opus.
 3. The same model that did the work, only if nothing else is available.
 
 Each step has a risk level, which you see in the plan. Risk decides how many reviewers look (one for low, two for normal, four for high). It never changes who gets asked first. On low-risk steps, only serious findings block. `normal` is the default risk; a `high`-risk step also has to say which users could be harmed and how if it's gotten wrong (`risk_reason`) — a new plan with a high-risk step that doesn't say so is refused before you ever see it, naming the step.
 
 At the start of each run the agent checks which AI tools are installed and sends each one a tiny test request. A tool that's signed out or out of credit gets skipped for six hours, and the next one takes its place. When nothing else works, the host's own sub-agents fill the slot so the build never stalls. On a high-risk step that can mean fewer distinct reviewers than four. Substitutions are logged, the plan and viewer say who reviewed each round, and you're told up front if every review will come from the same company that did the build.
+
+For OpenCode specifically, discovery goes further on its own: it reads OpenCode's own model list and picks one capable flat-rate model from a company other than yours (never your own company, never a model it can't map to a company, never a small or preview variant), testing it before adding it — no hand-written `providers --add` needed. Oh My Pi (omp) is discovered and labelled the same way as OpenCode: when it's installed and signed in, discovery reads its model catalog (`omp models --json`) the same way and picks a capable flat-rate model (for example GLM through an OpenCode Go subscription reached via omp) before adding it, with no hand-written `providers --add` either. Anything per-use or of unknown cost, from either tool (OpenCode Zen, OpenRouter, an unlisted provider) is never sent a request, not even that test one; it's listed instead, naming the exact tool, provider and model, each one saying it costs money (or that its cost is unknown and so treated as paid) and that you must be asked, by name, before it is ever used — the agent asks you directly, in plain words, before it ever uses one, using the listing's `add_model` id (the full `<provider>/<model>`, not the shorter name shown to you) for both the question and the add that follows it. That question (`ratchet.py ask paid-provider <tool> <model>`) only ever moves forward on one exact reply naming the model, never the plain "yes" that answers every other question; nothing is sent to that model, not even the one-off test request, until you give it, and it only covers that one tool and model. Pi (preset `pi`) has no such model lister yet, so it's listed under the tools that need a model picked by hand, the same as Copilot or Cursor.
 
 Each role also gets its own model. Planning, coding, fixing and reviewing use a strong model. Lighter jobs like planning tests use a cheaper one, and running tests the cheapest. You can change this in `.ratchet/config.json`.
 
@@ -249,6 +261,7 @@ Round 1 of a step always asks every reviewer. After that, review gets cheaper on
 - **A replaced round that nobody reviewed yet is free.** If the code changes again before any reviewer wrote a review, re-opening the round doesn't use up any of your review budget. Once a review has been written, though, that round counts, whether or not it was ever recorded.
 - **On a big diff, what changed since the last reviewed round comes first.** When a step's diff is too large to hand a reviewer whole, the files changed since the last round a reviewer actually saw come first; anything still left out after that is named by file, not just a character count, so a reviewer always sees what's new since it last looked, and knows by name what it didn't see.
 - **Small issues stop blocking after a couple of rounds.** Serious findings always block, every round. A minor one — a nit, a style note — blocks for the first couple of rounds (`converge_after_round` in config, default 2; so round 3 on), after which it's simply recorded for the final review instead of starting another round over it.
+- **A small fix after approval gets one reviewer, covering both lenses.** Once a step's adversarial gate has approved, a code fix at or under `small_edit_lines` (default 20 changed lines, measured since the last full multi-reviewer approval so several small fixes in a row still add up to a full round) opens its next round with a single reviewer who checks both standards and correctness, instead of the step's whole reviewer set — unless the step is high risk, which always keeps the full round. The commit message and `status` say when a round was reviewed this way, and by whom.
 
 ### One flaky failure doesn't cost you anything
 
@@ -263,6 +276,10 @@ Every reviewer's prompt, and every builder, fixer and test-writer's brief, opens
 ### When reviews drag on
 
 Reviewers can go back and forth for a while on a hard step. Ratchet itself watches for that, not the agent: once a step blocks a second round in a row, or a kind of finding the agent hadn't seen yet shows up a second time in a file an earlier round already flagged, it pauses before another round and makes the agent check in against the plan's own goal. The agent never decides this alone: it spawns a fresh strong-model reviewer with the objective, the open findings and the round history, which recommends narrowing or changing the step (simplify), asking you to accept the open findings as a known limit (only your own reply does that; the agent can't wave them through itself), or stopping to ask you how to wrap up. Separately, once a round blocks, the agent has to decide fix or rebut for every remaining open finding, however many, with a one-line reason, before it can open another round; a disputed finding it chose to rebut is shown to the next round's reviewers, who either drop it or press it again with a clearer case for who it would actually hurt. The final review, when everything is built, opens the same way: your goal, who it's for, and each thing "done" was supposed to mean, listed plainly for you to judge against the evidence, not claimed as met just because the checkpoints finished.
+
+### Pasting a proof receipt into the pull request
+
+Once you say yes to the final review's approval question, the agent runs `human-approve` and then runs `ratchet.py receipt`, pasting its finished markdown straight into that same wrap-up message (you never run `ratchet.py` yourself): one honest receipt to paste into the pull request. Each step's title, short commit and elapsed time, plus the whole run's own elapsed time: wall-clock, including any time spent waiting on you, never cost or tokens. Who reviewed each step and its rounds, with a review by the host's own sub-agent marked as such and why an outside reviewer was skipped, when Ratchet recorded that reason (otherwise it says plainly that the reason wasn't recorded). The findings you accepted, with your reason; the ones still left for later; and the ones `mark-fixed` closed later in the run. A step with no commit says so plainly ("no commit recorded") instead of guessing; because the receipt is only pasted after approval, its run total is always the finished total, never a time-so-far guess. The receipt also lists every line of the plan's objective ("done means") next to the test case(s) that prove it — id, title, file and whether it passed — so a line with no case naming it reads plainly "no test linked" instead of a made-up pass. `ratchet.py receipt --json` prints the same facts as data, for anything that wants to read them.
 
 ### Mistakes that keep coming back
 
@@ -373,7 +390,8 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 |---|---|
 | `ratchet.py doctor [--json]` | which CLIs have Ratchet hooks and when each last fired |
 | `ratchet.py status [--json]`, `plan-summary` | plain-text state; the plan step by step |
-| `ratchet.py brief [CPn] --role implementer\|fixer\|test-writer\|reviewer\|scout\|planner` | a sub-agent's opening text: the plan's objective (word for word as `plan-summary` shows it, or a plain no-objective note), then that role's own rules; the orchestrator pastes this at the top of every spawn prompt |
+| `ratchet.py changes CPn [--json]` | read-only: which changes since the step started are docs, which are code and how many code lines changed, which test files name each changed doc, and whether `doc_test_command` is configured |
+| `ratchet.py brief [CPn] --role implementer\|fixer\|test-writer\|reviewer\|scout\|planner` | a sub-agent's opening text: the plan's objective (word for word as `plan-summary` shows it, or a plain no-objective note), then that role's own rules; the orchestrator pastes this at the top of every spawn prompt. For the planner, it also ends with a "What earlier work says" section: recent learnings, findings earlier runs saved for later and nobody accepted yet, and limits the user already accepted, most relevant first then newest, each part capped with a count and a pointer to the full file (`.ratchet/learnings.md`, or a run's `state.json` under `.ratchet/runs/`). It also lists the related recorded specs for the parts being changed (OpenSpec, including Ratchet's own running records; finished Spec Kit features; done BMAD stories), each with its title, a one-line purpose and its path; no earlier work at all gets one plain line instead |
 | `ratchet.py view` | the viewer link (live URL if a server runs, else a `file://` link) |
 | `ratchet.py view --serve [--open]` | live page on a free port (4477 and up) at `http://127.0.0.1:<port>/` |
 | `ratchet.py view --serve --bind 0.0.0.0 [--public-host my-box.local]` | share `http://<host>:<port>/?t=<token>` (requests without the token get 403) |
@@ -382,10 +400,13 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py wait --for "..." [--minutes N]` | the run's own chat waits on background reviewers or sub-agents: until then (default 30 minutes, 1 to 120) it may end its turn without a blocked stop |
 | `ratchet.py set-review end\|each\|none` | how often you check in |
 | `ratchet.py reviewer-status [--reset <id>]` | the host, who is available, and retrying one early |
-| `ratchet.py providers [--discover] [--check [id]] [--add <id> --preset <p> --model <m>] [--remove <id>]` | agent tools that can review: find, test, add or remove them |
+| `ratchet.py providers [--discover] [--check [id]] [--add <id> --preset <p> --model <m>] [--remove <id>]` | agent tools that can review: find, test, add or remove them. A per-use or unknown-cost model (`providers --discover --json`'s `paid_options`) needs `ask paid-provider` answered first; `--add` for one refuses, with no request sent, until it is |
+| `ratchet.py ask paid-provider <tool> <model>` | ask the user whether to spend money on a per-use or unknown-cost model before it is ever used; only their own exact reply, `pay per use: <model>`, counts (never the usual yes words), and only then does `providers --add` send the one test request and add it |
 | `ratchet.py models` | which model each role's sub-agent uses on this host |
 | `ratchet.py spec detect`, `spec import <openspec\|speckit\|bmad\|auto> <id>`, `spec status` | build from an OpenSpec change, Spec Kit feature or BMAD story; which scenarios are proven so far; `spec keep on\|off` records the user's answer about a running spec |
-| `ratchet.py deferred` | review findings noted for later instead of blocking (minor ones, and any blocker/major/unknown-severity one with no `user_impact`), plus, in their own section first, any findings you accepted yourself, with your reason and who accepted them |
+| `ratchet.py deferred` | review findings noted for later instead of blocking (minor ones, and any blocker/major/unknown-severity one with no `user_impact`), plus, in their own section first, any findings you accepted yourself, with your reason and who accepted them, and a 'fixed later in the run' section for ones `mark-fixed` closed |
+| `ratchet.py mark-fixed CPn <ref>="<how>"` | record that a finding left for later was really fixed: refused unless its file changed since the round that raised it AND a later round was recorded on that changed code |
+| `ratchet.py receipt [--json]` | one proof receipt to paste into the pull request at the final review: each step's title, commit and elapsed time, the run's own elapsed time (no cost or tokens), who reviewed each step (host-company fallbacks marked, with why when recorded), findings accepted, left for later or fixed later in the run, and every objective done-means line next to the test case(s) that prove it (or "no test linked") |
 | `ratchet.py ask accept-finding CPn F1,F2`, `accept-finding CPn` | ask the user to accept named open (blocking) findings of a blocked round, with their own reason (`accept: <reason>`); record it once they reply |
 | `ratchet.py ask raise-limit CPn`, `raise-limit CPn` | ask the user to raise a blocked step's own review-round limit by one round, with their own reason (`raise: <reason>`); offered at most once per step, ever, whatever `config.json`'s `max_adversarial_rounds` is later edited to |
 | `ratchet.py triage CPn <ref>=fix:"<reason>"` / `<ref>=rebut:"<reason>"` | whenever a round blocks: decide fix or rebut for every blocking finding, even a single one, before the next round opens; never accept/defer/waive |
@@ -396,6 +417,7 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py lanes --scan <dir> [--json]` | each lane's phase, progress and whether it waits on a director |
 | `ratchet.py lanes --serve --scan <dir> [--bind 0.0.0.0]` | one dashboard for every lane |
 | `ratchet.py config --set key=value` | settings in `.ratchet/config.json` (reviewer roster, retry caps, `regression_command`, `ui_globs`, app URL) |
+| `ratchet.py ci-export [--stdout]` | write (or update) `.github/workflows/ratchet.yml`, the GitHub Actions workflow that keeps the run's mechanical checks running on every push and pull request; refuses to replace a hand-written file at that path; `--stdout` prints the workflow instead of writing it |
 
 The viewer server only serves the viewer, its live data and the prototype, never the rest of `.ratchet/`. Its URL is saved in `.ratchet/viewer.json`.
 
@@ -420,9 +442,20 @@ python3 tests/test_accept_finding.py
 python3 tests/test_brief.py
 python3 tests/test_brief_guard.py
 python3 tests/test_checkin.py
+python3 tests/test_ci_export.py
+python3 tests/test_ci_export_docs.py
+python3 tests/test_ci_export_shapes.py
+python3 tests/test_ci_export_write.py
 python3 tests/test_cleanup.py
 python3 tests/test_converge.py
 python3 tests/test_dedup_unknown_model.py
+python3 tests/test_deferred_fixed.py
+python3 tests/test_digest.py
+python3 tests/test_digest_docstring.py
+python3 tests/test_digest_specs.py
+python3 tests/test_discover.py
+python3 tests/test_discover_omp.py
+python3 tests/test_discover_paid.py
 python3 tests/test_docs.py
 python3 tests/test_flaky.py
 python3 tests/test_gates.py
@@ -439,8 +472,16 @@ python3 tests/test_limits.py
 python3 tests/test_objective.py
 python3 tests/test_plan_change.py
 python3 tests/test_providers.py
+python3 tests/test_quick_path.py
+python3 tests/test_quick_path_docs.py
+python3 tests/test_quick_path_docs_step.py
+python3 tests/test_quick_path_records.py
+python3 tests/test_quick_path_small.py
+python3 tests/test_receipt.py
+python3 tests/test_receipt_proof.py
 python3 tests/test_results.py
 python3 tests/test_review_objective.py
+python3 tests/test_run_all_dedupe.py
 python3 tests/test_runner.py
 python3 tests/test_signing.py
 python3 tests/test_specs.py

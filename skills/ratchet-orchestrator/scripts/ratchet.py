@@ -34,6 +34,7 @@ import secrets
 import json
 import os
 import re
+import shlex
 import unicodedata
 import shutil
 import stat
@@ -150,6 +151,18 @@ DEFAULT_CONFIG = {
     "spec_archive": True,
     "spec_keep": None,              # no spec tool: keep a running spec (openspec/specs/<run>/spec.md)? None = not asked yet           # archive an OpenSpec change (merge its deltas into the specs) when the run is approved
     "regression_command": None,     # full suite run before a checkpoint can complete
+    # The quick path (`ratchet.py changes CPn`): a file matching doc_globs and not doc_exclude_globs (plus the
+    # configured design_md and standards files) counts as a doc, not code. A test file matching test_globs "names"
+    # a doc when its text contains the doc's repo-relative path or file name. doc_test_command (with a {files}
+    # placeholder) runs just those files; unset, the docs quick path is off. small_edit_lines is the line-count
+    # ceiling (git diff --numstat, added+removed) for a one-reviewer small fix.
+    # .mdx is left out by default because it can hold real JSX code (Next.js pages, Docusaurus, Storybook);
+    # a project whose .mdx files are prose only can add "*.mdx" to its own doc_globs.
+    "doc_globs": ["*.md", "*.rst", "*.adoc"],
+    "doc_exclude_globs": ["SKILL.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", "agents/*.md"],
+    "test_globs": ["test_*", "*_test.*", "*.test.*", "*.spec.*"],
+    "doc_test_command": None,
+    "small_edit_lines": 20,
     "commit_per_checkpoint": True,
     "design_md": "DESIGN.md",
     "standards": [".ratchet/standards.md"],
@@ -479,6 +492,390 @@ def touches_ui(files: list[str], globs: list[str]) -> list[str]:
     return hits
 
 
+# --------------------------------------------------------------------------- quick path (`ratchet.py changes`)
+
+def _glob_hit(f: str, globs: list[str]) -> bool:
+    """True when f's basename or full repo-relative path matches one of globs — touches_ui's own rule. A
+    directory-shaped glob (one containing "/", e.g. "agents/*.md") also matches at any depth below the repo
+    root (e.g. "apps/bot/agents/x.md"), not only directly under a root-level directory of that name, so a
+    per-package instruction-file layout is a normal, expected match rather than a silent gap."""
+    name = os.path.basename(f)
+    return any(fnmatch.fnmatch(name, g) or fnmatch.fnmatch(f, g) or ("/" in g and fnmatch.fnmatch(f, "*/" + g))
+               for g in globs)
+
+
+def _project_files(root: Path, fp: dict) -> list[str]:
+    """Every file in fp's tree (tracked and untracked, minus .ratchet) — not just what git has staged or
+    committed — so a doc-naming test file still counts even before anyone runs `git add`."""
+    if fp.get("kind") == "git-tree":
+        r = subprocess.run(["git", "ls-tree", "-r", "--name-only", "--full-tree", fp["id"]], cwd=root,
+                           capture_output=True, text=True)
+        return [l for l in r.stdout.splitlines() if l]
+    return sorted(read_json(root / RATCHET_DIR / "manifests" / f"{fp['id']}.json", {},
+                            record="Ratchet treats it as naming no files (the fingerprint manifest cache, named "
+                                   "by its own hash)") or {})
+
+
+def _code_size(ctx: "Ctx", from_id: str, to_id: str, code_files: list[str]) -> tuple[int | None, list[str]]:
+    """git diff --numstat added+removed line count for code_files between two tree ids. Git prints "-\t-\tpath"
+    for a file it can't diff as text (binary): that size is unknown, not zero, so the total is reported as
+    `None` (never a partial sum that silently drops the unknown files) whenever any code file is uncountable.
+    Returns (total_or_None, the uncountable file paths)."""
+    if not code_files:
+        return 0, []
+    r = subprocess.run(["git", "diff", "--numstat", from_id, to_id, "--", *code_files], cwd=ctx.root,
+                       capture_output=True, text=True)
+    total, unknown = 0, []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            total += int(parts[0]) + int(parts[1])
+        except ValueError:
+            unknown.append(parts[2])  # binary file: numstat prints "-\t-\tpath"; size can't be counted
+    return (None if unknown else total), unknown
+
+
+def _tests_naming(ctx: "Ctx", cfg: dict, fp: dict, docs: list[str]) -> list[str]:
+    """Which test files (test_globs) name any of `docs` by its repo-relative path or file name (a plain
+    substring match, never guessed). Shared by both of classify_changes's ranges (base_tree and since_approval)
+    so a doc that is changed and then restored in one range, but not the other, still gets the tests that name
+    it from whichever range actually lists it as changed."""
+    if not docs:
+        return []
+    out = []
+    candidates = [t for t in _project_files(ctx.root, fp) if _glob_hit(t, cfg.get("test_globs") or [])]
+    for t in sorted(set(candidates)):
+        try:
+            text = (ctx.root / t).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(d in text or os.path.basename(d) in text for d in docs):
+            out.append(t)
+    return out
+
+
+def classify_changes(ctx: "Ctx", cp_id: str) -> dict:
+    """Read-only report of what changed since cp_id's base_tree: which files are docs (doc_globs, minus
+    doc_exclude_globs plus the configured design_md and standards files), which are code, how many code lines
+    changed in the code files (git diff --numstat, added+removed), which test files (test_globs) name a changed
+    doc by its repo-relative path or file name, and whether doc_test_command is configured at all. A code file
+    git can't diff as text (binary) makes `code_lines_changed` None and `code_lines_unknown` True: an unknown
+    size is reported plainly, never as zero, so it can never read as a small change. `since_approval` repeats
+    the same report (its own `doc_test_files` included, matched independently against its own `doc_files` so a
+    doc changed then restored in one range but not the other still gets the tests naming it from whichever
+    range actually lists it) for the narrower range from the adversarial gate's last recorded approval
+    fingerprint (when that gate has one) to now, plus a plain `docs_only`; when there is no recorded approval
+    yet (gate not required, or required but not yet passed), `approved` is False with a plain reason and the
+    rest are empty.
+    Never writes, and never gates: a locked reference file (DESIGN.md, standards) drifting since approval is
+    still just reported here as a changed file, not refused (that refusal is every other command's, not this
+    read-only report's). Which check (docs quick path, small fix, or full) applies to either range is not this
+    report's decision."""
+    st = ctx.state()
+    cps = (st.get("checkpoints") or {}).get(cp_id)
+    if cps is None:
+        die(f"{cp_id} is not a checkpoint in this run.")
+    cfg = ctx.config()
+    base = cps.get("base_tree")
+    fp = fingerprint(ctx.root)
+    files = sorted(changed_files(ctx.root, {"kind": "git-tree", "id": base}, fp)) if base else []
+    doc_files, code_files = _classify_doc_code(cfg, files)
+    code_lines, code_unknown = _code_size(ctx, base, fp["id"], code_files) if base else (0, [])
+    doc_test_files = _tests_naming(ctx, cfg, fp, doc_files)
+    doc_cmd = cfg.get("doc_test_command")
+    adv = (cps.get("gates") or {}).get("adversarial") or {}
+    approval_fp = adv.get("fingerprint")
+    if not approval_fp:
+        since_approval = {
+            "approved": False,
+            "reason": ("the adversarial gate is not required for this checkpoint" if not adv.get("required")
+                      else "the adversarial gate has not been approved yet for this checkpoint"),
+            "doc_files": [], "code_files": [], "code_lines_changed": 0, "code_lines_unknown": False,
+            "doc_test_files": [], "docs_only": None,
+        }
+    else:
+        a_files = sorted(changed_files(ctx.root, approval_fp, fp))
+        a_doc_files, a_code_files = _classify_doc_code(cfg, a_files)
+        a_lines, a_unknown = _code_size(ctx, approval_fp["id"], fp["id"], a_code_files)
+        since_approval = {
+            "approved": True,
+            "reason": None,
+            "doc_files": a_doc_files,
+            "code_files": a_code_files,
+            "code_lines_changed": a_lines,
+            "code_lines_unknown": bool(a_unknown),
+            "doc_test_files": _tests_naming(ctx, cfg, fp, a_doc_files),
+            "docs_only": len(a_code_files) == 0,
+        }
+    return {
+        "docs_only": len(code_files) == 0,
+        "doc_files": doc_files,
+        "code_files": code_files,
+        "code_lines_changed": code_lines,
+        "code_lines_unknown": bool(code_unknown),
+        "doc_test_files": doc_test_files,
+        "doc_quick_path": {"enabled": bool(doc_cmd),
+                            "reason": None if doc_cmd else "doc_test_command is not configured"},
+        "since_approval": since_approval,
+    }
+
+
+def cmd_changes(args):
+    """`ratchet.py changes CPn [--json]`: classify_changes, read-only (not in STATE_LOCKED_CMDS)."""
+    ctx = Ctx(find_root())
+    data = classify_changes(ctx, args.cp)
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2))
+        return
+    print(f"docs only: {data['docs_only']}")
+    print(f"doc files: {', '.join(data['doc_files']) or '(none)'}")
+    print(f"code files: {', '.join(data['code_files']) or '(none)'}")
+    print(f"code lines changed: {'unknown (binary code change)' if data['code_lines_unknown'] else data['code_lines_changed']}")
+    print(f"doc test files: {', '.join(data['doc_test_files']) or '(none)'}")
+    qp = data["doc_quick_path"]
+    print(f"docs quick path: {'on' if qp['enabled'] else 'off'}" + (f" ({qp['reason']})" if qp["reason"] else ""))
+    sa = data["since_approval"]
+    if not sa["approved"]:
+        print(f"since approval: not approved yet ({sa['reason']})")
+    else:
+        sa_lines = "unknown (binary code change)" if sa["code_lines_unknown"] else sa["code_lines_changed"]
+        print(f"since approval: docs only={sa['docs_only']}, doc files: {', '.join(sa['doc_files']) or '(none)'}, "
+              f"code files: {', '.join(sa['code_files']) or '(none)'}, code lines changed: {sa_lines}, "
+              f"doc test files: {', '.join(sa['doc_test_files']) or '(none)'}")
+
+
+# --------------------------------------------------------------------------- doc quick path at `complete` (CP2)
+# Doc edits made after a gate's own approval never reopen a review round: when every file changed since that
+# gate's recorded fingerprint is a doc (the one doc/code split in `_classify_doc_code`, also used by
+# classify_changes above so the two can never disagree) and doc_test_command is configured, `cmd_complete` runs
+# just the test files naming those docs instead of marking the gate stale. The same rule also lets a passing
+# full suite stay valid across a doc-only edit (`_skip_full_suite`), and every doc edit skipped this way is
+# recorded on the checkpoint (`doc_edits_unreviewed`) so the commit message, `status` and the final review can
+# all say so.
+
+def _classify_doc_code(cfg: dict, files: list[str]) -> tuple[list[str], list[str]]:
+    """The one doc/code split (doc_globs, minus doc_exclude_globs plus the configured design_md and standards
+    files) for an arbitrary file list. `classify_changes` above and `cmd_complete`'s quick path both call this
+    so what counts as a doc can never drift between the read-only report and the gate that skips review."""
+    exclude = [g for g in [*(cfg.get("doc_exclude_globs") or []), cfg.get("design_md"),
+                           *(cfg.get("standards") or [])] if g]
+    doc_globs = cfg.get("doc_globs") or []
+    doc_files = [f for f in files if _glob_hit(f, doc_globs) and not _glob_hit(f, exclude)]
+    code_files = [f for f in files if f not in doc_files]
+    return doc_files, code_files
+
+
+def _run_doc_test_command(ctx: "Ctx", cfg: dict, files: list[str], log_path: Path) -> tuple[int, str]:
+    """Runs doc_test_command with its {files} placeholder filled in by `files` (shlex-quoted, space-joined),
+    logged the same way _run_cmd logs regression_command. Returns (exit code, combined stdout+stderr)."""
+    cmd = cfg["doc_test_command"].replace("{files}", " ".join(shlex.quote(f) for f in files))
+    code, out, _ = _run_cmd(ctx, cmd, log_path, cfg["test_timeout_sec"])
+    return code, out
+
+
+def _skip_full_suite(ctx: "Ctx", cfg: dict, st: dict, fp: dict) -> tuple[bool, list[str]]:
+    """(True, the doc files involved) when regression_command already passed on a tree recorded at
+    st['regression_passed_fp'] that differs from `fp` only in docs (and doc_test_command is configured), so
+    `complete` can run just those docs' naming tests instead of the full suite again. (False, []) when there is
+    no recorded pass yet, the doc quick path is off, or anything that changed since is code."""
+    passed_fp = st.get("regression_passed_fp")
+    if not passed_fp or not cfg.get("doc_test_command"):
+        return False, []
+    changed = [f for f in changed_files(ctx.root, passed_fp, fp)
+              if f != RATCHET_DIR and not f.startswith(RATCHET_DIR + "/")]
+    if not changed:
+        return True, []
+    doc_files, code_files = _classify_doc_code(cfg, changed)
+    return (not code_files), doc_files
+
+
+def _doc_edit_status_lines(st: dict) -> list[str]:
+    """One plain line per checkpoint whose doc edit(s) after review were never re-reviewed (CP2's quick path),
+    for `status`, the commit message and the final review to all say the same thing about the same files."""
+    lines = []
+    for cid, c in (st.get("checkpoints") or {}).items():
+        docs = c.get("doc_edits_unreviewed")
+        if docs:
+            lines.append(f"{cid}: edited after review and not re-reviewed (doc quick path): {', '.join(docs)}.")
+    return lines
+
+
+# --------------------------------------------------------------------------- small-fix one-reviewer round (CP3)
+# After a checkpoint's adversarial gate has a clean, approved round, a small code fix made since that approval
+# (since_approval.code_lines_changed, the same measurement classify_changes/`changes --json` reports, at or
+# under config small_edit_lines) in a step that is not high risk opens its next review round with exactly one
+# reviewer instead of the step's normal full set, told to look only at the file(s) changed since approval
+# (review_rules' existing focus_files mechanism for round > 1 — unchanged). A fix over the limit, a code change
+# of unknown size (binary), or any fix in a high-risk step still opens the normal full round; a doc-only edit is
+# never downgraded here (docs_only stays on CP2's zero-reviewer quick path at `complete`, which runs before
+# `reviewers` would ever be called for it). `cmd_reviewers` sets `small_fix` on the round it opens;
+# `cmd_adv_record` records who did it on the checkpoint (`small_fix_review`) once that round is approved, so the
+# commit message and `status` can both say the fix was reviewed as a small fix by one reviewer, naming it.
+# The size is measured against the checkpoint's last FULL (non-small-fix) approval, not simply the gate's latest
+# one, so several small fixes in a row still add up: `cmd_adv_record` only updates `last_full_review_fingerprint`
+# on a full-round approval, never on a small-fix one, so the baseline stays put across a run of small fixes.
+
+def _is_small_fix_round(ctx: "Ctx", cfg: dict, cp_id: str, cp: dict, cps: dict, g: dict) -> bool:
+    if cp.get("risk", "normal") == "high":
+        return False
+    if cp.get("reviewers"):
+        return False  # the checkpoint pins its own reviewer list; that override always gets a normal full round
+    full_fp = cps.get("last_full_review_fingerprint")
+    if not full_fp:
+        return False  # no FULL-round approval recorded yet to measure a fix against (a user accept sets the
+        # gate fingerprint but never last_full_review_fingerprint, so it does not qualify): a "stale" status,
+        # set by `complete` once it detects the fix, does not disqualify it -- the approval itself still stands
+    fp = fingerprint(ctx.root)
+    files = sorted(changed_files(ctx.root, full_fp, fp))
+    doc_files, code_files = _classify_doc_code(cfg, files)
+    if not code_files:
+        return False  # nothing but docs changed since the last full review: not this round's concern
+    code_lines, code_unknown = _code_size(ctx, full_fp["id"], fp["id"], code_files)
+    if code_unknown:
+        return False
+    return code_lines <= cfg.get("small_edit_lines", 20)
+
+
+def _small_fix_reviewers(ctx: "Ctx", cfg: dict, cp: dict, exclude=None) -> list[dict] | None:
+    """Resolve a small-fix round's reviewer the one way it is ever allowed to be resolved: review_depth["low"],
+    accepted only when it comes back as exactly one both-lens reviewer. Used both when a small-fix round opens
+    and when cmd_reviewers re-resolves an already-open small-fix round (CP3 round-04 fix: the re-resolution
+    branch used to fall back to the step's own, possibly single-lens, risk instead of this). Returns None when
+    low-risk resolution can't produce a single both-lens reviewer, so the caller falls back to a normal round."""
+    low_resolved = resolve_reviewers(ctx, cfg, dict(cp, risk="low"), exclude=exclude)
+    if len(low_resolved) == 1 and (_roster_spec(cfg, low_resolved[0]["id"]) or {}).get("lens") == "both":
+        return low_resolved
+    return None
+
+
+def _small_fix_review_line(cid: str, cps: dict) -> str | None:
+    sf = cps.get("small_fix_review")
+    if not sf:
+        return None
+    who = sf.get("reviewer") or "a reviewer"
+    return f"{cid}: round {sf.get('round')} was reviewed as a small fix by one reviewer ({who})."
+
+
+def _small_fix_review_lines(st: dict) -> list[str]:
+    """One plain line per checkpoint whose last approved adversarial round was a one-reviewer small-fix review,
+    naming that reviewer, for `status` and the commit message to say the same thing about the same round."""
+    lines = []
+    for cid, c in (st.get("checkpoints") or {}).items():
+        line = _small_fix_review_line(cid, c)
+        if line:
+            lines.append(line)
+    return lines
+
+
+# --------------------------------------------------------------------------- docs-only step skips review (CP4)
+# When a checkpoint's own change since its base_tree (never the plan's claim -- the same real diff
+# `classify_changes` reports) is docs only, the step is not high risk, and doc_test_command is configured,
+# opening the checkpoint's adversarial review never opens a reviewer round: it runs the test files naming
+# those doc(s) instead (a failure names the test file and leaves the gate's status untouched) and, on success,
+# marks the adversarial gate passed directly, recording the skip (`docs_only_review_skip`) so the commit
+# message, `status` and the final review can all say which files were never reviewed and why. Reuses CP1's
+# `_classify_doc_code`/`_tests_naming` and CP2's `_run_doc_test_command` so the doc/code rule and the
+# doc-test-running logic never duplicate.
+
+def _docs_only_review_skip(ctx: "Ctx", st: dict, cfg: dict, cp: dict, cps: dict, cp_id: str,
+                           json_out: bool = False) -> bool:
+    """True once this call has handled the adversarial gate for a docs-only step (the caller returns without
+    opening a round); False when the normal full round still applies (code changed, high risk, a pinned
+    reviewer list, or the docs quick path is off)."""
+    if cp.get("risk", "normal") == "high" or not cfg.get("doc_test_command"):
+        return False
+    if cp.get("reviewers"):
+        return False  # the checkpoint pins its own reviewer list; that override always gets a normal full
+        # round, same as _is_small_fix_round
+    base = cps.get("base_tree")
+    if not base:
+        return False
+    fp = fingerprint(ctx.root)
+    files = sorted(changed_files(ctx.root, {"kind": "git-tree", "id": base}, fp))
+    if not files:
+        return False
+    doc_files, code_files = _classify_doc_code(cfg, files)
+    if code_files or not doc_files:
+        return False
+    doc_test_files = _tests_naming(ctx, cfg, fp, doc_files)
+    if doc_test_files:
+        dcode, dout = _run_doc_test_command(ctx, cfg, doc_test_files, ctx.evidence(cp_id) / "docs-only-review.log")
+        if dcode != 0:
+            die(f"{cp_id}: docs-only review check failed for {', '.join(doc_test_files)}:\n{_tail(dout)}", 2)
+        if fingerprint(ctx.root)["id"] != fp["id"]:
+            die("The doc test command changed files in the project. Those changes were never reviewed — find "
+                "out what wrote them (generated files? snapshots?) and either add them to .gitignore or "
+                "re-run the gates.", 2)
+    cps["gates"]["adversarial"].update(status="passed", fingerprint=fp, passed_at=now())
+    cps["docs_only_review_skip"] = {"files": doc_files, "doc_test_files": doc_test_files}
+    cps["step"] = _earliest_open_step(cps)
+    ctx.log(st, "adversarial_docs_only_skip", cp=cp_id, files=",".join(doc_files))
+    ctx.save_state(st)
+    build_viewer(ctx)
+    if json_out:
+        print(json.dumps({"checkpoint": cp_id, "docs_only_skip": {"files": doc_files,
+                                                                    "doc_test_files": doc_test_files}}, indent=2))
+    else:
+        print(f"{cp_id}: review skipped -- this step's change is docs only ({', '.join(doc_files)}); not reviewed. "
+              f"Doc test(s) run instead: {', '.join(doc_test_files) or '(no test file names these docs)'}")
+    return True
+
+
+def _docs_only_quick_path_off_note(ctx: "Ctx", cfg: dict, cp: dict, cps: dict) -> str | None:
+    """A plain note for `reviewers`' text output when this checkpoint's diff since base_tree is docs only but
+    doc_test_command is not configured, so the docs quick path is off and the normal full round still applies
+    -- visibility for why no skip happened, mirroring `changes`'s own doc_quick_path report."""
+    if cfg.get("doc_test_command") or cp.get("risk", "normal") == "high":
+        return None
+    base = cps.get("base_tree")
+    if not base:
+        return None
+    fp = fingerprint(ctx.root)
+    files = sorted(changed_files(ctx.root, {"kind": "git-tree", "id": base}, fp))
+    if not files:
+        return None
+    doc_files, code_files = _classify_doc_code(cfg, files)
+    if code_files or not doc_files:
+        return None
+    return (f"Docs quick path is off (doc_test_command is not configured): the changed file(s) "
+            f"({', '.join(doc_files)}) would otherwise skip review, so this round is the normal full review.")
+
+
+def _docs_only_skip_line(cid: str, cps: dict) -> str | None:
+    skip = cps.get("docs_only_review_skip")
+    if not skip:
+        return None
+    return (f"{cid}: review skipped because the step changed only docs ({', '.join(skip.get('files') or [])}); "
+            "not reviewed.")
+
+
+def _docs_only_skip_lines(st: dict) -> list[str]:
+    """One plain line per checkpoint whose adversarial review was skipped as docs only (CP4), naming the
+    file(s) never reviewed, for `status`, the commit message and the final review to all say the same thing."""
+    lines = []
+    for cid, c in (st.get("checkpoints") or {}).items():
+        line = _docs_only_skip_line(cid, c)
+        if line:
+            lines.append(line)
+    return lines
+
+
+# ----------------------------------------------------------- a full review clears skipped-review notes (CP5)
+# A record that a step's review was skipped or lightened (CP2's doc_edits_unreviewed, CP3's small_fix_review,
+# CP4's docs_only_review_skip) says less review happened than the step's history actually shows once a later
+# FULL round (every reviewer the step's own risk names) is recorded approved. `cmd_adv_record` calls this once,
+# on that full-round-approval branch only, next to where it sets `last_full_review_fingerprint` -- a small-fix
+# approval or a docs-only skip never clears any of these (they are not a full round), and a round that is not
+# approved is never reached here at all.
+
+def _clear_lighter_review_records(cps: dict) -> None:
+    cps.pop("docs_only_review_skip", None)
+    cps.pop("doc_edits_unreviewed", None)
+    cps.pop("small_fix_review", None)
+
+
 # --------------------------------------------------------------------------- tamper evidence
 # ratchet.py records a hash of every file it owns after each write, in RATCHET_HOME (outside the repo and off-limits
 # to agents). A write by any other route — a helper script, an editor, a "quick fix" — is detected on the next read.
@@ -534,21 +931,32 @@ def _read_record(path: Path, kind=dict, missing=_FRESH, lines: bool = False, tai
     return data, None
 
 
-def _write_record(path: Path, data, pretty: bool = False):
+def _write_record(path: Path, data, pretty: bool = False, raw: bool = False):
     """The one writer of Ratchet's records: replace the file in one rename, through a temp file of this process's
     own (pid plus a random token), flushed to disk first, so two writers never share a temp file, a reader never
     sees half a write, and a crash never leaves a half-written record. The temp file is removed on failure.
-    Raises OSError when it can't write; every caller handles that on its own terms."""
+    Raises OSError when it can't write; every caller handles that on its own terms.
+    raw=True: `data` is already the text to write, not a JSON value to encode (for a non-JSON generated
+    artifact such as ci-export's workflow file); `pretty` is ignored in that case. When `data` is `bytes`
+    (raw=True only), the temp file is opened in binary mode and those exact bytes are written, with no
+    newline translation or re-encoding, so a caller that already computed its own encoded bytes (so a
+    comparison, a write and a printed preview can never disagree) gets exactly those bytes on disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}-{secrets.token_hex(4)}.tmp")
-    text = (json.dumps(data, indent=2, ensure_ascii=False) + "\n") if pretty else json.dumps(data)
+    text = data if raw else ((json.dumps(data, indent=2, ensure_ascii=False) + "\n") if pretty else json.dumps(data))
     try:
-        # backslashreplace: a lone surrogate (from a reviewer's reply) is written as its own JSON escape, "\ud83d",
-        # which reads back as the same string; every other character encodes as UTF-8 unchanged
-        with open(tmp, "w", encoding="utf-8", errors="backslashreplace") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
+        if raw and isinstance(text, bytes):
+            with open(tmp, "wb") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+        else:
+            # backslashreplace: a lone surrogate (from a reviewer's reply) is written as its own JSON escape,
+            # "\ud83d", which reads back as the same string; every other character encodes as UTF-8 unchanged
+            with open(tmp, "w", encoding="utf-8", errors="backslashreplace") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
         os.replace(tmp, path)
     finally:
         try:
@@ -1537,7 +1945,8 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "fingerprint_include", "approver", "ui_single_reviewer_ok", "min_review_timeout_sec", "test_timeout_sec",
              "host_provider", "ui_reviewers", "design_md", "max_stop_blocks", "unavailable_ttl_hours",
              "verify_transcripts", "min_review_seconds", "commit_per_checkpoint", "blocking_severities",
-             "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round", "converge_after_round"]
+             "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round", "converge_after_round",
+             "doc_globs", "doc_exclude_globs", "test_globs", "doc_test_command", "small_edit_lines"]
 
 
 def _file_sha(p: Path) -> str | None:
@@ -1667,6 +2076,50 @@ def objective_problems(plan) -> list[str]:
     return errs
 
 
+def _proves_values(case) -> list:
+    """Normalize one test-plan case's "proves" field for every consumer (proves_problems, _unproven_done_means,
+    _done_means_proof): a missing value is [] (nothing to prove), a scalar int counts as [int] (the common
+    planner slip of writing "proves": 1 instead of [1]), a list is used as-is. Any other shape is not a number
+    or a list of numbers, so there is nothing valid to normalize here; plan-submit's proves_problems is the one
+    place that refuses it outright, naming the case, before plan-summary or receipt ever reads it."""
+    proves = case.get("proves")
+    if proves is None:
+        return []
+    if isinstance(proves, list):
+        return proves
+    if isinstance(proves, int) and not isinstance(proves, bool):
+        return [proves]
+    return []
+
+
+def proves_problems(ctx, plan) -> list[str]:
+    """CP3: a test-plan case's optional "proves" (the spec_ref precedent's sibling) names, 1-based, the lines
+    of the objective's done_means it proves. plan-submit refuses any number that is not really a done_means
+    line, naming the offending case; a plan with no objective or no done_means lines (objective_problems
+    already refuses that on its own) simply has nothing valid to name, so every number is refused. "proves" may
+    be a single integer (normalized to a one-item list, see _proves_values) or a list; any other shape (a
+    string, a dict, a list containing one) is refused here by name, so plan-summary and receipt never have to
+    guess at it."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    dm = obj.get("done_means") if isinstance(obj, dict) else None
+    n = len(dm) if isinstance(dm, list) else 0
+    errs = []
+    for cp in plan.get("checkpoints") or []:
+        for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
+            proves = case.get("proves")
+            if proves is None:
+                continue
+            if not isinstance(proves, list) and not (isinstance(proves, int) and not isinstance(proves, bool)):
+                errs.append(f"{case.get('id', '?')}: proves {proves!r} must be a done_means line number or a "
+                            f"list of them (objective.done_means has {n} line(s))")
+                continue
+            for p in _proves_values(case):
+                if not isinstance(p, int) or isinstance(p, bool) or p < 1 or p > n:
+                    errs.append(f"{case.get('id', '?')}: proves {p!r} is not a done_means line "
+                                f"(objective.done_means has {n} line(s))")
+    return errs
+
+
 NO_OBJECTIVE_NOTE = "no objective was stated for this run (an older plan, approved before this feature existed)"
 
 
@@ -1744,6 +2197,283 @@ def _normalize_role(raw: str) -> str | None:
     return tok if tok in ROLE_BRIEFS else None
 
 
+# ------------------------------------------------------------------------------------------------- earlier-work digest
+# So a new feature builds on what earlier work in this project already learned, instead of rediscovering or
+# contradicting it, the planner's own brief ends with a short "What earlier work says" section built entirely
+# from records already on disk; the orchestrator never has to collect this by hand. Entirely read-only: every
+# OTHER run's state.json is read with _read_record directly, never ctx.state() (which verifies the chain and
+# binds an owner -- right for the run this process is actually working on, wrong for history it only reads), and
+# a damaged or missing record is skipped, never fatal. CP2 adds a recorded-specs section to the same list this
+# helper returns, so cmd_brief only ever has one block to print.
+
+DIGEST_HEADING = "What earlier work says"
+DIGEST_ITEM_CAP = 5  # a few items per section; the rest are named by count and pointed at their file, not printed
+DIGEST_ITEM_MAX_CHARS = 200  # a fixed length per printed item, so one long or multi-line item can't break the list
+DIGEST_SPEC_HEAD = "Related specs:"
+DIGEST_SPEC_PATH_NOTE = "openspec/specs/, specs/ (Spec Kit) and docs/stories/ (BMAD)"
+
+_BULLET_HEAD_RE = re.compile(r"^-\s*\([^)]*\)\s*(.*)$")  # strips a learnings.md bullet's "(date, source)" head, leaving the text
+_BULLET_DATE_RE = re.compile(r"^-\s*\((\d{4}-\d{2}-\d{2})\b")  # the date at the start of that same head, for ranking
+_ACCEPTED_FINDING_MARKER_RE = re.compile(r"^Accepted finding (\S+) \(", re.I)  # the marker _append_learning writes
+
+
+def _digest_words(text: str) -> set:
+    return specsrc._words(text or "")
+
+
+def _digest_clean_item(text: str) -> str:
+    """One printed digest item, made safe for the short, plain list `_digest_cap_lines` prints: whitespace (including
+    embedded newlines) collapsed to single spaces, non-ASCII replaced, and truncated to DIGEST_ITEM_MAX_CHARS with a
+    trailing "..." when cut, so a multi-line or very long description can never break the list or defeat "stays
+    short"."""
+    one_line = " ".join(str(text or "").split())
+    ascii_text = one_line.encode("ascii", "replace").decode("ascii")
+    if len(ascii_text) > DIGEST_ITEM_MAX_CHARS:
+        ascii_text = ascii_text[:DIGEST_ITEM_MAX_CHARS - 3].rstrip() + "..."
+    return ascii_text
+
+
+def _digest_cp_order(cp) -> int:
+    """A checkpoint id ('CP1', 'CP12', ...) as a plain int for ordering, so 'later checkpoint first' is a number
+    comparison rather than a string one (where 'CP2' would wrongly sort after 'CP10')."""
+    m = re.search(r"(\d+)\s*$", str(cp or ""))
+    return int(m.group(1)) if m else 0
+
+
+def _digest_epoch(text) -> float | None:
+    """`text` parsed as an ISO-8601 timestamp (what `now()` writes, e.g. an `accepted_at`) into epoch seconds, or
+    None when it isn't one."""
+    if not text:
+        return None
+    try:
+        return _dt.datetime.fromisoformat(str(text)).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _digest_recency(epoch: float, cp: str = "", round_no=0) -> tuple:
+    """One comparable recency key, in the same unit (epoch seconds) for every item in a digest section, whatever
+    its source: a learnings.md bullet's own date, a finding's own recorded time, or (falling back) the run file's
+    mtime as a date. `cp`/`round_no` are a secondary, same-run tie-break only: many findings in one run share that
+    run's single mtime, so without this every one of them ties and a stable sort keeps the oldest five instead of
+    the newest; a later checkpoint and later round sort as newer when the timestamp itself ties."""
+    return (epoch, _digest_cp_order(cp), int(round_no or 0))
+
+
+def _digest_rank(words: set, relevant_to: set, recency) -> tuple:
+    """Sort key for one digest item: an item sharing a word with the active run's feature request comes before
+    everything else; within each of those two groups, the newest comes first (the run's own assumption: relevance
+    first, newest as the tie-break and the only order left once there is no feature to match against). `recency` is
+    a single comparable number or a `_digest_recency` tuple; either way every component sorts newest-first."""
+    relevant = bool(relevant_to) and bool(words & relevant_to)
+    if not isinstance(recency, tuple):
+        recency = (recency,)
+    return (0 if relevant else 1, tuple(-r for r in recency))
+
+
+def _learnings_bullets(ctx) -> list[str]:
+    """Every '- (...)' bullet line in learnings.md, oldest first (the file's own append order; age itself is read
+    from each bullet's own "(YYYY-MM-DD, ...)" head, see _digest_bullet_epoch, not from this order)."""
+    return [l.strip() for l in _learnings_text(ctx).splitlines() if l.strip().startswith("-")]
+
+
+def _digest_bullet_epoch(raw: str, fallback_index: int) -> float:
+    """A learnings.md bullet's own recency, in the same epoch-seconds unit every other digest item uses: the date
+    in its "(YYYY-MM-DD, ...)" head, read as UTC midnight. A bullet with no such date (malformed, or hand-edited)
+    falls back to its position in the file so it still sorts somewhere instead of crashing the brief."""
+    m = _BULLET_DATE_RE.match(raw)
+    if m:
+        try:
+            return _dt.datetime.strptime(m.group(1), "%Y-%m-%d").replace(tzinfo=_dt.timezone.utc).timestamp()
+        except ValueError:
+            pass
+    return float(fallback_index)
+
+
+def _digest_cap_lines(items: list[tuple], header: str, path_note: str) -> list[str]:
+    """`items` is a list of (sort_key, one-line text) already gathered for one section; prints the best
+    DIGEST_ITEM_CAP of them under `header`, then one line always naming the file this section's items come from
+    (plus how many more there are, when some were cut), so the planner knows where to read the rest even when
+    nothing was cut. Nothing is printed for an empty section (no header with nothing under it). Each item's text is
+    passed through _digest_clean_item first, so a multi-line or very long description can't break the list."""
+    if not items:
+        return []
+    items = sorted(items, key=lambda it: it[0])
+    shown, rest = items[:DIGEST_ITEM_CAP], items[DIGEST_ITEM_CAP:]
+    out = [header] + [f"  - {_digest_clean_item(line)}" for _, line in shown]
+    if rest:
+        out.append(f"  ... and {len(rest)} more - see {path_note}")
+    else:
+        out.append(f"  ... see {path_note}")
+    return out
+
+
+def _earlier_runs(ctx, active_slug):
+    """(slug, state, path) for every OTHER run folder under .ratchet/runs/: read with _read_record so a damaged
+    state.json, or a run folder with none at all, is skipped instead of failing the brief. Never the active run,
+    and never through ctx.state()."""
+    out = []
+    try:
+        slugs = sorted(p.name for p in (ctx.ratchet / "runs").iterdir() if p.is_dir())
+    except OSError:
+        return out
+    for slug in slugs:
+        if slug == active_slug:
+            continue
+        p = ctx.ratchet / "runs" / slug / "state.json"
+        st, why = _read_record(p, missing=_ABSENT)
+        if why is not None or st is _ABSENT or not isinstance(st, dict):
+            continue
+        out.append((slug, st, p))
+    return out
+
+
+def _spec_digest_entry(title: str, purpose: str, path: str) -> str:
+    """One printed 'Related specs:' line: "<title>: <purpose> (<path>)". The path is reserved its own room and
+    appended last, after the title/purpose head is truncated to fit -- so a long title can never push the path
+    past _digest_clean_item's length cap and drop the one thing the planner needs to open the full spec."""
+    title = str(title or "").strip()
+    purpose = str(purpose or "").strip()
+    path = str(path or "").strip()
+    tail = f" ({path})"
+    budget = max(DIGEST_ITEM_MAX_CHARS - len(tail), 0)
+    head = title + (f": {purpose}" if purpose else "")
+    if len(head) > budget:
+        head = head[:budget - 3].rstrip() + "..." if budget > 3 else head[:budget]
+    return f"{head}{tail}"
+
+
+def _related_spec_items(ctx, relevant_to: set) -> list[tuple]:
+    """(sort_key, line) for every recorded spec worth telling the planner about, ranked with the same
+    relevance-then-recency rule as every other digest section so no one spec tool is favoured over another:
+    OpenSpec's living records under openspec/specs/ (including Ratchet's own running records written by
+    living_spec_text), a finished Spec Kit feature (every task in tasks.md ticked) and a done BMAD story (its
+    status is exactly "done", ignoring case and surrounding whitespace). An open or unfinished one is left
+    out -- `spec detect` already covers those. Each
+    source is read the tolerant way (a bad or missing file is skipped, never fatal), since a brief must never
+    fail to print over a spec file someone is still editing."""
+    items = []
+    try:
+        openspec = specsrc.openspec_specs(ctx.root)
+    except (OSError, ValueError):
+        openspec = []
+    for s in openspec:
+        words = _digest_words(f"{s['title']} {s['purpose']}")
+        line = _spec_digest_entry(s["title"], s["purpose"], s["path"])
+        items.append((_digest_rank(words, relevant_to, _digest_recency(s["mtime"])), line))
+    try:
+        features = specsrc.speckit_features(ctx.root)
+    except (OSError, ValueError):
+        features = []
+    for f in features:
+        tasks = f.get("tasks") or []
+        if not tasks or not all(t.get("done") for t in tasks):
+            continue
+        path = f"{f['path']}/spec.md"
+        try:
+            mtime = (ctx.root / path).stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        purpose = f.get("why") or ""
+        words = _digest_words(f"{f['title']} {purpose}")
+        line = _spec_digest_entry(f["title"], purpose, path)
+        items.append((_digest_rank(words, relevant_to, _digest_recency(mtime)), line))
+    try:
+        stories = specsrc.bmad_stories(ctx.root)
+    except (OSError, ValueError):
+        stories = []
+    for s in stories:
+        if str(s.get("status") or "").strip().lower() != "done":
+            continue
+        try:
+            mtime = (ctx.root / s["path"]).stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        purpose = s.get("why") or ""
+        words = _digest_words(f"{s['title']} {purpose}")
+        line = _spec_digest_entry(s["title"], purpose, s["path"])
+        items.append((_digest_rank(words, relevant_to, _digest_recency(mtime)), line))
+    return items
+
+
+def _earlier_work_lines(ctx) -> list[str]:
+    """Everything the planner's brief shows about earlier work: the project's recent learnings, the findings
+    earlier (non-active) runs saved for later that nobody accepted yet, and the limits the user already
+    accepted (an accepted finding, or a learnings.md "Accepted limit (...)" bullet) -- most relevant to the new
+    feature first, newest after that, each section capped. A project with no earlier work of any kind gets one
+    plain line instead of empty sub-headings. Takes no lock and writes nothing."""
+    active_slug = ctx.active_slug()
+    active_feature = ""
+    if active_slug:
+        # Read with _read_record, the same tolerant path _earlier_runs uses for every OTHER run -- never
+        # ctx.state(), which verifies the chain and can die() on a mismatch; a brief must never fail to print
+        # over the active run's own record, so any problem here just leaves relevance empty.
+        st, why = _read_record(ctx.ratchet / "runs" / active_slug / "state.json", missing=_ABSENT)
+        if why is None and st is not _ABSENT and isinstance(st, dict):
+            active_feature = st.get("feature") or ""
+    relevant_to = _digest_words(active_feature)
+
+    learn_items, open_items, accepted_items = [], [], []
+    accepted_keys = set()  # "{slug}/{cp}/round-{round}/{reviewer-or-bare-id}" already shown from a state.json,
+                            # so the matching learnings.md marker line for the same finding is never shown twice
+
+    for slug, st, path in _earlier_runs(ctx, active_slug):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0
+        for cp, c in (st.get("checkpoints") or {}).items():
+            if not isinstance(c, dict):
+                continue
+            for f in c.get("deferred") or []:
+                if not isinstance(f, dict):
+                    continue
+                desc = str(f.get("description", "")).strip()
+                if not desc:
+                    continue
+                round_no = f.get("round")
+                if f.get("accepted"):
+                    who = f.get("accepted_by") or "a human"
+                    reason = str(f.get("reason", "")).strip()
+                    line = f"{cp} {_finding_key(f)} ({f.get('severity', '?')}), accepted by {who}: {desc}"
+                    if reason:
+                        line += f" - reason: {reason}"
+                    epoch = _digest_epoch(f.get("accepted_at")) or mtime
+                    recency = _digest_recency(epoch, cp, round_no)
+                    accepted_items.append((_digest_rank(_digest_words(desc), relevant_to, recency), line))
+                    accepted_keys.add(f"{slug}/{cp}/round-{round_no}/{_finding_key(f)}")
+                else:
+                    line = f"{cp} {_finding_key(f)} ({f.get('severity', '?')}): {desc}"
+                    epoch = _digest_epoch(f.get("at")) or mtime
+                    recency = _digest_recency(epoch, cp, round_no)
+                    open_items.append((_digest_rank(_digest_words(desc), relevant_to, recency), line))
+
+    for i, raw in enumerate(_learnings_bullets(ctx)):
+        m = _BULLET_HEAD_RE.match(raw)
+        rest = m.group(1) if m else raw
+        display = raw[1:].strip() if raw.startswith("-") else raw
+        recency = _digest_recency(_digest_bullet_epoch(raw, i))
+        fm = _ACCEPTED_FINDING_MARKER_RE.match(rest)
+        if fm:
+            if fm.group(1) in accepted_keys:
+                continue  # the matching finding already shown from its own run's state.json
+            accepted_items.append((_digest_rank(_digest_words(display), relevant_to, recency), display))
+        elif re.match(r"^Accepted limit\b", rest, re.I):
+            accepted_items.append((_digest_rank(_digest_words(display), relevant_to, recency), display))
+        else:
+            learn_items.append((_digest_rank(_digest_words(display), relevant_to, recency), display))
+
+    lines = _digest_cap_lines(learn_items, "Learnings:", ".ratchet/learnings.md")
+    lines += _digest_cap_lines(open_items, "Open findings (not fixed):",
+                               "each run's state.json under .ratchet/runs/")
+    lines += _digest_cap_lines(accepted_items, "Accepted limits:",
+                               "each run's state.json under .ratchet/runs/, and .ratchet/learnings.md")
+    lines += _digest_cap_lines(_related_spec_items(ctx, relevant_to), DIGEST_SPEC_HEAD, DIGEST_SPEC_PATH_NOTE)
+    if not lines:
+        return [DIGEST_HEADING, "There is no earlier work recorded for this project yet."]
+    return [DIGEST_HEADING] + lines
+
+
 def cmd_brief(args):
     """`brief [CPn] --role <role>`: the one place every Ratchet sub-agent's opening text comes from, so the
     orchestrator spawns a sub-agent with `ratchet.py brief CPn --role <role>` instead of retyping or half-remembering
@@ -1754,7 +2484,9 @@ def cmd_brief(args):
     checkpoint exists, before checkpoints.json even exists (that die is only reached when a CPn is given, since a
     CPn can't be looked up with no plan at all). A plan with no stated objective (approved before that rule existed)
     gets the plain NO_OBJECTIVE_NOTE instead of a crash. An unknown CPn is refused by `cp_by_id`, the same shared
-    lookup every other command uses."""
+    lookup every other command uses. The planner's brief, and only the planner's, ends with one more block: the
+    "What earlier work says" section from `_earlier_work_lines` (see there), so the plan builds on what earlier
+    work in this project already learned instead of rediscovering or contradicting it."""
     role = _normalize_role(args.role)
     if role is None:
         die(f"'{args.role}' is not a valid role for brief. Valid roles: {', '.join(ROLE_ORDER)} (or an agent name "
@@ -1773,6 +2505,9 @@ def cmd_brief(args):
     print(objective_brief(plan))
     print("")
     print(ROLE_BRIEFS[role])
+    if role == "planner":
+        print("")
+        print("\n".join(_earlier_work_lines(ctx)))
 
 
 def _final_review_lines(plan) -> list[str]:
@@ -2279,8 +3014,7 @@ def cmd_status_text(ctx: Ctx):
     if st.get("phase") == "awaiting_final_review":
         for line in _final_review_lines(plan):
             print(line)
-        left = [f for c in (st.get("checkpoints") or {}).values() for f in c.get("deferred") or []
-                if not f.get("accepted")]
+        left = [f for c in (st.get("checkpoints") or {}).values() for f in left_for_later(c)]
         if left:
             print(f"{len(left)} finding(s) were left for later (never accepted or fixed): run `ratchet.py "
                   "deferred` to see them.")
@@ -2319,6 +3053,12 @@ def cmd_status_text(ctx: Ctx):
     if note:
         print(note)
     for line in _accepted_findings_lines(st):
+        print(line)
+    for line in _doc_edit_status_lines(st):
+        print(line)
+    for line in _small_fix_review_lines(st):
+        print(line)
+    for line in _docs_only_skip_lines(st):
         print(line)
     w = live_wait(st)
     if w:
@@ -2405,6 +3145,24 @@ def _review_preview(ctx, cfg, cp) -> tuple[list[str], bool]:
     return names, host_only
 
 
+def _unproven_done_means(ctx, plan) -> list[tuple]:
+    """[(1-based line number, its own text), ...] for every objective.done_means line that no test-plan
+    case's "proves" names, across every checkpoint. Empty when the plan has no objective or no done_means at
+    all (nothing to flag). A heads-up only, never a refusal: plan-submit's proves_problems is the gate that
+    actually blocks a bad number."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    dm = obj.get("done_means") if isinstance(obj, dict) else None
+    if not isinstance(dm, list) or not dm:
+        return []
+    proved = set()
+    for cp in plan.get("checkpoints") or []:
+        for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
+            for p in _proves_values(case):
+                if isinstance(p, int) and not isinstance(p, bool):
+                    proved.add(p)
+    return [(i, t) for i, t in enumerate(dm, 1) if i not in proved]
+
+
 def cmd_plan_summary(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -2423,6 +3181,8 @@ def cmd_plan_summary(args):
         print("Out of scope:")
         for line in obj.get("out_of_scope") or []:
             print(f"  - {line}")
+        for i, text in _unproven_done_means(ctx, plan):
+            print(f"  Heads up: done_means line {i} (\"{text}\") has no test case proving it yet.")
     for line in spec_summary_lines(ctx, plan):
         print(line)
     all_host = True
@@ -2448,6 +3208,15 @@ def cmd_plan_summary(args):
           f"and kind of review count once, not twice; a round nobody reviewed yet costs nothing to replace; and "
           f"from round {converge_after + 1} on, a minor finding alone no longer blocks (it is still recorded, see "
           f"`ratchet.py deferred`).")
+    print(f"\nQuick paths: a step whose actual changes are docs only skips its review round entirely "
+          f"(the test files naming those docs run instead); once a step's review has approved, a doc edit "
+          f"made after that approval re-runs the test files naming that doc instead of opening a new review "
+          f"round; a small code fix (at or under {cfg.get('small_edit_lines', 20)} changed lines) in a step "
+          f"that is not high risk gets a one-reviewer check instead of the full round. A high-risk step, or "
+          f"any change that also touches code, always gets the normal full review and tests.")
+    if not cfg.get("doc_test_command"):
+        print("Note: doc_test_command is not configured, so the docs quick path is off right now: every step, "
+              "docs-only ones included, gets the normal full review and tests.")
     rows = dict(models_table(cfg))
     groups = {}
     for role, m in rows.items():
@@ -2620,6 +3389,82 @@ def _write_providers(ctx, plist):
     write_json(ctx.config_path, user)
 
 
+def _paid_provider_reply(model) -> str:
+    """The one exact reply that pays for a per-use (or unknown-cost) model, named in `ask paid-provider`'s
+    question. Never a generic listed yes (APPROVAL_REPLIES): this spends the developer's money, so the reply
+    must name the model it pays for, the same rule the learnings set for hooks-waive and accept-finding."""
+    return f"pay per use: {model}"
+
+
+def _needs_paid_ok(pv) -> str | None:
+    """'per-use' / 'unknown' when this `--add`'ed provider's model is billed per use (or its cost is
+    unknown, treated the same way) and so needs the developer's OK before it is probed; None when the
+    preset has no model lister (the cost check doesn't apply to it, e.g. a hand-written --command) or the
+    model is flat-rate."""
+    preset = pv.get("preset")
+    model = pv.get("model")
+    if not preset or preset not in MODEL_LISTERS or not model:
+        return None
+    cost = _listed_model_cost(model)
+    return cost if cost != "flat" else None
+
+
+def _paid_ok_refusal(tool, model) -> str:
+    return (f"{model} (via {tool}) costs money per use (or its cost is unknown, which Ratchet treats the same "
+            "way), including this one test request, so it was not added and nothing was sent to it. Ask the "
+            f"developer first: run `ratchet.py ask paid-provider {tool} {model}`, show them the question it "
+            "prints word for word, and wait for their exact reply before adding it.")
+
+
+def _consume_paid_ok(ctx, st, pv) -> str:
+    """The developer's one exact reply to `ask paid-provider <tool> <model>` for this exact tool and model,
+    consumed once (`providers --add` is state-locked whenever it may need this, so nothing else can spend it
+    at the same time). Dies, with nothing added and no request sent, when no such reply is on record, when
+    this lane is director-enrolled (a chat reply never counts as the developer's own OK to spend money, the
+    same rule as every other approval here), or when another question overtook this one before it was
+    answered."""
+    tool, model = pv.get("preset"), pv.get("model")
+    if approval_mode(ctx) == "director":
+        die(f"{model} (via {tool}) costs money per use (or its cost is unknown, treated the same way), and "
+            "this lane is director-enrolled: a chat reply here never counts as the developer's own OK to "
+            "spend money (unlike every other approval, paid-provider takes no director token). Nothing was "
+            "added and nothing was sent to it. The developer must give this OK themselves, in a lane that "
+            "isn't director-enrolled.")
+    p = st.get("pending") or {}
+    refusal = _paid_ok_refusal(tool, model)
+    if p.get("action") != "paid-provider" or p.get("tool") != tool or p.get("model") != model:
+        die(refusal)
+    if p.get("overtook"):
+        _clear_pending(st)
+        ctx.log(st, "paid_provider_unclear", tool=tool, model=model)
+        ctx.save_state(st)
+        die(f"This question was printed while another one (shall I "
+            f"{_question_what(p['overtook'], p.get('overtook_mode'))}?) was still waiting for the user's first "
+            "reply, so their reply could be meant for either. Nothing was added. Run `ratchet.py ask "
+            f"paid-provider {tool} {model}` again on its own.")
+    msgs = _replies(ctx, st, p.get("asked_at"), p)
+    if not msgs:
+        die(refusal)
+    entry = msgs[0]  # only the first reply after the question answers it
+    reply = entry.get("prompt", "")
+    exact = _paid_provider_reply(model)
+    if reply.strip().casefold() != exact.strip().casefold():
+        _spend_question(ctx, st, reply)
+        die(f"The user's first reply after the paid-provider question was not the exact reply \"{exact}\" (it "
+            f"was \"{reply[:120]}\"). Nothing was added. If they still want this, run `ratchet.py ask "
+            f"paid-provider {tool} {model}` again and show them the question word for word.")
+    if ctx.config().get("verify_transcripts", True):
+        good, why = _transcript_ok(entry, p.get("asked_at"))
+        if not good:
+            _spend_question(ctx, st, reply)
+            die(f"Couldn't confirm that reply came from the user ({why}). Nothing was added. Run `ratchet.py "
+                f"ask paid-provider {tool} {model}` again and ask them to reply again in this chat.")
+    _clear_pending(st)
+    ctx.log(st, "paid_provider_ok", tool=tool, model=model)
+    ctx.save_state(st)
+    return entry.get("at") or now()
+
+
 def cmd_providers(args):
     ctx = Ctx(find_root())
     ctx.ratchet.mkdir(exist_ok=True)
@@ -2655,6 +3500,12 @@ def cmd_providers(args):
         if not provider_company(pv):
             die(f"Can't tell which company's model '{args.add}' runs. Give --model (a model name from that tool) "
                 "or --company.")
+        paid_cost = _needs_paid_ok(pv)
+        if paid_cost:
+            # Never probed, checked or not, without the developer's own exact yes to THIS tool and model first
+            # (the paid-provider question); this runs before any request is sent, flat-rate adds are unaffected.
+            pv["paid_ok_at"] = _consume_paid_ok(ctx, ctx.state(), pv)
+            pv["cost"] = "per-use"
         if args.no_check:
             # an earlier result was about whatever had this id before
             p = _status_path(ctx)
@@ -2712,6 +3563,7 @@ def cmd_providers(args):
         rows.append({"id": pv["id"], "company": company, "model": pv.get("model"), "installed": installed,
                      "ok": bool(st_.get("ok")) and company not in (None, host), "state": state})
     found = []
+    paid_options = []
     if args.discover:
         known = {provider_binary(pv) for pv in plist}
         for name, pr in PRESETS.items():
@@ -2728,10 +3580,51 @@ def cmd_providers(args):
                 else:
                     rows.append({"id": name, "company": pr["company"], "model": None, "installed": True, "ok": False,
                                  "state": f"installed but failing: {detail}"})
-            elif not pr["company"]:
+            elif not pr["company"] and name not in MODEL_LISTERS:
                 found.append(name)
+            elif not pr["company"]:
+                lines, fmt, raw = _list_tool_models(name)
+                if fmt == "json" and raw:
+                    try:
+                        catalog = json.loads(raw)
+                    except (ValueError, TypeError):
+                        catalog = None
+                    lines = _model_catalog_lines(catalog) if isinstance(catalog, dict) else []
+                if not lines:
+                    found.append(name)
+                    continue
+                have = {r["company"] for r in rows if r.get("ok")}
+                picked = _pick_capable_listed_model(lines, host, have)
+                if picked:
+                    pv = {"id": f"{name}-{_model_family(_listed_model_name(picked))}", "preset": name,
+                          "model": picked, "cost": "flat"}
+                    good, detail, _saved = probe_provider(ctx, cfg, pv)
+                    if good:
+                        plist.append(pv)
+                        _write_providers(ctx, plist)
+                        rows.append({"id": pv["id"], "company": company_of_model(picked), "model": picked,
+                                     "installed": True, "ok": True, "cost": "flat",
+                                     "state": "working: added (flat-rate)"})
+                    else:
+                        rows.append({"id": pv["id"], "company": company_of_model(picked), "model": picked,
+                                     "installed": True, "ok": False, "cost": "flat",
+                                     "state": f"a flat-rate {name} model failed its test request: {detail}"})
+                else:
+                    # Every listed line was same-company, unmappable or a small/preview variant: nothing to
+                    # probe, but the tool is still installed and signed in, so keep it reachable by hand.
+                    found.append(name)
+                for (provider, company), group_lines in _paid_candidate_groups(lines, host).items():
+                    rep = _paid_pick(group_lines)
+                    if not rep:
+                        continue
+                    cost = _listed_model_cost(rep)
+                    label = "costs money per use" if cost == "per-use" else "cost unknown, treated as paid"
+                    paid_options.append({"tool": name, "provider": provider,
+                                         "model": _listed_model_name(rep), "add_model": rep, "cost": cost,
+                                         "text": f"{label}; ask the developer before this is used."})
     if args.json:
-        print(json.dumps({"host": host, "providers": rows, "needs_model": found}, indent=2))
+        print(json.dumps({"host": host, "providers": rows, "needs_model": found, "paid_options": paid_options},
+                         indent=2))
         return
     print(f"This agent runs on: {host}.")
     for r in rows:
@@ -2740,6 +3633,8 @@ def cmd_providers(args):
         print(f"  + {name:<10} {'?':<10} installed; it can run several companies' models. Pick a capable model from "
               f"a company other than {host} (the tool's own help lists them), then: "
               f"ratchet.py providers --add {name} --preset {name} --model <model>")
+    for p in paid_options:
+        print(f"  $ {p['tool']}/{p['provider']} {p['model']}: {p['text']}")
     if not any(r["ok"] for r in rows):
         print(f"No working provider from another company: reviews will come from {host}'s own models.")
 
@@ -3077,6 +3972,10 @@ PRESETS = {
                "command": ["cursor-agent", "-p", "{prompt}", "--output-format", "text", "--trust", "--mode", "ask"]},
     "opencode": {"bin": "opencode", "company": None, "stdin": False, "model_flag": ["-m"], "model_at": 2,
                  "command": ["opencode", "run", "{prompt}"]},
+    "omp": {"bin": "omp", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
+            "command": ["omp", "-p", "--no-session", "{prompt}"]},
+    "pi": {"bin": "pi", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
+           "command": ["pi", "-p", "--no-session", "{prompt}"]},
 }
 SHIPPED_DEFAULT_HISTORY = {"review_depth": [OLD_DEFAULT_REVIEW_DEPTH], "reviewers": [OLD_DEFAULT_REVIEWERS]}
 PRESET_BINARIES = {k: v["bin"] for k, v in PRESETS.items()}
@@ -3113,6 +4012,217 @@ def company_of_model(model) -> str | None:
         if re.search(rx, m):
             return company
     return None
+
+
+# A multi-company preset (today: opencode, omp) can list what it can reach without spending anything, so discovery
+# can pick a capable other-company model itself instead of leaving it to "needs_model". MODEL_LISTERS: preset
+# name -> the read-only command that prints "provider/model" lines, one per line. PROVIDER_COST: the service
+# namespace before a listed model's first "/" -> "flat" (a subscription already paid for) or "per-use" (billed
+# per request); a namespace missing from this table is unknown and is treated as paid, never probed without the
+# developer's OK. Both are small fixed tables, not a live price lookup (out of scope for this checkpoint).
+MODEL_LISTERS = {
+    "opencode": (["opencode", "models"], 20),
+    "omp": (["omp", "models", "--json"], 20, "json"),
+}
+PROVIDER_COST = {
+    "opencode-go": "flat",     # OpenCode Go: flat-rate subscription
+    "opencode": "per-use",     # OpenCode Zen: billed per request
+    "openrouter": "per-use",   # OpenRouter: billed per request
+    "openai-codex": "flat",    # Codex via omp: the developer's own signed-in subscription, already paid for
+}
+# When more than one other-company flat model is available, these families win: GLM and Kimi have been this
+# project's working reviewers so far. A short ordered tuple of name substrings, not a live quality ranking;
+# any company whose models don't match one just ties at "no preference" and falls back to the existing
+# "no working reviewer yet, then listing order" rule.
+FAMILY_PREFERENCE = ("glm", "kimi")
+# Words that mark a listed model as never-pick, whatever picker is asking: a speed/preview/open-weight
+# sibling of a company's flagship (flash, mini, nano, lite, small, haiku, free, preview, oss, gemma) or a
+# model that cannot write a text review at all (guard: safety classifier; image/vision: image generation;
+# embed/tts/audio: not a chat model). A table, not one hand-built regex, so it stays easy to extend. Matched
+# as a name token with _B/_E (so "5-small-2603" matches but "smaller-than-life" as a whole word wouldn't
+# apply here since these are name tokens, not prose) and prefixes included: "[a-z]*" after the word lets a
+# suffix like "flashx" or "liteweight" still match on its "flash"/"lite" prefix.
+REJECT_WORDS = ("flash", "mini", "nano", "lite", "small", "haiku", "free", "preview", "oss", "gemma",
+                "guard", "image", "vision", "embed", "tts", "audio")
+_REJECT_VARIANT_RX = re.compile(_B + r"(?:" + "|".join(REJECT_WORDS) + r")[a-z]*" + _E)
+
+
+def _is_rejected_variant(line: str) -> bool:
+    return bool(_REJECT_VARIANT_RX.search(line.lower()))
+
+
+def _is_model_line(line: str) -> bool:
+    """True for a line shaped like 'provider/model' (non-empty text on both sides of the first '/'), the
+    shape every real model-listing command prints, one per line. A banner, warning or table line on stdout
+    has no such shape and is never a model candidate, flat or paid."""
+    provider, sep, rest = line.partition("/")
+    return bool(sep) and bool(provider.strip()) and bool(rest.strip())
+
+
+def _model_catalog_lines(data) -> list[str]:
+    """Pull 'provider/model' lines out of an already-parsed {"models": [{"provider": ..., "id": ...,
+    "selector": "<provider>/<id>"}, ...]} catalog (omp's `models --json` shape). Falls back to building
+    "<provider>/<id>" when a model has no selector of its own. A shape without a usable models list, or no
+    line shaped like 'provider/model', is just an empty list, the same contract as the plain-lines listing.
+    Takes already-parsed data, never text: the one place that may parse that text into JSON is
+    cmd_providers, the only caller of _list_tool_models (see _CP5R11_JSON_PARSE in test_trust_cp5_d.py)."""
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return []
+    lines = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        sel = m.get("selector")
+        if not sel:
+            provider, mid = m.get("provider"), m.get("id")
+            sel = f"{provider}/{mid}" if provider and mid else None
+        if sel and _is_model_line(str(sel)):
+            lines.append(str(sel))
+    return lines
+
+
+def _list_tool_models(preset_name) -> tuple[list[str], str, str]:
+    """Run a multi-company preset's read-only model-listing command. Returns (lines, fmt, raw).
+    When the MODEL_LISTERS entry names the "lines" format, `lines` already holds its 'provider/model' lines
+    (dropping any line that isn't shaped like one) and `raw` is "". When it names the "json" format (omp's
+    catalog), `lines` is [] and `raw` carries the raw stdout text for the caller (cmd_providers) to parse
+    with _model_catalog_lines, because cmd_providers is the sanctioned place to parse JSON that is not one
+    of Ratchet's own records. A listing failure (not installed, times out, non-zero exit, no output) is
+    just ([], fmt, ""): the caller falls back to today's needs_model line, never a crash and never a
+    garbage candidate."""
+    spec = MODEL_LISTERS.get(preset_name)
+    if not spec:
+        return [], "lines", ""
+    cmd, timeout = spec[0], spec[1]
+    fmt = spec[2] if len(spec) > 2 else "lines"
+    if not shutil.which(cmd[0]):
+        return [], fmt, ""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return [], fmt, ""
+    if r.returncode != 0:
+        return [], fmt, ""
+    if fmt == "json":
+        return [], fmt, r.stdout or ""
+    lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    return [ln for ln in lines if _is_model_line(ln)], fmt, ""
+
+
+def _listed_model_cost(line: str) -> str:
+    """flat / per-use / unknown for one listed 'provider/model' line, by its service namespace (PROVIDER_COST).
+    Missing from the table means unknown, treated as paid."""
+    return PROVIDER_COST.get(line.split("/", 1)[0], "unknown")
+
+
+def _listed_model_name(line: str) -> str:
+    """The model name shown to the developer for a listed line, its service namespace stripped: 'opencode/
+    gpt-5.1-codex' -> 'gpt-5.1-codex', 'openrouter/z-ai/glm-5' -> 'z-ai/glm-5' (only the first '/' is removed)."""
+    return line.split("/", 1)[1] if "/" in line else line
+
+
+def _model_family(model_name: str) -> str:
+    """The short family name used to build a new provider id ('glm-5.3' -> 'glm'): the first non-numeric token
+    of the model name, so 'opencode-glm' reads naturally next to 'opencode-glm-flash' etc."""
+    for part in re.split(r"[^a-z0-9]+", model_name.lower()):
+        if part and not part[0].isdigit():
+            return part
+    return "model"
+
+
+def _family_rank(line: str) -> int:
+    """Where a listed line's model name falls in FAMILY_PREFERENCE (0 = most preferred); a name matching
+    none of the preferred families ranks after all of them, at len(FAMILY_PREFERENCE)."""
+    name = line.lower()
+    for i, fam in enumerate(FAMILY_PREFERENCE):
+        if fam in name:
+            return i
+    return len(FAMILY_PREFERENCE)
+
+
+def _model_version_key(model_name: str) -> tuple:
+    """The "newest version" ranking key, shared by every picker that compares a company's models
+    (_best_capable_line, used by both the flat auto-pick and each paid entry): every number in the model
+    name (after the namespace), as a flat tuple of per-component integers, so '5.10' sorts above '5.9'
+    (comparing them as floats would do the opposite). A number stuck to a unit letter ('120b', '31b', a
+    parameter count) is dropped, and so is a date-shaped number (a lone 4-digit group such as '2507' or
+    '2603', or a 6-8 digit date) -- neither is a version, and left in, a date reliably outranks a real,
+    smaller version number."""
+    stripped = re.sub(r"\d+(?:\.\d+)?[bmkt](?=$|[^a-z0-9])", "", model_name, flags=re.I)
+    stripped = re.sub(r"(?<!\d)\d{4}(?!\d)|(?<!\d)\d{6,8}(?!\d)", "", stripped)
+    return tuple(int(p) for n in re.findall(r"\d+(?:\.\d+)?", stripped) for p in n.split("."))
+
+
+def _best_capable_line(lines) -> str | None:
+    """The one line among a single company's listed lines that discovery may offer as a reviewer, flat or
+    paid: this is the ONE shared ranking used by both the flat auto-pick and each paid entry, so a company
+    is never offered a weaker model one way than the other. A line matching the reject-words table
+    (_is_rejected_variant) is never a candidate, full stop -- there is no fallback to a rejected line, so a
+    company whose only listed models are all rejected variants is simply not offered, flat or paid. Among
+    the survivors, the highest real version wins (_model_version_key); there is no further tie-break (in
+    particular, no name-length tie-break: a longer, suffixed name must never win just by being longer).
+    None if every line was rejected."""
+    survivors = [ln for ln in lines if not _is_rejected_variant(ln)]
+    if not survivors:
+        return None
+    return max(survivors, key=lambda line: _model_version_key(_listed_model_name(line)))
+
+
+def _pick_capable_listed_model(lines, host, have_companies=()) -> str | None:
+    """The one listed 'provider/model' line discovery may itself test and add: flat-rate, a company Ratchet's
+    patterns recognise (company_of_model) that isn't the host's own, and capable (_best_capable_line). An
+    unknown company or an unknown/per-use cost is never a candidate here. Prefers a company with no working
+    reviewer yet (`have_companies`), then the preferred family order (FAMILY_PREFERENCE), then falls back to
+    listing order; within one company, _best_capable_line picks the representative."""
+    by_company: dict[str, list[str]] = {}
+    for line in lines:
+        if _listed_model_cost(line) != "flat":
+            continue
+        company = company_of_model(line)
+        if not company or company == host:
+            continue
+        by_company.setdefault(company, []).append(line)
+    reps = {c: _best_capable_line(ls) for c, ls in by_company.items()}
+    reps = {c: rep for c, rep in reps.items() if rep}
+    if not reps:
+        return None
+    order = list(reps)
+    company = min(order, key=lambda c: (
+        c in have_companies, min(_family_rank(ln) for ln in by_company[c]), order.index(c)))
+    return reps[company]
+
+
+def _paid_candidate_groups(lines, host) -> dict:
+    """Non-flat ('per-use' or unknown-cost) listed lines, grouped by (provider namespace, company), so a
+    provider with many listed models (hundreds of OpenRouter lines, say) collapses to one representative
+    per company instead of flooding paid_options. The host's own company is dropped (never offered as a
+    paid option to pay for a model the host already runs for free). In a namespace PROVIDER_COST already
+    prices (a known paid service such as opencode/ or openrouter/), a model whose company Ratchet can't map
+    is skipped: Ratchet never uses an unknown-company model as a reviewer, so naming one here would just ask
+    the developer to pay for something the engine would then refuse. A namespace PROVIDER_COST doesn't know
+    at all (an unlisted provider) still lists its unmappable models as before, grouped under "", so an
+    unknown provider isn't silently dropped."""
+    groups: dict[tuple[str, str], list[str]] = {}
+    for line in lines:
+        if _listed_model_cost(line) == "flat":
+            continue
+        namespace = line.split("/", 1)[0]
+        company = company_of_model(line) or ""
+        if company and company == host:
+            continue
+        if not company and namespace in PROVIDER_COST:
+            continue
+        groups.setdefault((namespace, company), []).append(line)
+    return groups
+
+
+def _paid_pick(group_lines) -> str | None:
+    """The one line from a (provider, company) group to show as that group's paid option: the same shared
+    ranking the flat picker uses (_best_capable_line), so a paid entry is never named for a model the flat
+    picker itself would have rejected. None if the whole group was rejected variants, in which case the
+    caller must show no paid option for that group rather than suggest paying for a rejected model."""
+    return _best_capable_line(group_lines)
 
 
 def providers(cfg) -> list[dict]:
@@ -3452,7 +4562,7 @@ def cmd_plan_submit(args):
     if plan is None:
         die("checkpoints.json not found in the run folder")
     errs = (validate_plan(plan) + objective_problems(plan) + spec_plan_problems(ctx, plan)
-            + risk_reason_problems(plan.get("checkpoints", [])))
+            + risk_reason_problems(plan.get("checkpoints", [])) + proves_problems(ctx, plan))
     if errs:
         die("Plan invalid:\n  - " + "\n  - ".join(errs))
     st["phase"] = "awaiting_plan_approval"
@@ -3904,6 +5014,9 @@ ASKED_APPROVALS = ("approve-plan", "human-approve", "cancel", "set-review", "app
 
 
 def _ask_cmd(action, mode=None, eng="ratchet.py") -> str:
+    if action == "paid-provider" and mode and ":" in mode:
+        tool, model = mode.split(":", 1)  # `mode` is stored as "tool:model"; the real command takes two args
+        return f"`{eng} ask paid-provider {tool} {model}`"
     return f"`{eng} ask {action}{' ' + mode if mode else ''}`"
 
 
@@ -3911,6 +5024,10 @@ def _question_what(action, mode=None) -> str:
     """The question `ask <action>` put to the user, in the words it used ("shall I <this>?")."""
     if action == "set-review":
         return f"change how often they review to: {REVIEW_MODE_WORDS.get(mode, mode)}"
+    if action == "paid-provider" and mode and ":" in mode:
+        tool, model = mode.split(":", 1)
+        return (f"use {tool}'s {model} (costs money per use, or whose cost is unknown, treated the same way) "
+                "for reviews instead of only flat-rate ones")
     return ASKABLE.get(action, action)
 
 
@@ -3943,13 +5060,12 @@ def _spend_question(ctx, st, reply=""):
 def _asked_reply(ctx, st, action, p):
     """The user's answer to the question `ask <action>` printed, or die. Only their first reply after it counts."""
     want = p.get("action")
-    mode_txt = f" {p['mode']}" if p.get("mode") else ""
     if want != action:
         if want:
             what = _question_what(want, p.get("mode"))
             die(f"A different question is waiting for the user's answer: shall I {what}? Their reply answers THAT "
-                f"question, not this one. If they said yes to it, run `ratchet.py {PENDING_COMMAND.get(want, want)}"
-                f"{mode_txt}`. If they said no or moved on, run `ratchet.py ask withdraw`. Then print this question "
+                f"question, not this one. If they said yes to it, run `ratchet.py {_pending_followup(want, p.get('mode'))}"
+                "`. If they said no or moved on, run `ratchet.py ask withdraw`. Then print this question "
                 f"with {_ask_cmd(action)}, show it to them word for word, and wait for their reply.")
         die(f"Ratchet has not asked the user this question yet, so no reply counts as their answer. Run "
             f"{_ask_cmd(action)}, show them the question it prints word for word, and end your turn. Only their first "
@@ -5778,6 +6894,14 @@ def cmd_adv_record(args):
             "fix-list.json, re-run behavior (and UI if visible code changed), then re-run the adversaries."
             + (f" {ci_note}" if ci_note else ""), 2)
     g.update(status="passed", fingerprint=fp, passed_at=now(), evidence=str(dest.relative_to(ctx.root)))
+    if rnd.get("small_fix"):  # CP3: approved as a one-reviewer small-fix round -- named for the commit/status
+        cps["small_fix_review"] = {"round": rnd["round"], "reviewer": (rnd.get("reviewers") or [None])[0]}
+    else:
+        # CP3: anchor for `_is_small_fix_round` -- only a FULL round's approval moves this, so a run of small
+        # fixes keeps measuring against the same baseline and their sizes add up.
+        cps["last_full_review_fingerprint"] = fp
+        # CP5: this full round's own approval supersedes every lighter-review note recorded before it.
+        _clear_lighter_review_records(cps)
     cps["step"] = _earliest_open_step(cps)
     ctx.log(st, "adversarial_approved", cp=args.cp, round=g["attempts"])
     ctx.save_state(st)
@@ -6975,25 +8099,69 @@ def _checkin_decisions_lines(st) -> list[str]:
     return lines
 
 
+def _deferred_groups(cps) -> dict:
+    """Groups one checkpoint's own deferred findings (never accepted ones) by `_finding_key` (reviewer/id, or the
+    bare id when no reviewer is given), keeping only the LATEST round's own copy for each key: the same reviewer
+    re-raising the same id in a later round overwrites its own earlier, stale copy here. Two findings that merely
+    share a `kind` and `file` -- a different reviewer, or a different id -- are different keys and are never
+    merged into one; each keeps its own entry."""
+    groups: dict = {}
+    for f in cps.get("deferred") or []:
+        if f.get("accepted"):
+            continue
+        k = _finding_key(f)
+        if k not in groups or (f.get("round") or 0) >= (groups[k].get("round") or 0):
+            groups[k] = f
+    return groups
+
+
+def left_for_later(cps) -> list:
+    """A checkpoint's deferred findings still left for later at the end of the run: `_deferred_groups`'s one entry
+    per finding, minus any `ratchet.py mark-fixed` has since recorded fixed. Used by `deferred`, `deferred --json`
+    and the final-review count in `status`, so all three always agree on what is still left for later."""
+    return [f for f in _deferred_groups(cps).values() if not f.get("fixed")]
+
+
+def _fixed_later(cps) -> list:
+    """The companion list to `left_for_later`: the same deduped findings, kept only when `mark-fixed` marked them
+    fixed."""
+    return [f for f in _deferred_groups(cps).values() if f.get("fixed")]
+
+
 def cmd_deferred(args):
     """Findings that were recorded instead of blocking (minor ones, and any blocker/major/unknown-severity
     finding with no user_impact), for the user to decide on at the end, PLUS, in their own section first,
     findings the user accepted while a round was blocked: these were shown to the user and agreed to on purpose,
-    with a reason and who accepted them, so they are never mixed in with ones that simply never blocked."""
+    with a reason and who accepted them, so they are never mixed in with ones that simply never blocked. A finding
+    `ratchet.py mark-fixed` recorded fixed prints in its own 'fixed later in the run' section instead of under
+    'left for later' (both sections are deduped per `left_for_later`/`_fixed_later`: a finding re-raised in a
+    later round by the same reviewer with the same id shows once, as that later round's own copy)."""
     ctx = Ctx(find_root())
     st = ctx.state()
-    rows = [(cp, f) for cp, c in (st.get("checkpoints") or {}).items() for f in c.get("deferred") or []]
+    cps_map = st.get("checkpoints") or {}
+    accepted = [(cp, f) for cp, c in cps_map.items() for f in c.get("deferred") or [] if f.get("accepted")]
+    fixed = [(cp, f) for cp, c in cps_map.items() for f in _fixed_later(c)]
+    other = [(cp, f) for cp, c in cps_map.items() for f in left_for_later(c)]
     if getattr(args, "json", False):
+        rows = accepted + fixed + other
         print(json.dumps([dict(f, checkpoint=cp) for cp, f in rows], indent=2))
         return
-    if not rows:
+    if not (accepted or fixed or other):
         print("No findings were left for later.")
         return
-    other = [(cp, f) for cp, f in rows if not f.get("accepted")]
     acc_lines = _accepted_findings_lines(st)
     if acc_lines:
         for line in acc_lines:
             print(line)
+        if fixed or other:
+            print("")
+    if fixed:
+        print(f"{len(fixed)} finding(s) were fixed later in the run (a later round reviewed the change):")
+        for cp, f in fixed:
+            where = f" ({f['file']}{':' + str(f['line']) if f.get('line') else ''})" if f.get("file") else ""
+            fx = f.get("fixed") or {}
+            print(f"- {cp} {_finding_key(f)}{where}: {f.get('description', '').strip()[:240]} "
+                  f"[fixed in round {fx.get('round')}: {fx.get('how', '')}]")
         if other:
             print("")
     if other:
@@ -7002,6 +8170,424 @@ def cmd_deferred(args):
             where = f" ({f['file']}{':' + str(f['line']) if f.get('line') else ''})" if f.get("file") else ""
             why = f" [{f['deferred_because']}]" if f.get("deferred_because") else ""
             print(f"- {cp} {_finding_key(f)}{where}: {f.get('description', '').strip()[:240]}{why}")
+
+
+def cmd_mark_fixed(args):
+    """`ratchet.py mark-fixed CPn <ref>="<how>"`: records that a finding left for later (`ratchet.py deferred`)
+    was really fixed, so the final review's own left-for-later list stops showing it (`deferred` moves it under
+    'fixed later in the run' instead). Refused outright, with nothing changed, unless BOTH: (1) the finding's own
+    file has changed since the LATEST round that raised it (same reviewer/id) -- the baseline round is the
+    highest of every round among this checkpoint's own non-accepted deferred entries for that key AND every
+    recorded adversarial round whose own open-findings.json (the round's blocking findings, read fresh off disk,
+    not just this checkpoint's deferred list) lists that same key, so a round that re-raises the finding as
+    BLOCKING, not only one that defers it again, also becomes the new baseline -- that round itself can never
+    serve as its own proof -- and (2) a later adversarial round has since been recorded whose own fingerprint
+    already matches today's version of that file -- a fix nobody reviewed again does not count, and a file that
+    never moved does not either. Also refused for a finding the user already accepted (a separate decision,
+    `ratchet.py ask accept-finding`) or a reference naming no deferred finding at all."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    cps = (st.get("checkpoints") or {}).get(args.cp)
+    if cps is None:
+        die(f"No such checkpoint {args.cp}.")
+    ref, sep, rest = args.decision.partition("=")
+    ref = ref.strip()
+    how = rest.strip()
+    if len(how) >= 2 and how[0] == how[-1] and how[0] in ("'", '"'):
+        how = how[1:-1].strip()
+    if not sep or not how:
+        die(f"{args.decision!r}: use `mark-fixed {args.cp} <ref>=\"how it was fixed\"`. Nothing was recorded.")
+    all_deferred = cps.get("deferred") or []
+    open_deferred = [d for d in all_deferred if not d.get("accepted")]
+    found, err = _resolve_finding_ref(ref, open_deferred)
+    if err:
+        die(f"{err} Nothing was recorded.")
+    if found is None:
+        accepted = [d for d in all_deferred if d.get("accepted")]
+        acc, _ = _resolve_finding_ref(ref, accepted)
+        if acc is not None:
+            die(f"{ref} was accepted by the user, not deferred (see `ratchet.py ask accept-finding`); mark-fixed "
+                "does not apply to it. Nothing was recorded.")
+        die(f"{ref} does not exist among {args.cp}'s deferred findings (`ratchet.py deferred` lists them). "
+            "Nothing was recorded.")
+    key = _finding_key(found)
+    entries = [d for d in open_deferred if _finding_key(d) == key]
+    file = found.get("file")
+    rounds = ((cps.get("gates") or {}).get("adversarial") or {}).get("rounds") or []
+    raised_rounds = [d.get("round") for d in entries if d.get("round") is not None]
+    for rr in rounds:
+        rno = rr.get("round")
+        if rno is None:
+            continue
+        raw = _read_findings_file(_adv_round_dir(ctx, args.cp, rno) / "open-findings.json")
+        if any(_finding_key(f) == key for f in raw):
+            raised_rounds.append(rno)
+    raised_round = max(raised_rounds, default=None)
+    raised_rec = next((rr for rr in rounds if rr.get("round") == raised_round), None) \
+        if raised_round is not None else None
+    if raised_round is None or not file or not raised_rec or not raised_rec.get("fingerprint"):
+        die(f"{ref} has no recorded round or file on record to check whether it was really fixed. Nothing was "
+            "recorded.")
+    cur_fp = fingerprint(ctx.root)
+    raised_fp = {"kind": "git-tree", "id": raised_rec["fingerprint"]}
+    file_norm = _norm_path(file)
+    changed_since_raise = {_norm_path(x) for x in changed_files(ctx.root, raised_fp, cur_fp)}
+    if file_norm not in changed_since_raise:
+        die(f"{ref}'s file ({file}) has not changed since round {raised_round}, the round that raised it. "
+            "mark-fixed only applies once the file has really changed. Nothing was recorded.")
+    later_round = None
+    for rr in sorted(rounds, key=lambda r: r.get("round", 0)):
+        if rr.get("round", 0) <= raised_round or not rr.get("fingerprint"):
+            continue
+        rec_fp = {"kind": "git-tree", "id": rr["fingerprint"]}
+        if file_norm not in {_norm_path(x) for x in changed_files(ctx.root, rec_fp, cur_fp)}:
+            later_round = rr["round"]
+            break
+    if later_round is None:
+        die(f"{ref}: no later review round has been recorded on the changed code since round {raised_round}. Run "
+            f"`ratchet.py reviewers {args.cp}` and record a new round first. Nothing was recorded.")
+    latest_entry = max(entries, key=lambda d: d.get("round") or 0)
+    latest_entry["fixed"] = {"round": later_round, "how": how}
+    ctx.log(st, "finding_marked_fixed", cp=args.cp, ref=key, round=later_round)
+    ctx.save_state(st)
+    ok(f"Marked {key} fixed for {args.cp} (a later round, {later_round}, reviewed the changed code). Run "
+       "`ratchet.py deferred` to see it under 'fixed later in the run'.")
+
+
+# ---- receipt: one honest proof receipt to paste into the pull request, at the end of a run -----------------
+
+def _plain_duration(seconds) -> str:
+    """A wall-clock span as a plain duration ('4h 17m', '38m'): never cost, never tokens, just time."""
+    seconds = max(0, int(seconds or 0))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if days or hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _elapsed_seconds(a_iso, b_iso) -> int:
+    return max(0, int(_iso(b_iso) - _iso(a_iso)))
+
+
+def _step_reviewed_tree(cps) -> str | None:
+    """The git-tree id Ratchet recorded as reviewed for this checkpoint: its adversarial gate's own `fingerprint`
+    once that gate has passed, else the last adversarial round's own `fingerprint` (what that round actually
+    looked at), else None when no round has ever opened."""
+    g = (cps.get("gates") or {}).get("adversarial") or {}
+    fp = g.get("fingerprint")
+    if isinstance(fp, dict) and fp.get("id"):
+        return fp["id"]
+    rounds = g.get("rounds") or []
+    if rounds:
+        last_fp = rounds[-1].get("fingerprint")
+        if isinstance(last_fp, dict):
+            return last_fp.get("id")
+        if last_fp:
+            return last_fp
+    return None
+
+
+def _step_commit(ctx, cps) -> str | None:
+    """The short commit id to show for a checkpoint: its own recorded `commit` field (the one `complete` makes)
+    when there is one, else the one commit -- if any -- whose own git tree is exactly the tree Ratchet recorded
+    as reviewed for this step (`_step_reviewed_tree`: the step's passed adversarial gate, or else its last
+    adversarial round). Covers the one case `complete` itself leaves with no `commit` of its own even though
+    commit_per_checkpoint is on: the code was already committed by some other means (directly, by the user or
+    agent -- the accepted same-user limit) before `complete` ran, so there was nothing left for Ratchet's own
+    commit to add. Never guesses from commit dates or a time window (an ordinary manual commit made mid-step
+    that the reviewed tree does not match is never shown), so a step with no recorded commit and no commit whose
+    tree matches what was actually reviewed still says 'no commit recorded'."""
+    commit = cps.get("commit")
+    if commit:
+        return commit
+    tree = _step_reviewed_tree(cps)
+    if not tree or not _is_git(ctx.root):
+        return None
+    r = subprocess.run(["git", "log", "--format=%H %T"], cwd=ctx.root, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    for line in r.stdout.splitlines():
+        sha, _, cur_tree = line.partition(" ")
+        if cur_tree == tree:
+            return sha[:7]
+    return None
+
+
+def _step_elapsed(cps) -> tuple:
+    """(status, seconds) for one checkpoint: 'finished' (started_at..completed_at), 'not finished' (started_at..now,
+    the step is still mid-build) or 'not started' (no started_at yet: this step was never reached)."""
+    started = cps.get("started_at")
+    completed = cps.get("completed_at")
+    if not started:
+        return "not started", 0
+    if completed:
+        return "finished", _elapsed_seconds(started, completed)
+    return "not finished", _elapsed_seconds(started, now())
+
+
+def _run_elapsed(st) -> tuple:
+    """(status, seconds) for the whole run: 'finished' once the run-level 'approved' history event exists
+    (created_at..that event's own timestamp, the latest one if it is ever logged more than once), else 'not
+    finished' (created_at..now: time so far, never a final total presented as if the run had ended)."""
+    created = st.get("created_at")
+    if not created:
+        return "not finished", 0
+    approved_at = None
+    for h in st.get("history") or []:
+        if h.get("event") == "approved":
+            approved_at = h.get("at")  # the latest one wins when logged more than once
+    if approved_at:
+        return "finished", _elapsed_seconds(created, approved_at)
+    return "not finished", _elapsed_seconds(created, now())
+
+
+def _round_reviewer_entries(cfg, rnd_record: dict) -> list:
+    """One entry per reviewer this round actually recorded (the round's own 'reviewers' list, the final set after
+    any mid-round swap): {"round", "id", "host_fallback", "replaced", "reason"}. A host sub-agent reviewer
+    ('kind': 'agent' on the roster) is always marked `host_fallback`; its `reason` comes from the round's own
+    `substitutions` (cmd_reviewers' fallback record, fresh-round or the same-round re-resolve this checkpoint also
+    fills in) when one names it, else 'reason not recorded' -- never invented, never left blank -- including when
+    the round carries no `substitutions` key at all (a round recorded before that field existed). When today's
+    roster has nothing for this id (removed or renamed since this round ran), `host_fallback` is decided from the
+    recorded id's own naming convention (every host sub-agent id starts with "host-") instead of defaulting to
+    false, so a roster edit made later in the run never hides a real host-company fallback or its reason.
+
+    `reviewers` holds plain string ids while a round is still open (cmd_reviewers' own shape, including its
+    same-round re-resolve branch, before adv-record ever runs) and dicts ({"id", "vendor", "model"}) once that
+    round is recorded; either shape is accepted here. `substitutions` already carries the same `{"used",
+    "instead_of", "why"}` records for a pending round (built from its own `resolved` list) as for a recorded one,
+    so the lookup below needs no separate pending-round path."""
+    subs = rnd_record.get("substitutions")
+    by_used: dict = {}
+    if isinstance(subs, list):
+        for s in subs:
+            by_used.setdefault(s.get("used"), []).append(s)
+    out = []
+    for r in rnd_record.get("reviewers") or []:
+        rid = r if isinstance(r, str) else r.get("id")
+        spec = _roster_spec(cfg, rid) or {}
+        if spec:
+            host_fallback = spec.get("kind") == "agent"
+        else:
+            # Today's roster has nothing for this id (a custom host-agent reviewer renamed or removed since
+            # this round ran): fall back to the recorded id's own naming convention instead of calling it an
+            # outside reviewer. Every host sub-agent id this engine ever hands out starts with "host-".
+            host_fallback = bool(rid) and rid.startswith("host-")
+        replaced, reason = [], None
+        if host_fallback:
+            why = {}
+            for m in by_used.get(rid) or []:
+                for x in m.get("instead_of") or []:
+                    if x not in replaced:
+                        replaced.append(x)
+                why.update(m.get("why") or {})
+            if why:
+                reason = next(iter(why.values())) if len(why) == 1 else \
+                    "; ".join(f"{k}: {v}" for k, v in why.items())
+            else:
+                reason = "reason not recorded"
+        out.append({"round": rnd_record.get("round"), "id": rid, "host_fallback": host_fallback,
+                    "replaced": replaced, "reason": reason})
+    return out
+
+
+def _step_reviewer_entries(cfg, cps) -> list:
+    """Every recorded round's reviewers, plus the checkpoint's own currently-open round (`adv_round`) when one
+    exists and adv-record has not recorded it yet -- so a receipt asked for while a round is pending (or just
+    re-resolved mid-round) still honestly names its reviewers instead of silently omitting the step's own
+    in-progress round."""
+    rounds = ((cps.get("gates") or {}).get("adversarial") or {}).get("rounds") or []
+    out = []
+    for rnd_record in rounds:
+        out += _round_reviewer_entries(cfg, rnd_record)
+    pending = cps.get("adv_round")
+    if pending and not pending.get("recorded"):
+        out += _round_reviewer_entries(cfg, pending)
+    return out
+
+
+def _reviewer_line(e: dict) -> str:
+    if not e["host_fallback"]:
+        return f"  - round {e['round']}: {e['id']}"
+    if e["replaced"]:
+        return (f"  - round {e['round']}: {e['id']} - host's own company standing in, instead of "
+                f"{', '.join(e['replaced'])} ({e['reason']})")
+    return f"  - round {e['round']}: {e['id']} - host's own company fallback ({e['reason']})"
+
+
+def _receipt_accepted(st) -> list:
+    # "id" stays the finding's own bare id (the --json contract); "reviewer" is carried alongside it so two
+    # reviewers who independently picked the same bare id within one checkpoint can still be told apart
+    # (the qualified `_finding_key(f)` form the markdown prints uses exactly these two fields).
+    return [{"checkpoint": cp, "id": f.get("id"), "reviewer": f.get("reviewer"), "severity": f.get("severity"),
+             "description": f.get("description"), "reason": f.get("reason"),
+             "accepted_by": f.get("accepted_by") or "human"}
+            for cp, c in (st.get("checkpoints") or {}).items() for f in c.get("deferred") or [] if f.get("accepted")]
+
+
+def _receipt_left_for_later(st) -> list:
+    return [{"checkpoint": cp, "id": f.get("id"), "reviewer": f.get("reviewer"), "description": f.get("description"),
+             "deferred_because": f.get("deferred_because")}
+            for cp, c in (st.get("checkpoints") or {}).items() for f in left_for_later(c)]
+
+
+def _receipt_fixed_later(st) -> list:
+    out = []
+    for cp, c in (st.get("checkpoints") or {}).items():
+        for f in _fixed_later(c):
+            fx = f.get("fixed") or {}
+            out.append({"checkpoint": cp, "id": f.get("id"), "reviewer": f.get("reviewer"),
+                        "description": f.get("description"), "round": fx.get("round"), "how": fx.get("how")})
+    return out
+
+
+def _dm_case_status(ctx, cp_id: str, case: dict, behavior_status: str | None = None) -> str:
+    """One linked test case's own state for the receipt's done-means section. A browser-layer case is never
+    run by `ratchet.py behavior`, so it always reads "checked by the UI gate". Otherwise, this checkpoint's
+    latest per-case test report in evidence (whatever report format is actually on disk, read directly rather
+    than only when the approved plan names one, so a report already written always counts) decides passed vs
+    failed vs error vs skipped. With no report, or no result for this case in it, a supported exit-code-only
+    step (tests.report none or missing) still has a recorded result at the step level: `behavior_status` (the
+    checkpoint's own gates.behavior status, passed by the caller) says so, checked by exit code only rather
+    than per case, so a developer never sees a passing step's linked line read "no result recorded yet". With
+    no per-case report and no recorded behavior-gate status either (never run), that honest "no result
+    recorded yet" still stands. A case can have more than one matching report entry (a parameterized test, or
+    repeated runs); it counts as passed only when every matching entry passed, so one failed, errored or
+    skipped instance among several still shows as failed."""
+    if case.get("layer") == "browser":
+        return "checked by the UI gate"
+    case_id = case.get("id") or ""
+    pat = _case_id_re(case_id) if case_id else None
+    for name in ("test-report.json", "test-report.xml"):
+        p = ctx.evidence(cp_id) / name
+        if p.exists():
+            pairs, why = _read_test_report(ctx, p)
+            if pairs and pat:
+                statuses = [s for n, s in pairs if pat.search(n)]
+                if statuses:
+                    # a case passes only when every matching entry passed; any failed, errored or
+                    # skipped entry means the case shows as failed, however many entries it has
+                    return "passed" if all(s == "passed" for s in statuses) else "failed"
+    if behavior_status == "passed":
+        return "step tests passed, by exit code only (not checked per case)"
+    if behavior_status == "failed":
+        return "step tests failed, by exit code only (not checked per case)"
+    return "no result recorded yet"
+
+
+def _done_means_proof(ctx, plan, cps_map: dict | None = None) -> dict | None:
+    """None when the plan has no objective.done_means at all (an older plan, approved before either existed):
+    the receipt prints NO_OBJECTIVE_NOTE instead of this section. Otherwise {"lines": [{"text", "cases":
+    [{"id", "title", "file", "status"}]}], "any_proves": bool}; "any_proves" is False only when not one case
+    anywhere in the plan names a "proves" line (an old test plan from before that field existed), so the
+    receipt can add one plain note beside every line's own "no test linked" instead of pretending it checked.
+    `cps_map` (the run state's own checkpoint-by-id dict, passed by the caller) feeds each case's checkpoint's
+    recorded behavior-gate status into _dm_case_status, so an exit-code-only step still shows its real result."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    dm = obj.get("done_means") if isinstance(obj, dict) else None
+    if not isinstance(dm, list) or not dm:
+        return None
+    lines = [{"text": t, "cases": []} for t in dm]
+    any_proves = False
+    cps_map = cps_map or {}
+    for cp in plan.get("checkpoints") or []:
+        behavior_status = (((cps_map.get(cp["id"]) or {}).get("gates") or {}).get("behavior") or {}).get("status")
+        for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
+            for p in _proves_values(case):
+                if isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= len(dm):
+                    any_proves = True
+                    lines[p - 1]["cases"].append({"id": case.get("id"), "title": case.get("title", ""),
+                                                  "file": case.get("file", ""),
+                                                  "status": _dm_case_status(ctx, cp["id"], case, behavior_status)})
+    return {"lines": lines, "any_proves": any_proves}
+
+
+def cmd_receipt(args):
+    """`ratchet.py receipt` (plain markdown, or `--json`): one honest proof receipt to paste into the pull
+    request. Each step's title, short commit and elapsed time, the whole run's own elapsed time (wall-clock,
+    including any time spent waiting on you; never cost or tokens), who reviewed each step (a host-company
+    fallback marked as such, with why when Ratchet recorded it), the findings you accepted with their reason, and
+    findings left for later or fixed later in the run (CP1's own `left_for_later`/`_fixed_later` rule, so this
+    always agrees with `ratchet.py deferred` and `status`)."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    cfg = ctx.config()
+    plan = ctx.plan() or {"checkpoints": []}
+    cps_map = st.get("checkpoints") or {}
+    run_status, run_seconds = _run_elapsed(st)
+    steps = []
+    for cp in plan.get("checkpoints") or []:
+        cid = cp.get("id")
+        cps = cps_map.get(cid) or {}
+        status, seconds = _step_elapsed(cps)
+        steps.append({"id": cid, "title": cp.get("title", "?"), "commit": _step_commit(ctx, cps),
+                      "finished": status == "finished", "status": status, "elapsed_seconds": seconds,
+                      "reviewers": _step_reviewer_entries(cfg, cps)})
+    accepted, left, fixed = _receipt_accepted(st), _receipt_left_for_later(st), _receipt_fixed_later(st)
+    dm = _done_means_proof(ctx, plan, cps_map)
+    if getattr(args, "json", False):
+        data = {"run": {"elapsed_seconds": run_seconds, "finished": run_status == "finished"},
+                "steps": [{k: s[k] for k in ("id", "title", "commit", "finished", "elapsed_seconds", "reviewers")}
+                         for s in steps],
+                "accepted": accepted, "left_for_later": left, "fixed_later": fixed, "done_means": dm}
+        print(json.dumps(data, indent=2))
+        return
+    print(f"# Proof receipt: {plan.get('feature') or st.get('feature') or st.get('slug')}")
+    print("")
+    print("Steps (time is wall-clock, including any time spent waiting on you):")
+    for s in steps:
+        commit_txt = s["commit"] or "no commit recorded"
+        dur_txt = _plain_duration(s["elapsed_seconds"])
+        time_txt = dur_txt if s["finished"] else (
+            "not started" if s["status"] == "not started" else f"not finished (time so far: {dur_txt})")
+        print(f"- {s['id']} {s['title']}: commit {commit_txt}, time {time_txt}")
+        for e in s["reviewers"]:
+            print(_reviewer_line(e))
+    print("")
+    run_dur = _plain_duration(run_seconds)
+    run_txt = run_dur if run_status == "finished" else f"run not finished (time so far: {run_dur})"
+    print(f"Whole run time: {run_txt}")
+    print("")
+    if dm is None:
+        print(f"Done-means proof: {NO_OBJECTIVE_NOTE}.")
+    else:
+        print("Done-means proof (which tests prove each objective line):")
+        for i, line in enumerate(dm["lines"], 1):
+            print(f"{i}. {line['text']}")
+            if not line["cases"]:
+                print("   - no test linked")
+            else:
+                for c in line["cases"]:
+                    print(f"   - {c['id']} {c['title']} ({c['file']}): {c['status']}")
+        if not dm["any_proves"]:
+            print("Note: this plan's tests were never linked to done_means lines (an older test plan, "
+                  "approved before the \"proves\" field existed).")
+    acc_lines = _accepted_findings_lines(st)
+    if acc_lines:
+        print("")
+        for line in acc_lines:
+            print(line)
+    if fixed:
+        print("")
+        print(f"{len(fixed)} finding(s) fixed later in the run (a later round reviewed the change):")
+        for f in fixed:
+            print(f"- {f['checkpoint']} {_finding_key(f)}: {(f.get('description') or '').strip()[:240]} "
+                  f"[fixed in round {f.get('round')}: {f.get('how', '')}]")
+    if left:
+        print("")
+        print(f"{len(left)} finding(s) left for later (they did not block):")
+        for f in left:
+            why = f" [{f['deferred_because']}]" if f.get("deferred_because") else ""
+            print(f"- {f['checkpoint']} {_finding_key(f)}: {(f.get('description') or '').strip()[:240]}{why}")
+    if not (acc_lines or fixed or left):
+        print("")
+        print("No findings were accepted, left for later or fixed later in this run.")
 
 
 def cmd_complete(args):
@@ -7013,6 +8599,14 @@ def cmd_complete(args):
     cfg = ctx.config()
     fp = fingerprint(ctx.root)
     problems, stale = [], []
+    doc_edits = set()  # CP2 doc quick path: files found doc-only since behavior or adversarial passed, used only
+    # to pick which doc tests replace the staleness check -- never, on its own, a "not re-reviewed" record.
+    doc_edits_unreviewed_now = set()  # only files the ADVERSARIAL gate's own diff found doc-only: that gate's
+    # approval is the review the commit message/status/final review claim, so only this set is ever folded into
+    # cps["doc_edits_unreviewed"]. A file the behavior branch finds doc-only (to avoid the staleness block and
+    # help pick doc tests) is never added here on its own -- the adversarial round may since have reviewed and
+    # approved that exact edit (behavior always passes before the adversarial round opens). When the
+    # adversarial gate isn't required, this set stays empty and nothing is recorded as unreviewed from here.
     for name in ["behavior", "ui", "adversarial"]:
         g = cps["gates"][name]
         if not g["required"]:
@@ -7033,6 +8627,10 @@ def cmd_complete(args):
         if not changed:
             continue
         if name == "behavior":
+            doc_files, code_files = _classify_doc_code(cfg, changed)
+            if not code_files and cfg.get("doc_test_command"):
+                doc_edits.update(doc_files)
+                continue
             problems.append(f"code changed since behavior passed ({len(changed)} files) → re-run ratchet.py behavior {args.cp}")
             stale.append(name)
         elif name == "ui":
@@ -7041,6 +8639,11 @@ def cmd_complete(args):
                 problems.append(f"UI files changed since UI review ({', '.join(ui_changed[:5])}) → re-run ratchet-ui-compare")
                 stale.append(name)
         elif name == "adversarial":
+            doc_files, code_files = _classify_doc_code(cfg, changed)
+            if not code_files and cfg.get("doc_test_command"):
+                doc_edits.update(doc_files)
+                doc_edits_unreviewed_now.update(doc_files)
+                continue
             problems.append("code changed since adversarial approval → adversaries must review the final code")
             stale.append(name)
     if problems:
@@ -7051,7 +8654,45 @@ def cmd_complete(args):
         ctx.log(st, "complete_rejected", cp=args.cp, stale=stale)
         ctx.save_state(st)
         die(f"{args.cp} cannot complete:\n  - " + "\n  - ".join(problems), 2)
-    if cfg.get("regression_command"):
+    if doc_edits:
+        # CP2 doc quick path: every file changed since behavior/adversarial passed is a doc, so neither gate was
+        # marked stale above. Run only the test files that name those docs (never the full suite for this); a
+        # failure here leaves the gates' status exactly as it was and commits nothing, same as any other failed
+        # check below.
+        doc_test_files = _tests_naming(ctx, cfg, fp, sorted(doc_edits))
+        if doc_test_files:
+            dcode, dout = _run_doc_test_command(ctx, cfg, doc_test_files, ctx.evidence(args.cp) / "doc-tests.log")
+            if dcode != 0:
+                die(f"{args.cp} cannot complete: a doc test failed for the doc edit(s) made after review "
+                    f"({', '.join(sorted(doc_edits))}):\n  - " + "\n  - ".join(doc_test_files) + f"\n{_tail(dout)}", 2)
+            if fingerprint(ctx.root)["id"] != fp["id"]:
+                die("The doc test command changed files in the project. Those changes were never reviewed — find "
+                    "out what wrote them (generated files? snapshots?) and either add them to .gitignore or "
+                    "re-run the gates.", 2)
+        # Only files the ADVERSARIAL gate's own diff found doc-only (`doc_edits_unreviewed_now`) are ever
+        # recorded as "not re-reviewed": a file the behavior branch alone found doc-only may since have been
+        # reviewed and approved in the adversarial round itself, so it is never recorded here just for that.
+        if doc_edits_unreviewed_now:
+            cps["doc_edits_unreviewed"] = sorted(set(cps.get("doc_edits_unreviewed") or []) | doc_edits_unreviewed_now)
+        ctx.log(st, "doc_quick_path", cp=args.cp, files=sorted(doc_edits), tests=doc_test_files)
+    skip_full, full_doc_files = _skip_full_suite(ctx, cfg, st, fp) if cfg.get("regression_command") else (False, [])
+    if skip_full:
+        # Already passed on a tree that differs from now only in docs: run just those docs' naming tests
+        # instead of the full suite again. `full_doc_files` only selects which tests replace the full suite; it
+        # is never added to `doc_edits_unreviewed` (a file here may already have gone through, and passed, its
+        # own gate's normal adversarial round, so it was never actually skipped from review).
+        full_doc_tests = _tests_naming(ctx, cfg, fp, full_doc_files) if full_doc_files else []
+        if full_doc_tests:
+            dcode, dout = _run_doc_test_command(ctx, cfg, full_doc_tests,
+                                                ctx.evidence(args.cp) / "doc-tests-full-suite.log")
+            if dcode != 0:
+                die(f"{args.cp} cannot complete: the full suite already passed on a tree that differs only in "
+                    f"docs, but a doc test failed for {', '.join(full_doc_tests)}:\n{_tail(dout)}", 2)
+            if fingerprint(ctx.root)["id"] != fp["id"]:
+                die("The doc test command changed files in the project. Those changes were never reviewed — find "
+                    "out what wrote them (generated files? snapshots?) and either add them to .gitignore or "
+                    "re-run the gates.", 2)
+    if cfg.get("regression_command") and not skip_full:
         code, out, _ = _run_cmd(ctx, cfg["regression_command"], ctx.evidence(args.cp) / "regression.log",
                                 cfg["test_timeout_sec"])
         if code != 0 and not st.get("regression_flaky_used"):
@@ -7071,6 +8712,7 @@ def cmd_complete(args):
         if fingerprint(ctx.root)["id"] != fp["id"]:
             die("The regression command changed files in the project. Those changes were never reviewed — find out "
                 "what wrote them (generated files? snapshots?) and either add them to .gitignore or re-run the gates.", 2)
+        st["regression_passed_fp"] = fp
     if cp.get("guardrail"):
         probs = verify_guardrail(ctx, st, cp, cps, fp, cfg)
         if probs:
@@ -7095,6 +8737,15 @@ def cmd_complete(args):
             f"{n}={cps['gates'][n]['status']}" for n in ["behavior", "ui", "adversarial"])
         if cp.get("spec_refs"):
             msg += "\nSpec: " + ", ".join(_as_list(cp["spec_refs"]))[:600]
+        if cps.get("doc_edits_unreviewed"):
+            msg += ("\nDocs edited after review and not re-reviewed (doc quick path): "
+                    + ", ".join(cps["doc_edits_unreviewed"]))
+        small_fix_line = _small_fix_review_line(args.cp, cps)
+        if small_fix_line:
+            msg += "\n" + small_fix_line
+        docs_only_skip_line = _docs_only_skip_line(args.cp, cps)
+        if docs_only_skip_line:
+            msg += "\n" + docs_only_skip_line
         commit = _commit_reviewed(ctx.root, cps.get("base_tree"), fp, msg, extra=spec_files)
         if not commit:  # nothing new to commit: a run of complete that failed after its commit left it at HEAD
             commit = _head_commit_named(ctx.root, msg)
@@ -7117,6 +8768,8 @@ def cmd_complete(args):
             spec_notes += _spec_finish(ctx, st)
             register_active(ctx.root, None)
     ctx.save_state(st)
+    if st["phase"] == "done":
+        _ci_export_hint(ctx)
     build_viewer(ctx)
     ok(f"{args.cp} complete{f' (commit {commit})' if commit else ''}.")
     for n_ in spec_notes:
@@ -7176,6 +8829,8 @@ def cmd_human_approve(args):
     # "done" still accepts later feedback, so it keeps a pause marker
     st["awaiting_since"] = now() if st["phase"] in ("done", "awaiting_final_review") else None
     ctx.save_state(st)
+    if st["phase"] == "done":
+        _ci_export_hint(ctx)
     build_viewer(ctx)
     ok(f"Human approval recorded. Phase → {st['phase']}")
     print(json.dumps(next_action(ctx, st), indent=2))
@@ -7394,12 +9049,26 @@ ASKABLE = {"approve-plan": "start building the plan as it is",
            "accept-finding": "accept the open finding(s) named above as a known limit, with your own reason, instead "
                              "of running another review round",
            "raise-limit": "raise this step's review-round limit by one round, with your own reason, so the "
-                          "reviewers can keep going (offered at most once per step, ever)"}
+                          "reviewers can keep going (offered at most once per step, ever)",
+           "paid-provider": "use a provider that costs money per use (or whose cost is unknown, treated the "
+                            "same way) for reviews, named above, instead of only flat-rate ones"}
 # the command that carries out a "yes" to each question
 PENDING_COMMAND = {"approve-plan": "approve-plan", "human-approve": "human-approve", "approve-changes": "approve-changes", "cancel": "cancel", "set-review": "set-review",
                    "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec", "choice": "choice",
                    "accept-finding": "accept-finding", "raise-limit": "raise-limit"}
 REVIEW_MODE_WORDS = {"end": "only at the end", "each": "after every step", "none": "never (fully autonomous)"}
+
+
+def _pending_followup(action, mode=None) -> str:
+    """The real command that carries out a developer's yes to a waiting question, for the re-ask/overtaken
+    hints that build it from PENDING_COMMAND and the question's mode. paid-provider's mode is "tool:model"
+    (joined only for display/comparison); its real follow-up needs them as separate --preset/--model flags
+    and an id for the new provider, not PENDING_COMMAND's plain command-plus-mode form."""
+    if action == "paid-provider" and mode and ":" in mode:
+        tool, model = mode.split(":", 1)
+        return f"providers --add <id> --preset {tool} --model {model}"
+    cmd = PENDING_COMMAND.get(action, action)
+    return cmd + (f" {mode}" if mode else "")
 
 
 def cmd_ask(args):
@@ -7428,7 +9097,10 @@ def cmd_ask(args):
         die("ask accept-finding needs the finding ids to accept, e.g. `ratchet.py ask accept-finding CP2 F1,F2`")
     if args.action == "raise-limit" and not (args.mode and args.mode in (st.get("checkpoints") or {})):
         die("ask raise-limit needs the checkpoint id, e.g. `ratchet.py ask raise-limit CP2`")
-    if args.action not in ("set-review", "ui-respec", "accept-finding", "raise-limit") and args.mode:
+    if args.action == "paid-provider" and not (args.mode and getattr(args, "ids", None)):
+        die("ask paid-provider needs the tool and model, e.g. `ratchet.py ask paid-provider opencode "
+            "openrouter/z-ai/glm-5`")
+    if args.action not in ("set-review", "ui-respec", "accept-finding", "raise-limit", "paid-provider") and args.mode:
         die(f"ask {args.action} takes no extra value")
     _bind_owner(ctx, st, args.action, asker)
     if args.action == "raise-limit":
@@ -7437,6 +9109,8 @@ def cmd_ask(args):
         return _ask_choice(ctx, st, args)
     if args.action == "accept-finding":
         return _ask_accept_finding(ctx, st, args)
+    if args.action == "paid-provider":
+        return _ask_paid_provider(ctx, st, args)
     detail = ""
     if args.action == "approve-changes":
         # integrity_problems (via approval_snapshot/_plan_hash) no longer raises KeyError for a checkpoint
@@ -7551,7 +9225,7 @@ def _overtake(ctx, st, action, mode, asker=None) -> dict:
     if not answered and action in ("approve-plan", "human-approve"):
         die(f"A different question is still waiting for the user's first reply: shall I "
             f"{_question_what(oa, old.get('mode'))}? One reply can't answer two questions. Get that one answered "
-            f"(if they say yes, run `ratchet.py {PENDING_COMMAND.get(oa, oa)}{' ' + old['mode'] if old.get('mode') else ''}`"
+            f"(if they say yes, run `ratchet.py {_pending_followup(oa, old.get('mode'))}`"
             ") or run `ratchet.py ask withdraw` if you no longer need it, then ask this question on its own.")
     ctx.log(st, "question_overtaken", action=oa, mode=old.get("mode"), by=action, answered=answered)
     if answered:
@@ -7801,6 +9475,31 @@ def _ask_accept_finding(ctx, st, args):
           "limit, with their reason, instead of running another review round? To accept them, their reply must be "
           "exactly: accept: <their reason>. Only their first reply counts, and only that exact form (starting with "
           "\"accept: \") accepts them; any other reply accepts nothing.")
+    print(ASK_ALONE)
+
+
+def _ask_paid_provider(ctx, st, args):
+    """`ask paid-provider <tool> <model>`: the developer's OK to spend money on this one model, through
+    `providers --add`, the next time it is run for this exact tool and model. This spends real money (a
+    per-use request, or an unknown-cost one treated the same way), so it needs its own exact reply naming the
+    model (_paid_provider_reply), never the generic listed-yes words used for every other question."""
+    tool, model = args.mode, args.ids
+    overtook = _overtake(ctx, st, "paid-provider", f"{tool}:{model}")
+    asked = now()
+    st["pending"] = {"action": "paid-provider", "mode": f"{tool}:{model}", "tool": tool, "model": model,
+                     "asked_at": asked, "prev_awaiting": st.get("awaiting_since"),
+                     "session": _asking_session(ctx, st, "paid-provider"), **overtook}
+    st["awaiting_since"] = asked
+    ctx.log(st, "question_asked", action="paid-provider", mode=f"{tool}:{model}")
+    ctx.save_state(st)
+    if overtook:
+        print(_not_asked_text(f"`ratchet.py ask paid-provider {tool} {model}`", overtook))
+        return
+    exact = _paid_provider_reply(model)
+    print(f"ASK THE USER: {tool}'s model {model} costs money per use (or its cost is unknown, which Ratchet "
+          "treats the same way), including one small test request right now to check it works, before it is "
+          f"ever used for a review. Shall I use it? Only one exact reply agrees: reply exactly \"{exact}\". Any "
+          "other reply means no.")
     print(ASK_ALONE)
 
 
@@ -8462,6 +10161,8 @@ def cmd_reviewers(args):
     obj_oneline = re.sub(r"\s*\n\s*", " ", objective_brief(plan))
     fp = fingerprint(ctx.root)["id"]
     g = cps["gates"]["adversarial"]
+    if g["status"] != "passed" and _docs_only_review_skip(ctx, st, cfg, cp, cps, args.cp, json_out=args.json):
+        return
     rnd = cps.get("adv_round")
     if not rnd or rnd.get("recorded") or rnd["fingerprint"] != fp:
         ci = _checkin_state(cps)
@@ -8512,6 +10213,20 @@ def cmd_reviewers(args):
                 if narrowed_resolved:
                     resolved = narrowed_resolved
                     narrow_now = True
+        # CP3: a small fix made since the checkpoint's last FULL review opens with exactly one reviewer, told
+        # (via review_rules' existing focus_files, below) to look only at what changed since that approval. That
+        # one reviewer must still cover both lenses, so it is resolved the same way a low-risk step's single
+        # reviewer is (review_depth["low"], an any-both/host-both slot), never the step's own (possibly
+        # single-lens) first slot. The override is only used, and small_fix only set, when that resolution
+        # actually comes back as exactly one both-lens reviewer -- a customized review_depth["low"] (two slots,
+        # or a single-lens id) falls back to the step's normal full round instead of mislabeling it.
+        small_fix = _is_small_fix_round(ctx, cfg, args.cp, cp, cps, g)
+        if small_fix:
+            low_resolved = _small_fix_reviewers(ctx, cfg, cp)
+            if low_resolved is not None:
+                resolved = low_resolved
+            else:
+                small_fix = False
         g["attempts"] += 1
         st["adv_rounds_total"] = int(st.get("adv_rounds_total", 0)) + 1
         prev = rnd["round"] if rnd else 0
@@ -8533,7 +10248,7 @@ def cmd_reviewers(args):
         else:
             prev_round_tree = rnd["fingerprint"] if rnd else None
         rnd = {"round": prev + 1, "nonce": secrets.token_hex(8), "fingerprint": fp, "opened_at": now(),
-               "reviewers": [r["id"] for r in resolved], "narrowed": narrow_now,
+               "reviewers": [r["id"] for r in resolved], "narrowed": narrow_now, "small_fix": small_fix,
                "prev_round_tree": prev_round_tree,
                "substitutions": [{"used": r["id"], "instead_of": r["fallback_for"], "why": r["reasons"]}
                                  for r in resolved if r["fallback_for"]],
@@ -8554,17 +10269,45 @@ def cmd_reviewers(args):
         # every other reviewer on the same CLI, keep running.
         out_dir_now = _review_round_dir(ctx, args.cp, "adv", rnd["round"])
         round_cutoff = {p.name[:-len(".cutoff.json")] for p in out_dir_now.glob("*.cutoff.json")}
-        fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff)}
-        changed = False
-        for i, r in enumerate(rnd["resolved"]):
-            if (out_dir_now / f"{r['id']}.json").exists():
-                continue  # a finished review in this round is kept untouched, never re-resolved
-            okay, _why = reviewer_availability(ctx, cfg, r["id"])
-            if (not okay or r["id"] in round_cutoff) and r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
-                rnd["resolved"][i] = fresh[r["slot"]]
-                changed = True
+        changed, swapped_in = False, []
+        if rnd.get("small_fix"):
+            # A small-fix round's one reviewer must always cover both lenses, so re-resolve it the same way
+            # the round was opened (_small_fix_reviewers), never via the step's own (possibly single-lens)
+            # risk. When that can't produce a both-lens replacement, this stops being a small-fix round.
+            cur = rnd["resolved"][0]
+            if not (out_dir_now / f"{cur['id']}.json").exists():  # a finished review is kept untouched
+                okay, _why = reviewer_availability(ctx, cfg, cur["id"])
+                if not okay or cur["id"] in round_cutoff:
+                    replacement = _small_fix_reviewers(ctx, cfg, cp, exclude=round_cutoff)
+                    if replacement is not None:
+                        if replacement[0]["id"] != cur["id"]:
+                            rnd["resolved"] = replacement
+                            changed = True
+                            if replacement[0]["fallback_for"]:
+                                swapped_in.append({"used": replacement[0]["id"], "instead_of": replacement[0]["fallback_for"],
+                                                    "why": replacement[0]["reasons"]})
+                    else:
+                        rnd["small_fix"] = False
+                        rnd["resolved"] = resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff)
+                        changed = True
+                        swapped_in.extend({"used": r["id"], "instead_of": r["fallback_for"], "why": r["reasons"]}
+                                           for r in rnd["resolved"] if r["fallback_for"])
+        else:
+            fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff)}
+            for i, r in enumerate(rnd["resolved"]):
+                if (out_dir_now / f"{r['id']}.json").exists():
+                    continue  # a finished review in this round is kept untouched, never re-resolved
+                okay, _why = reviewer_availability(ctx, cfg, r["id"])
+                if (not okay or r["id"] in round_cutoff) and r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
+                    new_r = fresh[r["slot"]]
+                    rnd["resolved"][i] = new_r
+                    changed = True
+                    if new_r["fallback_for"]:
+                        swapped_in.append({"used": new_r["id"], "instead_of": new_r["fallback_for"], "why": new_r["reasons"]})
         if changed:
             rnd["reviewers"] = [r["id"] for r in rnd["resolved"]]
+            if swapped_in:  # record the same-round swap the same shape a fresh round's own substitutions use
+                rnd["substitutions"] = (rnd.get("substitutions") or []) + swapped_in
             ctx.log(st, "reviewer_fallback", cp=args.cp, detail="re-resolved within round " + str(rnd["round"]))
             ctx.save_state(st)
     _key, why = open_review_key(ctx, args.cp, "adv", rnd["round"], st)
@@ -8596,6 +10339,7 @@ def cmd_reviewers(args):
            "risk": cp.get("risk", "normal"), "round": rnd["round"], "fingerprint": fp,
            "review_rules": rules, "focus_files": sorted(focus) if focus is not None else None,
            "round_nonce": rnd["nonce"], "output_dir": str(out_dir), "narrowed": rnd.get("narrowed", False),
+           "small_fix": rnd.get("small_fix", False),
            "fixes_md": str(fixes) if rnd["round"] > 1 else None,
            "run_rounds_used": st.get("adv_rounds_total", 0), "run_rounds_cap": cfg["max_adversarial_rounds_run"],
            "reviewers": rows}
@@ -8604,6 +10348,12 @@ def cmd_reviewers(args):
         return
     print(f"{args.cp} risk={res['risk']} round={rnd['round']} fingerprint={fp[:12]} nonce={rnd['nonce']} "
           f"(run rounds {res['run_rounds_used']}/{res['run_rounds_cap']})")
+    if res["small_fix"]:
+        print(f"Small fix since approval (at or under {cfg.get('small_edit_lines', 20)} changed code lines): "
+              "one reviewer, scoped to the files changed since approval.")
+    off_note = _docs_only_quick_path_off_note(ctx, cfg, cp, cps)
+    if off_note:
+        print(off_note)
     if isinstance(obj, dict) and obj:
         print(f"Who it's for: {obj.get('users', '')}")
         print(f"What they want: {obj.get('goal', '')}")
@@ -8673,6 +10423,8 @@ def status_json(ctx: Ctx) -> dict:
             "hooks": hs, "hook_errors": hook_errors_view(ctx.root, hs.get("host", "unknown")),
             "viewer_url": viewer_link(ctx)["url"], "viewer_live": viewer_link(ctx)["live"],
             "done": sum(1 for c in cps if c["status"] == "done"), "total": len(cps),
+            "small_fix_reviews": _small_fix_review_lines(st),
+            "docs_only_review_skips": _docs_only_skip_lines(st),
             "checkpoints": cps, "updated_at": st.get("updated_at")}
 
 
@@ -9594,7 +11346,7 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                f"`{eng} resume --claim` only if their first reply after it is one of the listed yes "
                                "replies. Otherwise leave the run alone and do what they asked.")
             if p.get("action") and p["action"] != "hooks-waive":
-                cmd = PENDING_COMMAND.get(p["action"], p["action"]) + (" " + p["mode"] if p.get("mode") else "")
+                cmd = _pending_followup(p["action"], p.get("mode"))
                 what = _question_what(p["action"], p.get("mode"))
                 again = _ask_cmd(p["action"], p.get("mode"), eng=eng)
                 asked_in = _question_session(st, p)
@@ -9622,6 +11374,16 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                    "already answered it, so this later message is not their answer: it does NOT "
                                    "approve the plan, a checkpoint or anything else. If you still need their yes, "
                                    f"print the question again ({again}).")
+                if p["action"] == "paid-provider":
+                    # This question's own exact reply (never the generic listed-yes words: it spends money).
+                    exact = _paid_provider_reply(p.get("model") or "")
+                    matched = n["prompt"].strip().casefold() == exact.strip().casefold()
+                    verdict = (f"It is the exact reply (\"{exact}\")" if matched
+                               else f"It is NOT the exact reply (\"{exact}\"), so it approves nothing")
+                    return False, (f"[ratchet] This reply answers your waiting question: shall I {what}? {verdict}. "
+                                   f"Only after that exact reply run `{eng} {cmd}` (pick an id for the new provider); "
+                                   f"otherwise run `{eng} ask withdraw` and do what they asked. This reply does NOT "
+                                   "approve the plan, a checkpoint or anything else.")
                 verdict = ("It is one of the listed yes replies" if is_listed_yes(n["prompt"])
                            else "It is NOT one of the listed yes replies, so it approves nothing")
                 if p["action"] in ("approve-plan", "human-approve"):
@@ -12024,7 +13786,8 @@ STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "re
                      "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
                      "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait", "accept-finding",
                      "raise-limit", "check-in", "triage")
-LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers")  # tests, checks, a regression suite, provider probes
+LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers", "providers")  # tests, checks, a regression suite,
+                                                                               # provider probes (--add included)
 # The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
 OVERRIDE_CMDS = ("approve-plan", "human-approve", "approve-changes", "cancel", "set-review", "resume", "hooks-waive",
                  "ui-respec", "choice", "feedback", "accept-state", "init")
@@ -12041,6 +13804,11 @@ def _changes_state(args) -> bool:
         return bool(getattr(args, "offered", None))
     if args.cmd == "spec":
         return getattr(args, "spec_cmd", None) in ("import", "keep")
+    if args.cmd == "providers":
+        # --add is the only form that can consume the developer's one-time paid-provider OK (_consume_paid_ok)
+        # and send a real test request; locking it the same way every other question-consuming command is
+        # locked means two `providers --add` calls for the same tool/model never both spend that one OK.
+        return bool(getattr(args, "add", None))
     return args.cmd in STATE_LOCKED_CMDS
 
 
@@ -12218,6 +13986,376 @@ def _may_use_override(args) -> bool:
     return not getattr(args, "director_token", None) and not (args.cmd == "resume" and not args.claim)
 
 
+# --------------------------------------------------------------------------- CI export
+
+CI_WORKFLOW_HEADER = (
+    "# Generated by Ratchet (ratchet.py ci-export)\n"
+    "#\n"
+    "# This workflow runs the mechanical checks this project's Ratchet run relied on: the regression\n"
+    "# command (or, lacking one, completed steps' own test commands) and every automatic check saved\n"
+    "# from a guardrail step.\n"
+    "#\n"
+    "# It does not run Ratchet's AI review gates (adversarial review, UI review, human review). CI\n"
+    "# machines don't have the agent CLIs and credentials those gates need, so those gates stay a\n"
+    "# step a person or an agent runs, not a CI job.\n"
+    "#\n"
+    "# To regenerate this file, ask your agent to run Ratchet's CI export; don't edit it by hand.\n"
+)
+
+
+_NOTED_BAD_SHAPE = set()
+
+
+def _note_bad_shape(path: Path, why: str, outcome: str):
+    """Say plainly, on stderr, that one of Ratchet's own records held the wrong JSON shape and what
+    ci-export did instead (once per file and cause in a process). Worded like read_json's record= notes,
+    but for a file that parsed fine yet doesn't hold the shape expected at that point."""
+    key = (str(path), why, outcome)
+    if key in _NOTED_BAD_SHAPE:
+        return
+    _NOTED_BAD_SHAPE.add(key)
+    print(f"ratchet: {path} {why}; {outcome}", file=sys.stderr)
+
+
+def _ci_step_tests(ctx: Ctx) -> list:
+    """Completed steps' own tests.command, across every run under runs/, ordered by that run's created_at
+    (not its folder name) and then by the checkpoint order its own checkpoints.json saved. Each run's
+    checkpoints.json gives a checkpoint's tests.command; its state.json says which checkpoints are done.
+    A run folder whose state.json or checkpoints.json doesn't hold the shape expected is skipped whole, with
+    a plain stderr note naming the file; a single malformed checkpoint entry or item inside an otherwise
+    well-shaped run is skipped on its own, with its own note, leaving the run's other checkpoints intact."""
+    runs_dir = ctx.ratchet / "runs"
+    if not runs_dir.is_dir():
+        return []
+    runs = []
+    for run_dir in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
+        state_path = run_dir / "state.json"
+        plan_path = run_dir / "checkpoints.json"
+        state = read_json(state_path, {},
+                           record="ci-export skips this run folder's step tests") or {}
+        plan = read_json(plan_path, {},
+                          record="ci-export skips this run folder's step tests") or {}
+        if not isinstance(state, dict) or not isinstance(plan, dict):
+            continue
+        if "checkpoints" not in state:
+            done = {}
+        else:
+            done = state.get("checkpoints")
+            if not isinstance(done, dict):
+                _note_bad_shape(state_path, "holds a \"checkpoints\" value that isn't an object",
+                                 "ci-export skips this run folder's step tests")
+                continue
+        if "checkpoints" not in plan:
+            plan_checkpoints = []
+        else:
+            plan_checkpoints = plan.get("checkpoints")
+            if not isinstance(plan_checkpoints, list):
+                _note_bad_shape(plan_path, "holds a \"checkpoints\" value that isn't a list",
+                                 "ci-export skips this run folder's step tests")
+                continue
+        runs.append((str(state.get("created_at") or ""), run_dir.name, done, plan_checkpoints, state_path,
+                     plan_path))
+    runs.sort(key=lambda r: (r[0], r[1]))
+    out = []
+    for _created, slug, done, plan_checkpoints, state_path, plan_path in runs:
+        for cp in plan_checkpoints:
+            if not isinstance(cp, dict):
+                _note_bad_shape(plan_path, "has a \"checkpoints\" item that isn't an object",
+                                 "ci-export skips that checkpoint's step test")
+                continue
+            cp_id = cp.get("id")
+            if not isinstance(cp_id, str) or not cp_id:
+                _note_bad_shape(plan_path, "has a \"checkpoints\" item whose \"id\" isn't a nonempty string",
+                                 "ci-export skips that checkpoint's step test")
+                continue
+            if cp_id not in done:
+                continue
+            entry = done[cp_id]
+            if not isinstance(entry, dict):
+                _note_bad_shape(state_path, f"has a \"{cp_id}\" checkpoint entry that isn't an object",
+                                 "ci-export skips that checkpoint's step test")
+                continue
+            if entry.get("status") != "done":
+                continue
+            if "tests" not in cp:
+                continue
+            tests = cp["tests"]
+            if not isinstance(tests, dict):
+                _note_bad_shape(plan_path, f"has a \"{cp_id}\" checkpoint whose \"tests\" value isn't an object",
+                                 "ci-export skips that checkpoint's step test")
+                continue
+            command = tests.get("command") or ""
+            command = command.strip() if isinstance(command, str) else ""
+            if command:
+                out.append({"name": f"{slug} {cp_id} tests", "command": command})
+    return out
+
+
+def ci_commands(ctx: Ctx) -> list:
+    """The platform-neutral, ordered, deduplicated list of commands a CI workflow should run: the project's
+    regression command first, then every saved automatic check (config `checks`, in saved order); a
+    completed step's own tests.command (gathered by _ci_step_tests, run order then saved checkpoint order)
+    is added only when there is no regression command. Exact duplicate command text collapses to its first
+    occurrence. Each entry: {"name", "command", "note"} where `note` is a short comment for a command that
+    may need a running app/service CI does not start, or None."""
+    cfg = ctx.config()
+    app = cfg.get("app") or {}
+    app_note = ("this command may need a running app or service (config app.start_command/app.url is "
+                "set); CI does not start it") if (app.get("start_command") or app.get("url")) else None
+    regression = cfg.get("regression_command")
+    regression = regression.strip() if isinstance(regression, str) else ""
+    entries = []
+    if regression:
+        entries.append({"name": "Regression", "command": regression, "note": app_note})
+    for chk in cfg.get("checks") or []:
+        command = chk.get("command") if isinstance(chk, dict) else None
+        if not isinstance(command, str) or not command.strip():
+            continue
+        entries.append({"name": (chk.get("title") or chk.get("kind") or "Check") if isinstance(chk, dict) else "Check",
+                         "command": command, "note": app_note})
+    if not regression:
+        for e in _ci_step_tests(ctx):
+            entries.append({"name": e["name"], "command": e["command"], "note": app_note})
+    seen = set()
+    out = []
+    for e in entries:
+        if e["command"] in seen:
+            continue
+        seen.add(e["command"])
+        out.append(e)
+    return out
+
+
+def _ci_setup_steps(ctx: Ctx, commands: list) -> str:
+    """Setup steps chosen from the project's own files: Python (actions/setup-python) when there is a
+    pyproject.toml, requirements*.txt, setup.py, or a command starting with python/python3; Node
+    (actions/setup-node plus npm ci, pnpm or yarn by lockfile) when there is a package.json. Either, both
+    or neither may apply; this never guesses a language the project has no sign of.
+
+    Dependency installation, each independent of the others (neither suppresses the other):
+    - requirements.txt (that exact name) installs with `python -m pip install -r requirements.txt`. Any
+      other requirements*.txt files are named in a YAML comment instead of installed.
+    - a pyproject.toml containing a `[build-system]` table installs with `python -m pip install -e .`,
+      after the requirements line when both are present. A pyproject.toml without `[build-system]` (for
+      example one holding only tool config such as pytest or Ruff settings) installs nothing from it.
+    - when neither of the above emits an install, a plain comment says to add dependency setup, naming
+      any pyproject.toml, setup.py, uv.lock or poetry.lock found, since guessing one would be wrong as
+      often as right.
+
+    Node: `npm ci` when a package-lock.json or npm-shrinkwrap.json is present; `npm install` when
+    package.json has no lockfile at all. `pnpm-lock.yaml` gets pnpm/action-setup@v4 plus `pnpm install
+    --frozen-lockfile` only when package.json's `packageManager` field starts with `pnpm@` (the version
+    that action needs); otherwise just setup-node plus a comment to add the project's own pnpm setup.
+    `yarn.lock` gets setup-node plus a comment (yarn 1 and yarn berry differ), no corepack."""
+    root = ctx.root
+    req_files = sorted(root.glob("requirements*.txt"))
+    has_requirements_txt = (root / "requirements.txt").exists()
+    other_req_files = [f for f in req_files if f.name != "requirements.txt"]
+    pyproject_path = root / "pyproject.toml"
+    has_pyproject = pyproject_path.exists()
+    has_build_system = False
+    if has_pyproject:
+        try:
+            pyproject_text = pyproject_path.read_text()
+        except OSError:
+            pyproject_text = ""
+        has_build_system = any(re.match(r"^\[build-system\]", line) for line in pyproject_text.splitlines())
+    is_python = (has_pyproject or (root / "setup.py").exists() or req_files
+                 or any(re.match(r"\s*python3?\b", e["command"]) for e in commands))
+    is_node = (root / "package.json").exists()
+    out = ""
+    if is_python:
+        out += '      - uses: actions/setup-python@v5\n        with:\n          python-version: "3.x"\n'
+        emitted = False
+        if has_requirements_txt:
+            out += "      - run: python -m pip install -r requirements.txt\n"
+            emitted = True
+        if other_req_files:
+            names = ", ".join(f.name for f in other_req_files)
+            out += f"      # also found: {names}; add it if CI needs it\n"
+        if has_build_system:
+            out += "      - run: python -m pip install -e .\n"
+            emitted = True
+        if not emitted:
+            extras = [n for n, present in [
+                ("pyproject.toml", has_pyproject),
+                ("setup.py", (root / "setup.py").exists()),
+                ("uv.lock", (root / "uv.lock").exists()),
+                ("poetry.lock", (root / "poetry.lock").exists()),
+            ] if present]
+            suffix = (": " + ", ".join(extras)) if extras else ""
+            out += f"      # no dependency setup found{suffix}: add this project's dependency setup here\n"
+    if is_node:
+        install = None
+        comment = None
+        if (root / "pnpm-lock.yaml").exists():
+            package_manager = ""
+            pkg_data = read_json(root / "package.json", {},
+                                  record="Ratchet treats a damaged or non-object package.json as having no "
+                                         "packageManager field")
+            if isinstance(pkg_data, dict):
+                package_manager = pkg_data.get("packageManager") or ""
+            if isinstance(package_manager, str) and package_manager.startswith("pnpm@"):
+                out += "      - uses: pnpm/action-setup@v4\n"
+                install = "pnpm install --frozen-lockfile"
+            else:
+                comment = ("      # pnpm-lock.yaml found but package.json has no packageManager field "
+                           "starting with pnpm@: add this project's pnpm setup here\n")
+        elif (root / "yarn.lock").exists():
+            comment = "      # yarn.lock found: add this project's yarn setup here (yarn 1 and yarn berry differ)\n"
+        elif (root / "package-lock.json").exists() or (root / "npm-shrinkwrap.json").exists():
+            install = "npm ci"
+        else:
+            install = "npm install"
+        out += '      - uses: actions/setup-node@v4\n        with:\n          node-version: "20"\n'
+        if install:
+            out += f"      - run: {install}\n"
+        if comment:
+            out += comment
+    return out
+
+
+CI_RUN_INDENT = "          "  # content indent for a `run: |` block scalar: 2 more than "run:"'s own 8 spaces
+
+
+def render_github_actions(ctx: Ctx, commands: list) -> str:
+    """Deterministic GitHub Actions YAML text for `commands` (ci_commands(ctx)'s ordered, deduplicated
+    list): one job that checks out the code, sets up the project's own language, then runs every command
+    in order as its own step. Each command is written into a `run: |` block scalar exactly as given (every
+    quote, $ sign and line kept, never re-escaped or collapsed to one line); every line of the command is
+    indented by CI_RUN_INDENT so the whole block stays inside the scalar (a continuation line left at
+    column 0 would end the block early and corrupt the workflow). When the command's first line itself
+    starts with a space, an explicit indentation indicator (`|2`) is added so the parser can't mistake that
+    leading space for part of the block's own indentation. Chomping is clip (plain `|`/`|2`): the command is
+    normalized to exactly one trailing newline before rendering, which is what clip chomping hands back on
+    parse, so the command round-trips exactly. Step names are JSON-quoted strings so a command's own text
+    never has to be escaped into them. Nothing here is timestamped or otherwise non-deterministic: the same
+    inputs always render the same text."""
+    cfg = ctx.config()
+    timeout_sec = cfg.get("test_timeout_sec") or DEFAULT_CONFIG["test_timeout_sec"]
+    timeout_min = max(1, -(-int(timeout_sec) // 60))
+    out = (
+        CI_WORKFLOW_HEADER
+        + "name: Ratchet checks\n"
+        + "on:\n"
+        + "  push:\n"
+        + "  pull_request:\n"
+        + "jobs:\n"
+        + "  ratchet:\n"
+        + "    runs-on: ubuntu-latest\n"
+        + "    steps:\n"
+        + "      - uses: actions/checkout@v4\n"
+    )
+    out += _ci_setup_steps(ctx, commands)
+    for e in commands:
+        out += f"      - name: {json.dumps(e['name'])}\n"
+        if e.get("note"):
+            out += f"        # {e['note']}\n"
+        out += f"        timeout-minutes: {timeout_min}\n"
+        cmd_text = (e["command"].rstrip("\n") + "\n") if e["command"].strip("\n") else "\n"
+        body_lines = cmd_text.split("\n")[:-1]  # drop the "" artifact after the final newline
+        indicator = "|2" if body_lines and body_lines[0].startswith(" ") else "|"
+        out += f"        run: {indicator}\n"
+        for line in body_lines:
+            out += (CI_RUN_INDENT + line + "\n") if line else "\n"
+    return out
+
+
+CI_WORKFLOW_MARKER = CI_WORKFLOW_HEADER.split("\n", 1)[0] + "\n"  # the fixed first line that marks a file as Ratchet's
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _normalized_for_marker_check(data: bytes) -> bytes:
+    """`data` with an optional leading UTF-8 BOM stripped and CRLF normalized to LF, so a file Ratchet wrote
+    that git's core.autocrlf (or a BOM-writing editor) converted on checkout is still recognized as Ratchet's
+    own. Used only to decide ownership; the byte-equality check against the canonical (no-BOM, LF-only) text
+    still uses the raw bytes, so a converted file is treated as needing an update back to that canonical text,
+    not as already up to date."""
+    if data.startswith(_UTF8_BOM):
+        data = data[len(_UTF8_BOM):]
+    return data.replace(b"\r\n", b"\n")
+
+
+def _ci_workflow_bytes(text: str) -> bytes:
+    """The exact bytes ci-export writes, compares and prints for workflow text `text` (backslashreplace,
+    matching _write_record's own error handler), computed once so the up-to-date check, the file write and
+    --stdout can never disagree, even when a check command holds a lone surrogate or other unencodable char."""
+    return text.encode("utf-8", "backslashreplace")
+
+
+def cmd_ci_export(args):
+    ctx = Ctx(find_root())
+    commands = ci_commands(ctx)
+    if not commands:
+        die("nothing to run: no regression command, no saved checks, and no completed step has its own "
+            "test command. Set one (for example `ratchet.py config --set regression_command=...`) and "
+            "run this again.")
+    text = render_github_actions(ctx, commands)
+    data = _ci_workflow_bytes(text)
+    if getattr(args, "stdout", False):
+        buf = getattr(sys.stdout, "buffer", None)
+        if buf is not None:
+            sys.stdout.flush()
+            buf.write(data)
+            buf.flush()
+        else:  # no underlying byte stream (e.g. stdout replaced in a test harness): fall back to text
+            print(text, end="")
+        return
+    path = ctx.root / ".github" / "workflows" / "ratchet.yml"
+    cant_replace = ("won't replace it. Run `ratchet.py ci-export --stdout` to print the workflow instead, "
+                     "so you can show it to the developer.")
+    for parent in (ctx.root / ".github", ctx.root / ".github" / "workflows"):
+        if parent.is_symlink():
+            die(f"{parent} is a symlink: {cant_replace}")
+    if path.is_symlink():
+        die(f"{path} is a symlink, not a workflow Ratchet wrote: {cant_replace}")
+    if path.is_dir():
+        die(f"{path} is a directory, not a file: {cant_replace}")
+    if path.exists():
+        try:
+            existing = path.read_bytes()
+        except OSError as e:
+            die(f"could not read {path}: {e}. Fix the permission or ownership problem, then run this again.")
+        if not _normalized_for_marker_check(existing).startswith(CI_WORKFLOW_MARKER.encode()):
+            die(f"{path} already exists and was not written by Ratchet (it doesn't start with Ratchet's "
+                f"marker line): {cant_replace}")
+        if existing == data:
+            ok(f"{path} is already up to date.")
+            return
+    else:
+        for parent in (ctx.root / ".github", ctx.root / ".github" / "workflows"):
+            if parent.exists() and not parent.is_dir():
+                die(f"{parent} already exists and is not a directory, so Ratchet can't write the workflow "
+                    "there. Remove or rename it, then run this again.")
+    try:
+        _write_record(path, data, raw=True)
+    except OSError as e:
+        die(f"could not write {path}: {e}. Fix the permission or ownership problem, then run this again.")
+    ok(f"wrote {path}")
+
+
+def _ci_export_hint(ctx: Ctx) -> None:
+    """Printed once by whichever command finishes a run (cmd_complete when human_review is none, the
+    final cmd_human_approve otherwise): one line telling the agent it can keep this run's mechanical
+    checks running on every push and pull request with `ratchet.py ci-export`, and asking it to mention
+    that to the developer in plain words. Asks nothing new (no pending question) and stays silent when
+    there is nothing to export, or .github/workflows/ratchet.yml already matches what ci-export would
+    write -- reusing ci-export's own helpers (ci_commands, render_github_actions) so this can never
+    disagree with what `ratchet.py ci-export` itself would decide."""
+    try:
+        commands = ci_commands(ctx)
+        if not commands:
+            return
+        data = _ci_workflow_bytes(render_github_actions(ctx, commands))
+        path = ctx.root / ".github" / "workflows" / "ratchet.yml"
+        if path.exists() and not path.is_dir() and not path.is_symlink() and path.read_bytes() == data:
+            return
+    except Exception:
+        return
+    print("You can keep these checks running on every push and pull request: run `ratchet.py ci-export` "
+          "to write a GitHub Actions workflow for them, and mention this to the developer in plain words.")
+
+
 def main(argv=None):
     try:  # quiet exit when output is piped into head/grep
         import signal
@@ -12266,10 +14404,12 @@ def main(argv=None):
     a.add_argument("--claim", action="store_true"); a.set_defaults(fn=cmd_resume)
     a = sp.add_parser("ask", help="record and print the question you're about to ask the user (needed before approve-plan, "
                                   "human-approve, cancel, set-review, approve-changes, hooks-waive, resume --claim, "
-                                  "ui-respec, accept-finding)")
+                                  "ui-respec, accept-finding, paid-provider)")
     a.add_argument("action", choices=list(ASKABLE) + ["withdraw"])
-    a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec/accept-finding: the checkpoint id")
-    a.add_argument("ids", nargs="?", help="accept-finding: the finding ids to accept, comma-separated (e.g. F1,F2)")
+    a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec/accept-finding: the checkpoint "
+                                           "id; paid-provider: the tool (preset)")
+    a.add_argument("ids", nargs="?", help="accept-finding: the finding ids to accept, comma-separated (e.g. F1,F2); "
+                                          "paid-provider: the exact model name")
     a.add_argument("--options", help="choice: the option letters, e.g. A,B,C")
     a.add_argument("--guardrail", action="append", metavar="LETTER=KIND",
                    help="choice: picking LETTER adds a guardrail step (an automatic check) for this kind of finding")
@@ -12343,8 +14483,17 @@ def main(argv=None):
     a.set_defaults(fn=cmd_spec)
     a = sp.add_parser("deferred", help="findings recorded for later instead of blocking (minor, or no user_impact)")
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_deferred)
+    a = sp.add_parser("mark-fixed", help="record that a deferred finding was really fixed and reviewed again")
+    a.add_argument("cp"); a.add_argument("decision", metavar='ref="how it was fixed"')
+    a.set_defaults(fn=cmd_mark_fixed)
+    a = sp.add_parser("receipt", help="one proof receipt to paste into the pull request: steps, time, reviewers, "
+                                      "accepted/left-for-later/fixed-later findings")
+    a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_receipt)
     sp.add_parser("next").set_defaults(fn=cmd_next)
     a = sp.add_parser("status"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_status)
+    a = sp.add_parser("changes", help="which changes since a checkpoint's start are docs, how many code lines "
+                       "changed, which test files name a doc, and whether the docs quick path is on")
+    a.add_argument("cp"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_changes)
     sp.add_parser("plan-summary", help="plain per-step summary of the plan, to show the user before they approve"
                   ).set_defaults(fn=cmd_plan_summary)
     a = sp.add_parser("brief", help="print a sub-agent's opening text: the plan's objective, then that role's own "
@@ -12401,6 +14550,10 @@ def main(argv=None):
     a.set_defaults(fn=cmd_install_hooks)
     a = sp.add_parser("doctor", help="which hosts have Ratchet hooks, and are they firing?")
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_doctor)
+    a = sp.add_parser("ci-export", help="write (or, with --stdout, print) the GitHub Actions workflow that "
+                       "keeps running the regression command and saved checks after the run ends")
+    a.add_argument("--stdout", action="store_true", help="print the workflow instead of writing a file")
+    a.set_defaults(fn=cmd_ci_export)
 
     args = p.parse_args(argv)
     global _ENGINE_ARGV, _STATE_LOCK_HELD

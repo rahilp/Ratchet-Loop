@@ -222,6 +222,34 @@ def openspec_changes(root: Path) -> list[dict]:
     return out
 
 
+def openspec_specs(root: Path) -> list[dict]:
+    """The living OpenSpec records already merged into openspec/specs/<cap>/spec.md -- the shape OpenSpec's own
+    `archive` writes and the shape living_spec_text (ratchet.py) writes for Ratchet's own running records: a
+    '# ' title line and a one-line '## Purpose'. Read-only, for a brief's digest to point at, never for coverage
+    (a plan still imports a change from openspec/changes/, not from here). Each entry is {"title", "purpose",
+    "path", "mtime"}; a spec.md with no '# ' heading at all is skipped rather than shown with a guessed or
+    garbled title."""
+    base = root / "openspec" / "specs"
+    if not base.is_dir():
+        return []
+    out = []
+    for d in sorted(p for p in base.iterdir() if p.is_dir()):
+        p = d / "spec.md"
+        if not p.exists():
+            continue
+        text = _read(p)
+        m = re.search(r"^#\s+(.+?)\s*$", text, re.M)
+        if not m:
+            continue
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        out.append({"title": _strip_md(m.group(1)), "purpose": _section(text, ("Purpose",)),
+                    "path": str(p.relative_to(root)), "mtime": mtime})
+    return out
+
+
 def _openspec_dir(root: Path, change_id: str) -> tuple[Path | None, bool]:
     """(folder, archived?) — an archived change lives at openspec/changes/archive/<date>-<id>."""
     d = root / "openspec" / "changes" / change_id
