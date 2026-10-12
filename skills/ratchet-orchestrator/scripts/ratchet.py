@@ -74,7 +74,9 @@ DEFAULT_CONFIG = {
     # explicitly (anthropic | openai | google | github | <any name>). Reviewers prefer a provider
     # DIFFERENT from the host; when none is available the host's own sub-agents review.
     "host_provider": "auto",
-    # Other agent CLIs that can review, in order of preference. Any agent CLI works: use a preset
+    # Other agent CLIs that can review (an any-<lens> slot ranks them: any that is not per-use, flat-rate or with no cost
+    # label, before a per-use one with the developer's recorded OK; inside the first group the ones with "prefer_for"
+    # that lens, then the fewest recent starts, then flat-rate before unlabeled). Any agent CLI works: use a preset
     # (claude, codex, gemini, copilot, cursor, opencode) or your own "command". "company" is whose model it runs
     # (worked out from "model" when not given); a reviewer only counts as independent when its company differs
     # from the host's. `ratchet.py providers --discover` checks what is installed and adds what works.
@@ -92,7 +94,9 @@ DEFAULT_CONFIG = {
         "host-alt-both":        {"kind": "agent", "lens": "both", "vendor": "host", "alt": True},
     },
     # Review SLOTS by checkpoint risk; risk only changes how many reviewers look. "any-<lens>" means: the first
-    # available provider from a different company (a company not yet reviewing this round preferred), else the
+    # available provider from a different company in ranked order (not per-use before per-use with the developer's OK;
+    # a provider that prefers the lens; the fewest recent review starts machine-wide; flat-rate before no cost label;
+    # a company not yet reviewing this round preferred within that cost group only), else the
     # host's company on a different model (host-alt-<lens>), else the host itself (host-<lens>). A slot can also
     # name reviewer ids, or a list of ids as ordered alternatives.
     "review_depth": {
@@ -2906,6 +2910,40 @@ def _update_health(change, note: bool = True, lock=None) -> str:
     return res
 
 
+def _start_id(nonce, rid) -> str:
+    """The id of one review start: the round's nonce plus the reviewer id, so it belongs to that reviewer in that round
+    of that lane and no other, and a refund takes back exactly it."""
+    return f"{nonce}:{rid}"
+
+
+def update_review_starts(cfg, nonce, add=(), give_back=()) -> None:
+    """Change the shared provider health record's review starts in one save. `add` are the reviewer ids a round
+    (`nonce`) was just opened or refilled with: each reviewer's provider gets a start (a host reviewer has no provider),
+    so the next round, in this project or any other on the machine, spreads to the providers used least. `give_back`
+    are reviewer ids of this round that never really used their provider: exactly the start recorded for that
+    reviewer in that round is taken back, once. Best effort: a busy lock prints a note naming the review start and
+    the round goes on."""
+    adds = [(k, _start_id(nonce, r)) for r in add for k in [_reviewer_health_key(cfg, r)] if k]
+    backs = [(k, _start_id(nonce, r)) for r in give_back for k in [_reviewer_health_key(cfg, r)] if k]
+    if not adds and not backs:
+        return
+    at = _dt.datetime.now(_dt.timezone.utc)
+
+    def change(data):
+        for k, sid in backs:
+            phealth.refund_start(data, k, sid)
+        for k, sid in adds:
+            phealth.record_start(data, k, at, sid)
+    if _update_health(change, note=False) == "busy":
+        _note_record_busy(_health_path(), "a review start" if adds else "the give-back of a review start")
+
+
+def refund_review_start(cfg, nonce, rid) -> None:
+    """The review by `rid` in the round `nonce` never used its provider (the CLI failed before it answered): take back
+    exactly the start that round recorded for it (see update_review_starts). Once only: a second call finds none."""
+    update_review_starts(cfg, nonce, give_back=[rid])
+
+
 def provider_bench(cfg, rid) -> dict | None:
     """The live bench ({reason, since, until}) of the provider behind reviewer `rid`, as every lane sees it."""
     key = _reviewer_health_key(cfg, rid)
@@ -2984,6 +3022,8 @@ def probe_provider(ctx, cfg, pv, bench=True, note: bool = True, record: bool = T
     checked `providers --add`) passes record=False (nothing is written, and `saved` is False once a request was
     sent), then takes the three records' locks (provider-status, provider-health, unavailable-reviewers) itself and
     calls _record_probe."""
+    if per_use_unapproved(pv):  # costs money per use and no recorded OK: not even a test request
+        return False, "costs money per use and the developer has not given the exact OK; no request sent", True
     cmd_t, use_stdin = provider_command(pv)
     if not cmd_t:
         return False, "no command", True
@@ -3099,11 +3139,13 @@ def bench_quota(cfg, rid, reason, until) -> bool:
                                                             quota=True), note=False) != "busy"
 
 
-def record_round_failure(ctx, cfg, cp_id, round_no, rids) -> bool:
+def record_round_failure(ctx, cfg, cp_id, round_no, rids, own=None) -> bool:
     """A real review in round `round_no` of `cp_id` failed: record the provider behind each reviewer in `rids` in that
     round's `failed_providers` at once, so a test request that passes before the next `reviewers` call (it clears a
     plain bench) can't put the provider back in the round. Done under the state lock, like every other change to the
-    run; the round is left alone when it has moved on (another round, or already recorded). False when the lock could
+    run; the round is left alone when it has moved on (another round, or already recorded). `own` is the reviewer whose
+    own run failed: it goes in the round's `failed_reviewers`, so a sibling swapped out without running is told apart.
+    False when the lock could
     not be had in about 10 seconds (it is tried five times, so a long command holding it briefly does not lose the record): the bench still keeps the provider out until `reviewers` records it."""
     lock = _StateLock(ctx.root, cmd="review-failure")
     for _ in range(5):  # behind a long command (reviewers) one try waits only ~2s; this is a short write: ~10s in all
@@ -3118,8 +3160,10 @@ def record_round_failure(ctx, cfg, cp_id, round_no, rids) -> bool:
             return True
         failed = set(rnd.get("failed_providers") or [])
         failed |= {_reviewer_health_key(cfg, r) or r for r in rids}
-        if sorted(failed) != sorted(rnd.get("failed_providers") or []):
+        own_failed = set(rnd.get("failed_reviewers") or []) | ({own} if own else set())
+        if sorted(failed) != sorted(rnd.get("failed_providers") or []) or sorted(own_failed) != sorted(rnd.get("failed_reviewers") or []):
             rnd["failed_providers"] = sorted(failed)
+            rnd["failed_reviewers"] = sorted(own_failed)
             ctx.save_state(st)
         return True
     finally:
@@ -3316,6 +3360,13 @@ def cmd_providers(args):
             pv["company"] = args.company
         if args.for_risk:
             pv["for_risk"] = [x.strip() for x in args.for_risk.split(",") if x.strip()]
+        if args.prefer_for:
+            lenses = [x.strip() for x in args.prefer_for.split(",") if x.strip()]
+            bad = [x for x in lenses if x not in LENSES]
+            if bad or not lenses:
+                die(f"--prefer-for takes a comma list of lenses from {', '.join(LENSES)}; "
+                    f"{', '.join(repr(x) for x in bad) or repr(args.prefer_for)} is not one of them. Nothing was added.")
+            pv["prefer_for"] = list(dict.fromkeys(lenses))
         if not provider_company(pv):
             die(f"Can't tell which company's model '{args.add}' runs. Give --model (a model name from that tool) "
                 "or --company.")
@@ -3325,6 +3376,12 @@ def cmd_providers(args):
             # (the paid-provider question); this runs before any request is sent, flat-rate adds are unaffected.
             pv["paid_ok_at"] = _consume_paid_ok(ctx, ctx.state(), pv)
             pv["cost"] = "per-use"
+        elif args.preset in MODEL_LISTERS and pv.get("model"):
+            pv["cost"] = "flat"  # a listed model that needed no OK is flat-rate (discovery labels its picks the same way)
+        else:  # adding an id again (for example to set --prefer-for) keeps the cost label it already had
+            was = next((x.get("cost") for x in plist if x["id"] == pv["id"] and x.get("cost")), None)
+            if was:
+                pv["cost"] = was
         if args.no_check:
             # an earlier result was about whatever had this id before
             p = _status_path(ctx)
@@ -3388,6 +3445,8 @@ def cmd_providers(args):
             state = "same company as this agent, so not used as an independent reviewer"
         elif not company:
             state = "needs a model (which company's model it runs is unknown)"
+        elif per_use_unapproved(pv):
+            state = "costs money per use and has no recorded OK from the developer, so it is never used"
         elif not installed:
             state = f"not installed ('{provider_binary(pv)}' not found)"
         elif "ok" not in st_:
@@ -3395,7 +3454,8 @@ def cmd_providers(args):
         else:
             state = ("working" if st_.get("ok") else "failing") + f": {st_.get('detail')} ({str(st_.get('at'))[:16]}Z)"
         rows.append({"id": pv["id"], "company": company, "model": pv.get("model"), "installed": installed,
-                     "ok": bool(st_.get("ok")) and company not in (None, host), "state": state})
+                     "ok": bool(st_.get("ok")) and company not in (None, host) and not per_use_unapproved(pv),
+                     "state": state, **({"prefer_for": pv["prefer_for"]} if pv.get("prefer_for") else {})})
     found = []
     paid_options = []
     if args.discover:
@@ -4067,6 +4127,46 @@ def provider_by_id(cfg, pid) -> dict | None:
     return next((pv for pv in providers(cfg) if pv["id"] == pid), None)
 
 
+def per_use_unapproved(pv) -> bool:
+    """True for a provider whose cost label is anything but flat-rate (per-use, or any label Ratchet cannot call
+    free) and that carries no paid_ok_at: the developer never gave the exact OK for its model, so it is never chosen
+    for a review and never sent a request, not even a test request. A provider with no cost label is not in this
+    class (it keeps working as it always did)."""
+    return bool(pv) and pv.get("cost") not in (None, "", "flat") and not pv.get("paid_ok_at")
+
+
+def _cost_tier(pv) -> int:
+    """0 for a provider that is not per-use (flat-rate, or no cost label: a subscription CLI such as codex has none),
+    1 for a per-use provider (reached only with the developer's recorded OK, always after every tier 0 one)."""
+    return 0 if pv.get("cost") in (None, "", "flat") else 1
+
+
+def _reviewer_cost_tier(cfg, spec) -> int:
+    """The cost tier of the provider behind a roster spec (0 for a reviewer with no provider: a host reviewer, or a
+    hand-written one)."""
+    pv = provider_by_id(cfg, spec.get("provider")) if spec.get("provider") else None
+    return _cost_tier(pv) if pv is not None else 0
+
+
+def ranked_provider_ids(cfg, lens, health=None) -> list[str]:
+    """Every provider id, best first for a slot of `lens`: any that is not per-use (flat-rate or no cost label) before
+    a per-use one, and inside that first tier a provider that prefers the lens (`prefer_for`, set with providers --add
+    --prefer-for) before one that does not, then the fewest review starts in the shared record's recent hours (any
+    lane, any project), then flat-rate before no cost label, then the one started longest ago, then the order written
+    in config. This is only an order: whether a provider can be used right now (installed, not out, per-use with the
+    developer's OK) is reviewer_availability's call."""
+    health = provider_health() if health is None else health
+    at = _dt.datetime.now(_dt.timezone.utc)
+
+    def key(item):
+        i, pv = item
+        starts = phealth.recent_starts(health, _health_key(pv), at)
+        last = starts[-1].timestamp() if starts else 0.0
+        return (_cost_tier(pv), 0 if lens in (pv.get("prefer_for") or []) else 1, len(starts),
+                0 if pv.get("cost") == "flat" else 1, last, i)
+    return [pv["id"] for _i, pv in sorted(enumerate(providers(cfg)), key=key)]
+
+
 def provider_company(pv) -> str | None:
     if pv.get("company"):
         return norm_company(pv["company"])
@@ -4233,6 +4333,9 @@ def reviewer_availability(ctx, cfg, rid, risk=None) -> tuple[bool, str]:
         return False, f"same company as the host ({host}) — not an independent reviewer"
     if risk and spec.get("for_risk") and risk not in spec["for_risk"]:
         return False, f"not set up for {risk}-risk steps (for_risk: {', '.join(spec['for_risk'])})"
+    if per_use_unapproved(provider_by_id(cfg, spec.get("provider"))):
+        return False, ("costs money per use and the developer has not given the exact OK for this model "
+                       "(no paid_ok_at), so it is never used or sent a request")
     binary = reviewer_binary(cfg, rid) or ""
     if not binary or not shutil.which(binary):
         return False, f"'{binary or spec.get('preset')}' CLI not installed"
@@ -4253,13 +4356,16 @@ def _host_fallbacks(cfg, rid) -> list[str]:
     return [f"host-alt-{x}" for x in order if f"host-alt-{x}" in r] + [f"host-{x}" for x in order if f"host-{x}" in r]
 
 
-def expand_slot(cfg, slot) -> list[str]:
+def expand_slot(cfg, slot, health=None) -> list[str]:
+    """The reviewer ids a slot may use, in the order they are tried. An explicit id keeps the place it was written
+    in; any-<lens> becomes the providers' reviewers for that lens in ranked_provider_ids order (cost tier, lens
+    preference, fewest recent starts), then the host's own."""
     alts = list(slot) if isinstance(slot, list) else [slot]
     out = []
     for a in alts:
         m = re.fullmatch(r"any-(correctness|standards|both)", str(a))
         if m:
-            out += [f"{pv['id']}-{m.group(1)}" for pv in providers(cfg)]
+            out += [f"{pid}-{m.group(1)}" for pid in ranked_provider_ids(cfg, m.group(1), health)]
             out += [f"host-alt-{m.group(1)}", f"host-{m.group(1)}"]
         else:
             out.append(a)
@@ -4290,9 +4396,13 @@ def _dup_key(spec):
 def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None) -> list[dict]:
     """Turn review slots into concrete reviewer ids for THIS round.
 
-    Returns [{"id", "slot", "fallback_for": [ids skipped], "reasons": {...}}]. Other providers are
-    preferred in the order written, a provider not yet used this round before a repeat; the host's own
-    sub-agents fill any slot whose other providers are unavailable. A slot whose own pick turns out to be the
+    Returns [{"id", "slot", "fallback_for": [ids skipped], "reasons": {...}}]. An any-<lens> slot tries the
+    providers best first (ranked_provider_ids: not per-use, then per-use with the developer's recorded OK; the provider
+    that prefers the lens; the fewest recent review starts machine-wide; flat-rate before no cost label); an explicit
+    slot list keeps the order it was written in. A provider of a company not yet reviewing this round comes before a
+    repeat, but only inside the first candidate's cost tier (it never lifts a per-use provider); a
+    per-use provider with no recorded OK is never picked; the host's own sub-agents fill any slot whose other
+    providers are unavailable, after every other working provider (ranked the same way). A slot whose own pick turns out to be the
     same company, model and lens as a reviewer an earlier slot already chose collapses (no entry): that review
     already runs once, not twice, under a different id.
 
@@ -4308,6 +4418,7 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None) -
     replaces, so a kept slot's own pick can't use up a provider a replaced slot needs).
     """
     exclude = exclude or set()
+    health = provider_health()  # the shared record: recent review starts spread the slots across providers
     if cp.get("reviewers"):
         slots = list(cp["reviewers"])
     else:
@@ -4315,7 +4426,7 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None) -
         slots = depth.get(cp.get("risk", "normal")) or depth.get("normal")
         if not slots:  # legacy config: "adversaries": N
             slots = ["host-both"] if int(cfg.get("adversaries", 2)) == 1 else ["host-standards", "host-correctness"]
-    roster_ = {rid: _roster_spec(cfg, rid) for rid in set(roster(cfg)) | {a for sl in slots for a in expand_slot(cfg, sl)}}
+    roster_ = {rid: _roster_spec(cfg, rid) for rid in set(roster(cfg)) | {a for sl in slots for a in expand_slot(cfg, sl, health)}}
     roster_ = {k: v for k, v in roster_.items() if v is not None}
     risk = cp.get("risk", "normal")
     chosen, chosen_keys, out = set(), set(), []
@@ -4326,7 +4437,7 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None) -
     for n, slot in enumerate(slots, 1):
         if only_slots is not None and n not in only_slots:
             continue
-        alts = expand_slot(cfg, slot)
+        alts = expand_slot(cfg, slot, health)
         unknown = [a for a in alts if a not in roster_]
         if unknown:
             die(f"review_depth/checkpoint names unknown reviewer(s) {unknown}; add them under config 'providers' "
@@ -4335,8 +4446,8 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None) -
             if not any(a not in exclude and reviewer_availability(ctx, cfg, a, risk)[0] for a in alts):
                 # every provider the slot lists is out: other working providers (same lens) before the host
                 lens = roster_[alts[0]].get("lens", "both")
-                for pv in providers(cfg):
-                    rid_ = f"{pv['id']}-{lens}"
+                for pid_ in ranked_provider_ids(cfg, lens, health):
+                    rid_ = f"{pid_}-{lens}"
                     if (rid_ in roster_ and rid_ not in alts and rid_ not in exclude
                             and reviewer_availability(ctx, cfg, rid_, risk)[0]):
                         alts.append(rid_)
@@ -4354,7 +4465,11 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None) -
                 skipped.append(a)
                 reasons[a] = why
         used_vendors = {roster_[c].get("vendor") for c in chosen if roster_[c].get("kind") == "command"}
-        fresh = [c for c in candidates if roster_[c].get("kind") == "command" and roster_[c].get("vendor") not in used_vendors]
+        # A company not yet reviewing is preferred only among candidates of the first candidate's cost tier, so it never
+        # lifts a per-use provider over a usable one that is not (the candidates are already in ranked order)
+        best = _reviewer_cost_tier(cfg, roster_[candidates[0]]) if candidates else None
+        fresh = [c for c in candidates if roster_[c].get("kind") == "command" and roster_[c].get("vendor") not in used_vendors
+                 and _reviewer_cost_tier(cfg, roster_[c]) == best]
         pick = fresh[0] if fresh else (candidates[0] if candidates else None)
         if pick and candidates and pick != candidates[0]:
             skipped.append(candidates[0])
@@ -10032,6 +10147,7 @@ def cmd_reviewers(args):
             ctx.log(st, "reviewer_fallback", cp=args.cp, detail="; ".join(
                 f"{x['used']} instead of {', '.join(x['instead_of'])}" for x in rnd["substitutions"]))
         ctx.save_state(st)
+        update_review_starts(cfg, rnd["nonce"], rnd["reviewers"])
         drop_review_key(old_key)  # the replaced round (now saved as replaced) stops counting
     else:
         # same round: if a listed reviewer has become unavailable (its CLI failed), give its slot to the next
@@ -10044,6 +10160,7 @@ def cmd_reviewers(args):
         round_cutoff = {p.name[:-len(".cutoff.json")] for p in out_dir_now.glob("*.cutoff.json")}
         # A provider that failed a review in this round stays out of it, even if a later test request passes (the
         # exclusion lives in this round's own record, so the next round starts clean).
+        own_failed = set(rnd.get("failed_reviewers") or [])  # reviewers whose own run failed (external_review.py)
         failed_now = set(rnd.get("failed_providers") or [])
         for r in rnd["resolved"]:
             if not (out_dir_now / f"{r['id']}.json").exists() and not reviewer_availability(ctx, cfg, r["id"])[0]:
@@ -10060,7 +10177,11 @@ def cmd_reviewers(args):
         fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff | failed_ids,
                                                          taken=keep,
                                                          only_slots={rnd["resolved"][i]["slot"] for i in replace})}
-        changed, swapped_in, dropped = False, [], set()
+        changed, swapped_in, dropped, started, given_back = False, [], set(), [], []
+
+        def never_used(x):  # a slot given up before its reviewer ran: its start goes back (not after its own run)
+            if x not in round_cutoff and x not in own_failed:  # a sibling swapped out by that failure never ran
+                given_back.append(x)
         newly_failed = sorted(failed_now) != sorted(rnd.get("failed_providers") or [])
         if newly_failed:
             rnd["failed_providers"] = sorted(failed_now)
@@ -10069,6 +10190,8 @@ def cmd_reviewers(args):
             if r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
                 new_r = fresh[r["slot"]]
                 rnd["resolved"][i] = new_r
+                started.append(new_r["id"])
+                never_used(r["id"])
                 changed = True
                 if new_r["fallback_for"]:
                     swapped_in.append({"used": new_r["id"], "instead_of": new_r["fallback_for"], "why": new_r["reasons"]})
@@ -10079,6 +10202,7 @@ def cmd_reviewers(args):
                 host = next((h for h in _host_fallbacks(cfg, r["id"])
                              if h not in busy and reviewer_availability(ctx, cfg, h)[0]), None)
                 changed = True
+                never_used(r["id"])
                 if host is None:
                     dropped.add(i)
                 else:
@@ -10098,6 +10222,7 @@ def cmd_reviewers(args):
             ctx.log(st, "reviewer_fallback", cp=args.cp, detail="re-resolved within round " + str(rnd["round"]))
         if changed or newly_failed:
             ctx.save_state(st)
+        update_review_starts(cfg, rnd["nonce"], started, given_back)
     _key, why = open_review_key(ctx, args.cp, "adv", rnd["round"], st)
     if _key is None:
         die(review_key_problem(why, f"run `ratchet.py reviewers {args.cp}` again"))
@@ -12906,6 +13031,8 @@ def main(argv=None):
     a.add_argument("--add", metavar="ID"); a.add_argument("--preset"); a.add_argument("--command")
     a.add_argument("--stdin", action="store_true"); a.add_argument("--model"); a.add_argument("--company")
     a.add_argument("--for-risk", help="comma list of risks it may review (default all)")
+    a.add_argument("--prefer-for", help="comma list of lenses (correctness, standards, both) it reviews before other "
+                                        "providers of the same cost when a slot is any-<lens>")
     a.add_argument("--no-check", action="store_true"); a.add_argument("--remove", metavar="ID")
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_providers)
     a = sp.add_parser("models", help="which model each role's sub-agent uses on this host")

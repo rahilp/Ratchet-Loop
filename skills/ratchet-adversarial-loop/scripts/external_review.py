@@ -408,10 +408,13 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
         for k, v in subs.items():
             part = part.replace(k, v)
         cmd.append(part)
-    def unavailable(reason, quota=None, program=False):
+    def unavailable(reason, quota=None, program=False, unused=False):
         # A failure benches the failing provider only (its tool plus model), so GLM failing leaves Kimi, which runs
         # through the same OpenCode program, working. A program that is missing takes down every reviewer that runs
-        # through it (`program`).
+        # through it (`program`). `unused`: the provider was not really used (the CLI never ran, or no run of it, the
+        # first or the retry, produced any output), so the start this round recorded for the reviewer is given back; a
+        # timeout, a run that produced output (even a reply that could not be read, or a non-zero exit after it) and an
+        # out-of-credits provider all keep their start.
         binary = eng.reviewer_binary(cfg, a.reviewer)
         if program:
             same = [r for r in eng.roster(cfg) if eng.reviewer_binary(cfg, r) == binary] or [a.reviewer]
@@ -419,7 +422,9 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
             same = eng.same_provider_reviewers(cfg, a.reviewer)
         # This round learns of the failure now, not when `reviewers` next runs: a test request that passes in
         # between clears a plain bench, and must not hand the provider its slot back for the rest of the round.
-        eng.record_round_failure(ctx, cfg, a.cp, rnd["round"], same)
+        eng.record_round_failure(ctx, cfg, a.cp, rnd["round"], same, own=a.reviewer)
+        if unused and not quota:  # the CLI never ran or exited before answering: this round's own start goes back
+            eng.refund_review_start(cfg, rnd["nonce"], a.reviewer)  # (not after a timeout or a reply, nor out of credits)
         hours = None
         if quota:  # out of credits: every lane skips this provider until it said it is back (or a short re-test)
             reason = f"out of credits: {quota[1]}"
@@ -444,7 +449,7 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
     if too_big:  # never started: a CLI that takes the prompt as an argument can't be handed one this large
         unavailable(f"the review prompt ({len(prompt):,} characters) is too large to pass to '{cmd[0]}' as a "
                     f"command-line argument: {too_big}. Give this provider a 'command' that reads {{prompt_file}} "
-                    "or stdin to review changes this large")
+                    "or stdin to review changes this large", unused=True)
     shown = " ".join(c if len(c) < 80 else c[:40] + "…" for c in cmd)
 
     sent_at = []  # when each run of the CLI was started: a success only ends a quota bench that began before it
@@ -458,15 +463,15 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
             rr = subprocess.run(cmd, cwd=work, input=prompt if use_stdin else None, capture_output=True, text=True,
                                stdin=None if use_stdin else subprocess.DEVNULL, timeout=a.timeout, env=env)
         except FileNotFoundError:
-            unavailable(f"'{cmd[0]}' is not installed or not on PATH", program=True)
+            unavailable(f"'{cmd[0]}' is not installed or not on PATH", program=True, unused=True)
         except subprocess.TimeoutExpired:  # a hang is never retried — one timeout is enough to sideline it
             unavailable(f"timed out after {a.timeout}s")
         except OSError as e:  # the system refused to start it (E2BIG: the arguments were too large after all, ...)
             if e.errno == errno.E2BIG:
                 unavailable(f"the review prompt ({len(prompt):,} characters) is too large to pass to '{cmd[0]}' as a "
                             "command-line argument. Give this provider a 'command' that reads {prompt_file} or "
-                            "stdin to review changes this large")
-            unavailable(f"'{cmd[0]}' could not be started: {e.strerror or e}", program=True)
+                            "stdin to review changes this large", unused=True)
+            unavailable(f"'{cmd[0]}' could not be started: {e.strerror or e}", program=True, unused=True)
         tt = (out_file.read_text() if out_file.exists() else "") + "\n" + (rr.stdout or "")
         return rr, tt
 
@@ -502,7 +507,7 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
         (out.parent / f"{a.reviewer}.raw.txt").write_text(text + "\n--- stderr ---\n" + (r.stderr or ""))
         tail = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()[-1:] or [""]
         unavailable(f"exit {r.returncode}, no findings JSON ({tail[0][:160]})",
-                    quota=eng.quota_failure([r.stderr, text], cfg))
+                    quota=eng.quota_failure([r.stderr, text], cfg), unused=r.returncode != 0 and not text.strip())
     review = eng.clean_review_text(review)  # a cut-off emoji escape in the reply must not break signing or records
     # Stamp identity ourselves — never trust the model to echo these correctly.
     base = cps.get("base_tree")

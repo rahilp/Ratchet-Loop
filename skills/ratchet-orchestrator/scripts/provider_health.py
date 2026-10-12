@@ -6,7 +6,8 @@ it, keyed by its tool plus its model ('codex', 'opencode:opencode-go/glm-5.3'):
 
     {"<key>": {"ok": true|false, "at": "<time the last test request was SENT>", "detail": "<what came back>",
                "bench": {"reason": "...", "since": "<time>", "until": "<time>", "quota": true},
-               "claim": {"by": "<lane's token>", "since": "<time>", "until": "<time>"}}}
+               "claim": {"by": "<lane's token>", "since": "<time>", "until": "<time>"},
+               "starts": [{"at": "<time a review round was opened with this provider>", "id": "<start id>"}, ...]}}
 
 `bench` is present only while the provider is being skipped; it ends on its own at `until`. A bench with `quota` set
 is a provider that said it is out of credits: it waits for the reset time the provider gave (or a short re-test), a
@@ -15,6 +16,14 @@ while one lane's test request is on its way: other lanes wait for its result ins
 claim whose lane never answered ends on its own at `until`. A result is dated by when its request was sent, and a
 result older than the one already recorded never replaces it, so a slow answer that lands late cannot undo a newer
 one.
+
+`starts` lists when a review round was opened with the provider (any lane, any project), newest last, and only the
+last STARTS_HOURS hours are kept. Each start has an id (the round's nonce plus the reviewer id, so a start belongs to
+one reviewer in one round of one lane). Choosing a reviewer reads it to spread rounds: of two providers equally good
+for a slot, the one with fewer recent starts (then the one started longest ago) reviews. A provider that was not really
+used (no run of its CLI produced any output, or its slot was refilled or dropped in the same round before it
+reviewed) gives back exactly its own start by that id (refund_start), once: a second refund finds nothing to take
+back. A round replaced before anyone reviewed it keeps its starts.
 
 This module is pure record logic: every function takes the record's data (a dict) and edits it in place, or answers a
 question about it. It reads and writes no file. ratchet.py does that, only through update_record (under the record's
@@ -26,6 +35,7 @@ import datetime as _dt
 import re
 
 FILE = "provider-health.json"
+STARTS_HOURS = 6  # how long a review start counts as recent (and stays in the record)
 TEST_KEYS = ("ok", "at", "detail")
 
 
@@ -61,6 +71,47 @@ def fresh_ok(data: dict, key: str, at: _dt.datetime, ttl_minutes: float) -> bool
     e = _entry(data, key)
     t = _time(e.get("at"))
     return bool(e.get("ok") and t is not None and (at - t).total_seconds() < 60 * float(ttl_minutes))
+
+
+def _start_time(s):
+    """The time of one stored start: {"at", "id"}, or a bare time string written before starts had ids."""
+    return _time(s.get("at") if isinstance(s, dict) else s)
+
+
+def record_start(data: dict, key: str, at: _dt.datetime, sid: str) -> dict:
+    """Note that a review round was opened with the provider at `at` (start id `sid`), and forget starts older than
+    STARTS_HOURS. A start with this id already there is not added twice. Edits the data in place and returns it."""
+    e = dict(_entry(data, key))
+    old = e.get("starts") or []
+    keep = [s for s in old if (_start_time(s) or at) > at - _dt.timedelta(hours=STARTS_HOURS)]
+    if not any(isinstance(s, dict) and s.get("id") == sid for s in keep):
+        keep.append({"at": at.isoformat(timespec="microseconds"), "id": sid})
+    e["starts"] = keep
+    data[key] = e
+    return data
+
+
+def refund_start(data: dict, key: str, sid: str) -> dict:
+    """Take back the start with id `sid`, and only that one: a provider that was not really used does not count as
+    used. A no-op when there is no such start (already taken back, expired, or never saved). Returns the data."""
+    e = _entry(data, key)
+    starts = list(e.get("starts") or [])
+    left = [s for s in starts if not (isinstance(s, dict) and s.get("id") == sid)]
+    if len(left) != len(starts):
+        if left:
+            e["starts"] = left
+        else:
+            e.pop("starts", None)
+            if not e:
+                data.pop(key, None)
+    return data
+
+
+def recent_starts(data: dict, key: str, at: _dt.datetime) -> list:
+    """The times (datetimes, oldest first) a review round was opened with the provider in the last STARTS_HOURS
+    hours before `at`."""
+    times = [_start_time(s) for s in (_entry(data, key).get("starts") or [])]
+    return sorted(t for t in times if t is not None and t > at - _dt.timedelta(hours=STARTS_HOURS))
 
 
 def live_claim(data: dict, key: str, at: _dt.datetime) -> dict | None:
