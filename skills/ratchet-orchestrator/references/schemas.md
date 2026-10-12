@@ -15,6 +15,7 @@ Contents
 10. Hooks
 11. Building from a spec tool (OpenSpec, Spec Kit, BMAD)
 12. `ratchet.py receipt`
+13. CI export
 
 ---
 
@@ -529,4 +530,14 @@ One honest proof receipt to paste into the pull request, run at the final review
 }
 ```
 `done_means` is `null` when the plan has no `objective.done_means` at all (section 3's older-plan case); an empty `cases` list on a line means "no test linked", and `any_proves: false` means not one case in the whole plan carries a `"proves"` field (an old test plan). `steps`, `accepted`, `left_for_later` and `fixed_later` carry the same facts the markdown shows, in the same order the plan's own `checkpoints` list gives (not the order checkpoints finished). `accepted`/`left_for_later`/`fixed_later` carry the finding's own bare `id` PLUS its own `reviewer` (`null` when the finding was never tagged with one): the checkpoint alone never disambiguates two reviewers who independently picked the same bare id within one checkpoint, which is normal (their shared prompt gives every reviewer the identical example id), so `id` and `reviewer` together are this shape's own identity, matching the qualified `reviewer/id` form (`_finding_key`) the markdown prints. `run.finished` and a step's own `finished` are `true` only once the matching timestamp (the run's `approved` event; the step's `completed_at`) is on record; while false, the paired `elapsed_seconds` is time so far, not a final total.
+
+## 13. CI export
+
+`ratchet.py ci-export [--stdout]` writes a GitHub Actions workflow, `.github/workflows/ratchet.yml`, that keeps the mechanical checks a run relied on running on every push and pull request: config `regression_command` first, then every `checks[].command` (section 8, in saved order), then, only when there is no `regression_command`, a completed checkpoint's own `tests.command` across every run under `.ratchet/runs/`. Exact duplicate commands collapse to their first occurrence. The AI review gates (adversarial, UI, human review) are never part of this: the workflow's header says so and why (CI machines have neither the agent CLIs nor the credentials those gates need).
+
+Ownership is decided only by the file's first line, a fixed marker comment. A file at that path without the marker (hand-written, or written by another tool) is never touched: `ci-export` refuses, names the path and suggests `--stdout` so the agent can print the workflow and show it to the developer instead. With the marker already there, running `ci-export` again updates the file in place when the commands changed, and says it is already up to date, byte for byte, when they did not. `--stdout` prints the same bytes to stdout and writes nothing, whether or not a file already exists at that path.
+
+`ci-export` never starts an app, a database or anything needing secrets; a command that looks like it needs one (config `app.start_command` or `app.url` set) gets a comment in the workflow instead of a guess. Setup steps (checkout, then Python and/or Node, picked from the project's own files) come before the commands; nothing here is platform-specific to GitHub Actions in how commands are gathered, so another CI platform can reuse the same list later.
+
+At the end of a run, right when it finishes (the final `human-approve`, or `complete` itself when `human_review` is `none`), Ratchet prints one line telling the agent it can run `ratchet.py ci-export` to keep these checks running in CI, and asking it to mention that to the developer in plain words. This opens no question (`pending` stays empty) and never repeats on a later `status` or `next` read; it is also silent when there is nothing to export, or when `.github/workflows/ratchet.yml` already matches what `ci-export` would write.
 

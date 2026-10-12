@@ -190,6 +190,11 @@ When `next` says `awaiting_final_review` (or `awaiting_checkpoint_review` in `ea
 - **Logic-only work** (API, refactor, data migration): the planner sets `gates.ui: false` and there is no prototype.
 - **Migration / rebuild**: the reference is the old screen, not a prototype. The capture spec points `targets.reference` at the old app's URL.
 
+## CI export
+
+- At the end of a run, if `$RATCHET human-approve` or `$RATCHET complete` printed a one-line CI-export hint, mention it to the developer in plain words in your wrap-up (for example: "You can ask me to set up CI so these checks keep running on every push and pull request.").
+- When the developer asks for CI, run `$RATCHET ci-export`. It writes `.github/workflows/ratchet.yml`, or refuses and says why if a hand-written workflow is already there at that path. `--stdout` prints the workflow text instead of writing it, so you can show it to the developer. Never commit or push it for them.
+
 ## Running under a director (many lanes in parallel)
 
 A director is an orchestrator above Ratchet that runs several lanes at once, one Ratchet run per git worktree, and owns merge order, quotas and cross-lane checks. Ratchet stays the engine *inside* each lane. Nothing about the gates changes.

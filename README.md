@@ -171,6 +171,16 @@ The spec says what to build. Ratchet makes sure it was actually built. Every sce
 
 No spec tool? That's fine. The plan you approve is the spec. After your first finished feature, the agent will ask once if you'd like it to keep a simple record of what's been built: one file per feature, with each rule linked to the test that proves it. Yes or no, it remembers your answer.
 
+## CI export
+
+> Ask your agent to set up CI.
+
+That's all you say. Ratchet writes a GitHub Actions workflow that keeps the mechanical checks this run relied on running on every push and pull request: your project's regression or test command, plus every automatic check saved from a guardrail step, in that order.
+
+The AI review gates (adversarial review, UI review and human review) do not run in CI. CI machines don't have the agent CLIs and credentials those gates need, so those stay something a person or an agent runs, not a CI job.
+
+If a hand-written workflow already exists at that path, Ratchet never replaces it. It tells the agent so, and the agent can show you the file instead of writing it.
+
 ## Common questions
 
 **How long does it take?** A small feature usually takes tens of minutes, with the agent working by itself. Bigger ones take longer. You don't have to watch.
@@ -396,6 +406,7 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py lanes --scan <dir> [--json]` | each lane's phase, progress and whether it waits on a director |
 | `ratchet.py lanes --serve --scan <dir> [--bind 0.0.0.0]` | one dashboard for every lane |
 | `ratchet.py config --set key=value` | settings in `.ratchet/config.json` (reviewer roster, retry caps, `regression_command`, `ui_globs`, app URL) |
+| `ratchet.py ci-export [--stdout]` | write (or update) `.github/workflows/ratchet.yml`, the GitHub Actions workflow that keeps the run's mechanical checks running on every push and pull request; refuses to replace a hand-written file at that path; `--stdout` prints the workflow instead of writing it |
 
 The viewer server only serves the viewer, its live data and the prototype, never the rest of `.ratchet/`. Its URL is saved in `.ratchet/viewer.json`.
 
@@ -420,6 +431,10 @@ python3 tests/test_accept_finding.py
 python3 tests/test_brief.py
 python3 tests/test_brief_guard.py
 python3 tests/test_checkin.py
+python3 tests/test_ci_export.py
+python3 tests/test_ci_export_docs.py
+python3 tests/test_ci_export_shapes.py
+python3 tests/test_ci_export_write.py
 python3 tests/test_cleanup.py
 python3 tests/test_converge.py
 python3 tests/test_dedup_unknown_model.py
