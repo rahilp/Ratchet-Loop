@@ -2543,23 +2543,39 @@ def cmd_brief(args):
         print("\n".join(_earlier_work_lines(ctx)))
 
 
-def _final_review_lines(plan) -> list[str]:
-    """What `status` (and `status --json`'s own fields, read by the human-approve question) opens the final review
-    with: the objective's goal and users, then every done_means line, plain, for the user to judge against the
-    evidence themselves. Completing every checkpoint never proves a done_means line is actually met (simplifying a
-    step, or the user accepting a finding, can leave one unmet), so no line here claims met or not met; `status`
-    prints the findings accepted along the way (`_accepted_findings_lines`) and anything left for later right
-    after, so the user judges each line with that context, not a bare claim. A plan with no stated objective
-    (approved before this existed) gets a plain note instead of a crash."""
+def _final_review_lines(ctx, st, plan) -> list[str]:
+    """What `status` opens the final review with: the objective's goal and users, then a table of every
+    done_means line marked proven or unproven (`done_means_table`, the same verdicts `status --json` and the
+    receipt carry): the tests behind the line with their results, and for an unproven line why (no test linked,
+    a linked test failed or has no result, a browser test no UI gate checked, or an open finding that names the
+    line). Completing every checkpoint never proves a line is met, so the verdict comes from the recorded test
+    results and findings, not from the agent's judgment. `status` prints the findings accepted along the way
+    (`_accepted_findings_lines`) and anything left for later right after. A plan with no stated objective, or
+    whose tests are linked to no line (approved before that existed), gets a plain note instead of a table, and
+    never a crash."""
     obj = plan.get("objective") if isinstance(plan, dict) else None
     if not isinstance(obj, dict) or not obj:
         return [f"Objective: {NO_OBJECTIVE_NOTE}."]
-    lines = [f"Objective: {obj.get('goal', '')}", f"Who it's for: {obj.get('users', '')}",
-              "Done means (check each against what was actually built and the findings below; finishing the "
-              "checkpoints does not by itself mean these are met):"]
-    for dm in obj.get("done_means") or []:
-        lines.append(f"  - check: {dm}")
-    return lines
+    out = [f"Objective: {obj.get('goal', '')}", f"Who it's for: {obj.get('users', '')}"]
+    table = done_means_table(ctx, plan, st)
+    if not isinstance(table, list):
+        if not obj.get("done_means"):
+            out.append(f"Done means: {table}.")
+            return out
+        out.append("Done means:")
+        out += [f"  - {dm}" for dm in obj.get("done_means") or []]
+        out.append(table)
+        return out
+    n_ok = sum(1 for e in table if e["verdict"] == "proven")
+    out.append(f"Done means ({n_ok} of {len(table)} lines proven" + (
+        "" if n_ok == len(table) else f", {len(table) - n_ok} unproven") +
+        "; a line is proven only when every test linked to it passed and no open finding names it):")
+    for e in table:
+        out.append(f"  {e['number']}. {e['text']}: {e['verdict']}")
+        out += [f"     - {c['id']}: {c['result']}" for c in e["cases"]]
+        if e["reasons"]:
+            out.append(f"     Why unproven: {'; '.join(e['reasons'])}")
+    return out
 
 
 def _objective_fill_ins(obj: dict) -> list[str]:
@@ -3232,7 +3248,7 @@ def cmd_status_text(ctx: Ctx):
     st = ctx.state()
     plan = ctx.plan() or {"checkpoints": []}
     if st.get("phase") == "awaiting_final_review":
-        for line in _final_review_lines(plan):
+        for line in _final_review_lines(ctx, st, plan):
             print(line)
         left = [f for c in (st.get("checkpoints") or {}).values() for f in left_for_later(c)]
         if left:
@@ -9569,9 +9585,19 @@ def _receipt_fixed_later(st) -> list:
     return out
 
 
-def _dm_case_status(ctx, cp_id: str, case: dict, behavior_status: str | None = None) -> str:
-    """One linked test case's own state for the receipt's done-means section. A browser-layer case is never
-    run by `ratchet.py behavior`, so it always reads "checked by the UI gate". Otherwise, this checkpoint's
+DM_NO_UI_GATE = "not checked by any UI gate"
+DM_NO_RESULT = "no result recorded yet"
+DM_NO_TESTS_NOTE = ("No tests are linked to any of these lines (an older plan, from before tests could be linked "
+                    "to a done-means line), so there is no result to show for them.")
+DM_NO_LINES_NOTE = "no done-means lines were stated for this run's objective"
+
+
+def _dm_case_status(ctx, cp_id: str, case: dict, behavior_status: str | None = None,
+                    ui_status: str | None = None) -> str:
+    """One linked test case's own state for the receipt's and the final review's done-means section. A
+    browser-layer case is never run by `ratchet.py behavior`, so it reads "checked by the UI gate" when this
+    checkpoint's UI gate (`ui_status`, passed by the caller) passed, and DM_NO_UI_GATE when it did not (never
+    required, skipped, failed or still pending: nothing checked it). Otherwise, this checkpoint's
     latest per-case test report in evidence (whatever report format is actually on disk, read directly rather
     than only when the approved plan names one, so a report already written always counts) decides passed vs
     failed vs error vs skipped. With no report, or no result for this case in it, a supported exit-code-only
@@ -9583,7 +9609,7 @@ def _dm_case_status(ctx, cp_id: str, case: dict, behavior_status: str | None = N
     repeated runs); it counts as passed only when every matching entry passed, so one failed, errored or
     skipped instance among several still shows as failed."""
     if case.get("layer") == "browser":
-        return "checked by the UI gate"
+        return "checked by the UI gate" if ui_status == "passed" else DM_NO_UI_GATE
     case_id = case.get("id") or ""
     pat = _case_id_re(case_id) if case_id else None
     for name in ("test-report.json", "test-report.xml"):
@@ -9600,34 +9626,103 @@ def _dm_case_status(ctx, cp_id: str, case: dict, behavior_status: str | None = N
         return "step tests passed, by exit code only (not checked per case)"
     if behavior_status == "failed":
         return "step tests failed, by exit code only (not checked per case)"
-    return "no result recorded yet"
+    return DM_NO_RESULT
+
+
+def _finding_dm_lines(f: dict, n: int) -> set:
+    """The 1-based done-means line numbers a review finding names in its optional "done_means" field: one
+    number or a list of them (the shapes "proves" takes). Anything that is not a real line of this plan (a
+    string, a bool, 0, a number past the last line) names nothing and is ignored."""
+    v = f.get("done_means")
+    vals = v if isinstance(v, list) else [v]
+    return {x for x in vals if isinstance(x, int) and not isinstance(x, bool) and 1 <= x <= n}
+
+
+def _dm_case_reason(c: dict) -> str | None:
+    """Why one linked case does not prove its line, or None when it does (passed, passed by exit code only, or
+    checked by a passed UI gate). A failed case says failed (by exit code only when that is all that is known),
+    a case with nothing recorded says it has no result, a browser case no UI gate passed for says so."""
+    st, cid = c.get("status") or "", c.get("id")
+    if st in ("passed", "checked by the UI gate") or st.startswith("step tests passed"):
+        return None
+    if st == DM_NO_UI_GATE:
+        return f"{cid} is a browser test and no UI gate checked it"
+    if st.startswith("step tests failed"):
+        return f"{cid} failed, by exit code only (the step's tests were not checked per case)"
+    if st == "failed":
+        return f"{cid} failed"
+    return f"{cid} has no result"  # DM_NO_RESULT, or any status this function does not know
 
 
 def _done_means_proof(ctx, plan, cps_map: dict | None = None) -> dict | None:
     """None when the plan has no objective.done_means at all (an older plan, approved before either existed):
-    the receipt prints NO_OBJECTIVE_NOTE instead of this section. Otherwise {"lines": [{"text", "cases":
-    [{"id", "title", "file", "status"}]}], "any_proves": bool}; "any_proves" is False only when not one case
-    anywhere in the plan names a "proves" line (an old test plan from before that field existed), so the
-    receipt can add one plain note beside every line's own "no test linked" instead of pretending it checked.
-    `cps_map` (the run state's own checkpoint-by-id dict, passed by the caller) feeds each case's checkpoint's
-    recorded behavior-gate status into _dm_case_status, so an exit-code-only step still shows its real result."""
+    the receipt prints a plain note instead of this section (`_dm_none_note`: NO_OBJECTIVE_NOTE for a plan with
+    no objective, DM_NO_LINES_NOTE for an objective with no done_means lines). Otherwise {"lines": [{"number", "text",
+    "cases": [{"id", "title", "file", "status", "result"}], "verdict", "reasons"}], "any_proves": bool}; "any_proves"
+    is False only when not one case anywhere in the plan names a "proves" line (an old test plan from before that
+    field existed), so the receipt and the final review can add one plain note instead of pretending they
+    checked. "result" is the same text as "status". `verdict` is the one verdict every consumer shares (the
+    final review's table in `status` and `status --json`'s "done_means_table", and the receipt): "proven" when
+    the line has at least one linked case, every linked case passed (per case, or by exit code only, or checked
+    by a passed UI gate) and no open finding names the line; otherwise "unproven", with one plain string in
+    `reasons` for each cause: "no test linked", a linked case that failed / has no result / is a browser case no
+    UI gate checked, and each open finding that names the line in its "done_means" field. When "any_proves" is
+    False every line's `verdict` is None and `reasons` is [] (an older plan is not "unproven", it was never
+    linked), so no consumer reads a verdict that was never computed. An open finding is
+    exactly an entry `left_for_later` lists (so this agrees with `ratchet.py deferred`). `cps_map` (the run
+    state's own checkpoint-by-id dict, passed by the caller) feeds each case's checkpoint's recorded behavior-
+    and UI-gate status into _dm_case_status, and supplies the findings."""
     obj = plan.get("objective") if isinstance(plan, dict) else None
     dm = obj.get("done_means") if isinstance(obj, dict) else None
     if not isinstance(dm, list) or not dm:
         return None
-    lines = [{"text": t, "cases": []} for t in dm]
+    lines = [{"number": i, "text": t, "cases": []} for i, t in enumerate(dm, 1)]
     any_proves = False
     cps_map = cps_map or {}
     for cp in plan.get("checkpoints") or []:
-        behavior_status = (((cps_map.get(cp["id"]) or {}).get("gates") or {}).get("behavior") or {}).get("status")
+        gates = (cps_map.get(cp["id"]) or {}).get("gates") or {}
+        behavior_status = (gates.get("behavior") or {}).get("status")
+        ui_status = (gates.get("ui") or {}).get("status")
         for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
             for p in _proves_values(case):
                 if isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= len(dm):
                     any_proves = True
+                    status = _dm_case_status(ctx, cp["id"], case, behavior_status, ui_status)
                     lines[p - 1]["cases"].append({"id": case.get("id"), "title": case.get("title", ""),
-                                                  "file": case.get("file", ""),
-                                                  "status": _dm_case_status(ctx, cp["id"], case, behavior_status)})
+                                                  "file": case.get("file", ""), "status": status,
+                                                  "result": status})
+    findings = [f for c in cps_map.values() for f in left_for_later(c)]
+    for line in lines:
+        reasons = [r for r in (_dm_case_reason(c) for c in line["cases"]) if r] or (
+            [] if line["cases"] else ["no test linked"])
+        for f in findings:
+            if line["number"] in _finding_dm_lines(f, len(dm)):
+                reasons.append(f"open finding {_finding_key(f)}: {(f.get('description') or '').strip()[:240]}")
+        line["verdict"], line["reasons"] = ("unproven" if reasons else "proven"), reasons
+        if not any_proves:
+            # an older test plan (no case names a line): nothing was checked, so no line is proven or unproven;
+            # every output (status, the receipt, receipt --json) then shows the one older-plan note instead
+            line["verdict"], line["reasons"] = None, []
     return {"lines": lines, "any_proves": any_proves}
+
+
+def _dm_none_note(plan) -> str:
+    """The plain note for a plan _done_means_proof returns None for: NO_OBJECTIVE_NOTE when the plan states no
+    objective at all, DM_NO_LINES_NOTE when it has an objective with no done_means lines."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    return DM_NO_LINES_NOTE if isinstance(obj, dict) and obj else NO_OBJECTIVE_NOTE
+
+
+def done_means_table(ctx, plan, st):
+    """The final review's done-means table, one source for plain `status`, `status --json`'s "done_means_table"
+    and the receipt: the list of per-line entries from _done_means_proof ("number", "text", "verdict", "cases",
+    "reasons"), or one plain note string instead of a list when there is nothing to tabulate (no objective at
+    all: NO_OBJECTIVE_NOTE; an objective with no done-means lines: DM_NO_LINES_NOTE; no test linked to any line:
+    DM_NO_TESTS_NOTE)."""
+    dm = _done_means_proof(ctx, plan, st.get("checkpoints") or {})
+    if dm is None:
+        return _dm_none_note(plan)
+    return dm["lines"] if dm["any_proves"] else DM_NO_TESTS_NOTE
 
 
 def cmd_receipt(args):
@@ -9636,7 +9731,11 @@ def cmd_receipt(args):
     including any time spent waiting on you; never cost or tokens), who reviewed each step (a host-company
     fallback marked as such, with why when Ratchet recorded it), the findings you accepted with their reason, and
     findings left for later or fixed later in the run (CP1's own `left_for_later`/`_fixed_later` rule, so this
-    always agrees with `ratchet.py deferred` and `status`)."""
+    always agrees with `ratchet.py deferred` and `status`). Also the done-means proof (`_done_means_proof`): every
+    objective line with the tests linked to it and their results, a proven / unproven verdict and a "Why
+    unproven:" line per unproven line, the same verdicts `status` shows. A plan whose tests link to no line
+    (an older plan) gets one plain note instead of verdicts (`--json` then carries `verdict: null` on each
+    line); a plan with no objective, or an objective with no done-means lines, gets its own plain note."""
     ctx = Ctx(find_root())
     st = ctx.state()
     cfg = ctx.config()
@@ -9677,16 +9776,18 @@ def cmd_receipt(args):
     print(f"Whole run time: {run_txt}")
     print("")
     if dm is None:
-        print(f"Done-means proof: {NO_OBJECTIVE_NOTE}.")
+        print(f"Done-means proof: {_dm_none_note(plan)}.")
     else:
         print("Done-means proof (which tests prove each objective line):")
         for i, line in enumerate(dm["lines"], 1):
-            print(f"{i}. {line['text']}")
+            print(f"{i}. {line['text']}" + (f" - {line['verdict']}" if dm["any_proves"] else ""))
             if not line["cases"]:
                 print("   - no test linked")
             else:
                 for c in line["cases"]:
                     print(f"   - {c['id']} {c['title']} ({c['file']}): {c['status']}")
+            if dm["any_proves"] and line["reasons"]:
+                print(f"   Why unproven: {'; '.join(line['reasons'])}")
         if not dm["any_proves"]:
             print("Note: this plan's tests were never linked to done_means lines (an older test plan, "
                   "approved before the \"proves\" field existed).")
@@ -11989,6 +12090,7 @@ def status_json(ctx: Ctx) -> dict:
             "hooks": hs, "hook_errors": hook_errors_view(ctx.root, hs.get("host", "unknown")),
             "viewer_url": viewer_link(ctx)["url"], "viewer_live": viewer_link(ctx)["live"],
             "done": sum(1 for c in cps if c["status"] == "done"), "total": len(cps),
+            "done_means_table": done_means_table(ctx, plan, st) if st["phase"] == "awaiting_final_review" else None,
             "small_fix_reviews": _small_fix_review_lines(st),
             "docs_only_review_skips": _docs_only_skip_lines(st),
             "checkpoints": cps, "updated_at": st.get("updated_at")}
