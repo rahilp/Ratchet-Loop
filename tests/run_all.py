@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-Run every test suite at the same time.   python3 tests/run_all.py [--dir DIR] [--workers N] [--timeout SECONDS]
+Run every test suite at the same time.   python3 tests/run_all.py [--dir DIR] [--workers N] [--timeout SECONDS] [--max-stretch X]
 
 Finds every test_*.py file directly under DIR (default: this tests/ folder) and runs each one as its own
 process, several at once (half the CPU cores by default, at least 2). Each suite gets its own empty temp folder (TMPDIR, TEMP and
 TMP point at it); a suite that leaves anything in that folder is reported as failed even when its own checks
-passed. A suite still running after --timeout seconds is stopped and reported as timed out.
+passed. A suite still running after --timeout seconds (more on a busy machine, see below) is stopped and
+reported as timed out.
+
+The time limit grows with machine load: on every check it is --timeout times the one-minute load average divided by
+the CPU count (never less than --timeout, never more than --timeout times --max-stretch, default 4), so a suite that
+is only slow because the machine is busy is given more time. The end summary has one line for each suite that ran
+past its --timeout or was stopped at a stretched limit. RATCHET_FAKE_LOADAVG (a number, "unavailable", or @FILE
+holding a number) and RATCHET_FAKE_CPUS replace the real readings; the tests use them.
 
 Each suite also gets RATCHET_RUN_ALL=1 and RATCHET_RUN_ALL_SUITES (a comma-separated list of every suite name in
 this run), so a suite that also runs other suites as subprocesses (test_trust_cp5_regression.py runs
@@ -46,6 +53,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DEFAULT_TIMEOUT = 900.0
 DEFAULT_TAIL = 40
+DEFAULT_MAX_STRETCH = 4.0
+POLL_SECONDS = 0.25
 TAG_VAR = "RATCHET_RUN_ALL_TAG"
 RUN_ALL_VAR = "RATCHET_RUN_ALL"
 SUITES_VAR = "RATCHET_RUN_ALL_SUITES"
@@ -104,6 +113,41 @@ def start_order(suites: list, history: dict) -> list:
     return sorted(suites, key=lambda s: (-expected(s), s.name))
 
 
+# ---- machine load ------------------------------------------------------------------------------------------
+
+
+def read_load():
+    """(one-minute load average, CPU count) right now, or None when there is no usable reading. The environment
+    variables RATCHET_FAKE_LOADAVG ("unavailable", a number, or "@file" holding a number) and RATCHET_FAKE_CPUS
+    replace the real values (the tests use them). Never raises."""
+    fake = os.environ.get("RATCHET_FAKE_LOADAVG")
+    try:
+        if fake is not None:
+            fake = fake.strip()
+            if fake.startswith("@"):
+                with open(fake[1:], "r", encoding="utf-8") as f:
+                    fake = f.read().strip()
+            load = float(fake)
+        else:
+            load = os.getloadavg()[0]
+        cpus = int(os.environ.get("RATCHET_FAKE_CPUS") or 0) or (os.cpu_count() or 1)
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not (load == load and load < float("inf")) or load < 0 or cpus < 1:
+        return None
+    return load, cpus
+
+
+def stretch_factor(max_stretch: float):
+    """(factor, load, cpus): how many times longer than --timeout a suite may run right now. The factor is
+    load / cpus, at least 1 and at most max_stretch; 1 when there is no usable reading."""
+    reading = read_load()
+    if reading is None:
+        return 1.0, None, None
+    load, cpus = reading
+    return min(max(1.0, load / cpus), max_stretch), load, cpus
+
+
 # ---- running one suite -------------------------------------------------------------------------------------
 
 
@@ -116,6 +160,7 @@ class Result:
         self.duration = 0.0
         self.tail: list = []
         self.error = ""
+        self.stretch = ""  # a summary line when this suite ran past its --timeout or was stopped at a stretched one
 
     @property
     def passed(self) -> bool:
@@ -276,9 +321,11 @@ def read_tail(log: Path, lines: int) -> list:
 
 
 class Runner:
-    def __init__(self, root: Path, timeout: float, tail: int, suite_names: str = ""):
+    def __init__(self, root: Path, timeout: float, tail: int, suite_names: str = "",
+                 max_stretch: float = DEFAULT_MAX_STRETCH):
         self.root = root
         self.timeout = timeout
+        self.max_stretch = max_stretch
         self.tail = tail
         self.suite_names = suite_names
         self.lock = threading.Lock()
@@ -305,11 +352,7 @@ class Runner:
                                             stdin=subprocess.DEVNULL, env=env, start_new_session=True)
                     self.running[suite.name] = proc
                 try:
-                    res.exit_code = proc.wait(timeout=self.timeout)
-                except subprocess.TimeoutExpired:
-                    res.timed_out = True
-                    stop(proc)
-                    res.exit_code = proc.returncode
+                    self.wait(proc, res, t0)
                 finally:
                     with self.lock:
                         self.running.pop(suite.name, None)
@@ -330,6 +373,36 @@ class Runner:
             res.tail = read_tail(log, self.tail)
         return res
 
+    def wait(self, proc, res: Result, t0: float) -> None:
+        """Wait for a suite, polling. The deadline is --timeout times the stretch factor of the latest reading, so
+        a load spike while the suite runs still extends it; it is never earlier than --timeout. Stops the suite
+        when the deadline passes. The summary line reports the limit in force when the suite ended: the latest
+        reading taken after --timeout, or a fresh one when the suite ended before another poll could take it. A
+        suite stopped at the plain --timeout (the load had fallen back) gets no line."""
+        seen = None
+        while True:
+            factor, load, cpus = stretch_factor(self.max_stretch)
+            elapsed = time.monotonic() - t0
+            if elapsed >= self.timeout:
+                seen = (factor, load, cpus) if factor > 1.0 else None  # the limit in force past --timeout
+            if elapsed >= self.timeout * factor:
+                res.timed_out = True
+                stop(proc)
+                res.exit_code = proc.returncode
+                break
+            try:
+                res.exit_code = proc.wait(timeout=min(POLL_SECONDS, self.timeout * factor - elapsed))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if seen is None and not res.timed_out and time.monotonic() - t0 >= self.timeout:
+            fresh = stretch_factor(self.max_stretch)  # ended within one poll of passing --timeout
+            seen = fresh if fresh[0] > 1.0 else None
+        if seen:
+            factor, load, cpus = seen
+            res.stretch = (f"{res.name}: time limit stretched {factor:.1f}x ({self.timeout:.0f}s to "
+                           f"{self.timeout * factor:.0f}s) at load {load:.1f} on {cpus} CPUs")
+
     def stop_all(self) -> None:
         with self.lock:
             self.stopping = True
@@ -349,14 +422,19 @@ def default_workers() -> int:
 
 
 def parse_args(argv):
-    p = argparse.ArgumentParser(description="Run every tests/test_*.py suite at the same time.")
+    p = argparse.ArgumentParser(usage="%(prog)s [options]",
+                                description="Run every tests/test_*.py suite at the same time.")
     p.add_argument("--dir", default=str(HERE), help="folder holding the test_*.py suites (default: tests/)")
     p.add_argument("--workers", type=int, default=default_workers(),
                    help=f"how many suites run at once (default {default_workers()}: half the CPU cores, at least 2; "
                         "each suite starts its own subprocesses, so one suite per core overloads the machine "
                         "and was slower when measured)")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
-                   help=f"seconds before a suite is stopped and reported as timed out (default {DEFAULT_TIMEOUT:.0f})")
+                   help="seconds before a suite is stopped and reported as timed out; on a busy machine the limit grows, "
+                        f"up to --max-stretch times this (default {DEFAULT_TIMEOUT:.0f})")
+    p.add_argument("--max-stretch", type=float, default=DEFAULT_MAX_STRETCH,
+                   help="the time limit grows with machine load (timeout x load / CPUs); this is the most times "
+                        f"the timeout it can grow to (default {DEFAULT_MAX_STRETCH:.0f}; 1 turns the stretch off)")
     p.add_argument("--tail", type=int, default=DEFAULT_TAIL,
                    help=f"lines of output shown for each failed suite (default {DEFAULT_TAIL})")
     args = p.parse_args(argv)
@@ -364,6 +442,8 @@ def parse_args(argv):
         p.error("--workers must be at least 1")
     if args.timeout <= 0:
         p.error("--timeout must be more than 0")
+    if not (1.0 <= args.max_stretch < float("inf")):
+        p.error("--max-stretch must be a number, 1 or more")
     if args.tail < 0:
         p.error("--tail must be 0 or more")
     return args
@@ -396,7 +476,7 @@ def main(argv=None) -> int:
     (root / "tmp").mkdir()
     (root / "logs").mkdir()
     suite_names = ",".join(s.name for s in order)
-    runner = Runner(root, args.timeout, args.tail, suite_names)
+    runner = Runner(root, args.timeout, args.tail, suite_names, args.max_stretch)
     results: list = []
     started = time.monotonic()
     interrupted = False
@@ -440,6 +520,11 @@ def main(argv=None) -> int:
     for r in sorted(results, key=lambda r: (-r.duration, r.name)):
         status = "passed" if r.passed else "FAILED"
         print(f"  {r.duration:7.1f}s  {status:<6}  {r.name:<{width}}")
+    stretched = sorted(r.stretch for r in results if r.stretch)
+    if stretched:
+        print()
+        for ln in stretched:
+            print(ln)
     print(f"\n{len(results) - len(failed)} passed, {len(failed)} failed (suites) in {wall:.1f}s "
           f"with {workers} workers", flush=True)
     if failed:
