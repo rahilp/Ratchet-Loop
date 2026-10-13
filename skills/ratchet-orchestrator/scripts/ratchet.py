@@ -139,6 +139,7 @@ DEFAULT_CONFIG = {
     "checkin_round": 2,
     "unavailable_ttl_hours": 6,     # an other-provider reviewer that failed (auth, quota, timeout) is skipped this long
     "quota_retest_minutes": 20,     # a provider out of credits that gave no reset time (or one already past) is tried again after this
+    "provider_share": {"max": 3, "minutes": 15},  # at most this many review starts on one provider in any window of this many minutes, across every lane on the machine
     "max_adversarial_rounds": 6,    # per checkpoint; after this the loop blocks and escalates
     "max_adversarial_rounds_run": 30,  # across the whole run (quota guard); then blocks and escalates
     "approver": "human",            # human | director | either  (see director-enroll)
@@ -2916,13 +2917,23 @@ def _start_id(nonce, rid) -> str:
     return f"{nonce}:{rid}"
 
 
+def _start(data, key, at, sid) -> None:
+    """Record one review start on a provider and note when a round picked it (`picked`: the rotation tie-break, kept
+    when a replaced unreviewed round gives its starts back)."""
+    phealth.record_start(data, key, at, sid)
+    phealth.mark_picked(data, key, at)
+
+
 def update_review_starts(cfg, nonce, add=(), give_back=()) -> None:
-    """Change the shared provider health record's review starts in one save. `add` are the reviewer ids a round
-    (`nonce`) was just opened or refilled with: each reviewer's provider gets a start (a host reviewer has no provider),
-    so the next round, in this project or any other on the machine, spreads to the providers used least. `give_back`
-    are reviewer ids of this round that never really used their provider: exactly the start recorded for that
-    reviewer in that round is taken back, once. Best effort: a busy lock prints a note naming the review start and
-    the round goes on."""
+    """Change the shared provider health record's review starts in one save, without choosing anything: the unlocked,
+    best-effort recorder. Opening and refilling a round reserve their starts through _reserve_under_lock (which also
+    checks provider_share); this is used for those only when that lock was busy (the starts are recorded afterwards, with
+    no share check), for releasing a reservation whose provider was never tested, and for external_review's refunds.
+    `add` are the reviewer ids a round (`nonce`) starts with: each reviewer's provider gets a start (a host reviewer has
+    no provider), so the next round, in this project or any other on the machine, spreads to the providers used least.
+    `give_back` are reviewer ids of this round that never really used their provider: exactly the start recorded for
+    that reviewer in that round is taken back, once. A busy lock prints a note naming the review start and the round
+    goes on."""
     adds = [(k, _start_id(nonce, r)) for r in add for k in [_reviewer_health_key(cfg, r)] if k]
     backs = [(k, _start_id(nonce, r)) for r in give_back for k in [_reviewer_health_key(cfg, r)] if k]
     if not adds and not backs:
@@ -2933,9 +2944,45 @@ def update_review_starts(cfg, nonce, add=(), give_back=()) -> None:
         for k, sid in backs:
             phealth.refund_start(data, k, sid)
         for k, sid in adds:
-            phealth.record_start(data, k, at, sid)
+            _start(data, k, at, sid)
     if _update_health(change, note=False) == "busy":
         _note_record_busy(_health_path(), "a review start" if adds else "the give-back of a review start")
+
+
+def _reserve_under_lock(cfg, ignore, pick, refunds, adds, keep_picked=False):
+    """Choose reviewers and reserve their starts as ONE step under the shared provider record's lock, so lanes
+    opening rounds at the same moment can never take more than provider_share.max starts on one provider in the window:
+    the second lane's choice is made after the first lane's reservation is saved. Inside the lock this calls
+    `pick(share)` (resolve_reviewers with the record read under the lock; `share` = {"data", "ignore"} where `ignore`
+    are start ids about to be given back and so not counted), then gives back the starts `refunds(picked)` lists and
+    records the starts `adds(picked)` lists, both as [(reviewer id, round nonce)], and saves them together
+    (`keep_picked`: the given-back starts keep their pick time, for a round replaced unreviewed). Returns what
+    `pick` returned, or None when the lock could not be had (a note says the starts could not be reserved under the
+    lock; the caller goes on without a reservation and records its starts afterwards, best effort). What it then
+    goes on with differs: a round being opened keeps the read-only share pick it made just before (the share was
+    checked on an unlocked read, only the atomic reservation is lost); a same-round refill picks with no share."""
+    out = []
+
+    def change(data):
+        picked = pick({"data": data, "ignore": set(ignore)})
+        at = _dt.datetime.now(_dt.timezone.utc)
+        for rid, nonce in refunds(picked):
+            key = _reviewer_health_key(cfg, rid)
+            if key:
+                phealth.refund_start(data, key, _start_id(nonce, rid), keep_picked)
+        for rid, nonce in adds(picked):
+            key = _reviewer_health_key(cfg, rid)
+            if key:
+                _start(data, key, at, _start_id(nonce, rid))
+        out.append(picked)
+    if _update_health(change, note=False) == "busy":
+        p = _health_path()
+        print(f"ratchet: {p} was being updated by another Ratchet command (its lock {_record_lock_path(p)} could not be "
+              "had), so this round's review starts could not be reserved under the lock (the provider share was checked "
+              "on an unlocked read, or not at all for a same-round refill); they are recorded afterwards if the lock "
+              "frees up.", file=sys.stderr)
+        return None
+    return out[0]
 
 
 def refund_review_start(cfg, nonce, rid) -> None:
@@ -3125,6 +3172,29 @@ def quota_retest_minutes(cfg) -> float:
         die(f"quota_retest_minutes must be a positive number of minutes, but it is {json.dumps(v)}. Set it with "
             "`ratchet.py config --set quota_retest_minutes=20`.")
     return n
+
+
+def provider_share(cfg) -> tuple[int, float]:
+    """The provider_share setting as (max, minutes): at most `max` review starts on one provider in any `minutes`
+    minutes, across every lane on the machine. `max` is a positive whole number and `minutes` a positive number
+    (decimals accepted); anything else is a plain error naming the setting and its value."""
+    v = cfg.get("provider_share", {"max": 3, "minutes": 15})
+    if not isinstance(v, dict):
+        die(f"provider_share must be {{\"max\": <whole number>, \"minutes\": <number>}}, but it is {json.dumps(v)}. "
+            "Set it with `ratchet.py config --set provider_share.max=3 provider_share.minutes=15`.")
+    mx, mins = v.get("max", 3), v.get("minutes", 15)
+    if isinstance(mx, bool) or not isinstance(mx, int) or mx < 1:
+        die(f"provider_share.max must be a positive whole number of review starts, but it is {json.dumps(mx)}. Set it "
+            "with `ratchet.py config --set provider_share.max=3`.")
+    ok_mins = isinstance(mins, (int, float)) and not isinstance(mins, bool) and 0 < mins < float("inf")
+    if not ok_mins:
+        die(f"provider_share.minutes must be a positive number of minutes, but it is {json.dumps(mins)}. Set it with "
+            "`ratchet.py config --set provider_share.minutes=15`.")
+    return mx, float(mins)
+
+
+def _minutes_text(m: float) -> str:
+    return f"{m:g} minute" + ("" if m == 1 else "s")
 
 
 def bench_quota(cfg, rid, reason, until) -> bool:
@@ -4152,16 +4222,17 @@ def ranked_provider_ids(cfg, lens, health=None) -> list[str]:
     """Every provider id, best first for a slot of `lens`: any that is not per-use (flat-rate or no cost label) before
     a per-use one, and inside that first tier a provider that prefers the lens (`prefer_for`, set with providers --add
     --prefer-for) before one that does not, then the fewest review starts in the shared record's recent hours (any
-    lane, any project), then flat-rate before no cost label, then the one started longest ago, then the order written
-    in config. This is only an order: whether a provider can be used right now (installed, not out, per-use with the
-    developer's OK) is reviewer_availability's call."""
+    lane, any project), then flat-rate before no cost label, then the one picked longest ago (a round replaced
+    unreviewed gives its starts back but keeps this time), then the order written in config. This is only an order:
+    whether a provider can be used right now (installed, not out, per-use with the developer's OK) is
+    reviewer_availability's call."""
     health = provider_health() if health is None else health
     at = _dt.datetime.now(_dt.timezone.utc)
 
     def key(item):
         i, pv = item
         starts = phealth.recent_starts(health, _health_key(pv), at)
-        last = starts[-1].timestamp() if starts else 0.0
+        last = phealth.last_picked(health, _health_key(pv), at)  # a replaced unreviewed round keeps it: rotation goes on
         return (_cost_tier(pv), 0 if lens in (pv.get("prefer_for") or []) else 1, len(starts),
                 0 if pv.get("cost") == "flat" else 1, last, i)
     return [pv["id"] for _i, pv in sorted(enumerate(providers(cfg)), key=key)]
@@ -4393,7 +4464,7 @@ def _dup_key(spec):
             spec.get("lens"))
 
 
-def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None) -> list[dict]:
+def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None, share=None) -> list[dict]:
     """Turn review slots into concrete reviewer ids for THIS round.
 
     Returns [{"id", "slot", "fallback_for": [ids skipped], "reasons": {...}}]. An any-<lens> slot tries the
@@ -4416,9 +4487,27 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None) -
 
     `only_slots`: slot numbers to resolve; every other slot is skipped (a same-round refill resolves only the slots it
     replaces, so a kept slot's own pick can't use up a provider a replaced slot needs).
+
+    `share`: {"data": the shared provider record, "ignore": start ids not to count}. A provider that already has
+    provider_share.max review starts inside the last provider_share.minutes (read from that record, any lane, plus the
+    picks this call has made) is skipped for the slot, with a plain reason, and the slot goes to the next working
+    provider. Pass the record read under its lock (_reserve_under_lock) when the picks are about to be reserved; None
+    applies no share (a round already open is only shown, never counted again).
     """
     exclude = exclude or set()
-    health = provider_health()  # the shared record: recent review starts spread the slots across providers
+    health = share["data"] if share is not None else provider_health()  # the shared record: starts spread the slots
+    cap, tentative, at = (provider_share(cfg) if share is not None else None), {}, _dt.datetime.now(_dt.timezone.utc)
+
+    def over_share(rid_):  # why the provider behind rid_ takes no more starts right now, else None
+        key = _reviewer_health_key(cfg, rid_) if cap else None
+        if key is None:
+            return None
+        n = phealth.starts_within(health, key, at, cap[1], share["ignore"]) + tentative.get(key, 0)
+        if n < cap[0]:
+            return None
+        win = _minutes_text(cap[1])
+        return (f"it already has {n} review start{'' if n == 1 else 's'} in the last {win}, and a provider takes at "
+                f"most {cap[0]} per {win} across all lanes on this machine")
     if cp.get("reviewers"):
         slots = list(cp["reviewers"])
     else:
@@ -4443,13 +4532,14 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None) -
             die(f"review_depth/checkpoint names unknown reviewer(s) {unknown}; add them under config 'providers' "
                 "or 'reviewers'.")
         if all(roster_[a].get("kind") == "command" for a in alts):
-            if not any(a not in exclude and reviewer_availability(ctx, cfg, a, risk)[0] for a in alts):
+            if not any(a not in exclude and reviewer_availability(ctx, cfg, a, risk)[0] and not over_share(a)
+                       for a in alts):
                 # every provider the slot lists is out: other working providers (same lens) before the host
                 lens = roster_[alts[0]].get("lens", "both")
                 for pid_ in ranked_provider_ids(cfg, lens, health):
                     rid_ = f"{pid_}-{lens}"
                     if (rid_ in roster_ and rid_ not in alts and rid_ not in exclude
-                            and reviewer_availability(ctx, cfg, rid_, risk)[0]):
+                            and reviewer_availability(ctx, cfg, rid_, risk)[0] and not over_share(rid_)):
                         alts.append(rid_)
             alts += _host_fallbacks(cfg, alts[0])
         skipped, reasons, pick, candidates = [], {}, None, []
@@ -4459,6 +4549,8 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None) -
             okay, why = reviewer_availability(ctx, cfg, a, risk)
             if okay and a in exclude:
                 okay, why = False, "failed a review earlier this round"
+            if okay and over_share(a):
+                okay, why = False, over_share(a)
             if okay:
                 candidates.append(a)
             else:
@@ -4486,6 +4578,8 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None) -
         dup_key = _dup_key(roster_[pick])
         if dup_key is not None:
             chosen_keys.add(dup_key)
+        if cap and _reviewer_health_key(cfg, pick):  # this pick takes one start of its provider's share
+            tentative[_reviewer_health_key(cfg, pick)] = tentative.get(_reviewer_health_key(cfg, pick), 0) + 1
         spec = roster_[pick]
         model = spec.get("model") if spec.get("kind") == "command" else (
             "a different model: " + " or ".join(host_model_map(cfg).get("alternates") or []) if spec.get("alt")
@@ -10092,29 +10186,59 @@ def cmd_reviewers(args):
                              "(config change + approve-changes).")
             ctx.save_state(st)
             die(st["blocked_reason"], 2)
-        resolved = resolve_reviewers(ctx, cfg, cp)
-        for _ in range(4):  # test the providers we are about to rely on; a failing one hands its slot on
-            due = {(_roster_spec(cfg, r["id"]) or {}).get("provider") for r in resolved}
-            due = [pid for pid in due if pid and probe_due(ctx, cfg, pid)]
-            if not due:
-                break
-            for pid in due:
-                good, detail = probe_shared(ctx, cfg, provider_by_id(cfg, pid))
-                print(f"  checked {pid}: {'working' if good else 'not usable now (' + detail + ')'}", file=sys.stderr)
-            resolved = resolve_reviewers(ctx, cfg, cp)
+        provider_share(cfg)  # a bad provider_share setting stops here, before anything is opened or reserved
         # Narrow after round 1: when the round being replaced was recorded (it blocked) and was itself NOT
         # narrowed, the next round only asks the lens(es) that still had an open blocker/major finding — a lens
         # that approved isn't re-run. A narrowed round whose fix still left a blocker open brings back the full
         # set for the round after it (narrow_now stays False), rather than narrowing further.
         was_narrowed = bool(rnd.get("narrowed")) if rnd else False
+        open_lenses = _open_blocking_lenses(ctx, cfg, args.cp, rnd, cps) if rnd and rnd.get("recorded") and not was_narrowed else set()
         narrow_now = False
-        if rnd and rnd.get("recorded") and not was_narrowed:
-            open_lenses = _open_blocking_lenses(ctx, cfg, args.cp, rnd, cps)
-            if open_lenses:
-                narrowed_resolved = [r for r in resolved if (_roster_spec(cfg, r["id"]) or {}).get("lens") in open_lenses]
-                if narrowed_resolved:
-                    resolved = narrowed_resolved
-                    narrow_now = True
+
+        def pick_round(share):
+            nonlocal narrow_now
+            # Decide which slots survive narrowing first (without the share), then rank and reserve only those: a slot
+            # narrowing drops must not use up a start of the provider's share and push a kept slot to the host.
+            full = resolve_reviewers(ctx, cfg, cp)
+            keep_slots = {r["slot"] for r in full if (_roster_spec(cfg, r["id"]) or {}).get("lens") in open_lenses}
+            narrow_now = bool(open_lenses and keep_slots)
+            return resolve_reviewers(ctx, cfg, cp, only_slots=keep_slots if narrow_now else None, share=share)
+        # A round replaced before anyone reviewed it (the code changed again before any review was written) gives its
+        # reservations back in the same locked step that reserves the new round's; one with a review file keeps them
+        # (a reviewer that was cut off or failed on its own ran, so it keeps its start too).
+        old_nonce = rnd["nonce"] if rnd else None
+        give_old = []
+        if rnd and not rnd.get("recorded"):
+            old_dir = _review_round_dir(ctx, args.cp, "adv", rnd["round"])
+            if not any(p for p in old_dir.glob("*.json") if not p.name.endswith(".cutoff.json")):
+                ran = {p.name[:-len(".cutoff.json")] for p in old_dir.glob("*.cutoff.json")} | set(rnd.get("failed_reviewers") or [])
+                give_old = [x for x in rnd.get("reviewers") or [] if x not in ran]
+        new_nonce = secrets.token_hex(8)
+        ignore_old = {_start_id(old_nonce, x) for x in give_old}
+        reserved, tries = False, 0
+        while True:  # test the providers we are about to rely on; a failing one hands its slot on
+            tries += 1
+            # who would review, with the share applied (read, not reserved): a provider the locked pick will skip for
+            # being at its share gets no test request
+            resolved = pick_round({"data": provider_health(), "ignore": set(ignore_old)})
+            due = {(_roster_spec(cfg, r["id"]) or {}).get("provider") for r in resolved}
+            due = [pid for pid in due if pid and probe_due(ctx, cfg, pid)] if tries < 6 else []
+            if not due:
+                got = _reserve_under_lock(cfg, ignore_old, pick_round, lambda _r: [(x, old_nonce) for x in give_old],
+                                          lambda picked: [(r["id"], new_nonce) for r in picked], keep_picked=True)
+                if got is None:  # the record's lock was busy: go on with the unreserved picks (starts recorded below)
+                    break
+                resolved = got
+                give_old = []  # given back with the reservation
+                due = {(_roster_spec(cfg, r["id"]) or {}).get("provider") for r in resolved}
+                due = [pid for pid in due if pid and probe_due(ctx, cfg, pid)] if tries < 6 else []
+                if not due:
+                    reserved = True
+                    break
+                update_review_starts(cfg, new_nonce, give_back=[r["id"] for r in resolved])  # not tested yet: release
+            for pid in due:
+                good, detail = probe_shared(ctx, cfg, provider_by_id(cfg, pid))
+                print(f"  checked {pid}: {'working' if good else 'not usable now (' + detail + ')'}", file=sys.stderr)
         g["attempts"] += 1
         st["adv_rounds_total"] = int(st.get("adv_rounds_total", 0)) + 1
         prev = rnd["round"] if rnd else 0
@@ -10135,7 +10259,7 @@ def cmd_reviewers(args):
             prev_round_tree = rnd.get("prev_round_tree")
         else:
             prev_round_tree = rnd["fingerprint"] if rnd else None
-        rnd = {"round": prev + 1, "nonce": secrets.token_hex(8), "fingerprint": fp, "opened_at": now(),
+        rnd = {"round": prev + 1, "nonce": new_nonce, "fingerprint": fp, "opened_at": now(),
                "reviewers": [r["id"] for r in resolved], "narrowed": narrow_now,
                "prev_round_tree": prev_round_tree,
                "substitutions": [{"used": r["id"], "instead_of": r["fallback_for"], "why": r["reasons"]}
@@ -10147,7 +10271,10 @@ def cmd_reviewers(args):
             ctx.log(st, "reviewer_fallback", cp=args.cp, detail="; ".join(
                 f"{x['used']} instead of {', '.join(x['instead_of'])}" for x in rnd["substitutions"]))
         ctx.save_state(st)
-        update_review_starts(cfg, rnd["nonce"], rnd["reviewers"])
+        if not reserved:  # the record's lock was busy: record this round's starts now, best effort
+            if give_old:
+                update_review_starts(cfg, old_nonce, give_back=give_old)
+            update_review_starts(cfg, rnd["nonce"], rnd["reviewers"])
         drop_review_key(old_key)  # the replaced round (now saved as replaced) stops counting
     else:
         # same round: if a listed reviewer has become unavailable (its CLI failed), give its slot to the next
@@ -10174,9 +10301,29 @@ def cmd_reviewers(args):
                    and (not reviewer_availability(ctx, cfg, r["id"])[0] or r["id"] in round_cutoff
                         or r["id"] in failed_ids)]
         keep = {r["id"] for i, r in enumerate(rnd["resolved"]) if i not in replace}
-        fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff | failed_ids,
-                                                         taken=keep,
-                                                         only_slots={rnd["resolved"][i]["slot"] for i in replace})}
+        replaced_slots = {rnd["resolved"][i]["slot"] for i in replace}
+
+        def pick_refill(share):
+            return resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff | failed_ids, taken=keep,
+                                     only_slots=replaced_slots, share=share)
+        # A replaced slot whose reviewer never ran gives its start back, and its replacement reserves one, in the same
+        # locked step that checks the share (the start about to be given back is not counted against it).
+        idle = {rnd["resolved"][i]["slot"]: rnd["resolved"][i]["id"] for i in replace
+                if rnd["resolved"][i]["id"] not in round_cutoff and rnd["resolved"][i]["id"] not in own_failed}
+        nonce_now = rnd["nonce"]
+        refill_reserved = False
+        got = None
+        if replace:
+            got = _reserve_under_lock(
+                cfg, {_start_id(nonce_now, x) for x in idle.values()}, pick_refill,
+                lambda picked: [(x, nonce_now) for sl, x in idle.items()
+                                if next((p["id"] for p in picked if p["slot"] == sl), None) != x],
+                lambda picked: [(p["id"], nonce_now) for p in picked
+                                if p["id"] != next((rnd["resolved"][i]["id"] for i in replace
+                                                    if rnd["resolved"][i]["slot"] == p["slot"]), None)])
+        if got is not None:
+            refill_reserved = True
+        fresh = {r["slot"]: r for r in (got if got is not None else pick_refill(None))}
         changed, swapped_in, dropped, started, given_back = False, [], set(), [], []
 
         def never_used(x):  # a slot given up before its reviewer ran: its start goes back (not after its own run)
@@ -10189,6 +10336,10 @@ def cmd_reviewers(args):
             r = rnd["resolved"][i]
             if r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
                 new_r = fresh[r["slot"]]
+                if r["id"] not in new_r["fallback_for"]:  # the reviewer it replaces is always named, wherever it ranks
+                    new_r["fallback_for"] = [r["id"]] + list(new_r["fallback_for"])
+                    new_r["reasons"].setdefault(r["id"], "failed a review earlier this round" if r["id"] in failed_ids
+                                                else "no longer available")
                 rnd["resolved"][i] = new_r
                 started.append(new_r["id"])
                 never_used(r["id"])
@@ -10222,7 +10373,8 @@ def cmd_reviewers(args):
             ctx.log(st, "reviewer_fallback", cp=args.cp, detail="re-resolved within round " + str(rnd["round"]))
         if changed or newly_failed:
             ctx.save_state(st)
-        update_review_starts(cfg, rnd["nonce"], started, given_back)
+        if not refill_reserved:  # the record's lock was busy (or nothing was replaced): starts recorded now
+            update_review_starts(cfg, rnd["nonce"], started, given_back)
     _key, why = open_review_key(ctx, args.cp, "adv", rnd["round"], st)
     if _key is None:
         die(review_key_problem(why, f"run `ratchet.py reviewers {args.cp}` again"))
@@ -10396,6 +10548,9 @@ def cmd_config(args):
             for p in parts[:-1]:
                 cur = cur.setdefault(p, {})
             cur[parts[-1]] = val
+        if any(kv.partition("=")[0].split(".")[0] == "provider_share" for kv in args.set):
+            share = user.get("provider_share")  # as it will read once merged over the defaults
+            provider_share({"provider_share": {**DEFAULT_CONFIG["provider_share"], **share} if isinstance(share, dict) else share})
         write_json(ctx.config_path, user)
         cfg = ctx.config()
         for kv in args.set:

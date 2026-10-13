@@ -7,7 +7,8 @@ it, keyed by its tool plus its model ('codex', 'opencode:opencode-go/glm-5.3'):
     {"<key>": {"ok": true|false, "at": "<time the last test request was SENT>", "detail": "<what came back>",
                "bench": {"reason": "...", "since": "<time>", "until": "<time>", "quota": true},
                "claim": {"by": "<lane's token>", "since": "<time>", "until": "<time>"},
-               "starts": [{"at": "<time a review round was opened with this provider>", "id": "<start id>"}, ...]}}
+               "starts": [{"at": "<time a review round was opened with this provider>", "id": "<start id>"}, ...],
+               "picked": "<time a review round last picked this provider>"}}
 
 `bench` is present only while the provider is being skipped; it ends on its own at `until`. A bench with `quota` set
 is a provider that said it is out of credits: it waits for the reset time the provider gave (or a short re-test), a
@@ -20,10 +21,19 @@ one.
 `starts` lists when a review round was opened with the provider (any lane, any project), newest last, and only the
 last STARTS_HOURS hours are kept. Each start has an id (the round's nonce plus the reviewer id, so a start belongs to
 one reviewer in one round of one lane). Choosing a reviewer reads it to spread rounds: of two providers equally good
-for a slot, the one with fewer recent starts (then the one started longest ago) reviews. A provider that was not really
+for a slot, the one with fewer recent starts (then the one picked longest ago) reviews. A provider that was not really
 used (no run of its CLI produced any output, or its slot was refilled or dropped in the same round before it
 reviewed) gives back exactly its own start by that id (refund_start), once: a second refund finds nothing to take
-back. A round replaced before anyone reviewed it keeps its starts.
+back. A round replaced before anyone reviewed it gives all its starts back the same way; one replaced after a review
+file exists keeps them. A start is also a reservation of the provider's fair share: starts_within counts the starts
+inside the last `provider_share.minutes` across the whole machine, and a provider with `provider_share.max` of them
+takes no more new rounds until some leave the window (ratchet.py checks and reserves under the record's lock).
+
+`picked` is when a round last picked the provider (mark_picked, called with each start; record_start alone does not
+set it). Giving a start back because the provider was not really used forgets that pick with it, but giving back a
+round replaced before anyone reviewed it does not (refund_start keep_picked), so rounds opened back to back with no
+review in between still rotate: of two providers with the same number of recent starts, the one picked longest ago
+goes first (last_picked).
 
 This module is pure record logic: every function takes the record's data (a dict) and edits it in place, or answers a
 question about it. It reads and writes no file. ratchet.py does that, only through update_record (under the record's
@@ -91,19 +101,37 @@ def record_start(data: dict, key: str, at: _dt.datetime, sid: str) -> dict:
     return data
 
 
-def refund_start(data: dict, key: str, sid: str) -> dict:
+def mark_picked(data: dict, key: str, at: _dt.datetime) -> dict:
+    """Note that a review round picked the provider at `at` (the later of this and what is there stays). Unlike a
+    start it is never taken back by a give-back: it is what keeps rounds opened back to back, with no review in
+    between, rotating across the providers. Edits the data in place and returns it."""
+    e = dict(_entry(data, key))
+    before = _time(e.get("picked"))
+    if before is None or before < at:
+        e["picked"] = at.isoformat(timespec="microseconds")
+    data[key] = e
+    return data
+
+
+def refund_start(data: dict, key: str, sid: str, keep_picked: bool = False) -> dict:
     """Take back the start with id `sid`, and only that one: a provider that was not really used does not count as
-    used. A no-op when there is no such start (already taken back, expired, or never saved). Returns the data."""
+    used, and the time it was picked is forgotten with the start (`picked`, when it is that start's own time). With
+    `keep_picked` that time stays: a round replaced before anyone reviewed it gives its starts back but its pick still
+    counts for rotation. A no-op when there is no such start (already taken back, expired, or never saved). Returns
+    the data."""
     e = _entry(data, key)
     starts = list(e.get("starts") or [])
+    gone = [s for s in starts if isinstance(s, dict) and s.get("id") == sid]
     left = [s for s in starts if not (isinstance(s, dict) and s.get("id") == sid)]
     if len(left) != len(starts):
+        if not keep_picked and e.get("picked") == gone[0].get("at"):
+            e.pop("picked", None)
         if left:
             e["starts"] = left
         else:
             e.pop("starts", None)
-            if not e:
-                data.pop(key, None)
+        if not e:
+            data.pop(key, None)
     return data
 
 
@@ -112,6 +140,27 @@ def recent_starts(data: dict, key: str, at: _dt.datetime) -> list:
     hours before `at`."""
     times = [_start_time(s) for s in (_entry(data, key).get("starts") or [])]
     return sorted(t for t in times if t is not None and t > at - _dt.timedelta(hours=STARTS_HOURS))
+
+
+def starts_within(data: dict, key: str, at: _dt.datetime, minutes: float, ignore=()) -> int:
+    """How many review starts the provider has inside the last `minutes` before `at`, across every lane: the count a
+    provider's share is held to. A start whose id is in `ignore` (one that is about to be given back) is not counted."""
+    since = at - _dt.timedelta(minutes=float(minutes))
+    n = 0
+    for s in _entry(data, key).get("starts") or []:
+        t = _start_time(s)
+        if t is not None and t > since and not (isinstance(s, dict) and s.get("id") in ignore):
+            n += 1
+    return n
+
+
+def last_picked(data: dict, key: str, at: _dt.datetime) -> float:
+    """When a round last picked the provider, as a timestamp (0.0 if it never did): the later of `picked` (which a
+    give-back does not erase) and the newest start from the last STARTS_HOURS hours (a record written before `picked`
+    existed)."""
+    e = _entry(data, key)
+    times = [_time(e.get("picked"))] + recent_starts(data, key, at)
+    return max([t.timestamp() for t in times if t is not None] or [0.0])
 
 
 def live_claim(data: dict, key: str, at: _dt.datetime) -> dict | None:
