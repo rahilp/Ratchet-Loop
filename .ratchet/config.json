@@ -29,20 +29,12 @@
       "host-both"
     ],
     "normal": [
-      [
-        "opencode-glm-standards",
-        "opencode-kimi-standards",
-        "copilot-standards",
-        "gemini-standards",
-        "host-alt-standards"
-      ],
+      "host-standards",
       [
         "codex-correctness",
-        "opencode-kimi-correctness",
-        "opencode-glm-correctness",
-        "copilot-correctness",
         "gemini-correctness",
-        "host-alt-correctness"
+        "claude-correctness",
+        "copilot-correctness"
       ]
     ],
     "high": [
@@ -50,18 +42,15 @@
       "host-correctness",
       [
         "codex-correctness",
-        "opencode-kimi-correctness",
-        "opencode-glm-correctness",
-        "copilot-correctness",
         "gemini-correctness",
-        "host-alt-correctness"
+        "claude-correctness",
+        "copilot-correctness"
       ],
       [
-        "opencode-glm-standards",
-        "opencode-kimi-standards",
-        "copilot-standards",
         "gemini-standards",
-        "host-alt-standards"
+        "claude-standards",
+        "codex-standards",
+        "copilot-standards"
       ]
     ]
   },
