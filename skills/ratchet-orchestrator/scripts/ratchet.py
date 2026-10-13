@@ -4444,13 +4444,14 @@ def _note_fresh(note) -> bool:
 
 
 def _note_engine_call(root: Path, cmd: str, session: str | None, tool_input: dict | None = None):
-    """Guard hook: for every `ratchet.py init` / `ask` / `wait` / `complete` call `cmd` really runs, note which chat
-    is about to run it here, with its exact arguments. A `complete` note also carries the host's run_in_background
-    and timeout for the call (`bg`, `timeout`), which `complete` reads to warn about a foreground run. Best effort;
+    """Guard hook: for every `ratchet.py init` / `ask` / `wait` / `complete` / `integrate` call `cmd` really runs, note
+    which chat is about to run it here, with its exact arguments. A `complete` or `integrate` note also carries the
+    host's run_in_background and timeout for the call (`bg`, `timeout`), which that command reads to warn about a
+    foreground run. Best effort;
     never blocks the call."""
     if not session:
         return
-    calls = [a for a in _engine_invocations(cmd) if _engine_subcommand(a) in ("init", "ask", "wait", "complete")]
+    calls = [a for a in _engine_invocations(cmd) if _engine_subcommand(a) in ("init", "ask", "wait", "complete", "integrate")]
     if not calls:
         return
     try:
@@ -4461,7 +4462,7 @@ def _note_engine_call(root: Path, cmd: str, session: str | None, tool_input: dic
                 key = f"{root.resolve()}|{_engine_subcommand(argv)}"
                 kept = [x for x in (notes.get(key) if isinstance(notes.get(key), list) else []) if _note_fresh(x)]
                 note = {"session": session, "argv": argv, "at": now()}
-                if _engine_subcommand(argv) == "complete":
+                if _engine_subcommand(argv) in ("complete", "integrate"):
                     ti = tool_input if isinstance(tool_input, dict) else {}
                     note["bg"] = ti.get("run_in_background") is True
                     note["timeout"] = ti.get("timeout") if isinstance(ti.get("timeout"), (int, float)) else None
@@ -5936,9 +5937,11 @@ def cmd_director_enroll(args):
     ok(f"Lane {ctx.root} enrolled: approvals now require a director token.")
 
 
-def _integrate_lane(main: Path, target: str):
+def _integrate_lane(main: Path, target: str, fail=None):
     """(lane folder, branch or None) for a lane named by folder or by branch, from git's list of this project's
-    worktrees. Dies with a plain line when the name is neither."""
+    worktrees. Ends with a plain line (through `fail`, which the real merge uses to record the refusal; die when none
+    is given) when the name is neither."""
+    fail = fail or die
     r = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=main, capture_output=True, text=True, timeout=60)
     trees, cur = [], None
     for ln in r.stdout.splitlines():
@@ -5952,104 +5955,701 @@ def _integrate_lane(main: Path, target: str):
         hit = next((t for t in trees if t["path"] == os.path.realpath(p)), None)
         if hit:
             return Path(hit["path"]), hit["branch"]
-        die(f"{target} is not a git worktree of this project, so it is not a lane. Give the lane's folder (a git "
+        fail(f"{target} is not a git worktree of this project, so it is not a lane. Give the lane's folder (a git "
             "worktree of this project) or its branch name. Nothing was changed.")
     hit = next((t for t in trees if t["branch"] == target), None)
     if hit:
         return Path(hit["path"]), hit["branch"]
-    die(f"No lane found for '{target}': no worktree has that branch checked out, and it is not a folder. Give the "
+    fail(f"No lane found for '{target}': no worktree has that branch checked out, and it is not a folder. Give the "
         "lane's folder or its branch name (the lane's branch must be checked out in a worktree). Nothing was changed.")
 
 
-def cmd_integrate(args):
-    """`integrate <lane> --dry-run` (director only): checks that a finished lane is ready to merge into the main
-    checkout and says what integrate would do. Reads only: it runs no git command that writes and changes no file."""
-    require_director_session("integrate")
-    if not args.dry_run:
-        die("integrate can only check a lane so far: run it with --dry-run to see what it would do. The merge itself "
-            "comes in a later version. Nothing was changed.")
-    main = find_root()
-    if not _is_git(main):
-        die("integrate needs a git project: it merges a lane's branch. Nothing was changed.")
-    lane, branch = _integrate_lane(main, args.lane)
-    if lane == main.resolve():
-        die("That folder is the main checkout itself, not a lane. Give the lane's folder or its branch name. "
-            "Nothing was changed.")
-    lctx, mctx = Ctx(lane), Ctx(main)
-    name = branch or str(lane)
-    slug = lctx.active_slug()
-    if not slug or not lctx.state_path(slug).is_file():
-        die(f"The lane '{name}' has no active run, so there is nothing finished to integrate. Give the folder or "
-            "branch of a lane whose agent ran its work through Ratchet. Nothing was changed.")
-    lst, why = _read_record(lctx.state_path(slug))
-    if why:
-        die(f"The lane's run state ({lctx.state_path(slug)}) can't be read ({why}), so integrate can't tell if the "
-            "run is finished. Have the lane's agent check it with status. Nothing was changed.")
-    phase = lst.get("phase")
-    if phase != "done":
-        die(f"The lane's run '{slug}' is not finished (it is in phase '{phase}'). Have the lane's agent finish it, "
-            "then run integrate again. Nothing was changed.")
+def _integrate_line(info: dict, result: str, suite: str, detail: str, commits=None) -> dict:
+    """One record line for .ratchet/integrations.jsonl: time, lane, run, commits, suite (passed | failed | not-run),
+    result (merged | rolled-back | refused | no-op) and a plain detail."""
+    return {"time": now(), "lane": info.get("lane"), "run": info.get("run"),
+            "commits": list(commits if commits is not None else info.get("commits") or []), "suite": suite,
+            "result": result, "detail": detail}
 
-    def git(d, *a):
+
+def _integrate_record(main: Path, info: dict = None, result: str = "", suite: str = "", detail: str = "", commits=None,
+                      line: dict = None) -> bool:
+    """Append one line (built from the arguments, or `line` as it is) to .ratchet/integrations.jsonl in the main
+    checkout (run state, git-ignored). Never rewrites what is there. Returns whether the line was written; a record
+    that cannot be written is said on stderr and never changes the outcome (the caller keeps the journal so the next
+    integrate records it)."""
+    try:
+        (main / RATCHET_DIR).mkdir(exist_ok=True)
+    except OSError:
+        pass
+    line = line if line is not None else _integrate_line(info or {}, result, suite, detail, commits)
+    if not _append_jsonl(main / RATCHET_DIR / "integrations.jsonl", line):
+        print("ratchet: could not write the integration record (.ratchet/integrations.jsonl); the outcome stands",
+              file=sys.stderr)
+        return False
+    return True
+
+
+def _integrate_drop_scratch(tmp):
+    """Remove an integrate scratch copy: the links to the project's installed dependencies as links (never followed),
+    then the folder. It is a clone of its own, not a registered worktree, so main's git has nothing to prune."""
+    tmp = Path(tmp)
+    for dep in DEP_DIRS:
+        try:
+            if (tmp / dep).is_symlink():
+                (tmp / dep).unlink()
+        except OSError:
+            pass
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _integrate_clear_leftovers(prefix: str):
+    """Called with the integrate lock held: a scratch copy left in the temp folder by an integrate of this repository
+    that was killed (named with this repository's prefix) is removed. No other repository's copy has this prefix."""
+    tmpdir = Path(tempfile.gettempdir())
+    try:
+        old = [p for p in tmpdir.iterdir() if p.name.startswith(prefix) and p.is_dir() and not p.is_symlink()]
+    except OSError:
+        return
+    for p in old:
+        _integrate_drop_scratch(p)
+
+
+def _integrate_dirty(d, exclude):
+    """Paths with uncommitted changes to tracked files in the checkout `d` (untracked files are not listed), relative
+    to the project folder; `exclude`: leave out Ratchet's own folder."""
+    def git(*a):
         return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True, timeout=60)
+    top = Path(git("rev-parse", "--show-toplevel").stdout.strip() or d)
+    prefix = git("rev-parse", "--show-prefix").stdout.strip()
+    r = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames",
+                        "--untracked-files=no", "--", prefix or ".", *([f":(exclude){prefix}{RATCHET_DIR}"] if exclude else [])],
+                       cwd=top, capture_output=True, text=True, timeout=60)
+    return [x[3:][len(prefix):] if prefix and x[3:].startswith(prefix) else x[3:] for x in r.stdout.split("\0") if x]
 
-    def dirty(d, exclude):
-        top = Path(git(d, "rev-parse", "--show-toplevel").stdout.strip() or d)
-        prefix = git(d, "rev-parse", "--show-prefix").stdout.strip()
-        r = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames",
-                            "--untracked-files=no", "--", prefix or ".", *([f":(exclude){prefix}{RATCHET_DIR}"] if exclude else [])],
-                           cwd=top, capture_output=True, text=True, timeout=60)
-        return [x[3:][len(prefix):] if prefix and x[3:].startswith(prefix) else x[3:] for x in r.stdout.split("\0") if x]
 
-    if git(lane, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
-        die(f"A merge is in progress in the lane '{name}'. Have the lane's agent finish or abort it there first, "
-            "then run integrate again. Nothing was changed.")
-    bad = dirty(lane, True)
-    if bad:
-        die(f"The lane '{name}' has uncommitted changes ({', '.join(bad[:5])}). Have the lane's agent commit or "
-            "discard them, then run integrate again. Nothing was changed.")
-    if git(main, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
-        die("The main checkout has a merge in progress. Finish or abort it before integrating. Nothing was changed.")
-    carried = []
-    for path in dirty(main, False):
-        (carried if path in MERGE_SHARED else bad).append(path)
-    if bad:
-        die(f"The main checkout has uncommitted changes to project files ({', '.join(bad[:5])}). Ask the developer "
-            "to commit or stash them (integrate does not touch them), then run integrate again. Nothing was changed.")
+def _integrate_untracked(d):
+    """Files in the checkout `d` that git does not track, ignored ones included (paths from the repository top): a
+    merge may not overwrite any of them."""
+    out = []
+    for extra in ((), ("--ignored",)):
+        r = subprocess.run(["git", "--no-optional-locks", "ls-files", "--others", "--exclude-standard", "--full-name",
+                            "-z", *extra], cwd=d, capture_output=True, text=True, timeout=60)
+        out += [x for x in r.stdout.split("\0") if x and x not in out]
+    return out
+
+
+def _integrate_run_problem(main: Path, mctx):
+    """Why the main checkout's own run stops a merge right now (a plain sentence ending in what to do), or None. The
+    same rule as lane F's merge guard: only a run that is building mid-step (or blocked), or paused from building or
+    blocked, stops it; done, cancelled, not-yet-approved plan phases and a run paused from a waiting phase do not."""
     mslug = mctx.active_slug()
     if mslug and mctx.state_path(mslug).is_file():
         mst, why = _read_record(mctx.state_path(mslug))
         if why:
-            die(f"The main checkout's run state ({mctx.state_path(mslug)}) can't be read ({why}), so integrate can't "
-                "tell if its run is between steps. Check it with status first. Nothing was changed.")
-        # the same rule as lane F's merge guard: only a run that is building mid-step (or blocked) stops a merge;
-        # done, paused, cancelled and not-yet-approved plan phases do not
+            return (f"The main checkout's run state ({mctx.state_path(mslug)}) can't be read ({why}), so integrate "
+                    "can't tell if its run is between steps. Check it with status first.")
         if mst.get("phase") in ("building", "blocked") and not _between_steps(mst, main):
-            die(f"The main checkout's own run '{mslug}' is in phase '{mst.get('phase')}', in the middle of a step. "
-                "Wait for the step to finish (or for the run to be unblocked), then run integrate again. Nothing was "
-                "changed.")
+            return (f"The main checkout's own run '{mslug}' is in phase '{mst.get('phase')}', in the middle of a step. "
+                    "Wait for the step to finish (or for the run to be unblocked), then run integrate again.")
+        if mst.get("phase") == "paused" and mst.get("paused_from") in ("building", "blocked"):
+            # like `merged`: a run paused from building keeps its step's starting tree, which a merge now would
+            # leave behind the lane's work
+            return (f"The main checkout's own run '{mslug}' is paused from phase '{mst.get('paused_from')}', in the "
+                    "middle of a step. Resume it (resume) until it is between steps, then run integrate again.")
+    return None
+
+
+def _integrate_check(main: Path, target: str, info: dict, fail):
+    """Everything integrate checks before it changes anything, for the dry run and the real merge alike. `fail(msg)`
+    ends the command with a plain message (the real merge records it as refused first). Reads only. Returns the
+    facts: lane folder, name, run slug, main's tip, the lane's tip, the branch main is on, the commits the lane would
+    bring (as "<hash> <subject>" lines), the uncommitted Ratchet files on main, and main's context."""
+    info["lane"] = target
+    where = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=main, capture_output=True, text=True, timeout=60)
+    if where.stdout.strip():
+        # known limit: the scratch clone, the suite and the file checks all assume the project is the repository top
+        fail(f"integrate supports a Ratchet project at the top of its git repository only, and this project sits at "
+             f"'{where.stdout.strip()}' inside its repository. Merge this lane by hand (git merge in the main checkout, "
+             "then run the suite there). Nothing was changed.")
+    wt = subprocess.run(["git", "config", "--get", "core.worktree"], cwd=main, capture_output=True, text=True, timeout=60)
+    if wt.stdout.strip():
+        # known limit: the scratch clone takes main's local config, and a core.worktree there would point its git
+        # commands at main's own files
+        fail(f"integrate does not support a main checkout whose git config sets core.worktree ({wt.stdout.strip()}): "
+             "the scratch copy would work on main's files. Merge this lane by hand (git merge in the main checkout, "
+             "then run the suite there). Nothing was changed.")
+    if subprocess.run(["git", "cat-file", "-e", "HEAD:.gitmodules"], cwd=main, capture_output=True, text=True,
+                      timeout=60).returncode == 0:
+        # known limit: the scratch copy would have empty submodule folders, and the suite would blame the lane
+        fail("integrate cannot test a project with git submodules yet (main's tree has a .gitmodules file): the "
+             "scratch copy's submodule folders would be empty. Merge this lane by hand (git merge in the main checkout, "
+             "then run the suite there). Nothing was changed.")
+    lane, branch = _integrate_lane(main, target, fail)
+    if lane == main.resolve():
+        fail("That folder is the main checkout itself, not a lane. Give the lane's folder or its branch name. "
+             "Nothing was changed.")
+    lctx, mctx = Ctx(lane), Ctx(main)
+    name = branch or str(lane)
+    info["lane"] = name
+    slug = lctx.active_slug()
+    if not slug or not lctx.state_path(slug).is_file():
+        fail(f"The lane '{name}' has no active run, so there is nothing finished to integrate. Give the folder or "
+             "branch of a lane whose agent ran its work through Ratchet. Nothing was changed.")
+    info["run"] = slug
+    lst, why = _read_record(lctx.state_path(slug))
+    if why:
+        fail(f"The lane's run state ({lctx.state_path(slug)}) can't be read ({why}), so integrate can't tell if the "
+             "run is finished. Have the lane's agent check it with status. Nothing was changed.")
+    phase = lst.get("phase")
+    if phase != "done":
+        fail(f"The lane's run '{slug}' is not finished (it is in phase '{phase}'). Have the lane's agent finish it, "
+             "then run integrate again. Nothing was changed.")
+
+    def git(d, *a):
+        return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True, timeout=60)
+
+    dirty = _integrate_dirty
+
+    if git(lane, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+        fail(f"A merge is in progress in the lane '{name}'. Have the lane's agent finish or abort it there first, "
+             "then run integrate again. Nothing was changed.")
+    bad = dirty(lane, True)
+    if bad:
+        fail(f"The lane '{name}' has uncommitted changes ({', '.join(bad[:5])}). Have the lane's agent commit or "
+             "discard them, then run integrate again. Nothing was changed.")
+    if git(main, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+        fail("The main checkout has a merge in progress. Finish or abort it before integrating. Nothing was changed.")
+    carried = []
+    for path in dirty(main, False):
+        (carried if path in MERGE_SHARED else bad).append(path)
+    if bad:
+        fail(f"The main checkout has uncommitted changes to project files ({', '.join(bad[:5])}). Ask the developer "
+             "to commit or stash them (integrate does not touch them), then run integrate again. Nothing was changed.")
+    problem = _integrate_run_problem(main, mctx)
+    if problem:
+        fail(problem + " Nothing was changed.")
     head = git(main, "rev-parse", "HEAD").stdout.strip()
     lhead = git(lane, "rev-parse", "HEAD").stdout.strip()
-    target = git(main, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "HEAD"
+    tip = git(main, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "HEAD"
     commits = git(main, "log", "--format=%h %s", f"{head}..{lhead}").stdout.splitlines()
+    hashes = git(main, "log", "--format=%H", f"{head}..{lhead}").stdout.split()
+    info["commits"] = [lhead]
+    return {"lane": lane, "name": name, "slug": slug, "head": head, "lhead": lhead, "target": tip, "commits": commits,
+            "hashes": hashes, "carried": carried, "mctx": mctx}
+
+
+def cmd_integrate(args):
+    """`integrate <lane>` (director only): merges a finished lane into the main checkout. The merge is made and the
+    regression_command is run in a scratch clone of main (in the temp folder, borrowing main's objects, at main's tip);
+    only when the suite passes on that exact commit and main has not moved is the commit fetched into main and main
+    fast-forwarded to it. Any failure removes the scratch clone and
+    leaves main exactly as it was (it never resets, checks out or cleans main's files, and never commits anything
+    but the merge). Every attempt is appended to .ratchet/integrations.jsonl. Nothing is pushed.
+    `--dry-run` only checks the lane and says what integrate would do; it reads only and writes nothing."""
+    require_director_session("integrate")
+    main = find_root()
+    if not _is_git(main):
+        die("integrate needs a git project: it merges a lane's branch. Nothing was changed.")
+    if args.dry_run:
+        try:
+            _integrate_dry_run(main, _integrate_check(main, args.lane, {}, die))
+        except subprocess.TimeoutExpired as e:
+            die("A git command timed out while integrate checked the lane "
+                f"({' '.join(str(a) for a in e.cmd)[:80]}). Nothing was changed. Run integrate again.")
+        return
+    info = {"lane": args.lane, "run": None, "commits": []}
+
+    held = {"lock": False}  # only the integrate that holds the lock (and so wrote the journal) may remove the journal
+
+    def finish(result, suite, msg, detail=None, commits=None):
+        line = _integrate_line(info, result, suite, detail or msg, commits)
+        if held["lock"]:  # the outcome goes into the journal first, so a record that cannot be written now is not lost
+            try:
+                j, why = _read_record(_integrate_journal(common))
+                j = j if not why and isinstance(j, dict) else {}
+                j["outcome"] = line
+                _write_record(_integrate_journal(common), j)
+            except Exception:
+                pass
+        wrote = _integrate_record(main, line=line)
+        if held["lock"]:
+            if wrote:
+                try:
+                    _integrate_journal(common).unlink()  # the attempt is on record: nothing left to recover
+                except OSError:
+                    pass
+            else:
+                print("ratchet: the attempt's outcome is kept in the integrate journal; the next integrate records it "
+                      "once the record can be written", file=sys.stderr)
+        if result in ("merged", "no-op"):
+            ok(msg)
+            return
+        die(msg)
+
+    cd = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=main, capture_output=True, text=True, timeout=60)
+    common = Path(cd.stdout.strip() or ".git")
+    common = common if common.is_absolute() else main / common
+    lk = _IntegrateLock(main, common, f"integrate {args.lane}")
+    why = lk.acquire()
+    try:
+        if why:
+            busy = (f"Another integrate is already running (Ratchet is busy running {lk.holder}). Try again when it "
+                    "finishes. Nothing was changed.")
+            finish("refused", "not-run", busy if why.startswith("Ratchet is busy") else why)
+        held["lock"] = True
+        info["prefix"] = "ratchet-integrate-" + hashlib.sha1(os.path.realpath(common).encode()).hexdigest()[:10] + "-"
+        _integrate_recover(main, common)
+        # this attempt's journal from here on (after recover, so an old one is never overwritten): a kill during the
+        # checks is recorded by the next integrate too
+        _write_record(_integrate_journal(common), {"lane": args.lane, "run": None, "head": None, "lhead": None,
+                                                   "target": None, "sha": None, "suite": "not-run", "started": now()})
+        _integrate_clear_leftovers(info["prefix"])
+        try:
+            f = _integrate_check(main, args.lane, info, lambda m: finish("refused", "not-run", m))
+        except subprocess.TimeoutExpired as e:
+            finish("refused", "not-run", "A git command timed out while integrate checked the lane "
+                   f"({' '.join(str(a) for a in e.cmd)[:80]}). Nothing was changed. Run integrate again.")
+        _integrate_merge(main, f, info, finish)
+    finally:
+        lk.release()
+
+
+def _integrate_dry_run(main: Path, f: dict):
+    name, slug, head, lhead, target, commits = f["name"], f["slug"], f["head"], f["lhead"], f["target"], f["commits"]
+
+    def git(d, *a):
+        return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True, timeout=60)
+
     if not commits:
         ok(f"Dry run: the lane '{name}' (run '{slug}') has nothing new to bring to {target}, so there is nothing to "
            "merge. Nothing was changed.")
         return
+    layout = _integrate_layout_problem(main, head, lhead)
+    if layout:
+        die("Dry run: integrate would refuse this lane. " + layout)
     base = git(main, "merge-base", head, lhead).stdout.strip()
-    differ = [f for f in sorted(MERGE_SHARED)
-              if any(git(main, "diff", "--name-only", base, side, "--", f).stdout.strip() for side in (lhead, head))]
-    suite = mctx.config().get("regression_command")
+    differ = [x for x in sorted(MERGE_SHARED)
+              if any(git(main, "diff", "--name-only", base, side, "--", x).stdout.strip() for side in (lhead, head))]
+    suite = f["mctx"].config().get("regression_command")
     lines = [f"Dry run: integrate would merge the lane '{name}' (run '{slug}', finished) into {target}.",
              f"Commits it would bring to {target} ({len(commits)}):", *[f"  {c}" for c in commits],
              "Ratchet's own files that differ since the lane branched (merged by Ratchet's rules): "
              + (", ".join(differ) if differ else "none differ."),
              "Uncommitted Ratchet files on main it would carry across (never committed): "
-             + (", ".join(sorted(carried)) if carried else "none."),
+             + (", ".join(sorted(f["carried"])) if f["carried"] else "none."),
              "Suite it would run on the merged code before main moves: "
              + (suite if suite else "none (no regression_command is set)."),
              "This was a dry run: nothing was changed, no merge was made and nothing was pushed."]
     ok("\n".join(lines))
+
+
+def _integrate_linked_deps(main: Path) -> list:
+    """Installed-dependency folders (DEP_DIRS) of the main checkout whose contents point back into the main checkout
+    itself, outside that dependency folder: workspace links in node_modules or vendor, and a Python editable install
+    (a .pth, .egg-link or __editable__ file, or an editable direct_url.json, naming main's path). The scratch copy
+    borrows those folders by link, so the suite would load main's code from before the merge through them. Returns
+    short "where -> what" strings (at most three); [] when none."""
+    from urllib.parse import unquote, urlparse
+    roots = sorted({os.path.realpath(main), os.path.abspath(main)})
+    found = []
+
+    def inside(path, dep_real):
+        path = os.path.normpath(path)
+        return any(path == r or path.startswith(r + os.sep) for r in roots) and not (
+            path == dep_real or path.startswith(dep_real + os.sep))
+
+    def links(dep, dep_real, d, level):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            return
+        for n in names:
+            p = os.path.join(d, n)
+            if os.path.islink(p):
+                t = os.path.realpath(p)
+                if inside(t, dep_real):
+                    found.append(f"{os.path.relpath(p, main)} -> {os.path.relpath(t, main)}")
+            elif level == 1 and os.path.isdir(p) and (dep != "node_modules" or n.startswith("@") or n == ".bin"):
+                links(dep, dep_real, p, 2)
+
+    pat = re.compile("(?:" + "|".join(re.escape(r) for r in roots) + r")(?![\w.\-])[^\s'\"\\]*")
+
+    def text_of(p):
+        try:
+            if os.path.getsize(p) > 1000000:
+                return ""
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def python_installs(dep_real, dep_dir):
+        sites = []
+        for lib in ("lib", "lib64", "Lib"):
+            base = os.path.join(dep_dir, lib)
+            try:
+                sites += [os.path.join(base, n, "site-packages") for n in sorted(os.listdir(base)) if n.startswith("python")]
+            except OSError:
+                pass
+            sites.append(os.path.join(base, "site-packages"))
+        for site in sites:
+            try:
+                names = sorted(os.listdir(site))
+            except OSError:
+                continue
+            for n in names:
+                p = os.path.join(site, n)
+                if n.endswith((".pth", ".egg-link")) or n.startswith("__editable__"):
+                    hit = next((m.group(0) for m in pat.finditer(text_of(p)) if inside(m.group(0), dep_real)), None)
+                    if hit:
+                        found.append(f"{os.path.relpath(p, main)} -> {os.path.relpath(hit, main)}")
+                elif n.endswith(".dist-info"):
+                    try:
+                        # direct_url.json is the installer's own file, not a Ratchet record: unreadable or
+                        # invalid means not an editable install, never an exit
+                        du, _why = _read_record(Path(p) / "direct_url.json", kind=dict, missing={})
+                        url = (du or {}).get("url") or ""
+                        loc = unquote(urlparse(url).path)
+                        if (du.get("dir_info") or {}).get("editable") and url.startswith("file:") and inside(loc, dep_real):
+                            found.append(f"{os.path.relpath(p, main)} -> {os.path.relpath(loc, main)}")
+                    except (ValueError, AttributeError):
+                        pass
+
+    for dep in DEP_DIRS:
+        dep_dir = os.path.join(main, dep)
+        if not os.path.isdir(dep_dir):
+            continue
+        dep_real = os.path.realpath(dep_dir)
+        links(dep, dep_real, dep_dir, 1)
+        if dep in (".venv", "venv"):
+            python_installs(dep_real, dep_dir)
+        if dep == "vendor":
+            # Composer's autoloader maps the project's own classes through __DIR__ . '/../..', which resolves the
+            # linked folder back into this checkout
+            try:
+                auto = sorted(n for n in os.listdir(os.path.join(dep_dir, "composer"))
+                              if n.startswith("autoload_") and n.endswith(".php"))
+            except OSError:
+                auto = []
+            for rel in ["vendor/autoload.php"] + ["vendor/composer/" + n for n in auto]:
+                if os.path.isfile(os.path.join(main, rel)):
+                    found.append(f"{rel} -> this checkout's classes (Composer's autoloader)")
+                    break
+    return found[:3]
+
+
+def _integrate_move_base(main: Path, mctx, sha: str, lane: str, run: str):
+    """Called holding main's state lock, right after main was fast-forwarded to the merge commit `sha`. When main's own
+    run is building at step 'tests' (between steps: the only building state integrate allows), its current step's
+    starting tree and commit are moved to the merge, the way `merged` does for a lane, so the step's reviewers and its
+    commit see only the step's own changes and not the lane's. Other phases set a fresh starting tree when their next
+    step begins. Logged as `integrated_lane`. A run state that can't be read is left alone (the merge stands)."""
+    mslug = mctx.active_slug()
+    if not (mslug and mctx.state_path(mslug).is_file()):
+        return
+    mst, why = _read_record(mctx.state_path(mslug))
+    cur = (mst or {}).get("current") if not why else None
+    if not (cur and mst.get("phase") == "building" and (mst.get("checkpoints") or {}).get(cur, {}).get("step") == "tests"):
+        return
+    base = fingerprint(main)["id"]
+    mst["base_tree"] = base
+    mst["checkpoints"][cur]["base_tree"] = base
+    mst["checkpoints"][cur]["base_head"] = sha
+    mctx.log(mst, "integrated_lane", commit=sha, lane=lane, run=run)
+    mctx.save_state(mst)
+
+
+def _integrate_layout_problem(main: Path, head: str, lhead: str):
+    """The known layout limits the real merge refuses before any clone, as one plain line (or None), so the dry run
+    can report them too: the lane changes a dependency manifest or lockfile (the suite would run with main's installed
+    dependencies, linked in, which cannot match the lane's), or main's installed dependencies link back into main."""
+    manifests = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock",
+                 "bun.lockb", "pyproject.toml", "setup.py", "setup.cfg", "Pipfile", "Pipfile.lock", "uv.lock",
+                 "poetry.lock", "Gemfile", "Gemfile.lock", "composer.json", "composer.lock", "Cargo.toml", "Cargo.lock",
+                 "go.mod", "go.sum"}
+    base = subprocess.run(["git", "merge-base", head, lhead], cwd=main, capture_output=True, text=True, timeout=60)
+    changed = subprocess.run(["git", "diff", "--name-only", base.stdout.strip() or head, lhead], cwd=main,
+                             capture_output=True, text=True, timeout=60).stdout.split()
+    deps = [p for p in changed if os.path.basename(p) in manifests
+            or (os.path.basename(p).startswith("requirements") and p.endswith(".txt"))]
+    if deps:
+        return (f"The lane changes the project's dependencies ({', '.join(deps[:5])}). integrate runs the suite with "
+                "main's installed dependencies, which do not match the lane's, and cannot install the lane's yet. Merge "
+                "this lane by hand (git merge in the main checkout, install, then run the suite there). Nothing was "
+                "changed.")
+    linked = _integrate_linked_deps(main)
+    if linked:
+        return ("integrate cannot test this project layout yet: its installed dependencies link back into the main "
+                f"checkout ({'; '.join(linked)}; workspace links or an editable install), so a suite run on the merged "
+                "copy would load main's code from before the merge. Merge this lane by hand (git merge in the main "
+                "checkout, then run the suite there). Nothing was changed.")
+    return None
+
+
+def _integrate_journal(common: Path) -> Path:
+    """The journal of the integrate attempt under way (next to the integrate lock): what the next integrate needs to
+    record the attempt if this one is killed before it records itself."""
+    return common / "ratchet-integrate.journal"
+
+
+def _integrate_recover(main: Path, common: Path):
+    """Called with the integrate lock held, before a new attempt starts: an attempt that ended without its record line
+    (killed mid-run, or its record could not be written) left its journal. Record only, nothing else is changed: the
+    journaled outcome as it is when there is one; else merged with a note when main's history holds that attempt's
+    merge commit (killed after the fast-forward; main's run is not touched, so a step in progress shows the lane's
+    changes in its own diff), else rolled back (killed during the suite or before). The journal is removed only once
+    the record line is written; when it cannot be, the command stops with a plain line and the journal stays."""
+    journal = _integrate_journal(common)
+    if not journal.is_file():
+        return
+    j, why = _read_record(journal)
+    j = j if not why and isinstance(j, dict) else {}
+    lane, run, sha, head, lhead = j.get("lane"), j.get("run"), j.get("sha"), j.get("head"), j.get("lhead")
+    info = {"lane": lane, "run": run}
+
+    def git(*a):
+        return subprocess.run(["git", *a], cwd=main, capture_output=True, text=True, timeout=60)
+
+    if isinstance(j.get("outcome"), dict):
+        line = j["outcome"]
+    elif sha and git("merge-base", "--is-ancestor", sha, "HEAD").returncode == 0:  # main took it (and may have moved on)
+        lane_commits = git("rev-list", f"{head}..{lhead}").stdout.split() if head and lhead else []
+        note = (f"An earlier integrate of the lane '{lane}' (run '{run}') was interrupted after {j.get('target') or 'main'} "
+                f"took its merge commit {sha[:9]}; it is recorded now. Main's run was not changed: if it is in the "
+                "middle of a step, that step's diff also shows the lane's changes.")
+        line = _integrate_line(info, "merged", j.get("suite") or "passed", note, [sha] + lane_commits)
+        print(f"RATCHET: note: {note}", file=sys.stderr, flush=True)
+    else:
+        line = _integrate_line(info, "rolled-back", j.get("suite") or "not-run",
+                               f"An earlier integrate of the lane '{lane}' (run '{run}') was interrupted (killed) before "
+                               "it finished; main did not take the merge.", [lhead] if lhead else [])
+    if not _integrate_record(main, line=line):
+        die(f"The record of an earlier interrupted integrate (of the lane '{lane}') could not be written to "
+            f"{RATCHET_DIR}/integrations.jsonl in the main checkout. Fix that (the file and its folder must be "
+            "writable), then run integrate again: it records that attempt first. Nothing was changed.")
+    try:
+        journal.unlink()
+    except OSError:
+        pass
+
+
+def _integrate_merge(main: Path, f: dict, info: dict, finish):
+    """The real merge, after every check passed (see cmd_integrate). `finish(result, suite, message, detail, commits)`
+    records the attempt and ends the command. A journal of the attempt (lane, run, main's tip, the merge commit once
+    made, the suite's state) is kept next to the integrate lock until the record line is written, so an attempt killed
+    mid-run is recorded by the next integrate (_integrate_recover)."""
+    import types
+    name, slug, head, lhead, target = f["name"], f["slug"], f["head"], f["lhead"], f["target"]
+    if not f["commits"]:
+        finish("no-op", "not-run", f"The lane '{name}' is already merged into {target} (its tip is in main's history), "
+               "so nothing was changed.")
+        return
+    cfg = f["mctx"].config()
+    suite = cfg.get("regression_command")
+    if not suite:
+        finish("refused", "not-run", "No regression_command is set, and integrate will not merge code that no suite "
+               "has run on. Set one with `config --set regression_command=...`, then run integrate again. Nothing was "
+               "changed.")
+    timeout = int(cfg.get("test_timeout_sec") or DEFAULT_CONFIG["test_timeout_sec"])
+    layout = _integrate_layout_problem(main, head, lhead)
+    if layout:
+        finish("refused", "not-run", layout)
+
+    def git(d, *a):
+        return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True, timeout=120)
+
+    state = {"suite": "not-run"}
+
+    def rolled(msg, suite_state, detail=None, commits=None):
+        finish("rolled-back", suite_state, msg + " Nothing was changed.", detail or msg, commits)
+
+    def path_of(r):  # a path git printed for main, made absolute
+        p = Path(r.stdout.strip())
+        return p if p.is_absolute() else main / p
+
+    common = path_of(git(main, "rev-parse", "--git-common-dir"))
+    hooks = git(main, "config", "--get", "core.hooksPath").stdout.strip()
+    if hooks and not hooks.startswith("~") and not os.path.isabs(hooks):
+        hooks = str(Path(git(main, "rev-parse", "--show-toplevel").stdout.strip() or main) / hooks)
+    hooks = hooks or str(path_of(git(main, "rev-parse", "--git-path", "hooks")))
+    entry = {"lane": name, "run": slug, "head": head, "lhead": lhead, "target": target, "sha": None,
+             "suite": "not-run", "started": now()}
+    _write_record(_integrate_journal(common), entry)
+    tmp = Path(tempfile.mkdtemp(prefix=info["prefix"]))
+    try:
+        # a clone of its own that borrows main's objects (so main's worktree list, refs and files are never touched
+        # while the suite runs); its commits come back to main by a fetch once the suite has passed. It takes main's
+        # own local git settings (identity, signing, merge drivers, filters, attributes) and runs main's hooks, so the
+        # merge commit is made the way a merge in main would be
+        who = []
+        for k, d in (("user.name", "Ratchet"), ("user.email", "ratchet@localhost")):
+            who += ["-c", f"{k}={git(main, 'config', k).stdout.strip() or d}"]
+        r = git(main, "clone", "-q", "--shared", "--no-checkout", str(main), str(tmp))
+        if r.returncode == 0:
+            r = git(tmp, "config", "--local", "--add", "include.path", str(common / "config"))
+        if r.returncode == 0:
+            attrs = path_of(git(main, "rev-parse", "--git-path", "info/attributes"))
+            try:
+                if attrs.is_file():
+                    (tmp / ".git" / "info").mkdir(exist_ok=True)
+                    shutil.copyfile(str(attrs), str(tmp / ".git" / "info" / "attributes"))
+            except OSError:
+                pass
+            # no hook runs for this checkout: nothing is checked out in main, so no checkout hook would run there
+            r = git(tmp, "-c", f"core.hooksPath={tmp / '.git' / 'ratchet-no-hooks'}", "checkout", "-q", "--detach", head)
+        if r.returncode != 0:
+            rolled(f"Could not make the scratch copy of main to merge in ({(r.stderr or r.stdout).strip()[:300]}).",
+                   "not-run")
+        mcfg = ["-c", f"core.hooksPath={hooks}"]
+        for dep in DEP_DIRS:
+            if (main / dep).exists() and not (tmp / dep).exists():
+                try:
+                    (tmp / dep).symlink_to(main / dep)
+                except OSError:
+                    pass
+        r = git(tmp, *who, *mcfg, "merge", "--no-ff", "--no-commit", lhead)
+        if r.returncode != 0:
+            files = git(tmp, "diff", "--name-only", "--diff-filter=U").stdout.split()
+            if files:
+                rolled(f"Merging the lane '{name}' into {target} conflicts in: {', '.join(files)}. Have the lane's "
+                       "agent merge main into the lane (git merge main, resolve the files, commit, then run "
+                       "`ratchet.py merged`), then run integrate again.", "not-run")
+            rolled(f"git could not merge the lane '{name}' ({(r.stderr or r.stdout).strip()[:300]}).", "not-run")
+        r = git(tmp, *who, *mcfg, "commit", "-q", "-m", f"Merge lane '{name}' (run {slug})", "-m",
+                f"Ratchet-Integrated: {name} {slug}")
+        if r.returncode != 0:
+            rolled(f"git could not commit the merge ({(r.stderr or r.stdout).strip()[:300]}).", "not-run")
+        sha = git(tmp, "rev-parse", "HEAD").stdout.strip()
+        git(tmp, "update-ref", "refs/heads/ratchet-integrate", sha)
+        entry["sha"] = sha
+        _write_record(_integrate_journal(common), entry)
+        commits = [sha] + list(f["hashes"])  # recorded only once the merge commit is in main; until then the record
+        # keeps the lane's tip, since the scratch merge commit exists nowhere else
+        touched = set(git(tmp, "diff", "--name-only", head, sha).stdout.split())
+        clash = sorted(x for x in f["carried"] if x in touched)
+        if clash:
+            rolled(f"The merge changes {', '.join(clash)}, which has uncommitted changes on main that integrate does "
+                   "not merge yet. Ask the developer to commit or stash that file (integrate does not touch it), then "
+                   "run integrate again.", "not-run")
+        loose = sorted(x for x in _integrate_untracked(main) if x in touched)
+        if loose:
+            rolled(f"Main has a file git does not track yet ({', '.join(loose[:5])}) at a path the lane also adds, so "
+                   "main cannot take the merge. Ask the developer to move or delete that file (or commit it), then run "
+                   "integrate again.", "not-run")
+        _warn_if_foreground(f["mctx"], cfg, what="integrate", rerun=False)
+        code, out, _dur = _run_cmd(types.SimpleNamespace(root=tmp), suite, tmp / "integrate-suite.log", timeout)
+        if code != 0:
+            tail = "\n".join(out.strip().splitlines()[-40:])[-3000:]
+            how = (f"timed out after {timeout}s" if code == 124 else f"failed (exit {code})")
+            rolled(f"The suite {how} on the merged code, so main was not changed. Last output:\n{tail}\nHave the "
+                   "lane's agent fix the failure in the lane and finish the lane again, then run integrate again.",
+                   "failed", f"The suite {how} on the merged code.")
+        state["suite"] = entry["suite"] = "passed"
+        _write_record(_integrate_journal(common), entry)
+        # what the suite tested must be the merge commit itself: a suite that rewrites tracked files first (a code
+        # generator or formatter that runs before the tests) passed on something else
+        st = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames",
+                             "--untracked-files=no"], cwd=tmp, capture_output=True, text=True, timeout=120)
+        moved = [x[3:] for x in st.stdout.split("\0") if x]
+        if git(tmp, "rev-parse", "HEAD").stdout.strip() != sha or moved:
+            rolled(f"The suite passed, but it changed tracked files in the merged copy ({', '.join(moved[:5]) or 'HEAD'}), "
+                   "so what it tested is not the merge commit. Make the regression command leave tracked files as they "
+                   "are (commit generated files in the lane, or generate them outside the tracked tree), then run "
+                   "integrate again.", "passed", "The suite changed tracked files in the merged copy.")
+
+        def main_problem():
+            """(message, short detail) for what changed in main while the suite ran, or None. Run holding main's state
+            lock, right before the fast-forward: the same checks as before the suite, plus the tip and the branch."""
+            cur = git(main, "rev-parse", "HEAD").stdout.strip()
+            if cur != head:
+                return (f"Main moved while the suite ran (it was at {head[:9]}, it is now at {cur[:9]}), so nothing "
+                        "was merged. Run integrate again: it merges onto the new tip.", "Main moved while the suite ran.")
+            br = git(main, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "HEAD"
+            if br != target:
+                return (f"Main's checkout was switched from {target} to {br} while the suite ran, so nothing was "
+                        f"merged. Switch it back to {target}, then run integrate again.",
+                        "Main's branch changed while the suite ran.")
+            if git(main, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+                return ("The suite passed, but a merge was started in the main checkout while it ran. Finish or abort "
+                        "it, then run integrate again.", "A merge started in main while the suite ran.")
+            run_why = _integrate_run_problem(main, f["mctx"])
+            if run_why:
+                return ("The suite passed, but main's own run changed while it ran. " + run_why,
+                        "Main's run was in the middle of a step when the suite ended.")
+            bad, carried = [], []
+            for path in _integrate_dirty(main, False):
+                (carried if path in MERGE_SHARED else bad).append(path)
+            if bad:
+                return (f"The suite passed, but main now has uncommitted changes to project files "
+                        f"({', '.join(bad[:5])}). Ask the developer to commit or stash them (integrate does not touch "
+                        "them), then run integrate again.", "Main got uncommitted changes while the suite ran.")
+            clash_now = sorted(x for x in carried if x in touched)
+            if clash_now:
+                return (f"The suite passed, but the merge changes {', '.join(clash_now)}, which has uncommitted changes "
+                        "on main that integrate does not merge yet. Ask the developer to commit or stash that file "
+                        "(integrate does not touch it), then run integrate again.",
+                        "A shared Ratchet file on main changed while the suite ran.")
+            loose_now = sorted(x for x in _integrate_untracked(main) if x in touched)
+            if loose_now:
+                return (f"The suite passed, but main now has a file git does not track yet ({', '.join(loose_now[:5])}) "
+                        "at a path the lane also adds. Ask the developer to move or delete that file (or commit it), "
+                        "then run integrate again.", "Main got an untracked file the lane adds.")
+            return None
+
+        # nothing in main may change between the last check and the fast-forward, so both happen holding main's
+        # state lock (the lock every command that changes main's run takes); a developer's merge.autoStash setting
+        # must never turn an edit made meanwhile into conflict markers, so the fast-forward is told not to stash
+        slock = _StateLock(main, cmd="integrate")
+        try:
+            lwhy = slock.acquire()
+            if lwhy:
+                rolled("The suite passed, but Ratchet is busy in the main checkout, so integrate could not check main "
+                       f"before moving it ({lwhy.split(' Nothing was done')[0]}). Try again when it finishes.",
+                       "passed", "Main's state was busy when the suite ended.")
+            problem = main_problem()
+            if problem:
+                rolled(problem[0], "passed", problem[1])
+            late = ""
+            r = git(main, "fetch", "-q", str(tmp), "refs/heads/ratchet-integrate")  # only brings the commit's objects
+            if r.returncode == 0:
+                try:
+                    # main's hooks (post-merge, say) run inside this call, so it gets the suite's time limit; a hook
+                    # still running after that does not undo a fast-forward that already happened
+                    r = subprocess.run(["git", "-c", "merge.autoStash=false", "merge", "--ff-only",
+                                        "--no-overwrite-ignore", sha], cwd=main, capture_output=True, text=True,
+                                       timeout=max(120, timeout))
+                except subprocess.TimeoutExpired:
+                    if git(main, "rev-parse", "HEAD").stdout.strip() != sha:
+                        raise
+                    r = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+                    late = (f" A git hook on main was still running after {max(120, timeout)}s, so integrate stopped "
+                            "waiting for it; check its result yourself.")
+            landed = r.returncode == 0 and git(main, "rev-parse", "HEAD").stdout.strip() == sha
+            if landed:
+                info["commits"] = commits
+                _integrate_move_base(main, f["mctx"], sha, name, slug)
+        finally:
+            slock.release()
+        if not landed:
+            why = (r.stderr or r.stdout).strip()
+            if "untracked" in why.lower() or "ignored" in why.lower():
+                rolled(f"The suite passed, but main could not take the merge: a file git does not track yet would be "
+                       f"overwritten ({why[:300]}). Ask the developer to move or delete that file (or commit it), then "
+                       "run integrate again.", "passed", "Main could not take the merge: " + why[:200])
+            rolled(f"The suite passed, but main could not take the merge ({why[:300]}). Ask the developer to commit "
+                   "the uncommitted changes in main (or stash them), then run integrate again.", "passed",
+                   "Main could not take the merge: " + why[:200])
+        finish("merged", "passed", f"Merged the lane '{name}' (run '{slug}') into {target}: {len(f['commits'])} "
+               f"commit(s), merge commit {sha[:9]}. The suite passed on exactly that commit before {target} moved. "
+               f"Nothing was pushed.{late}", None, commits)
+    except subprocess.TimeoutExpired as e:
+        cmd = " ".join(str(a) for a in (e.cmd if isinstance(e.cmd, (list, tuple)) else [e.cmd]))[:80]
+        finish("rolled-back", state["suite"], f"A git command timed out ({cmd}), so integrate stopped. Check "
+               "`git status` and `git log -1` in main to see whether it took the merge, then run integrate again (it "
+               "says 'already merged' if it did).", "A git command timed out: " + cmd, info.get("commits"))
+    finally:
+        _integrate_drop_scratch(tmp)
 
 
 def cmd_director_sign(args):
@@ -9828,18 +10428,25 @@ def cmd_receipt(args):
         print("No findings were accepted, left for later or fixed later in this run.")
 
 
-def _warn_if_foreground(ctx, cfg):
-    """complete runs the whole regression suite. Unless the guard hook noted that the host runs this exact call in
-    the background, say first (stderr, flushed) that a tool timeout could cut it off. No note, or a note that does
-    not say, counts as foreground. Never changes what complete does."""
-    note = _noted_session(ctx.root, "complete", whole=True)
+def _warn_if_foreground(ctx, cfg, what="complete", rerun=True):
+    """`what` (complete, or integrate) runs the whole regression suite. Unless the guard hook noted that the host runs
+    this exact call in the background, say first (stderr, flushed) that a tool timeout could cut it off. No note, or
+    a note that does not say, counts as foreground. `rerun`: complete may run the suite a second time after a failure.
+    Never changes what the command does."""
+    note = _noted_session(ctx.root, what, whole=True)
+    if not note and what == "integrate":
+        # the guard notes the call under the folder it was run from (a director's own folder, reaching main with
+        # --root), not under main
+        here = find_root(Path.cwd())
+        if here.resolve() != ctx.root.resolve():
+            note = _noted_session(here, what, whole=True)
     if note and note.get("bg") is True:
         return
     secs = int(cfg.get("test_timeout_sec") or DEFAULT_CONFIG["test_timeout_sec"])
     span = f"{secs // 60} minutes" if secs >= 120 else f"{secs} seconds"
-    print(f"WARNING: a tool timeout could cut this complete call off. It runs the whole regression suite, which "
-          f"can take up to {span}, and after a failure it may run the suite a second time, so up to about "
-          f"twice that. Run it in the background instead (run_in_background), then wait for it to "
+    again = (", and after a failure it may run the suite a second time, so up to about twice that" if rerun else "")
+    print(f"WARNING: a tool timeout could cut this {what} call off. It runs the whole regression suite, which "
+          f"can take up to {span}{again}. Run it in the background instead (run_in_background), then wait for it to "
           f"finish.", file=sys.stderr, flush=True)
 
 
@@ -15833,6 +16440,16 @@ class _StateLock(_BreakerLock):
         return False
 
 
+class _IntegrateLock(_StateLock):
+    """The one-integrate-at-a-time lock: a lock file in the repository's git common dir (shared by the main checkout and
+    every lane worktree), built like the state lock so it is cleared at once when the integrate that made it was
+    killed (_StateLock's dead-owner check), and refused quickly as busy while a live one runs."""
+
+    def __init__(self, main: Path, common: Path, cmd: str):
+        super().__init__(main, wait=STATE_LOCK_BUSY_WAIT_SECONDS, cmd=cmd, refresh=True)
+        self.path = common / "ratchet-integrate.lock"
+
+
 def _may_use_override(args) -> bool:
     """Whether this command may ask for the RATCHET_HUMAN_OVERRIDE code (it reaches human_override): it is asked
     before the state lock is taken."""
@@ -16383,7 +17000,7 @@ def main(argv=None):
     a.set_defaults(fn=cmd_lanes)
     a = sp.add_parser("director-key"); a.add_argument("--rotate", action="store_true"); a.set_defaults(fn=cmd_director_key)
     sp.add_parser("director-enroll").set_defaults(fn=cmd_director_enroll)
-    a = sp.add_parser("integrate", help="director only: check a finished lane before merging it into main")
+    a = sp.add_parser("integrate", help="director only: merge a finished lane into main (suite first), or check it with --dry-run")
     a.add_argument("lane", help="the lane's folder (a git worktree) or its branch name")
     a.add_argument("--dry-run", action="store_true", help="say what integrate would do; change nothing")
     a.set_defaults(fn=cmd_integrate)
