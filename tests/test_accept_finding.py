@@ -128,7 +128,7 @@ def round_limit_project(name):
           "tests": {"files": ["tests/cp1.test.js"], "command": "test -f src/f.js"}}
     (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
                                                        "checkpoints": [cp]}))
-    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
+    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
     r = th.rx(d, env, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout
     th.rx(d, env, "ask", "approve-plan")
@@ -977,7 +977,7 @@ def run_wide_cap_project(name):
            "tests": {"files": ["tests/cp2.test.js"], "command": "test -f src/g.js"}}
     (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
                                                        "checkpoints": [cp1, cp2]}))
-    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
+    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
     (run / "tests" / "CP2.json").write_text(json.dumps({"cases": [{"id": "CP2-T01", "layer": "code"}]}))
     r = th.rx(d, env, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout

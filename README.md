@@ -44,7 +44,7 @@ That's all you have to type. The agent takes it from there. It may ask a few qui
 
 First the agent does some quick checks on its own. Are the hooks working? Which other AI tools are installed that could review the work? Has your team already written a spec for this? If anything needs your OK, like installing the hooks or starting a new git branch, it asks. If it finds a problem that would get in the way (the app won't start, there's no way to run tests, the screenshot tool is missing, or you have unsaved changes), it tells you in one message and offers to fix each one.
 
-Then it shows you the plan, right in the chat. It opens with the objective: who the result is for, what they want, what done means to them, and what's out of scope (for example users: "managers who approve leave requests"; goal: "clear a team's leave requests without leaving the app"; done means: "a manager can approve or reject a request with a reason"; out of scope: "approving another team's requests"). Every step, every reviewer and every finding points back to it, so the build stays aimed at what you actually asked for. Below that you'll see each step, what "done" means for it, whether its look will be checked, how risky it is and who will review it. Read it. Say "yes" to start, or tell it what to change. If the feature has new screens, you also get a clickable prototype to look at first, so you can see what it'll look like before anything is built. Once you say yes, the plan, the design file and the prototype are locked. The agent can't change them later without asking you.
+Then it shows you the plan, right in the chat. It opens with the objective: who the result is for, what they want, what done means to them, and what's out of scope (for example users: "managers who approve leave requests"; goal: "clear a team's leave requests without leaving the app"; done means: "a manager can approve or reject a request with a reason"; out of scope: "approving another team's requests"). Every step, every reviewer and every finding points back to it, so the build stays aimed at what you actually asked for. Every done-means line is linked to at least one planned test case that proves it, and the plan summary shows those cases under each line; the engine refuses a plan that leaves a line unlinked before you ever see it, so there is no line that nothing will check. Below that you'll see each step, what "done" means for it, whether its look will be checked, how risky it is and who will review it. Read it. Say "yes" to start, or tell it what to change. If the feature has new screens, you also get a clickable prototype to look at first, so you can see what it'll look like before anything is built. Once you say yes, the plan, the design file and the prototype are locked. The agent can't change them later without asking you.
 
 Now you can walk away. For each step the agent writes the tests first and makes sure they fail. Then it writes the code until they pass. Then the reviewers go looking for problems, and anything they find gets fixed and checked again. Every finished step becomes its own git commit, and you get a one-line update as each one lands.
 
@@ -473,6 +473,8 @@ python3 tests/test_digest_specs.py
 python3 tests/test_discover.py
 python3 tests/test_discover_omp.py
 python3 tests/test_discover_paid.py
+python3 tests/test_dm_plan.py
+python3 tests/test_dm_plan_extend.py
 python3 tests/test_dm_table.py
 python3 tests/test_docs.py
 python3 tests/test_flaky.py

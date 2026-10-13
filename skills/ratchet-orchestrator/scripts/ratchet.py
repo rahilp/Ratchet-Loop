@@ -2106,7 +2106,7 @@ def objective_problems(plan) -> list[str]:
 
 
 def _proves_values(case) -> list:
-    """Normalize one test-plan case's "proves" field for every consumer (proves_problems, _unproven_done_means,
+    """Normalize one test-plan case's "proves" field for every consumer (proves_problems, _done_means_links,
     _done_means_proof): a missing value is [] (nothing to prove), a scalar int counts as [int] (the common
     planner slip of writing "proves": 1 instead of [1]), a list is used as-is. Any other shape is not a number
     or a list of numbers, so there is nothing valid to normalize here; plan-submit's proves_problems is the one
@@ -2124,7 +2124,8 @@ def _proves_values(case) -> list:
 def proves_problems(ctx, plan) -> list[str]:
     """CP3: a test-plan case's optional "proves" (the spec_ref precedent's sibling) names, 1-based, the lines
     of the objective's done_means it proves. plan-submit refuses any number that is not really a done_means
-    line, naming the offending case; a plan with no objective or no done_means lines (objective_problems
+    line, naming the offending case (plan-extend applies the same check to the appended checkpoints' cases only,
+    passing a plan holding just those); a plan with no objective or no done_means lines (objective_problems
     already refuses that on its own) simply has nothing valid to name, so every number is refused. "proves" may
     be a single integer (normalized to a one-item list, see _proves_values) or a list; any other shape (a
     string, a dict, a list containing one) is refused here by name, so plan-summary and receipt never have to
@@ -2152,11 +2153,14 @@ def proves_problems(ctx, plan) -> list[str]:
 NO_OBJECTIVE_NOTE = "no objective was stated for this run (an older plan, approved before this feature existed)"
 
 
-def objective_brief(plan) -> str:
+def objective_brief(plan, proof_notes=None) -> str:
     """Plain text of the plan's objective, for the top of every reviewer prompt and every sub-agent's brief: who
-    the result is for, what they want, what done means, what is out of scope. A plan with no objective at all
-    (a run approved before CP1's objective_problems() existed) gets a plain note instead of a crash, so a legacy
-    run keeps reviewing normally."""
+    the result is for, what they want, what done means, what is out of scope. With `proof_notes` (the dict
+    `_done_means_proof_notes` builds: {1-based done_means line number: one note line}), each done-means bullet is
+    followed by its note (`Proved by: <case ids>`, or the plain `Heads up` for a line no case proves yet); this is
+    the one rendering `plan-summary`, `brief` and the launch guard share, so a brief's objective matches
+    plan-summary's word for word. A plan with no objective at all (a run approved before CP1's
+    objective_problems() existed) gets a plain note instead of a crash, so a legacy run keeps reviewing normally."""
     obj = plan.get("objective") if isinstance(plan, dict) else None
     if not isinstance(obj, dict) or not obj:
         return f"Objective: {NO_OBJECTIVE_NOTE}."
@@ -2164,7 +2168,10 @@ def objective_brief(plan) -> str:
     dm = obj.get("done_means") or []
     if dm:
         lines.append("Done means:")
-        lines += [f"  - {x}" for x in dm]
+        for i, x in enumerate(dm, 1):
+            lines.append(f"  - {x}")
+            if proof_notes and proof_notes.get(i):
+                lines.append(f"    {proof_notes[i]}")
     oos = obj.get("out_of_scope") or []
     if oos:
         lines.append("Out of scope:")
@@ -2200,6 +2207,11 @@ ROLE_BRIEFS = {
     "planner": ("Rules: write the plan's objective first. Slice the work into small checkpoints of increasing "
                 "complexity a human can approve in minutes. Ask a question instead of guessing on anything that "
                 "changes the plan's shape. A high-risk step needs its own risk_reason naming who could be harmed."),
+    "test-planner": ("Rules: plan this checkpoint's test cases before any code exists, through public entry "
+                     "points, with every done_when line covered. Every objective done-means line above needs at "
+                     "least one case, in some step's tests/CPn.json, whose \"proves\" names it by its 1-based "
+                     "number; plan-submit refuses a plan that leaves a done-means line unlinked, naming the line. "
+                     "Don't write test code."),
 }
 
 ROLE_ORDER = ["implementer", "fixer", "test-writer", "reviewer", "scout", "planner"]
@@ -2209,12 +2221,13 @@ ROLE_ORDER = ["implementer", "fixer", "test-writer", "reviewer", "scout", "plann
 # wording per agent (the fix this round deliberately keeps smaller than a custom brief for each one).
 _GENERIC_ROLE_RULES = ("Rules: follow your own agent instructions for this role. Serve the objective above. Make "
                         "the smallest change for the job. Don't run the full test suite unless asked.")
-for _generic_role in ("behavior-reviewer", "design-system", "prototyper", "test-planner", "test-runner",
-                      "variant-writer", "visual-reviewer"):
+for _generic_role in ("behavior-reviewer", "design-system", "prototyper", "test-runner", "variant-writer",
+                      "visual-reviewer"):
     ROLE_BRIEFS[_generic_role] = _GENERIC_ROLE_RULES
 
 # agents/*.md names that don't match a ROLE_BRIEFS key directly (the rest of the agents/ file stems -- adversary,
-# behavior-reviewer, checkpoint-planner, design-system, fixer, implementer, prototyper, test-planner, test-runner,
+# behavior-reviewer, checkpoint-planner, design-system, fixer, implementer, prototyper, test-planner (its own
+# entry above: the done-means link rule), test-runner,
 # test-writer, variant-writer, visual-reviewer, app-scout -- already equal a ROLE_BRIEFS key once the optional
 # `ratchet-` prefix is stripped). Keep this to just the renames so `--role` accepts every agent the orchestrator
 # spawns without a bespoke rule set per agent.
@@ -2515,7 +2528,10 @@ def cmd_brief(args):
     the agent's name (any file stem under agents/, with or without the `ratchet-` prefix) as well as the six
     original role names; see `_normalize_role`. CPn is optional: the scout and the planner are briefed before any
     checkpoint exists, before checkpoints.json even exists (that die is only reached when a CPn is given, since a
-    CPn can't be looked up with no plan at all). A plan with no stated objective (approved before that rule existed)
+    CPn can't be looked up with no plan at all). Under each done-means line it prints the same `Proved by` or
+    `Heads up` note plan-summary prints (`_done_means_proof_notes`), so the two stay word for word the same and the
+    launch guard (`_brief_guard`) compares against this same rendering. A plan with no
+    stated objective (approved before that rule existed)
     gets the plain NO_OBJECTIVE_NOTE instead of a crash. An unknown CPn is refused by `cp_by_id`, the same shared
     lookup every other command uses. The planner's brief, and only the planner's, ends with one more block: the
     "What earlier work says" section from `_earlier_work_lines` (see there), so the plan builds on what earlier
@@ -2535,7 +2551,8 @@ def cmd_brief(args):
         header = f"Brief for the {role} (no checkpoint yet)"
     print(header)
     print("")
-    print(objective_brief(plan))
+    st, _why = _read_record(ctx.state_path())
+    print(objective_brief(plan, _done_means_proof_notes(ctx, plan, st)))
     print("")
     print(ROLE_BRIEFS[role])
     if role == "planner":
@@ -3384,22 +3401,88 @@ def _review_preview(ctx, cfg, cp) -> tuple[list[str], bool]:
     return names, host_only
 
 
-def _unproven_done_means(ctx, plan) -> list[tuple]:
-    """[(1-based line number, its own text), ...] for every objective.done_means line that no test-plan
-    case's "proves" names, across every checkpoint. Empty when the plan has no objective or no done_means at
-    all (nothing to flag). A heads-up only, never a refusal: plan-submit's proves_problems is the gate that
-    actually blocks a bad number."""
+def _done_means_links(ctx, plan) -> dict:
+    """{1-based line number: [case id, ...]} for every objective.done_means line, across every checkpoint's
+    test plan (a step with no tests/CPn.json contributes nothing): the case ids whose "proves" names that line,
+    in plan order. Empty when the plan has no objective or no done_means list at all. Shared by
+    _done_means_proof_notes (the Proved by / Heads up note under each line in plan-summary, brief, the
+    reviewers `how` line and the launch guard) and _unproven_done_means."""
     obj = plan.get("objective") if isinstance(plan, dict) else None
     dm = obj.get("done_means") if isinstance(obj, dict) else None
     if not isinstance(dm, list) or not dm:
-        return []
-    proved = set()
+        return {}
+    links = {i: [] for i in range(1, len(dm) + 1)}
     for cp in plan.get("checkpoints") or []:
         for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
             for p in _proves_values(case):
-                if isinstance(p, int) and not isinstance(p, bool):
-                    proved.add(p)
-    return [(i, t) for i, t in enumerate(dm, 1) if i not in proved]
+                if isinstance(p, int) and not isinstance(p, bool) and p in links:
+                    links[p].append(str(case.get("id", "?")))
+    return links
+
+
+def _unproven_done_means(ctx, plan) -> list[tuple]:
+    """[(1-based line number, its own text), ...] for every objective.done_means line that no test-plan
+    case's "proves" names, across every checkpoint. Empty when the plan has no objective or no done_means at
+    all (nothing to flag). One consumer: unlinked_done_means_problems, the refusal plan-submit applies to every
+    line and plan-extend applies to the lines feedback added since the approval snapshot. The Proved by / Heads
+    up notes plan-summary and brief print come from _done_means_proof_notes, not from here."""
+    links = _done_means_links(ctx, plan)
+    dm = (plan.get("objective") or {}).get("done_means") if links else []
+    return [(i, t) for i, t in enumerate(dm, 1) if not links.get(i)]
+
+
+def unlinked_done_means_problems(ctx, plan, approved_lines=()) -> list[str]:
+    """The "Plan invalid" refusal for unlinked done-means lines: one message per objective.done_means line that
+    no test-plan case's "proves" names, naming the line by its 1-based number and its exact text and telling the
+    agent what to add. Only that line is named (two lines with the same wording are told apart by number). A
+    plan with no objective or no done_means list has nothing to link, so this is empty and objective_problems
+    does the refusing. plan-submit calls it next to proves_problems for every line. plan-extend passes
+    approved_lines=_approved_done_means(st): a line whose text the approved plan already had is skipped, so a run
+    whose plan was approved before this rule keeps taking feedback and new steps, while a line feedback added
+    after the approval is refused like a new plan's."""
+    return [f"done_means line {i} (\"{t}\") has no test case proving it. Add a case to a step's tests/CPn.json "
+            f"whose \"proves\" names line {i}."
+            for i, t in _unproven_done_means(ctx, plan) if t not in approved_lines]
+
+
+def _approved_done_means(st) -> list[str]:
+    """The objective.done_means lines the approved plan had, read from the approval snapshot
+    (st["approved"]["objective"], written by approve-plan and refreshed by plan-extend). [] for a run that has no
+    approval yet or whose approved plan had no objective or no done_means list. Used by plan-extend (which lines
+    feedback added) and _unlinked_done_means_note."""
+    obj = (st.get("approved") or {}).get("objective")
+    dm = obj.get("done_means") if isinstance(obj, dict) else None
+    return [t for t in dm if isinstance(t, str)] if isinstance(dm, list) else []
+
+
+def _unlinked_done_means_note(st, line) -> str:
+    """Why the Heads up note under an unlinked done_means line (plan-summary, brief, the reviewers `how` line and
+    the launch guard, via _done_means_proof_notes) says what it says, from the run's state and never assumed: while the plan is still being planned, plan-submit is what refuses it; a line the approved
+    plan already had predates the rule (the only way an approved plan has one) and keeps working; any other line
+    was added after the approval and plan-extend refuses the extension until a case proves it."""
+    if st.get("phase") in ("planning", "awaiting_plan_approval"):
+        return "plan-submit refuses the plan until a case's \"proves\" names it"
+    if line in _approved_done_means(st):
+        return "this plan was approved before every line needed one; it keeps working"
+    return "it was added after the plan was approved; plan-extend refuses the extension until a case's \"proves\" names it"
+
+
+def _done_means_proof_notes(ctx, plan, st) -> dict:
+    """{1-based done_means line number: the one note line objective_brief prints under that line}: `Proved by:
+    <case ids>` from _done_means_links, or the plain `Heads up` (worded by _unlinked_done_means_note from the run's
+    state `st`, which may be {} when it can't be read) for a line no case proves yet. {} when the plan has no
+    objective or no done_means list. Shared by plan-summary, brief and the sub-agent launch guard, so all three
+    render the objective the same way."""
+    links = _done_means_links(ctx, plan)
+    dm = (plan.get("objective") or {}).get("done_means") if links else []
+    notes = {}
+    for i, line in enumerate(dm, 1):
+        if links.get(i):
+            notes[i] = f"Proved by: {', '.join(links[i])}"
+        else:
+            notes[i] = (f"Heads up: done_means line {i} (\"{line}\") has no test case proving it yet "
+                        f"({_unlinked_done_means_note(st or {}, line)}).")
+    return notes
 
 
 def cmd_plan_summary(args):
@@ -3412,16 +3495,9 @@ def cmd_plan_summary(args):
     print(f"Plan: {plan.get('feature') or st.get('feature')} ({len(plan['checkpoints'])} steps)")
     obj = plan.get("objective")
     if isinstance(obj, dict) and obj:
-        print(f"\nWho it's for: {obj.get('users', '')}")
-        print(f"What they want: {obj.get('goal', '')}")
-        print("Done means:")
-        for line in obj.get("done_means") or []:
-            print(f"  - {line}")
-        print("Out of scope:")
-        for line in obj.get("out_of_scope") or []:
-            print(f"  - {line}")
-        for i, text in _unproven_done_means(ctx, plan):
-            print(f"  Heads up: done_means line {i} (\"{text}\") has no test case proving it yet.")
+        print("")
+        # the same rendering brief prints (minus its "Objective" heading), so the two match word for word
+        print("\n".join(objective_brief(plan, _done_means_proof_notes(ctx, plan, st)).splitlines()[1:]))
     for line in spec_summary_lines(ctx, plan):
         print(line)
     all_host = True
@@ -5354,6 +5430,12 @@ REVIEW_ASK_NEXT = ("Settle any other question or offer first, in its own turn. T
 
 
 def cmd_plan_submit(args):
+    """Validates a new plan and moves the run to awaiting_plan_approval. Refused as "Plan invalid" (nothing
+    saved, so approve-plan has nothing to approve) for a shape error, a missing objective, a spec gap, a missing
+    risk_reason, a bad "proves" number, or, since the done-means-proven run, an objective.done_means line that no
+    test-plan case's "proves" names (unlinked_done_means_problems: each such line named by number and text).
+    plan-extend applies that last check only to the lines feedback added since the approval snapshot, so a plan
+    approved before it keeps working."""
     ctx = Ctx(find_root())
     st = ctx.state()
     if st["phase"] not in ("planning", "awaiting_plan_approval"):
@@ -5362,7 +5444,8 @@ def cmd_plan_submit(args):
     if plan is None:
         die("checkpoints.json not found in the run folder")
     errs = (validate_plan(plan) + objective_problems(plan) + spec_plan_problems(ctx, plan)
-            + risk_reason_problems(plan.get("checkpoints", [])) + proves_problems(ctx, plan))
+            + risk_reason_problems(plan.get("checkpoints", [])) + proves_problems(ctx, plan)
+            + unlinked_done_means_problems(ctx, plan))
     if errs:
         die("Plan invalid:\n  - " + "\n  - ".join(errs))
     st["phase"] = "awaiting_plan_approval"
@@ -10435,9 +10518,17 @@ def cmd_plan_extend(args):
     edited = [c["id"] for c in plan["checkpoints"] if c["id"] in approved_cps and _sha(c) != approved_cps[c["id"]]]
     if edited:
         die(f"Existing checkpoint(s) {edited} were edited. Feedback only APPENDS new checkpoints; restore the originals.")
-    rr_errs = risk_reason_problems([cp_by_id(plan, cid) for cid in new_ids])  # only the APPENDED checkpoints: an
-    if rr_errs:                                                              # existing high-risk one predating
-        die("Plan invalid:\n  - " + "\n  - ".join(rr_errs))                  # this rule keeps working untouched.
+    appended = [cp_by_id(plan, cid) for cid in new_ids]
+    # Only the APPENDED checkpoints are judged here: an existing high-risk step predating the risk_reason rule,
+    # or an existing case whose "proves" plan-submit already accepted, keeps working untouched. The appended
+    # cases' "proves" get plan-submit's own shape and range check, and the done-means lines feedback ADDED must
+    # be proved (a line the approved plan already had keeps working unlinked: it predates the rule). One refusal
+    # names everything, the bad "proves" first so the agent sees the real cause before the unproved line.
+    errs = (proves_problems(ctx, {"objective": plan.get("objective"), "checkpoints": appended})
+            + risk_reason_problems(appended)
+            + unlinked_done_means_problems(ctx, plan, approved_lines=_approved_done_means(st)))
+    if errs:
+        die("Plan invalid:\n  - " + "\n  - ".join(errs))
     _validate_new_checkpoints(ctx, plan, new_ids)
     for cid in new_ids:
         st["checkpoints"][cid] = new_cp_state(cp_by_id(plan, cid))
@@ -11706,7 +11797,9 @@ def cmd_reviewers(args):
     plan = ctx.plan()
     cp = cp_by_id(plan, args.cp)
     obj = plan.get("objective") if isinstance(plan, dict) else None
-    obj_oneline = re.sub(r"\s*\n\s*", " ", objective_brief(plan))
+    # the same rendering brief prints and the launch guard expects (with the Proved by / Heads up notes), so a
+    # prompt that starts with this `how` objective passes the guard once the orchestrator pastes it
+    obj_oneline = re.sub(r"\s*\n\s*", " ", objective_brief(plan, _done_means_proof_notes(ctx, plan, st)))
     fp = fingerprint(ctx.root)["id"]
     g = cps["gates"]["adversarial"]
     if g["status"] != "passed" and _docs_only_review_skip(ctx, st, cfg, cp, cps, args.cp, json_out=args.json):
@@ -14752,11 +14845,12 @@ def _brief_guard(n: dict, root: Path) -> str | None:
     if _run_phase(root) not in ("building", "blocked"):
         return None
     ctx = Ctx(root)
-    expected = re.sub(r"\s+", " ", objective_brief(ctx.plan())).strip()
+    st, _why = _read_record(ctx.state_path())
+    plan = ctx.plan()
+    expected = re.sub(r"\s+", " ", objective_brief(plan, _done_means_proof_notes(ctx, plan, st))).strip()
     got = re.sub(r"\s+", " ", str(n["input"].get("prompt") or n["prompt"] or "")).strip()
     if expected and expected in got:
         return None
-    st, _why = _read_record(ctx.state_path())
     cp = (st or {}).get("current") or "CPn"
     return (f"RATCHET GUARD: this sub-agent's prompt is missing the plan's objective. Start its prompt with the "
             f"output of `$RATCHET brief {cp} --role {role}`, then the rest of the prompt.")

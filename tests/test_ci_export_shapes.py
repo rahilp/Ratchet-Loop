@@ -106,6 +106,9 @@ def add_fake_run(d: Path, slug: str, cp_id: str, test_command: str, created_at: 
                              "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",
                              "tests": {"files": [f"tests/{cp_id.lower()}.test.js"], "command": test_command}}]}
     (run_dir / "checkpoints.json").write_text(json.dumps(plan))
+    (run_dir / "tests").mkdir(exist_ok=True)  # CP2: the one done_means line is linked to a case, like a real plan
+    (run_dir / "tests" / f"{cp_id}.json").write_text(
+        json.dumps({"cases": [{"id": f"{cp_id}-T01", "layer": "code", "proves": [1]}]}))
 
 
 def cp_item(cp_id: str, command: str, title="step", tests_value=None) -> dict:

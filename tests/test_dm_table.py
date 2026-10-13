@@ -48,7 +48,7 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import _tmp                     # noqa: E402
 import test_gates as g          # noqa: E402  (approve_plan, open_round, write_review, git, say, rx, ENGINE, ENV)
-import test_receipt_proof as rp  # noqa: E402  (_bare_cp1, _legacy_approve, _write_report)
+import test_receipt_proof as rp  # noqa: E402  (_bare_cp1, _legacy_approve, _legacy_submit, _write_report)
 
 PASS = FAIL = 0
 CASE_STATUS: dict[str, bool] = {}
@@ -120,6 +120,16 @@ def _cp(i):
             "tests": {"files": [f"tests/cp{i}.test.js"], "command": f"node --test tests/cp{i}.test.js"}}
 
 
+def _every_line_linked(done_means, steps):
+    """True when every 1-based done-means line is named in some case's "proves" (an int or a list of ints)."""
+    linked = set()
+    for cases in steps:
+        for c in cases:
+            p = c.get("proves")
+            linked.update([p] if isinstance(p, int) else (p or []))
+    return all(i in linked for i in range(1, len(done_means) + 1))
+
+
 def _setup(name, steps, dm=None, objective=True, approve=True):
     """A throwaway git project with one checkpoint per entry of `steps` (each a list of test-plan cases), a real
     objective with `dm` done-means lines, plan-submitted and (by default) approved."""
@@ -132,8 +142,16 @@ def _setup(name, steps, dm=None, objective=True, approve=True):
     for i, cases in enumerate(steps, 1):
         (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": cases}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
-    r = g.rx(d, "plan-submit")
-    assert r.returncode == 0, r.stdout + r.stderr
+    if objective and not _every_line_linked(plan["objective"]["done_means"], steps):
+        # CP2's refusal rule: plan-submit now refuses a plan with a done-means line no case proves. The cases
+        # here that deliberately leave a line unlinked (T09 with no "proves" at all, T13, the _mixed_run cases
+        # with line 2 unlinked, and the others linking only some lines) model an older plan, submitted before
+        # that rule existed, so they go through the legacy path tests/test_receipt_proof.py uses; a fully
+        # linked plan still goes through the real plan-submit.
+        rp._legacy_submit(d)
+    else:
+        r = g.rx(d, "plan-submit")
+        assert r.returncode == 0, r.stdout + r.stderr
     if approve:
         g.approve_plan(d)
     return d

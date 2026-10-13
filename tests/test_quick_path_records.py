@@ -275,7 +275,7 @@ def _docs_only_project(name, risk=None, config=None):
     if cp1["risk"] == "high":
         cp1["risk_reason"] = _tmp.RISK_REASON_MIN
     plan = {"feature": "x", "objective": _tmp.OBJECTIVE_MIN, "checkpoints": [cp1]}
-    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
+    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
     r = g.rx(d, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout

@@ -717,7 +717,7 @@ def project(name):
         "id": "CP1", "title": "Step 1", "summary": "s", "done_when": ["works"], "risk": "low",
         "gates": {"behavior": True, "ui": False, "adversarial": True},
         "tests": {"files": ["tests/test_cp1.py"], "command": "python3 tests/test_cp1.py"}}]}))
-    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
+    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
     rx(d, "plan-submit")
     rx(d, "ask", "approve-plan")  # an approval answers the question Ratchet printed
     say(d, "yes, go ahead")

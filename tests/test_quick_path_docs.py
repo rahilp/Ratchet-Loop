@@ -328,8 +328,8 @@ def t08_complete_skips_the_full_suite_when_only_docs_changed_since_it_last_passe
            "green_first_ok": True,
            "tests": {"files": ["tests/cp2.test.js"], "command": "node --test tests/cp2.test.js"}}
     plan = {"feature": "x", "objective": _tmp.OBJECTIVE_MIN, "checkpoints": [cp1, cp2]}
-    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
-    (run / "tests" / "CP2.json").write_text(json.dumps({"cases": [{"id": "CP2-T01", "layer": "code"}]}))
+    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
+    (run / "tests" / "CP2.json").write_text(json.dumps({"cases": [{"id": "CP2-T01", "layer": "code", "proves": [1]}]}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
     r = g.rx(d, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout
@@ -524,8 +524,8 @@ def _two_checkpoint_project(name, doc_cmd, regression_cmd, cp2_risk="low"):
     if cp2_risk == "high":
         cp2["risk_reason"] = "forces a normal adversarial review round for this fixture's doc-only step"
     plan = {"feature": "x", "objective": _tmp.OBJECTIVE_MIN, "checkpoints": [cp1, cp2]}
-    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
-    (run / "tests" / "CP2.json").write_text(json.dumps({"cases": [{"id": "CP2-T01", "layer": "code"}]}))
+    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
+    (run / "tests" / "CP2.json").write_text(json.dumps({"cases": [{"id": "CP2-T01", "layer": "code", "proves": [1]}]}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
     r = g.rx(d, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout

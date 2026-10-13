@@ -148,7 +148,7 @@ def plan_project(approve: bool) -> Path:
         if UI[i]:
             cp.update(ui_scope="the page", ui_states=[{"name": "default", "how": "open it"}])
         plan["checkpoints"].append(cp)
-        (run / "tests" / f"CP{i + 1}.json").write_text(json.dumps({"cases": [{"id": f"CP{i + 1}-T01", "layer": "code"}]}))
+        (run / "tests" / f"CP{i + 1}.json").write_text(json.dumps({"cases": [{"id": f"CP{i + 1}-T01", "layer": "code", "proves": [1]}]}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
     r = rx(d, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout

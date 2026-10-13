@@ -162,7 +162,7 @@ def _bare_project_risk(name, risk="high", risk_reason=None):
     if risk_reason is not None:
         cp["risk_reason"] = risk_reason
     plan = {"feature": "x", "objective": _tmp.OBJECTIVE_MIN, "checkpoints": [cp]}
-    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
+    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
     return d
 

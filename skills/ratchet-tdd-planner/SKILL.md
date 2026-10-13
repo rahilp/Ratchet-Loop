@@ -40,9 +40,11 @@ Schema: see `ratchet-orchestrator/references/schemas.md` §4. Requirements:
 - Include `"files"`, `"command"` and `"report"` (plus `"report_reason"` when it is `none`) at top level.
 - When `checkpoints.json` has a top-level `objective`, fill each case's `"proves"` with the 1-based line
   number(s) of the `objective.done_means` lines this case proves (e.g. `"proves": [1, 3]`), the same way
-  `spec_ref` names a spec scenario. A case that proves none of them can leave `"proves"` out. The receipt
-  (`ratchet.py receipt`) lists every done_means line next to the case(s) that prove it, so an unlinked line
-  reads honestly as "no test linked" instead of guessing.
+  `spec_ref` names a spec scenario. Every objective done_means line needs at least one case, in some step's test plan, whose `"proves"` names it;
+  only a case that proves none of the lines leaves `"proves"` out. `plan-submit` refuses a plan that leaves a done_means line unlinked,
+  naming the line by number and text, so check the other steps' `tests/CPn.json` files when a line of the objective belongs to
+  another step. The final review and the receipt (`ratchet.py receipt`) show every done_means line next to the case(s) that
+  prove it and whether they passed.
 
 ## Quality bar (self-check before returning)
 - Every `done_when` line is covered by at least one case.

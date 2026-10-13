@@ -126,7 +126,7 @@ def project(env, approved=True):
               "tests": {"files": ["tests/cp1.test.js"], "command": "node --test tests/cp1.test.js"}}
         (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
                                                            "checkpoints": [cp]}))
-        (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
+        (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
         r = rx(d, env, "plan-submit")
         assert r.returncode == 0, r.stderr + r.stdout
         rx(d, env, "ask", "approve-plan")  # CP5: an approval answers the question Ratchet printed

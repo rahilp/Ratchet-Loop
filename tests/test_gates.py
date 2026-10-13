@@ -92,7 +92,7 @@ def project(name="p", cps=1, extra_cp=None, config=None) -> Path:
         if cp.get("risk") == "high" and not cp.get("risk_reason"):
             cp["risk_reason"] = _tmp.RISK_REASON_MIN  # CP1: plan-submit refuses high risk with no risk_reason
         plan["checkpoints"].append(cp)
-        (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code"}]}))
+        (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code", "proves": [1]}]}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
     r = rx(d, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout
@@ -563,7 +563,7 @@ def main():
     check("emptying the test plan after approval stops the gates", r.returncode != 0 and "changed after the user approved" in r.stderr, r.stderr)
     r = rx(d, "approve-changes")
     check("approve-changes without a new user message is refused", r.returncode != 0)
-    tp.write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
+    tp.write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
     rx(d, "config", "--set", "max_adversarial_rounds=99")
     r = rx(d, "tests-written", "CP1")
     check("weakening a config rule after approval stops the gates", r.returncode != 0 and "max_adversarial_rounds" in r.stderr)
