@@ -171,6 +171,15 @@ DEFAULT_CONFIG = {
     "doc_exclude_globs": ["SKILL.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", "agents/*.md"],
     "test_globs": ["test_*", "*_test.*", "*.test.*", "*.spec.*"],
     "doc_test_command": None,
+    # Related tests before the full suite (`complete`): related_test_command (with a {files} placeholder) runs
+    # the step's own planned test files, the test files it changed, and the test files (test_globs) that name a
+    # file it changed, ranked by the function names that changed, at most related_tests_max of them (a value that
+    # is not a whole number of 1 or more falls back to 8); unset, the step goes straight to the full suite.
+    # related_always lists test files that join that list outside the cap when the step adds a test file, changes
+    # a doc, or adds or changes a code line holding a quoted string (for Ratchet's own repo: tests/test_docs.py).
+    "related_test_command": None,
+    "related_tests_max": 8,
+    "related_always": [],
     "small_edit_lines": 20,
     "commit_per_checkpoint": True,
     "design_md": "DESIGN.md",
@@ -560,9 +569,48 @@ def _code_size(ctx: "Ctx", from_id: str, to_id: str, code_files: list[str]) -> t
     return (None if unknown else total), unknown
 
 
+_PY_EXT = (".py",)
+_JS_EXT = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+
+
+def _import_forms(path: str) -> list[re.Pattern]:
+    """The import shapes under which a test names the code file `path` without spelling its path or file name:
+    for Python, its dotted module path and the `from <package> import <module>` statement (`src/app/billing.py`:
+    `src.app.billing`, `app.billing`, `src/app/billing`, `app/billing`, `from app import billing`; a top-level
+    `billing.py`: `import billing`, `from billing import`); for JS/TS, its extension-less repo path and a quoted
+    module specifier ending in `/<stem>` (`src/billing.ts`: `src/billing`, `'../billing'`, `'./billing.js'`).
+    Never a bare stem on its own, which would pull in the whole suite. Empty for any other file kind."""
+    stem, ext = os.path.splitext(path)
+    parts = stem.split("/")
+    forms: list[re.Pattern] = []
+    if ext in _PY_EXT and parts[-1] != "__init__":
+        for i in range(len(parts) - 1):
+            tail = parts[i:]
+            forms.append(re.compile(r"(?<![\w.])" + r"\.".join(map(re.escape, tail)) + r"(?!\w)"))
+            forms.append(re.compile(re.escape("/".join(tail)) + r"(?!\w)"))
+            forms.append(re.compile(r"\bfrom\s+" + r"\.".join(map(re.escape, tail[:-1])) + r"\s+import\s+[^\n]*\b"
+                                    + re.escape(tail[-1]) + r"\b"))
+        if len(parts) == 1:
+            forms.append(re.compile(r"^\s*(?:import\s+" + re.escape(stem) + r"\b|from\s+" + re.escape(stem)
+                                    + r"\s+import\b)", re.M))
+    elif ext in _JS_EXT:
+        forms.append(re.compile(re.escape(stem) + r"(?![\w$])"))  # src/billing, never src/billing2
+        forms.append(re.compile(r"/" + re.escape(parts[-1]) + r"(?:\.(?:js|jsx|ts|tsx|mjs|cjs))?['\"]"))
+    return forms
+
+
+def _names_file(text: str, path: str) -> bool:
+    """Whether `text` names the file `path`: its repo-relative path or file name as a plain substring, or one of
+    the import shapes `_import_forms` lists for its kind (so a test that imports a changed module counts)."""
+    if path in text or os.path.basename(path) in text:
+        return True
+    return any(p.search(text) for p in _import_forms(path))
+
+
 def _tests_naming(ctx: "Ctx", cfg: dict, fp: dict, docs: list[str]) -> list[str]:
     """Which test files (test_globs) name any of `docs` by its repo-relative path or file name (a plain
-    substring match, never guessed). Shared by both of classify_changes's ranges (base_tree and since_approval)
+    substring match, never guessed), or import it (`_names_file`: a Python module's dotted path, a JS/TS module's
+    extension-less path). Shared by both of classify_changes's ranges (base_tree and since_approval)
     so a doc that is changed and then restored in one range, but not the other, still gets the tests that name
     it from whichever range actually lists it as changed."""
     if not docs:
@@ -574,7 +622,7 @@ def _tests_naming(ctx: "Ctx", cfg: dict, fp: dict, docs: list[str]) -> list[str]
             text = (ctx.root / t).read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if any(d in text or os.path.basename(d) in text for d in docs):
+        if any(_names_file(text, d) for d in docs):
             out.append(t)
     return out
 
@@ -712,6 +760,276 @@ def _skip_full_suite(ctx: "Ctx", cfg: dict, st: dict, fp: dict) -> tuple[bool, l
         return True, []
     doc_files, code_files = _classify_doc_code(cfg, changed)
     return (not code_files), doc_files
+
+
+# --------------------------------------------------------------------------- related tests before the full suite
+# Right before `complete` runs regression_command, it runs the few test files related to what the step changed
+# since its base_tree (related_test_command with {files}): the step's own planned test files ("planned test"),
+# the test files it changed ("changed test"), and the test files that name a changed file, deleted ones included,
+# by its path or file name or by importing it ("names <file>", _tests_naming's match through _names_file), ranked
+# by the function names the step changed and capped at related_tests_max. A
+# failure stops the step at once, naming the file, and the full suite is never started; it is not a suite
+# failure, so it spends no flaky re-run and leaves every gate as it was. The files in related_always join the
+# list outside the cap whenever the step adds a test file, changes a doc, or adds or changes a code line holding
+# a quoted string ("doc check: <trigger>"). The pass runs only when the full suite is about to run.
+
+_RELATED_LABEL_PLANNED = "planned test"
+_RELATED_LABEL_CHANGED = "changed test"
+_NO_FILES_PLACEHOLDER_MSG = ("related_test_command has no {files} placeholder, so it cannot run only the related "
+                             "files (it would run the whole suite twice); set it to a command with {files} (for "
+                             "example 'pnpm vitest run {files}') or unset it to turn the related pass off.")
+_DEF_LINE_RE = re.compile(r"^\s*(?:(?:export|default|async|static|public|private|protected|pub|abstract|override|"
+                          r"final|unsafe|extern)\s+)*(?:def|function|fn|func|class|struct|interface|trait|impl|enum|"
+                          r"sub|proc|method)\b")
+_DEF_SKIP_WORDS = {"export", "default", "async", "static", "public", "private", "protected", "pub", "abstract",
+                   "override", "final", "unsafe", "extern", "def", "function", "fn", "func", "class", "struct",
+                   "interface", "trait", "impl", "enum", "sub", "proc", "method", "const", "let", "var", "type",
+                   "import", "from", "if", "else", "for", "while", "return", "switch", "case", "try", "catch",
+                   "with", "as", "new", "this", "self", "module", "package", "use", "require"}
+_STRING_LITERAL_RE = re.compile(r'"[^"\n]*"|\'[^\'\n]*\'|`[^`\n]*`')
+
+
+def _related_tests_max(cfg: dict) -> tuple[int, str | None]:
+    """(the cap on the related list, a note when the configured value was ignored): related_tests_max must be a
+    whole number of 1 or more; anything else (0, a word, a fraction) falls back to the default so the pass is
+    never run with no files by accident."""
+    default = int(DEFAULT_CONFIG["related_tests_max"])
+    raw = cfg.get("related_tests_max", default)
+    try:
+        v = int(raw) if not isinstance(raw, bool) and float(raw) == int(raw) else None
+    except (TypeError, ValueError):
+        v = None
+    if v is None or v < 1:
+        return default, (f"related_tests_max is {json.dumps(raw)}, not a whole number of 1 or more; "
+                         f"ignored, using the default {default}")
+    return v, None
+
+
+def _defined_name(line: str) -> str | None:
+    """The name a definition-shaped line defines (git's own funcname rule, a line starting in column 0 with a
+    letter, `_` or `$`, plus indented def/function/class/fn lines so a Python method or a nested function
+    counts too): its first word that is not a keyword or modifier. None for any other line."""
+    if not line or not (line[0].isalpha() or line[0] in "_$" or _DEF_LINE_RE.match(line)):
+        return None
+    for m in re.finditer(r"[A-Za-z_$][\w$]*", line):
+        if m.group(0) not in _DEF_SKIP_WORDS:
+            return m.group(0)
+    return None
+
+
+def _enclosing_names(text: str) -> list[str | None]:
+    """For every line of `text` (by index), the name of the nearest definition-shaped line at or above it."""
+    out, cur = [], None
+    for line in text.splitlines():
+        name = _defined_name(line)
+        if name:
+            cur = name
+        out.append(cur)
+    return out
+
+
+def _changed_lines(ctx: "Ctx", base: str, fp: dict, files: list[str]) -> dict:
+    """Per file (git diff -U0 between the step's base tree and `fp`): {"added": [(line number in the new file,
+    text)], "removed": [line numbers in the old file]}. Only the files given are diffed."""
+    out: dict = {}
+    if not files:
+        return out
+    r = subprocess.run(["git", "diff", "-U0", "--no-color", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/",
+                        base, fp["id"], "--", *files], cwd=ctx.root, capture_output=True, text=True, errors="replace")
+    cur, new_no, old_no, in_header = None, 0, 0, False
+    for line in r.stdout.splitlines():
+        # `--- `/`+++ ` are file headers only between a `diff --git` line and the first hunk; inside a hunk a
+        # removed `-- note` or an added `++ x` line looks the same and must count as content.
+        if line.startswith("diff --git "):
+            in_header, cur = True, None
+            continue
+        if in_header and line.startswith("+++ "):
+            path = line[4:]
+            cur = path[2:] if path.startswith("b/") else (None if path == "/dev/null" else path)
+            if cur is not None:
+                out.setdefault(cur, {"added": [], "removed": []})
+            in_header = False
+            continue
+        if in_header or cur is None:
+            continue
+        m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if m:
+            old_no, new_no = int(m.group(1)), int(m.group(2))
+            continue
+        if line.startswith("+"):
+            out[cur]["added"].append((new_no, line[1:]))
+            new_no += 1
+        elif line.startswith("-"):
+            out[cur]["removed"].append(old_no)
+            old_no += 1
+    return out
+
+
+def _changed_function_names(ctx: "Ctx", base: str, lines: dict) -> set[str]:
+    """The names of the functions (definition-shaped lines, `_defined_name`) that hold an added or changed line
+    in the working tree, or a removed line in the base tree, for the files in `lines` (`_changed_lines`)."""
+    names: set[str] = set()
+    for path, d in lines.items():
+        if d["added"]:
+            try:
+                encl = _enclosing_names((ctx.root / path).read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                encl = []
+            for no, _ in d["added"]:
+                if 0 < no <= len(encl) and encl[no - 1]:
+                    names.add(encl[no - 1])
+        if d["removed"]:
+            r = subprocess.run(["git", "show", f"{base}:{path}"], cwd=ctx.root, capture_output=True, text=True,
+                               errors="replace")
+            encl = _enclosing_names(r.stdout) if r.returncode == 0 else []
+            for no in d["removed"]:
+                if 0 < no <= len(encl) and encl[no - 1]:
+                    names.add(encl[no - 1])
+    return names
+
+
+def _related_tests(ctx: "Ctx", cfg: dict, cp: dict, cps: dict, fp: dict) -> dict:
+    """Which test files `complete` runs before the full suite, and why: {"picked": [(file, reason)], "notes":
+    [plain lines for the output], "candidates": how many files beyond the step's own planned ones were found,
+    "cap": the cap in force}. The step's own planned test files come first ("planned test"), then the test files
+    (test_globs) it changed ("changed test"), then the test files naming a file it changed ("names <file>"),
+    those mentioning a changed function name before the rest; the cap (related_tests_max) keeps the first N of
+    that order. Each file in related_always is then added once, outside the cap, when the step added a test file,
+    changed a doc, or added or changed a code line (not a test, not a doc) holding a quoted string, with a reason
+    naming the trigger(s) ("doc check: new test file"); a file already picked keeps its first reason; one that
+    does not exist is skipped with a note. A deleted file is never handed to the command."""
+    base = cps.get("base_tree")
+    cap, cap_note = _related_tests_max(cfg)
+    notes = [cap_note] if cap_note else []
+    test_globs = cfg.get("test_globs") or []
+    exists = set(_project_files(ctx.root, fp))
+    picked: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(f, reason):
+        if f not in seen:
+            seen.add(f)
+            picked.append((f, reason))
+
+    for f in _as_list((cp.get("tests") or {}).get("files") or []):
+        if f in exists:
+            add(f, _RELATED_LABEL_PLANNED)
+        else:
+            notes.append(f"planned test file {f} is not in the project; not run")
+    status: dict = {}
+    if base:
+        r = subprocess.run(["git", "diff-tree", "-r", "-z", "--no-renames", "--name-status", base, fp["id"]],
+                           cwd=ctx.root, capture_output=True)
+        parts = r.stdout.decode("utf-8", "surrogateescape").split("\0") if r.returncode == 0 else []
+        for s, f in zip(parts[0::2], parts[1::2]):
+            if f and f != RATCHET_DIR and not f.startswith(RATCHET_DIR + "/"):
+                status[f] = s[:1]
+    changed = sorted(status)
+    changed_tests = [f for f in changed if _glob_hit(f, test_globs) and f in exists]
+    for f in changed_tests:
+        add(f, _RELATED_LABEL_CHANGED)
+    doc_files, code_files = _classify_doc_code(cfg, changed)
+    code_files = [f for f in code_files if not _glob_hit(f, test_globs)]
+    # Deleted and renamed-away files stay search keys: a test naming a module the step removed is the one most
+    # likely to break. Only the test files handed to the command must exist.
+    named = [f for f in changed if not _glob_hit(f, test_globs)]
+    naming = [t for t in _tests_naming(ctx, cfg, fp, named) if t not in seen]
+    lines = _changed_lines(ctx, base, fp, code_files) if base else {}
+    hot = _changed_function_names(ctx, base, lines) if base else set()
+    ranked = []
+    for t in naming:
+        try:
+            text = (ctx.root / t).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        names_it = [f for f in named if _names_file(text, f)]
+        hits = sum(1 for n in hot if re.search(r"\b" + re.escape(n) + r"\b", text))
+        ranked.append((-hits, t, names_it))
+    for _, t, names_it in sorted(ranked):
+        add(t, "names " + ", ".join(names_it[:3]) + (", ..." if len(names_it) > 3 else ""))
+    candidates = len(picked) - sum(1 for _, r in picked if r == _RELATED_LABEL_PLANNED)
+    picked = picked[:cap]
+    triggers = []
+    if any(status.get(f) == "A" for f in changed_tests):
+        triggers.append("new test file")
+    if doc_files:
+        triggers.append("doc file changed")
+    if any(_STRING_LITERAL_RE.search(text) for d in lines.values() for _, text in d["added"]):
+        triggers.append("user-facing text")
+    always = _as_list(cfg.get("related_always") or [])
+    if triggers:
+        kept = {f for f, _ in picked}
+        for f in always:
+            if f in kept:
+                continue
+            if f not in exists:
+                notes.append(f"{f} is named in related_always but was not found in the project; skipped")
+                continue
+            kept.add(f)
+            picked.append((f, "doc check: " + ", ".join(triggers)))
+    return {"picked": picked, "notes": notes, "candidates": candidates, "cap": cap}
+
+
+def _failing_files(out: str, files: list[str]) -> list[str]:
+    """The picked files the runner's output reports as failed: each file whose repo-relative path or bare file
+    name (word-bounded, as tests/run_all.py prints `FAILED (exit 1)  test_x.py` and `Failed: test_x.py`) sits on
+    a failure line: one carrying a failure status token (the whole word FAIL/FAILED/failed in any case, or a
+    ✗/✕/× mark, never `fails` inside a test title) and no pass mark (PASS/PASSED/passed/ok, ✓/√), so a passing
+    test whose title says "fails" (vitest `✓ ... > login fails`, pytest `::test_login_fails PASSED`) is never
+    named."""
+    lines = [l for l in out.splitlines()
+             if re.search(r"\bfail(?:ed)?\b|[✗✕×]", l, re.I) and not re.search(r"\b(?:pass(?:ed)?|ok)\b|[✓√]", l, re.I)]
+    hit = []
+    for f in files:
+        name = re.escape(os.path.basename(f))
+        if any(f in l or re.search(r"(?<![\w/.-])" + name + r"(?![\w-])", l) for l in lines):
+            hit.append(f)
+    return hit
+
+
+def _run_related_tests(ctx: "Ctx", cfg: dict, cp: dict, cps: dict, fp: dict) -> None:
+    """The related pass at `complete`, right before the full suite: says which files were picked and why, runs
+    related_test_command on them (evidence/CPn/related-tests.log) and dies, naming the failing file(s), when it
+    fails, without saving state (same as the full suite's failure branch); the full suite is then never started
+    and no gate, attempt count or flaky allowance changes. With related_test_command unset it only says the pass
+    is off; a value without {files} is refused before anything runs."""
+    cp_id = cp["id"]
+    if not cfg.get("related_test_command"):
+        print("Related tests: off (related_test_command is not configured); running the full suite directly.")
+        return
+    if "{files}" not in str(cfg["related_test_command"]):
+        die(_NO_FILES_PLACEHOLDER_MSG, 2)
+    sel = _related_tests(ctx, cfg, cp, cps, fp)
+    picked, notes, cap = sel["picked"], sel["notes"], sel["cap"]
+    for n in notes:
+        print(f"Related tests: {n}")
+    ranked = [f for f, r in picked if not r.startswith("doc check")]
+    own = sum(1 for _, r in picked if r == _RELATED_LABEL_PLANNED)
+    if sel["candidates"] + own > cap:
+        print(f"Related tests: picked {len(ranked)} of {sel['candidates']} other candidate(s) and {own} planned test "
+              f"file(s) together (cap related_tests_max={cap})"
+              + ("; the doc check is added on top of the cap" if len(picked) > len(ranked) else ""))
+    if not picked:
+        print("Related tests: nothing to run before the full suite (no planned, changed or naming test file).")
+        return
+    print(f"Related tests (before the full suite), {len(picked)} file(s):")
+    for f, reason in picked:
+        print(f"  - {f}: {reason}")
+    files = [f for f, _ in picked]
+    cmd = cfg["related_test_command"].replace("{files}", " ".join(shlex.quote(f) for f in files))
+    code, out, _ = _run_cmd(ctx, cmd, ctx.evidence(cp_id) / "related-tests.log", cfg["test_timeout_sec"])
+    if code != 0:
+        # Like the full suite's failure branch below in `complete`: print the tail and die without saving state,
+        # so nothing from this failed call (a doc quick-path record above it) is persisted.
+        print(_tail(out))
+        failing = _failing_files(out, files)
+        die(f"{cp_id} cannot complete: a related test failed (exit {code}) before the full suite, which was not "
+            f"started" + (f"; failing: {', '.join(failing)}" if failing else "") + ". Fix it and run complete again; "
+            f"this was not a suite failure, so no flaky re-run was spent and no gate changed. Files run:\n  - "
+            + "\n  - ".join(f"{f} ({r})" for f, r in picked), 2)
+    if fingerprint(ctx.root)["id"] != fp["id"]:
+        die("The related test command changed files in the project. Those changes were never reviewed; find out "
+            "what wrote them (generated files? snapshots?) and either add them to .gitignore or re-run the gates.", 2)
 
 
 def _doc_edit_status_lines(st: dict) -> list[str]:
@@ -1977,8 +2295,8 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "host_provider", "ui_reviewers", "design_md", "max_stop_blocks", "unavailable_ttl_hours",
              "verify_transcripts", "min_review_seconds", "commit_per_checkpoint", "blocking_severities",
              "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round", "converge_after_round",
-             "doc_globs", "doc_exclude_globs", "test_globs", "doc_test_command", "small_edit_lines",
-             "load_stretch_max"]
+             "doc_globs", "doc_exclude_globs", "test_globs", "doc_test_command", "related_test_command",
+             "related_tests_max", "related_always", "small_edit_lines", "load_stretch_max"]
 
 
 def _file_sha(p: Path) -> str | None:
@@ -3443,6 +3761,10 @@ def cmd_plan_summary(args):
     if not cfg.get("doc_test_command"):
         print("Note: doc_test_command is not configured, so the docs quick path is off right now: every step, "
               "docs-only ones included, gets the normal full review and tests.")
+    if not cfg.get("related_test_command"):
+        print("Note: related_test_command is not configured, so the related pass before the full suite is off: a "
+              "break is found only when the full suite runs at the end of each step. To turn it on, set it to the "
+              "project's test command with a {files} placeholder (for example 'pnpm vitest run {files}').")
     rows = dict(models_table(cfg))
     groups = {}
     for role, m in rows.items():
@@ -10000,6 +10322,9 @@ def cmd_complete(args):
                     "out what wrote them (generated files? snapshots?) and either add them to .gitignore or "
                     "re-run the gates.", 2)
     if cfg.get("regression_command") and not skip_full:
+        # The related pass runs only here, when the full suite is about to run: a break in the step's own,
+        # changed or naming test files stops the step in seconds, before the suite; it never replaces the suite.
+        _run_related_tests(ctx, cfg, cp, cps, fp)
         code, out, _ = _run_cmd(ctx, cfg["regression_command"], ctx.evidence(args.cp) / "regression.log",
                                 cfg["test_timeout_sec"])
         if code != 0 and not st.get("regression_flaky_used"):
@@ -12217,6 +12542,8 @@ def cmd_config(args):
                 val = v
             if k == "quota_retest_minutes":
                 quota_retest_minutes({k: val})
+            if k == "related_test_command" and val and "{files}" not in str(val):
+                die(_NO_FILES_PLACEHOLDER_MSG, 2)
             cur = user
             parts = k.split(".")
             for p in parts[:-1]:

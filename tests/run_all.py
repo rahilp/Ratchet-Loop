@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Run every test suite at the same time.   python3 tests/run_all.py [--dir DIR] [--workers N] [--timeout SECONDS] [--max-stretch X]
+Run every test suite at the same time.   python3 tests/run_all.py [--dir DIR] [--workers N] [--timeout SECONDS] [--max-stretch X] [FILE ...]
 
 Finds every test_*.py file directly under DIR (default: this tests/ folder) and runs each one as its own
-process, several at once (half the CPU cores by default, at least 2). Each suite gets its own empty temp folder (TMPDIR, TEMP and
-TMP point at it); a suite that leaves anything in that folder is reported as failed even when its own checks
+process, several at once. With FILE arguments (paths relative to the working folder, or names inside DIR) it
+runs only those suites, in the same way; a FILE that does not exist is refused before anything starts, so a
+partly wrong list never runs half. Ratchet's own `related_test_command` ("python3 tests/run_all.py {files}")
+calls it this way to run the test files related to a step before the full suite. Suites run several at once
+(half the CPU cores by default, at least 2). Each suite gets its own empty temp folder (TMPDIR, TEMP and TMP
+point at it); a suite that leaves anything in that folder is reported as failed even when its own checks
 passed. A suite still running after --timeout seconds (more on a busy machine, see below) is stopped and
 reported as timed out.
 
@@ -427,7 +431,7 @@ def default_workers() -> int:
 
 
 def parse_args(argv):
-    p = argparse.ArgumentParser(usage="%(prog)s [options]",
+    p = argparse.ArgumentParser(usage="%(prog)s [options] [FILE ...]",
                                 description="Run every tests/test_*.py suite at the same time.")
     p.add_argument("--dir", default=str(HERE), help="folder holding the test_*.py suites (default: tests/)")
     p.add_argument("--workers", type=int, default=default_workers(),
@@ -442,6 +446,9 @@ def parse_args(argv):
                         f"the timeout it can grow to (default {DEFAULT_MAX_STRETCH:.0f}; 1 turns the stretch off)")
     p.add_argument("--tail", type=int, default=DEFAULT_TAIL,
                    help=f"lines of output shown for each failed suite (default {DEFAULT_TAIL})")
+    p.add_argument("files", nargs="*", metavar="FILE",
+                   help="run only these suites: paths relative to the working folder, or names inside --dir "
+                        "(default: every test_*.py in --dir)")
     args = p.parse_args(argv)
     if args.workers < 1:
         p.error("--workers must be at least 1")
@@ -466,7 +473,23 @@ def main(argv=None) -> int:
     if not folder.is_dir():
         print(f"No test suites found: {folder} is not a folder.", file=sys.stderr)
         return 2
-    suites = sorted(p for p in folder.glob("test_*.py") if p.is_file())
+    if args.files:
+        suites, missing = [], []
+        for f in args.files:
+            cand = Path(f)
+            if not cand.is_file():
+                cand = folder / Path(f).name
+            if not cand.is_file():
+                missing.append(f)
+            elif cand.resolve() not in {s.resolve() for s in suites}:
+                suites.append(cand.resolve())
+        if missing:
+            print("No suite was run: " + ", ".join(f"{m} does not exist (not a file relative to the working folder, "
+                                                   f"and not a file inside {folder})" for m in missing),
+                  file=sys.stderr)
+            return 2
+    else:
+        suites = sorted(p for p in folder.glob("test_*.py") if p.is_file())
     if not suites:
         print(f"No test suites found in {folder} (looked for test_*.py files).", file=sys.stderr)
         return 2
