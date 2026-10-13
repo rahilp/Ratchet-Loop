@@ -353,8 +353,11 @@ def t09_oversized_reviewer_marked_unavailable():
 
     unavail_path = d / ".ratchet/unavailable-reviewers.json"
     unavail = json.loads(unavail_path.read_text()) if unavail_path.exists() else {}
-    check("[CP4-T09] the failed reviewer is recorded in unavailable-reviewers.json",
-          "big-both" in unavail, unavail)
+    health_path = Path(g.ENV["RATCHET_HOME"]) / "provider-health.json"
+    health = json.loads(health_path.read_text()) if health_path.exists() else {}
+    check("[CP4-T09] a prompt-size failure never marks the reviewer unavailable or benches its provider",
+          not any(k.startswith("big-") for k in unavail) and "bench" not in (health.get("cursor") or {}),
+          (unavail, health.get("cursor")))
 
     r2 = g.rx(d, "reviewers", "CP1", "--json", env=env)
     check("[CP4-T09] `reviewers CP1` still succeeds after the failure (doesn't stall)", r2.returncode == 0, r2.stderr)

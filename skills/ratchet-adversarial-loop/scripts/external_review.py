@@ -34,10 +34,24 @@ Placeholders in "command": {prompt_file} {prompt} {out_file} {root} {model}. Wit
 is piped on stdin. Flags differ between CLI versions — give a provider its own "command" if a preset
 doesn't match the version you have installed.
 
-A CLI that takes the prompt only as a command-line argument ({prompt}: the copilot, cursor and opencode presets)
-can't be given a prompt larger than the system allows for one argument (on Linux 128 KiB; a big diff gets there).
-Such a reviewer is not started: it is marked unavailable with a plain reason and the script exits 3, like any other
-failure. To review large changes with that CLI, give its provider a "command" that reads {prompt_file} or stdin.
+The opencode preset gets the prompt on stdin, after a short message and with `--format json`, a fixed `--title`
+(without one OpenCode resends the whole prompt in the background to name the session) and `--variant low` (the
+provider's own `variant` replaces low; "none" sends no --variant; OpenCode applies a variant only to models that
+define it and ignores it for the others, such as GLM except glm-5.2, and Kimi), so a big prompt never meets a
+command-line limit. Its answer is read from the text events of the JSON event stream only (never a reasoning or tool event, which
+may hold a findings example or the echoed request). An exit 0 with no answer text, or a step that stopped with reason
+"length" (out of output room, even when what it wrote looks complete, and even when an error event comes with it), or
+a reply in prose with no findings JSON from a run that finished cleanly (exit 0, no error event), is a failed attempt,
+never an approval: only that reviewer's slot falls back for this round (a cutoff marker in the round's folder), the
+provider is not benched. A usage-limit message in an error event or on stderr (never in the answer text) benches the
+provider, as any quota failure does; any other error event is a provider failure, benched as usual, whatever the answer.
+
+A CLI that takes the prompt only as a command-line argument ({prompt}: the copilot, cursor, omp and pi presets, or a
+provider `command` with {prompt}) can't be given a prompt larger than the system allows for one argument (on Linux
+128 KiB; a big diff gets there). Such a reviewer is not started and exits 3 with a plain reason, like any other
+failure, but a size failure never benches or marks the provider and counts against no lane's shared health: only that
+reviewer's slot moves on for this round (a cutoff marker in the round's folder) and its review start is given back.
+To review large changes with that CLI, give its provider a "command" that reads {prompt_file} or stdin.
 
 The prompt and the CLI's reply are kept in a temp folder (ratchet-<reviewer>-...) while the review runs; it is
 removed when the review ends, pass or fail. With --dry-run it is kept, so the prompt can be read.
@@ -408,13 +422,28 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
         for k, v in subs.items():
             part = part.replace(k, v)
         cmd.append(part)
+    def round_only(reason, raw=None, unused=False):
+        # A failed attempt that holds nothing against the provider: only this reviewer's slot falls back, for this
+        # round (the marker in the round's folder; no unavailable_ttl_hours mark, no bench, nothing in the shared health
+        # record), so the provider's other slots and every other lane keep using it. `unused`: the provider never ran
+        # (a prompt too large for a command line), so the start this round recorded for the reviewer is given back.
+        if raw is not None:
+            (out.parent / f"{a.reviewer}.raw.txt").write_text(raw)
+        if unused:
+            eng.refund_review_start(cfg, rnd["nonce"], a.reviewer)
+        (out.parent / f"{a.reviewer}.cutoff.json").write_text(json.dumps({"reason": reason, "at": eng.now()}))
+        print(f"{a.reviewer}: {reason}. This slot falls back for round {rnd['round']} only — run "
+              f"`ratchet.py reviewers {a.cp}` again.", file=sys.stderr)
+        sys.exit(3)
+
     def unavailable(reason, quota=None, program=False, unused=False):
         # A failure benches the failing provider only (its tool plus model), so GLM failing leaves Kimi, which runs
         # through the same OpenCode program, working. A program that is missing takes down every reviewer that runs
         # through it (`program`). `unused`: the provider was not really used (the CLI never ran, or no run of it, the
         # first or the retry, produced any output), so the start this round recorded for the reviewer is given back; a
         # timeout, a run that produced output (even a reply that could not be read, or a non-zero exit after it) and an
-        # out-of-credits provider all keep their start.
+        # out-of-credits provider all keep their start. A prompt too large for a command line is not routed here: it
+        # never benches or marks a provider (round_only).
         binary = eng.reviewer_binary(cfg, a.reviewer)
         if program:
             same = [r for r in eng.roster(cfg) if eng.reviewer_binary(cfg, r) == binary] or [a.reviewer]
@@ -447,12 +476,25 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
     env = dict(os.environ, RATCHET_NESTED_REVIEW="1")
     too_big = argv_problem(cmd, env)
     if too_big:  # never started: a CLI that takes the prompt as an argument can't be handed one this large
-        unavailable(f"the review prompt ({len(prompt):,} characters) is too large to pass to '{cmd[0]}' as a "
-                    f"command-line argument: {too_big}. Give this provider a 'command' that reads {{prompt_file}} "
-                    "or stdin to review changes this large", unused=True)
+        round_only(f"the review prompt ({len(prompt):,} characters) is too large to pass to '{cmd[0]}' as a "
+                   f"command-line argument: {too_big}. Give this provider a 'command' that reads {{prompt_file}} "
+                   "or stdin to review changes this large", unused=True)
     shown = " ".join(c if len(c) < 80 else c[:40] + "…" for c in cmd)
 
     sent_at = []  # when each run of the CLI was started: a success only ends a quota bench that began before it
+    streams = []  # what event_stream read from each run's output (None: plain text)
+
+    def quota_of(rr, text):
+        # Out of credits, as the provider said it. A JSON event stream is read from its stderr (error events are merged
+        # into it) only: the model's own answer text can quote a limit message without the provider being out of credits.
+        return eng.quota_failure([rr.stderr] if streams and streams[-1] else [rr.stderr, text], cfg)
+
+    def prose_reply(rr, text):
+        # A JSON-event run that finished cleanly (exit 0, no error event, nothing about credits on stderr) but whose
+        # answer holds no findings JSON did answer: the provider is not at fault, so only this slot falls back (a
+        # failed attempt for this round, no bench).
+        ev = streams[-1] if streams else None
+        return bool(ev) and rr.returncode == 0 and not ev["errors"] and not quota_of(rr, text)
 
     def run_once():
         print(f"running {a.reviewer}: {shown}", file=sys.stderr)
@@ -468,10 +510,27 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
             unavailable(f"timed out after {a.timeout}s")
         except OSError as e:  # the system refused to start it (E2BIG: the arguments were too large after all, ...)
             if e.errno == errno.E2BIG:
-                unavailable(f"the review prompt ({len(prompt):,} characters) is too large to pass to '{cmd[0]}' as a "
-                            "command-line argument. Give this provider a 'command' that reads {prompt_file} or "
-                            "stdin to review changes this large", unused=True)
+                round_only(f"the review prompt ({len(prompt):,} characters) is too large to pass to '{cmd[0]}' as a "
+                           "command-line argument. Give this provider a 'command' that reads {prompt_file} or "
+                           "stdin to review changes this large", unused=True)
             unavailable(f"'{cmd[0]}' could not be started: {e.strerror or e}", program=True, unused=True)
+        ev = eng.event_stream(rr.stdout)
+        streams.append(ev)
+        if ev:  # a JSON event stream: the answer is its text events only; an error event reads like stderr
+            rr.stdout, rr.stderr = ev["text"], (rr.stderr or "") + "\n".join(ev["errors"])
+            raw = rr.stdout + "\n--- stderr ---\n" + rr.stderr
+            # A message about credits (an error event or stderr, never the answer text) is the quota bench (CP3). A
+            # 'length' finish is a failed attempt for this round only, error event or not. An exit 0 with an empty
+            # answer is too, unless an error event came with it: that is a provider failure, benched as usual.
+            quota = quota_of(rr, "")
+            if ev["length"]:  # out of output room: even a complete-looking reply is not trusted
+                if quota:
+                    unavailable("the model stopped at its output limit and the provider is out of credits",
+                                quota=quota)
+                round_only("the model stopped at its output limit (finish reason 'length'), so its reply is not "
+                           "trusted as a review", raw)
+            if rr.returncode == 0 and not ev["text"].strip() and not quota and not ev["errors"]:
+                round_only("the model gave no answer text (exit 0 with an empty answer)", raw)
         tt = (out_file.read_text() if out_file.exists() else "") + "\n" + (rr.stdout or "")
         return rr, tt
 
@@ -490,24 +549,26 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
             # Cut off twice: fall back only THIS slot for this round — no unavailable_ttl_hours mark, so the
             # provider is never sidelined for hours and its other slots keep running (see cmd_reviewers' same-
             # round branch, which reads this marker from the round's own folder).
-            (out.parent / f"{a.reviewer}.raw.txt").write_text(text2 + "\n--- stderr ---\n" + (r2.stderr or ""))
-            marker = out.parent / f"{a.reviewer}.cutoff.json"
-            marker.write_text(json.dumps({"reason": "reply cut off mid-answer twice in a row", "at": eng.now()}))
-            print(f"{a.reviewer}: cut off twice in a row (the reply never finished). This slot falls back for "
-                  f"round {rnd['round']} only — run `ratchet.py reviewers {a.cp}` again.", file=sys.stderr)
-            sys.exit(3)
+            round_only("reply cut off mid-answer twice in a row (the reply never finished)",
+                       text2 + "\n--- stderr ---\n" + (r2.stderr or ""))
         else:
             # The retry's reply is not cut off at all — a genuine failure (quota, auth, plain error, ...), not
             # another truncation. This goes through the normal unavailable() path, same as any other real failure.
+            if prose_reply(r2, text2):
+                round_only("the model answered without any findings JSON (a reply in prose)",
+                           text2 + "\n--- stderr ---\n" + (r2.stderr or ""))
             (out.parent / f"{a.reviewer}.raw.txt").write_text(text2 + "\n--- stderr ---\n" + (r2.stderr or ""))
             tail = ((r2.stderr or "") + (r2.stdout or "")).strip().splitlines()[-1:] or [""]
             unavailable(f"exit {r2.returncode}, no findings JSON ({tail[0][:160]})",
-                        quota=eng.quota_failure([r2.stderr, text2], cfg))
+                        quota=quota_of(r2, text2))
     if review is None:
+        if prose_reply(r, text):
+            round_only("the model answered without any findings JSON (a reply in prose)",
+                       text + "\n--- stderr ---\n" + (r.stderr or ""))
         (out.parent / f"{a.reviewer}.raw.txt").write_text(text + "\n--- stderr ---\n" + (r.stderr or ""))
         tail = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()[-1:] or [""]
         unavailable(f"exit {r.returncode}, no findings JSON ({tail[0][:160]})",
-                    quota=eng.quota_failure([r.stderr, text], cfg), unused=r.returncode != 0 and not text.strip())
+                    quota=quota_of(r, text), unused=r.returncode != 0 and not text.strip())
     review = eng.clean_review_text(review)  # a cut-off emoji escape in the reply must not break signing or records
     # Stamp identity ourselves — never trust the model to echo these correctly.
     base = cps.get("base_tree")

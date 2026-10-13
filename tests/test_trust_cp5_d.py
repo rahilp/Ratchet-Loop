@@ -290,6 +290,7 @@ _CP5R11_JSON_PARSE = {
     "normalize_hook": "a field of the hook payload",
     "cmd_config": "a value given on the command line",
     "cmd_providers": "a value given on the command line",
+    "event_stream": "a line of an agent CLI's --format json output, not a record",
 }
 # Functions that may write files without the writer or appender: outputs and inputs that are not Ratchet's records.
 _CP5R11_WRITES = {

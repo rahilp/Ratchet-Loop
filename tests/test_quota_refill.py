@@ -513,7 +513,9 @@ def t10_same_round_refill_never_repeats_a_reviewer_another_slot_runs():
 
 @case("CP4-T11")
 def t11_prompt_too_large_benches_only_that_model():
-    p = Proj("india", ["opencode"], [GLM, KIMI], [["opencode-glm-both"]])
+    # the prompt goes to the CLI as one argument (an explicit command, as a preset's own stdin delivery has no size limit)
+    arg_cmd = ["opencode", "run", "{prompt}", "-m", "{model}"]
+    p = Proj("india", ["opencode"], [dict(GLM, command=arg_cmd), dict(KIMI, command=arg_cmd)], [["opencode-glm-both"]])
     (p.dir / "src" / "big.js").write_text("".join(f"// filler line {i} " + "x" * 60 + "\n" for i in range(3000)))
     beh = p.run("behavior", "CP1")
     need("set-up: behavior CP1 passes with the large file added", beh.returncode == 0, said(beh)[-300:])
@@ -525,9 +527,9 @@ def t11_prompt_too_large_benches_only_that_model():
           (ext.returncode, said(ext)[-300:]))
     check("the CLI was never started", p.calls("opencode-glm", "review") == [], p.calls())
     out = p.status()
-    check("opencode-glm-both is marked unavailable", listed_failed(out, "opencode-glm-both"),
-          status_line(out, "opencode-glm-both") or out)
-    check("every opencode-kimi-* reviewer stays available (only the failing model is benched)",
+    check("opencode-glm-both is not marked unavailable (a prompt-size failure never benches a provider)",
+          listed_available(out, "opencode-glm-both"), status_line(out, "opencode-glm-both") or out)
+    check("every opencode-kimi-* reviewer stays available (a size failure benches no model)",
           all(listed_available(out, f"opencode-kimi-{lens}") for lens in ("both", "standards", "correctness")), out)
 
 

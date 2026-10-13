@@ -3057,10 +3057,46 @@ def _update_provider_status(ctx, change, note: bool = True, lock=None) -> str:
     return res
 
 
+_EVENT_TYPES = ("step_start", "step_finish", "text", "reasoning", "tool_use", "tool_result", "error")
+
+
+def event_stream(stdout) -> dict | None:
+    """Read the output of `opencode run --format json`: one JSON event per line ({"type", "part": {...}} with type
+    step_start, text, reasoning, tool_use, step_finish or error). Returns {"text": the text events' answer text only,
+    "errors": the error events' messages, "length": a step finished with reason "length" (the model ran out of
+    output room)}, or None when the output holds no event (an older CLI or a plain-text program), which callers read
+    as plain text. A reasoning or tool event, and the request echoed in either, is never part of the answer."""
+    text, errors, length, seen = [], [], False, False
+    for line in str(stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:  # a line of a program's output, not a record Ratchet keeps (so not _read_record)
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict) or ev.get("type") not in _EVENT_TYPES:
+            continue
+        seen = True
+        part = ev["part"] if isinstance(ev.get("part"), dict) else {}
+        if ev["type"] == "text":
+            text.append(str(part.get("text") or ""))
+        elif ev["type"] == "step_finish" and part.get("reason") == "length":
+            length = True
+        elif ev["type"] == "error":
+            err = ev["error"] if isinstance(ev.get("error"), dict) else {}
+            data = err.get("data") if isinstance(err.get("data"), dict) else {}
+            errors.append(str(data.get("message") or err.get("message") or err.get("name") or "error"))
+    return {"text": "\n".join(text), "errors": errors, "length": length} if seen else None
+
+
 def probe_provider(ctx, cfg, pv, bench=True, note: bool = True, record: bool = True,
                    by: str | None = None) -> tuple[bool, str, bool]:
-    """Send a tiny request through the provider exactly as a review would go, and record the result (_record_probe:
-    the shared provider-health.json, then this project's unavailable-reviewers.json), dated when the request was
+    """Send a tiny request through the provider as a review would go (the same command with the variant arguments),
+    plus the preset's `probe_args` (opencode: --title=connectivity check, which replaces the review's title); a JSON
+    event stream in its output is read with event_stream (only the answer text can hold the token, and an error
+    event reads like stderr). The result is recorded (_record_probe: the shared provider-health.json, then this
+    project's unavailable-reviewers.json), dated when the request was
     sent; `by` is the claim this lane holds on the provider (probe_shared), ended with the result.
     Returns (good, detail, saved): `saved` is False when either of those writes could not be made because its lock
     was busy (True when both were saved, or when nothing was sent because the provider has no command or isn't
@@ -3087,6 +3123,10 @@ def probe_provider(ctx, cfg, pv, bench=True, note: bool = True, record: bool = T
         for k, v in subs.items():
             part = part.replace(k, v)
         cmd.append(part)
+    if not pv.get("command"):  # a preset may label its test request (opencode titles the session)
+        extra = list((PRESETS.get(pv.get("preset", "")) or {}).get("probe_args") or [])
+        names = tuple(a.split("=", 1)[0] + "=" for a in extra if a.startswith("--") and "=" in a)
+        cmd = [c for c in cmd if not c.startswith(names)] + extra  # its own value replaces the preset's, never doubled
     sent = _dt.datetime.now(_dt.timezone.utc)  # the result is dated by this, not by when the answer came back
     quota_until = None  # set when the provider said it is out of credits: the time it said it is back
     try:
@@ -3094,6 +3134,9 @@ def probe_provider(ctx, cfg, pv, bench=True, note: bool = True, record: bool = T
                            stdin=None if use_stdin else subprocess.DEVNULL,  # a CLI waiting on stdin must not hang
                            timeout=int(cfg.get("probe_timeout_sec", 120)),
                            env=dict(os.environ, RATCHET_NESTED_REVIEW="1"))
+        ev = event_stream(r.stdout)
+        if ev:  # a JSON event stream: only its answer text can hold the token (not the request echoed in an event)
+            r.stdout, r.stderr = ev["text"], (r.stderr or "") + "\n".join(ev["errors"])
         text = (out_file.read_text() if out_file.exists() else "") + (r.stdout or "") + (r.stderr or "")
         good = PROBE_TOKEN in text.replace("\n", "")
         detail = "answered the test request" if good else (
@@ -3430,6 +3473,15 @@ def cmd_providers(args):
             pv["company"] = args.company
         if args.for_risk:
             pv["for_risk"] = [x.strip() for x in args.for_risk.split(",") if x.strip()]
+        if args.variant:
+            if not PRESETS.get(args.preset or "", {}).get("variant_flag") or args.command:
+                die("--variant sets the thinking level of the opencode preset (for example low or high; none turns "
+                    "the cap off). Nothing was added.")
+            pv["variant"] = args.variant
+        elif PRESETS.get(args.preset or "", {}).get("variant_flag") and not args.command:  # adding again keeps it
+            was = next((x.get("variant") for x in plist if x["id"] == pv["id"] and x.get("variant")), None)
+            if was:
+                pv["variant"] = was
         if args.prefer_for:
             lenses = [x.strip() for x in args.prefer_for.split(",") if x.strip()]
             bad = [x for x in lenses if x not in LENSES]
@@ -3934,8 +3986,19 @@ PRESETS = {
     "cursor": {"bin": "cursor-agent", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
                # --trust: no workspace-trust prompt in headless runs; --mode ask: read-only, cannot edit files
                "command": ["cursor-agent", "-p", "{prompt}", "--output-format", "text", "--trust", "--mode", "ask"]},
-    "opencode": {"bin": "opencode", "company": None, "stdin": False, "model_flag": ["-m"], "model_at": 2,
-                 "command": ["opencode", "run", "{prompt}"]},
+    # The review prompt goes on stdin (opencode joins piped stdin to the message), so its size never meets the
+    # command-line limit; the short message only says what to do with it. --format json prints an event stream, of
+    # which only the text events are the answer; --variant (the provider's own `variant`, default low) asks for low
+    # thinking, which opencode applies only to models that define that variant (it ignores it for the others, such as
+    # GLM and Kimi). The fixed --title keeps opencode from sending the whole prompt a second time, in the background,
+    # just to name the session.
+    "opencode": {"bin": "opencode", "company": None, "stdin": True, "model_flag": ["-m"], "model_at": 2,
+                 "command": ["opencode", "run", "Carry out the task described on stdin. Reply with only what it asks for.",
+                             "--format", "json", "--title=ratchet review"],
+                 "variant_flag": "--variant", "variant_default": "low",
+                 # the test request's session is titled for what it is, so it is told apart in OpenCode's session list
+                 # (probe_provider drops the review title when it adds this one, so --title is given once)
+                 "probe_args": ["--title=connectivity check"]},
     "omp": {"bin": "omp", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
             "command": ["omp", "-p", "--no-session", "{prompt}"]},
     "pi": {"bin": "pi", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
@@ -4254,7 +4317,9 @@ def provider_binary(pv) -> str | None:
 
 
 def provider_command(pv) -> tuple[list[str], bool]:
-    """(command template, prompt on stdin?) with the model filled in."""
+    """(command template, prompt on stdin?) of a provider: its own `command` (or its preset's) with the model filled
+    in. A preset's command also gets the model flag and the thinking-cap arguments appended (_variant_args: the
+    provider's `variant`, else the preset's default, "none" sends nothing); an own `command` is used as written."""
     preset = PRESETS.get(pv.get("preset", "")) or {}
     if pv.get("command"):
         cmd = [str(c).replace("{model}", str(pv.get("model") or "")) for c in pv["command"]]
@@ -4263,7 +4328,15 @@ def provider_command(pv) -> tuple[list[str], bool]:
     if pv.get("model") and cmd:
         at = preset.get("model_at", 1)
         cmd = cmd[:at] + list(preset.get("model_flag") or ["--model"]) + [str(pv["model"])] + cmd[at:]
-    return cmd, bool(preset.get("stdin", False))
+    return cmd + _variant_args(preset, pv), bool(preset.get("stdin", False))
+
+
+def _variant_args(preset, pv) -> list[str]:
+    """The thinking-cap arguments of a preset that has one (opencode): the provider's `variant`, else the preset's
+    default (low); the value "none" sends nothing."""
+    flag = preset.get("variant_flag")
+    value = str((pv or {}).get("variant") or preset.get("variant_default") or "none")
+    return [flag, value] if flag and value != "none" else []
 
 
 def roster(cfg) -> dict:
@@ -4289,13 +4362,15 @@ def _roster_spec(cfg, rid):
 
 
 def reviewer_command(cfg, rid) -> tuple[list[str], bool]:
+    """(command template, prompt on stdin?) of a reviewer: its provider's (provider_command), a reviewer's own
+    `command` as written, or an older preset reviewer's preset command with the preset's default variant added."""
     spec = _roster_spec(cfg, rid) or {}
     if spec.get("provider"):
         return provider_command(provider_by_id(cfg, spec["provider"]) or {})
     if spec.get("command"):
         return [str(c) for c in spec["command"]], bool(spec.get("stdin", False))
     preset = PRESETS.get(spec.get("preset", "")) or {}
-    return list(preset.get("command") or []), bool(preset.get("stdin", False))
+    return list(preset.get("command") or []) + _variant_args(preset, None), bool(preset.get("stdin", False))
 
 
 def host_model_map(cfg) -> dict:
@@ -13186,6 +13261,7 @@ def main(argv=None):
     a.add_argument("--add", metavar="ID"); a.add_argument("--preset"); a.add_argument("--command")
     a.add_argument("--stdin", action="store_true"); a.add_argument("--model"); a.add_argument("--company")
     a.add_argument("--for-risk", help="comma list of risks it may review (default all)")
+    a.add_argument("--variant", help="thinking level for an opencode provider (default low; none turns the cap off)")
     a.add_argument("--prefer-for", help="comma list of lenses (correctness, standards, both) it reviews before other "
                                         "providers of the same cost when a slot is any-<lens>")
     a.add_argument("--no-check", action="store_true"); a.add_argument("--remove", metavar="ID")
