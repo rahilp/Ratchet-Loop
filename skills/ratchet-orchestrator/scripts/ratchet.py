@@ -388,6 +388,12 @@ def fingerprint(root: Path) -> dict:
     return {"kind": "manifest", "id": fid}
 
 
+def _head_sha(root: Path) -> str:
+    """HEAD's commit sha, or "" when there is none (no git, or no commit yet)."""
+    r = subprocess.run(["git", "rev-parse", "-q", "--verify", "HEAD"], cwd=root, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str, extra: dict | None = None):
     """Commit exactly what this checkpoint changed, byte for byte as reviewed: HEAD plus the difference between the
     checkpoint's starting tree and the reviewed tree. Unrelated work already in the tree, and anything the user has
@@ -2790,6 +2796,8 @@ def waiting_question(ctx: Ctx, st):
         return None
     if p.get("phase") and p["phase"] != st.get("phase"):
         return None
+    if p.get("overtook"):  # printed as NOT ASKED: it never reached the user, and the question it replaced is gone too
+        return None
     waiting_on = _question_waiter(ctx, p["action"] == "claim")
     if waiting_on == "user" and _question_answered(ctx, st, p):
         return None
@@ -4656,6 +4664,7 @@ def cmd_approve_plan(args):
     first["status"] = "in_progress"
     first["started_at"] = now()
     first["base_tree"] = fingerprint(ctx.root)["id"]
+    first["base_head"] = _head_sha(ctx.root)  # the commit `merged` counts the lane's own commits from
     st["awaiting_since"] = None
     ctx.log(st, "plan_approved", by=msg["by"], note=msg.get("prompt", "")[:200])
     ctx.save_state(st)
@@ -5185,15 +5194,16 @@ def _all_planned_ids(ctx):
     return [c["id"] for cp in plan.get("checkpoints") or [] for c in _planned_cases(ctx, cp["id"])]
 
 
-def _base_file_text(ctx, st, rel):
-    """The file as it was when the run started: its text, "" when the file did not exist then, or None when the base
-    can't be read (no git, no base tree, tree gone). None means nothing in the file counts as lane-added."""
-    tree = st.get("base_tree")
-    if not tree or not re.fullmatch(r"[0-9a-f]{40,64}", str(tree)) or not _is_git(ctx.root):
+def _file_at(ctx, rev, rel):
+    """The file as it stands in the tree or commit `rev`: its text, "" when the file is not there, or None when it
+    can't be read (no git, no such tree or commit)."""
+    if not rev or not re.fullmatch(r"[0-9a-f]{40,64}", str(rev)) or not _is_git(ctx.root):
         return None
     try:
-        t = subprocess.run(["git", "cat-file", "-t", tree], cwd=ctx.root, capture_output=True, text=True, timeout=30)
-        if t.returncode != 0 or t.stdout.strip() != "tree":
+        t = subprocess.run(["git", "rev-parse", "-q", "--verify", f"{rev}^{{tree}}"], cwd=ctx.root,
+                           capture_output=True, text=True, timeout=30)
+        tree = t.stdout.strip()
+        if t.returncode != 0 or not tree:
             return None
         # The tree is the whole repo's, so a Ratchet root below the repo root needs the repo-relative path.
         pre = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=ctx.root, capture_output=True, text=True,
@@ -5212,6 +5222,32 @@ def _base_file_text(ctx, st, rel):
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
+
+
+def _origin_file_texts(ctx, st, rel):
+    """The texts of file `rel` that decide what the lane added: at the run's base tree, at the first step's starting
+    tree (set when the plan was approved, so a merge or fast-forward made before that is in it), and at every
+    non-first parent of a merge commit made on HEAD's history since the run began (what main brought in). None when
+    any of them can't be read: nothing in the file then counts as lane-added (any doubt locks)."""
+    first = ((ctx.plan() or {}).get("checkpoints") or [{}])[0].get("id")
+    trees = [st.get("base_tree"), ((st.get("checkpoints") or {}).get(first) or {}).get("base_tree")]
+    try:
+        since = int(_dt.datetime.fromisoformat(st["created_at"]).timestamp()) - 2
+        ml = subprocess.run(["git", "rev-list", "--parents", "--merges", f"--since={since}", "HEAD"], cwd=ctx.root,
+                            capture_output=True, text=True, timeout=60)
+    except (KeyError, ValueError, OSError, subprocess.SubprocessError):
+        return None
+    if ml.returncode != 0:
+        return None
+    for line in ml.stdout.splitlines():
+        trees += line.split()[2:]
+    texts = [_file_at(ctx, t, rel) for t in dict.fromkeys(trees)]
+    if texts and texts[0] is not None and trees[1] and texts[1:2] == [None] and trees[1] != trees[0]:
+        # The first step's tree is gone: it only matters if the lane fast-forwarded to main since the run began.
+        g = lambda *a: subprocess.run(["git", *a], cwd=ctx.root, capture_output=True, text=True, timeout=30)
+        if _fast_forwarded(g, None, None, since + 2) == "":
+            texts.pop(1)
+    return None if not texts or any(t is None for t in texts) else texts
 
 
 def _py_uses(node, loads=False) -> set:
@@ -5285,18 +5321,20 @@ def _py_free_defs(ctx, st, rel, old):
     every def and class name), and a file where a planned case id sits outside every def (module data, a header
     docstring, a comment not directly above a def) is not touched at all, exactly as the freeze reads it."""
     none = (set(), set(), None)
-    base = _base_file_text(ctx, st, rel)
-    if base is None or os.path.basename(rel) == "conftest.py" or not any(_case_id_re(i).search(old) for i in _all_planned_ids(ctx)):
+    bases = _origin_file_texts(ctx, st, rel)
+    if bases is None or os.path.basename(rel) == "conftest.py" or not any(_case_id_re(i).search(old) for i in _all_planned_ids(ctx)):
         return none  # a file with no planned case id in it (a shared helper file) keeps the whole-file freeze
     try:
         t_old = ast.parse(old)
-        t_base = ast.parse(base)
+        t_bases = [ast.parse(b) for b in bases]
     except (SyntaxError, ValueError):
         return none
-    base_names, base_members = _py_top_names(t_base), set()
-    for s in t_base.body:
-        if isinstance(s, ast.ClassDef):
-            base_members.update((s.name, nm) for nm, _ in _py_scope_items(s.body))
+    base_names, base_members = set(), set()  # what was in the file before the lane: at the run's base or from main
+    for t_base in t_bases:
+        base_names |= _py_top_names(t_base)
+        for s in t_base.body:
+            if isinstance(s, ast.ClassDef):
+                base_members.update((s.name, nm) for nm, _ in _py_scope_items(s.body))
     defs = list(_py_defs(t_old.body))
     units, _module_ids, loose = _py_place(old.splitlines(), defs, _all_planned_ids(ctx))
     if loose:
@@ -8458,7 +8496,14 @@ def cmd_complete(args):
         if not commit:  # nothing new to commit: a run of complete that failed after its commit left it at HEAD
             commit = _head_commit_named(ctx.root, msg)
     cps.update(status="done", completed_at=now(), commit=commit)
-    ctx.log(st, "checkpoint_complete", cp=args.cp, commit=commit)
+    # With no commit made, the reviewed tree (after the spec ticks) is what `merged` compares the lane's own commits with.
+    reviewed = fingerprint(ctx.root) if not commit and _is_git(ctx.root) else {}
+    # HEAD is recorded with it: `merged` uses it to tell a file that was never committed (untracked, then deleted)
+    # from a file a lane commit removed.
+    head_now = _head_sha(ctx.root) if reviewed.get("kind") == "git-tree" else ""
+    ctx.log(st, "checkpoint_complete", cp=args.cp, commit=commit,
+            **({"tree": reviewed["id"], **({"head": head_now} if head_now else {})}
+               if reviewed.get("kind") == "git-tree" else {}))
     order = [c["id"] for c in ctx.plan()["checkpoints"]]
     remaining = [c for c in order if st["checkpoints"][c]["status"] != "done"]
     mode = st.get("human_review", "end")
@@ -8467,7 +8512,7 @@ def cmd_complete(args):
         st["awaiting_since"] = now()
         st["review_target"] = args.cp
     elif remaining:
-        _advance(st, remaining[0], fingerprint(ctx.root)["id"])
+        _advance(st, remaining[0], fingerprint(ctx.root)["id"], _head_sha(ctx.root))
     else:
         st["current"] = None
         st["phase"] = "awaiting_final_review" if mode != "none" else "done"
@@ -8526,8 +8571,11 @@ def cmd_merged(args):
         return subprocess.run(["git", *a], cwd=top, capture_output=True, text=text and inp is None, input=inp, env=env,
                               timeout=60)
 
-    dirty = [ln[3:] for ln in tgit("status", "--porcelain", "--untracked-files=no", "--", prefix or ".",
-                                   f":(exclude){run_dir}").stdout.splitlines()]
+    def nul_paths(r):   # git's path lists come NUL-separated (-z): names with spaces or non-ASCII letters stay whole
+        return [x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x]
+
+    dirty = [x[3:] for x in nul_paths(tgit("status", "--porcelain", "-z", "--no-renames", "--untracked-files=no", "--",
+                                           prefix or ".", f":(exclude){run_dir}", text=False))]
     if dirty:
         die(f"Tracked files have edits that are not committed ({', '.join(dirty[:5])}). Undo them, or finish the "
             "step they belong to first (committing them now would be lane work no one reviewed), then run merged. "
@@ -8557,10 +8605,23 @@ def cmd_merged(args):
             f"second merge with `git reset --keep {p1[:7]}` (its first parent). Nothing was changed.")
     ref = st["checkpoints"][cur].get("base_tree") if phase == "building" and cur and not from_merge else (
         git("rev-parse", f"{last['commit']}^{{tree}}").stdout.strip() if last and last.get("commit") else None)
-    loose = [f for f in tgit("ls-files", "--others", "--exclude-standard", "--", prefix or ".",
-                             f":(exclude){run_dir}", *JUNK_PATHSPECS).stdout.split("\n") if f]
+    fp_ref = bool(ref and phase == "building" and cur and not from_merge)  # a fingerprint tree, not a commit's tree
+    if not ref and last and re.fullmatch(r"[0-9a-f]{40,64}", str(last.get("tree") or "")):
+        ref, fp_ref = last["tree"], True   # complete made no commit (commit_per_checkpoint is false): the reviewed tree
+    if not ref:
+        undo = f"Run `git reset --keep {p1[:7]}` (the merge's first parent) to undo the merge. "
+        die("merged cannot tell which work the last step's reviewers saw: that step finished without a commit and "
+            "no reviewed tree was recorded for it (it finished before Ratchet recorded one). So it cannot check that "
+            "the lane has no commits no step reviewed. Nothing was changed. " + undo
+            + ("Then ask the user for a step of its own through feedback, and merge main once that step has started."
+               if phase == "awaiting_final_review" else
+               "Then get the waiting review approved, and merge main again once the next step has started."
+               if phase == "awaiting_checkpoint_review" else
+               "Then finish this step (complete), and merge main again once the next step has started."))
+    loose = nul_paths(tgit("ls-files", "-z", "--others", "--exclude-standard", "--", prefix or ".",
+                           f":(exclude){run_dir}", *JUNK_PATHSPECS, text=False))
     if phase == "building" and ref:   # the step's own new files (its tests) are its own changes; older ones are not
-        in_ref = set(tgit("ls-tree", "-r", "--name-only", ref).stdout.split("\n"))
+        in_ref = set(nul_paths(tgit("ls-tree", "-r", "-z", "--name-only", ref, text=False)))
         loose = [f for f in loose if f in in_ref]
     if loose:
         die(f"There are files git does not track yet ({', '.join(loose[:5])}). Commit them in a reviewed step, "
@@ -8568,16 +8629,43 @@ def cmd_merged(args):
             "an untracked file or lane work), then run merged: otherwise the next step's reviewers and commit "
             "would pick them up as its own changes. Nothing was changed.")
     if ref:
-        own = [f for f in tgit("diff-tree", "-r", "--no-renames", "--name-only", ref,
-                               f"{p1}^{{tree}}").stdout.split()
+        own = [f for f in nul_paths(tgit("diff-tree", "-r", "-z", "--no-renames", "--name-only", ref,
+                                         f"{p1}^{{tree}}", text=False))
                if f != run_dir and not f.startswith(run_dir + "/")]
-        if own and phase == "building" and not from_merge:   # fingerprint-only files are not commits' work
-            gone = [f for f in own if git("cat-file", "-e", f"{p1}:{f}").returncode != 0]
-            if gone:
-                ig = tgit("check-ignore", "-z", "--stdin", text=False,
-                          inp="\0".join(gone).encode("utf-8", "surrogateescape") + b"\0")
-                skip = set(ig.stdout.decode("utf-8", "surrogateescape").split("\0"))
-                own = [f for f in own if f not in skip]
+        if own and fp_ref:   # a fingerprint tree also holds files no commit ever held (untracked, ignored ones)
+            # Only a path some commit since the step's starting commit touched is a lane commit's work; the rest
+            # (a stray untracked file, a gitignored file named in fingerprint_include) is not.
+            if phase == "building":
+                start = str(st["checkpoints"][cur].get("base_head") or "")
+            else:
+                start = str((last or {}).get("head") or "") if (last or {}).get("event") == "checkpoint_complete" else ""
+            undo = f"Undo the merge with `git reset --keep {p1[:7]}` (the merge's first parent). "
+            if not re.fullmatch(r"[0-9a-f]{40,64}", start) or git("cat-file", "-e", f"{start}^{{commit}}").returncode != 0:
+                die("merged cannot tell which commits the lane made since the last step: this step's starting commit "
+                    "was not recorded (the run began before Ratchet recorded it) or is gone. So it cannot check that "
+                    "the lane has no commits no step reviewed. Nothing was changed. " + undo
+                    + ("Then ask the user for a step of its own through feedback, and merge main once that step has "
+                       "started." if phase == "awaiting_final_review" else
+                       "Then get the waiting review approved, and merge main again once the next step has started."
+                       if phase == "awaiting_checkpoint_review" else
+                       "Then finish this step (complete), and merge main again once the next step has started."))
+            anc = git("merge-base", "--is-ancestor", start, p1)
+            if anc.returncode == 1:
+                die(f"The lane's history no longer includes the commit this step started from ({start[:7]}): commits "
+                    "were reset or rebased away since then, so merged cannot tell what the lane changed. Nothing was "
+                    "changed. Undo the merge with git, put the lane's history back, then merge main and run merged.")
+            if anc.returncode != 0:
+                die(f"git could not compare the lane with the step's starting commit ({anc.stderr.strip()[:200]}). "
+                    "Nothing was changed.")
+            touched = []
+            for f in own:
+                r = tgit("rev-list", "-1", "--full-history", f"{start}..{p1}", "--", f":(literal){f}")
+                if r.returncode != 0:
+                    die(f"git could not list the lane's commits that touch {f} ({r.stderr.strip()[:200]}). "
+                        "Nothing was changed.")
+                if r.stdout.strip():
+                    touched.append(f)
+            own = touched
         if own:
             die(f"The lane has commits since the last step finished that never went through the gates "
                 f"({', '.join(own[:5])}; added, changed or removed), so merged cannot hide them from the reviewers. "
@@ -8714,6 +8802,7 @@ def cmd_merged(args):
     st["base_tree"] = base
     if phase == "building":
         st["checkpoints"][cur]["base_tree"] = base
+        st["checkpoints"][cur]["base_head"] = head
     ctx.log(st, "merged_main", commit=head, tree=tree, accepted=accepted,
             by_hand=[f.decode("utf-8", "replace") for f in by_hand] if phase == "building" else [])
     ctx.save_state(st)
@@ -8748,13 +8837,14 @@ def _earliest_open_step(cps):
     return "complete"
 
 
-def _advance(st, cp_id, base_tree=None):
+def _advance(st, cp_id, base_tree=None, base_head=None):
     st["current"] = cp_id
     st["phase"] = "building"
     st["checkpoints"][cp_id]["status"] = "in_progress"
     st["checkpoints"][cp_id]["started_at"] = now()
     if base_tree:
         st["checkpoints"][cp_id]["base_tree"] = base_tree  # what reviewers diff against
+        st["checkpoints"][cp_id]["base_head"] = base_head or ""  # HEAD then: where `merged` starts counting lane commits
 
 
 def cmd_human_approve(args):
@@ -8780,7 +8870,7 @@ def cmd_human_approve(args):
         remaining = [c for c in order if st["checkpoints"][c]["status"] != "done"]
         st["review_target"] = None
         if remaining:
-            _advance(st, remaining[0], fingerprint(ctx.root)["id"])
+            _advance(st, remaining[0], fingerprint(ctx.root)["id"], _head_sha(ctx.root))
         else:
             st["phase"] = "done"
             st["current"] = None
@@ -8858,7 +8948,7 @@ def cmd_plan_extend(args):
     for cid in new_ids:
         st["checkpoints"][cid] = new_cp_state(cp_by_id(plan, cid))
     st["plan_hash"] = _plan_hash(plan, ctx)
-    _advance(st, new_ids[0], fingerprint(ctx.root)["id"])
+    _advance(st, new_ids[0], fingerprint(ctx.root)["id"], _head_sha(ctx.root))
     st["approved"] = approval_snapshot(ctx, st)  # the user's feedback is the approval for the appended checkpoints
     register_active(ctx.root, st["slug"])
     ctx.log(st, "plan_extended", added=new_ids)
@@ -9720,7 +9810,7 @@ def _unblock(ctx, st, by, note) -> str:
     if back == "building" and not cur:  # nothing current: pick up the next unfinished checkpoint
         pending = [c for c in order if st["checkpoints"][c]["status"] != "done"]
         if pending:
-            _advance(st, pending[0], fingerprint(ctx.root)["id"])
+            _advance(st, pending[0], fingerprint(ctx.root)["id"], _head_sha(ctx.root))
         else:
             st["phase"] = "awaiting_final_review"
     elif cur:
