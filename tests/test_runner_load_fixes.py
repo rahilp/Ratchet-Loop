@@ -4,7 +4,8 @@ CP1 fix-round tests: the summary line reports the limit that was really in force
 
 Drives Runner.wait() from tests/run_all.py directly, with the load faked through RATCHET_FAKE_LOADAVG.
   - [CP1-X2] a suite that ends within one poll of passing --timeout, saved only by the stretch, still gets a line
-  - [CP1-A3] a suite stopped at the plain --timeout because the load fell back gets no line claiming a stretch
+  - [CP1-A3] a load drop after --timeout passed does not take back the stretched limit: the suite is stopped at the
+             limit it was granted, and the line reports that limit (CP2 round 2: the limit in force never shrinks)
 """
 from __future__ import annotations
 
@@ -72,10 +73,10 @@ def x2_exit_right_after_timeout_is_reported():
           and "load 8.0 on 4 CPUs" in res.stretch, res.stretch)
 
 
-def a3_falling_load_is_not_reported_as_a_stretch():
-    print("CP1-A3: a suite stopped at the plain --timeout after the load fell gets no stretch line")
-    # timeout 1s at 2x: the stretched deadline is 2s. The load falls at 1.5s, half a second after the limit
-    # first stretches and half a second before the stretched deadline.
+def a3_falling_load_keeps_the_granted_limit():
+    print("CP1-A3: a load drop after --timeout passed keeps the stretched limit, and the line reports that limit")
+    # timeout 1s at 2x: the stretched deadline is 2s. The load falls at 1.5s, half a second after --timeout passed
+    # and half a second before the stretched deadline: the suite is still given its 2s, and stopped only then.
     reading = Path(_tmp.mkdtemp(prefix="rt-fix-")) / "load.txt"
     reading.write_text("8\n")
     saved = set_fake_load(f"@{reading}", "4")
@@ -91,18 +92,22 @@ def a3_falling_load_is_not_reported_as_a_stretch():
         runner = run_all.Runner(Path(tempfile.gettempdir()), 1.0, 10, "", 4.0)
         res = run_all.Result("test_beta.py")
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        t0 = time.monotonic()
         try:
-            runner.wait(proc, res, time.monotonic())
+            runner.wait(proc, res, t0)
         finally:
             run_all.kill_tree(proc)
+        took = time.monotonic() - t0
     finally:
         restore_env(saved)
     check("[CP1-A3] it was stopped as timed out", res.timed_out, res.exit_code)
-    check("[CP1-A3] no line claims a stretch that was not in force", res.stretch == "", res.stretch)
+    check("[CP1-A3] it was stopped at the granted 2s, not cut at 1s when the load fell", 1.9 <= took < 2.6, took)
+    check("[CP1-A3] the line reports the limit that was applied: stretched 2.0x (1s to 2s) at load 8",
+          "stretched 2.0x (1s to 2s)" in res.stretch and "load 8.0 on 4 CPUs" in res.stretch, res.stretch)
 
 
 if __name__ == "__main__":
     x2_exit_right_after_timeout_is_reported()
-    a3_falling_load_is_not_reported_as_a_stretch()
+    a3_falling_load_keeps_the_granted_limit()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

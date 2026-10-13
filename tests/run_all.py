@@ -9,8 +9,8 @@ passed. A suite still running after --timeout seconds (more on a busy machine, s
 reported as timed out.
 
 The time limit grows with machine load: on every check it is --timeout times the one-minute load average divided by
-the CPU count (never less than --timeout, never more than --timeout times --max-stretch, default 4), so a suite that
-is only slow because the machine is busy is given more time. The end summary has one line for each suite that ran
+the CPU count (never less than --timeout, never more than --timeout times --max-stretch, default 4; a load drop never
+shortens a limit already granted), so a suite that is only slow because the machine is busy is given more time. The end summary has one line for each suite that ran
 past its --timeout or was stopped at a stretched limit. RATCHET_FAKE_LOADAVG (a number, "unavailable", or @FILE
 holding a number) and RATCHET_FAKE_CPUS replace the real readings; the tests use them.
 
@@ -374,34 +374,39 @@ class Runner:
         return res
 
     def wait(self, proc, res: Result, t0: float) -> None:
-        """Wait for a suite, polling. The deadline is --timeout times the stretch factor of the latest reading, so
-        a load spike while the suite runs still extends it; it is never earlier than --timeout. Stops the suite
-        when the deadline passes. The summary line reports the limit in force when the suite ended: the latest
-        reading taken after --timeout, or a fresh one when the suite ended before another poll could take it. A
-        suite stopped at the plain --timeout (the load had fallen back) gets no line."""
-        seen = None
+        """Wait for a suite, polling. The deadline is --timeout times the highest stretch factor read while the
+        suite runs, so a load spike while it runs still extends it and a load drop never takes back time already
+        granted; it is never earlier than --timeout. Stops the suite when the deadline passes. The summary line
+        reports the limit in force when the suite ended (the highest reached, or a fresh reading when the suite
+        ended within one poll of passing --timeout); a suite that ran within the plain --timeout gets no line."""
+        peak = None  # the reading that set the highest limit so far: the limit in force never shrinks
+        limit = self.timeout
         while True:
             factor, load, cpus = stretch_factor(self.max_stretch)
+            if self.timeout * factor > limit:
+                limit = self.timeout * factor
+                peak = (factor, load, cpus)
             elapsed = time.monotonic() - t0
-            if elapsed >= self.timeout:
-                seen = (factor, load, cpus) if factor > 1.0 else None  # the limit in force past --timeout
-            if elapsed >= self.timeout * factor:
+            if elapsed >= limit:
                 res.timed_out = True
                 stop(proc)
                 res.exit_code = proc.returncode
                 break
             try:
-                res.exit_code = proc.wait(timeout=min(POLL_SECONDS, self.timeout * factor - elapsed))
+                res.exit_code = proc.wait(timeout=min(POLL_SECONDS, limit - elapsed))
                 break
             except subprocess.TimeoutExpired:
                 continue
-        if seen is None and not res.timed_out and time.monotonic() - t0 >= self.timeout:
+        ran_past = res.timed_out or time.monotonic() - t0 >= self.timeout
+        if ran_past and not res.timed_out:
             fresh = stretch_factor(self.max_stretch)  # ended within one poll of passing --timeout
-            seen = fresh if fresh[0] > 1.0 else None
-        if seen:
-            factor, load, cpus = seen
+            if self.timeout * fresh[0] > limit:
+                limit = self.timeout * fresh[0]
+                peak = fresh
+        if peak and ran_past:
+            factor, load, cpus = peak
             res.stretch = (f"{res.name}: time limit stretched {factor:.1f}x ({self.timeout:.0f}s to "
-                           f"{self.timeout * factor:.0f}s) at load {load:.1f} on {cpus} CPUs")
+                           f"{limit:.0f}s) at load {load:.1f} on {cpus} CPUs")
 
     def stop_all(self) -> None:
         with self.lock:

@@ -37,6 +37,7 @@ import re
 import shlex
 import unicodedata
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -176,7 +177,8 @@ DEFAULT_CONFIG = {
     "standards": [".ratchet/standards.md"],
     "app": {"start_command": None, "url": None, "healthcheck": None},
     "test_timeout_sec": 900,
-    "max_stop_blocks": 40,          # safety valve for the Stop hook (reset whenever a gate makes progress)
+    "load_stretch_max": 4,          # a busy machine stretches test_timeout_sec by load average / CPUs, up to this many times
+    "max_stop_blocks": 40,         # safety valve for the Stop hook (reset whenever a gate makes progress)
     "fingerprint_include": [],      # gitignored files that still matter to behaviour (e.g. ".env.test"); added to fingerprints
     "ui_single_reviewer_ok": False, # allow a UI review with only one of visual/behaviour (human-set, locked at approval)
     "min_review_timeout_sec": 120,  # other-provider reviewers can't be given a timeout short enough to knock them out
@@ -1975,7 +1977,8 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "host_provider", "ui_reviewers", "design_md", "max_stop_blocks", "unavailable_ttl_hours",
              "verify_transcripts", "min_review_seconds", "commit_per_checkpoint", "blocking_severities",
              "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round", "converge_after_round",
-             "doc_globs", "doc_exclude_globs", "test_globs", "doc_test_command", "small_edit_lines"]
+             "doc_globs", "doc_exclude_globs", "test_globs", "doc_test_command", "small_edit_lines",
+             "load_stretch_max"]
 
 
 def _file_sha(p: Path) -> str | None:
@@ -6086,9 +6089,159 @@ def cmd_tests_written(args):
     ok(f"{args.cp}: all {len(_planned_cases(ctx, args.cp))} planned cases are present. Next: ratchet.py red {args.cp}")
 
 
+RUN_POLL_SECONDS = 0.25  # how often a running test command's deadline is recomputed from the machine load
+
+
+def _read_load():
+    """(one-minute load average, CPU count) right now, or None when there is no usable reading. The environment
+    variables RATCHET_FAKE_LOADAVG ("unavailable", a number, or "@file" holding a number) and RATCHET_FAKE_CPUS
+    replace the real values (the tests use them; tests/run_all.py reads the same two). Never raises."""
+    fake = os.environ.get("RATCHET_FAKE_LOADAVG")
+    try:
+        if fake is not None:
+            fake = fake.strip()
+            if fake.startswith("@"):
+                with open(fake[1:], "r", encoding="utf-8") as f:
+                    fake = f.read().strip()
+            load = float(fake)
+        else:
+            load = os.getloadavg()[0]
+        cpus = int(os.environ.get("RATCHET_FAKE_CPUS") or 0) or (os.cpu_count() or 1)
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not (load == load and load < float("inf")) or load < 0 or cpus < 1:
+        return None
+    return load, cpus
+
+
+def _stretch_factor(max_stretch: float):
+    """(factor, load, cpus): how many times longer than test_timeout_sec a command may run right now. The factor is
+    load / cpus, at least 1 and at most max_stretch; 1 when there is no usable reading."""
+    reading = _read_load()
+    if reading is None:
+        return 1.0, None, None
+    load, cpus = reading
+    return min(max(1.0, load / cpus), max_stretch), load, cpus
+
+
+def _load_stretch_max(cfg) -> float:
+    """The configured ceiling on the stretch (load_stretch_max), a number of 1 or more; the default otherwise."""
+    try:
+        v = float(cfg.get("load_stretch_max"))
+    except (TypeError, ValueError):
+        return float(DEFAULT_CONFIG["load_stretch_max"])
+    return v if 1.0 <= v < float("inf") else float(DEFAULT_CONFIG["load_stretch_max"])
+
+
+def _secs(x: float) -> str:
+    """A number of seconds for a log line: whole when it is whole (`2s`), else one decimal (`2.5s`)."""
+    return str(int(x)) if float(x) == int(x) else f"{x:.1f}"
+
+
+def _kill_group(proc) -> None:
+    """Stop a command and everything it started (its own process group), then reap it. Never raises."""
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+_STOP_SIGNALS = tuple(s for s in ("SIGTERM", "SIGINT", "SIGHUP") if hasattr(signal, s))
+
+
+def _forward_stop(proc) -> list:
+    """While `proc` runs, a SIGTERM, SIGINT or SIGHUP sent to ratchet.py (an agent's tool timeout cutting a
+    foreground call off) first stops the command's whole process group, then takes its usual course (the previous
+    handler, or the default exit), so no suite is left running behind a stopped ratchet.py. A signal the process
+    ignores stays ignored. Returns the previous handlers for _restore_handlers; [] when handlers cannot be set
+    (not the main thread)."""
+    saved = []
+
+    def on_stop(signum, frame):
+        _kill_group(proc)
+        _restore_handlers(saved)
+        os.kill(os.getpid(), signum)
+
+    for name in _STOP_SIGNALS:
+        sig = getattr(signal, name)
+        try:
+            prev = signal.getsignal(sig)
+            if prev == signal.SIG_IGN:
+                continue
+            signal.signal(sig, on_stop)
+        except (ValueError, OSError):
+            continue
+        saved.append((sig, prev))
+    return saved
+
+
+def _restore_handlers(saved: list) -> None:
+    for sig, prev in saved:
+        try:
+            signal.signal(sig, prev if prev is not None else signal.SIG_DFL)
+        except (ValueError, OSError, TypeError):
+            pass
+
+
+def _wait_stretched(proc, timeout: float, max_stretch: float):
+    """Wait for a command, polling. The deadline is `timeout` times the highest stretch factor read while the
+    command runs (re-read every RUN_POLL_SECONDS, so a load spike while the command runs still extends it; a load
+    drop never shortens a limit already granted), never earlier than `timeout` and never later than `timeout` times
+    `max_stretch`. Stops the whole process group when the deadline passes. Returns (timed_out, limit, note): the
+    limit in force when the command ended, and a line saying the limit was stretched (the highest reading taken
+    during the run, or a fresh one when the command ended within one poll of passing `timeout`), or "" when the
+    command ran within the configured limit."""
+    t0 = time.monotonic()
+    peak = None  # the reading that set the highest limit so far: the limit in force never shrinks
+    timed_out = False
+    limit = float(timeout)
+    while True:
+        factor, load, cpus = _stretch_factor(max_stretch)
+        if timeout * factor > limit:
+            limit = timeout * factor
+            peak = (factor, load, cpus)
+        elapsed = time.monotonic() - t0
+        if elapsed >= limit:
+            timed_out = True
+            _kill_group(proc)
+            break
+        try:
+            proc.wait(timeout=min(RUN_POLL_SECONDS, limit - elapsed))
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    ran_past = timed_out or time.monotonic() - t0 >= timeout
+    if ran_past and not timed_out:
+        fresh = _stretch_factor(max_stretch)  # ended within one poll of passing the configured limit
+        if timeout * fresh[0] > limit:
+            limit = timeout * fresh[0]
+            peak = fresh
+    if peak is None or not ran_past:
+        return timed_out, (limit if timed_out else float(timeout)), ""
+    factor, load, cpus = peak
+    note = (f"time limit stretched {factor:.1f}x ({_secs(timeout)}s to {_secs(limit)}s) at load {load:.1f} "
+            f"on {cpus} CPUs")
+    return timed_out, limit, note
+
+
 def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None):
-    """Run a test or check command. With `report`, the command gets that path in RATCHET_TEST_REPORT, and any file
-    already there is deleted first, so a report left by an earlier run can never count for this one."""
+    """Run a test or check command in its own process group and wait for it with _wait_stretched: on a busy machine
+    its time limit is `timeout` (test_timeout_sec) times the load average over the CPU count, re-read while it runs
+    (the highest reading wins: a load drop never shortens the limit), never below `timeout` and at most
+    `load_stretch_max` times it; a command still running at that limit is stopped with its whole process group and
+    logged as `TIMEOUT after <limit>s` (exit 124). When the limit was stretched the log header gets one line saying
+    so, with the factor, both limits, the load and the CPU count. A SIGTERM, SIGINT or SIGHUP to ratchet.py while
+    the command runs stops the command's process group first (_forward_stop). With `report`, the
+    command gets that path in RATCHET_TEST_REPORT, and any file already there is deleted first, so a report left by
+    an earlier run can never count for this one. Output goes through temp files, so a command that prints a lot
+    never stalls on a full pipe."""
     env = dict(os.environ, CI="1", FORCE_COLOR="0")
     env.pop("RATCHET_TEST_REPORT", None)
     if report is not None:
@@ -6099,16 +6252,30 @@ def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None):
         except OSError as e:
             die(f"Could not delete the old test report at {report.relative_to(ctx.root)} ({e}); remove it and re-run.")
         env["RATCHET_TEST_REPORT"] = str(report)
+    max_stretch = _load_stretch_max(ctx.config())
     t0 = _dt.datetime.now()
-    try:
-        r = subprocess.run(command, shell=True, cwd=ctx.root, capture_output=True, text=True,
-                           timeout=timeout, env=env)
-        code, out = r.returncode, (r.stdout or "") + "\n" + (r.stderr or "")
-    except subprocess.TimeoutExpired as e:
-        code, out = 124, f"TIMEOUT after {timeout}s\n{e.stdout or ''}{e.stderr or ''}"
+    with tempfile.TemporaryFile() as so, tempfile.TemporaryFile() as se:
+        proc = subprocess.Popen(command, shell=True, cwd=ctx.root, stdout=so, stderr=se, env=env,
+                                start_new_session=True)
+        saved = _forward_stop(proc)
+        try:
+            timed_out, limit, note = _wait_stretched(proc, float(timeout), max_stretch)
+        finally:
+            _restore_handlers(saved)
+        so.seek(0)
+        se.seek(0)
+        stdout = so.read().decode("utf-8", errors="replace")
+        stderr = se.read().decode("utf-8", errors="replace")
+    if timed_out:
+        code, out = 124, f"TIMEOUT after {_secs(limit)}s\n{stdout}{stderr}"
+    else:
+        code, out = proc.returncode, stdout + "\n" + stderr
     dur = (_dt.datetime.now() - t0).total_seconds()
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text(f"$ {command}\n# exit={code} duration={dur:.1f}s at {now()}\n\n{out}")
+    header = f"$ {command}\n# exit={code} duration={dur:.1f}s at {now()}\n"
+    if note:
+        header += f"# {note}\n"
+    log_path.write_text(f"{header}\n{out}")
     return code, out, dur
 
 
@@ -9721,10 +9888,11 @@ def _warn_if_foreground(ctx, cfg):
         return
     secs = int(cfg.get("test_timeout_sec") or DEFAULT_CONFIG["test_timeout_sec"])
     span = f"{secs // 60} minutes" if secs >= 120 else f"{secs} seconds"
+    stretch = _load_stretch_max(cfg)
     print(f"WARNING: a tool timeout could cut this complete call off. It runs the whole regression suite, which "
-          f"can take up to {span}, and after a failure it may run the suite a second time, so up to about "
-          f"twice that. Run it in the background instead (run_in_background), then wait for it to "
-          f"finish.", file=sys.stderr, flush=True)
+          f"can take up to {span} (up to {_secs(stretch)} times that on a busy machine, load_stretch_max), and "
+          f"after a failure it may run the suite a second time, so up to about twice that. Run it in the "
+          f"background instead (run_in_background), then wait for it to finish.", file=sys.stderr, flush=True)
 
 
 def cmd_complete(args):

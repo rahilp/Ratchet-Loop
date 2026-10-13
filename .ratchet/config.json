@@ -43,14 +43,10 @@
         "codex-correctness",
         "opencode-kimi-correctness",
         "opencode-glm-correctness",
-        "copilot-correctness",
-        "gemini-correctness",
         "host-alt-correctness"
       ],
       [
         "opencode-glm-standards",
-        "copilot-standards",
-        "gemini-standards",
         "host-alt-standards"
       ]
     ]
@@ -82,6 +78,20 @@
       "id": "opencode-kimi",
       "preset": "opencode",
       "model": "opencode-go/kimi-k3"
+    },
+    {
+      "id": "longcat-free",
+      "preset": "opencode",
+      "model": "opencode-go/longcat-2.5-preview-free",
+      "company": "meituan",
+      "cost": "flat"
+    },
+    {
+      "id": "step5-free",
+      "preset": "opencode",
+      "model": "opencode-go/step-5-preview-free",
+      "company": "stepfun",
+      "cost": "flat"
     }
   ],
   "test_timeout_sec": 3600,
@@ -96,12 +106,12 @@
   "host_models": {
     "anthropic": {
       "strong": "inherit",
-      "standard": "sonnet",
+      "standard": "fable",
       "light": "haiku",
       "alternates": [
+        "fable",
         "sonnet",
-        "opus",
-        "fable"
+        "opus"
       ]
     }
   }
