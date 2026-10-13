@@ -5936,6 +5936,122 @@ def cmd_director_enroll(args):
     ok(f"Lane {ctx.root} enrolled: approvals now require a director token.")
 
 
+def _integrate_lane(main: Path, target: str):
+    """(lane folder, branch or None) for a lane named by folder or by branch, from git's list of this project's
+    worktrees. Dies with a plain line when the name is neither."""
+    r = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=main, capture_output=True, text=True, timeout=60)
+    trees, cur = [], None
+    for ln in r.stdout.splitlines():
+        if ln.startswith("worktree "):
+            cur = {"path": os.path.realpath(ln[9:]), "branch": None}
+            trees.append(cur)
+        elif ln.startswith("branch ") and cur:
+            cur["branch"] = ln[7:][len("refs/heads/"):] if ln[7:].startswith("refs/heads/") else ln[7:]
+    p = Path(target).expanduser()
+    if p.is_dir():
+        hit = next((t for t in trees if t["path"] == os.path.realpath(p)), None)
+        if hit:
+            return Path(hit["path"]), hit["branch"]
+        die(f"{target} is not a git worktree of this project, so it is not a lane. Give the lane's folder (a git "
+            "worktree of this project) or its branch name. Nothing was changed.")
+    hit = next((t for t in trees if t["branch"] == target), None)
+    if hit:
+        return Path(hit["path"]), hit["branch"]
+    die(f"No lane found for '{target}': no worktree has that branch checked out, and it is not a folder. Give the "
+        "lane's folder or its branch name (the lane's branch must be checked out in a worktree). Nothing was changed.")
+
+
+def cmd_integrate(args):
+    """`integrate <lane> --dry-run` (director only): checks that a finished lane is ready to merge into the main
+    checkout and says what integrate would do. Reads only: it runs no git command that writes and changes no file."""
+    require_director_session("integrate")
+    if not args.dry_run:
+        die("integrate can only check a lane so far: run it with --dry-run to see what it would do. The merge itself "
+            "comes in a later version. Nothing was changed.")
+    main = find_root()
+    if not _is_git(main):
+        die("integrate needs a git project: it merges a lane's branch. Nothing was changed.")
+    lane, branch = _integrate_lane(main, args.lane)
+    if lane == main.resolve():
+        die("That folder is the main checkout itself, not a lane. Give the lane's folder or its branch name. "
+            "Nothing was changed.")
+    lctx, mctx = Ctx(lane), Ctx(main)
+    name = branch or str(lane)
+    slug = lctx.active_slug()
+    if not slug or not lctx.state_path(slug).is_file():
+        die(f"The lane '{name}' has no active run, so there is nothing finished to integrate. Give the folder or "
+            "branch of a lane whose agent ran its work through Ratchet. Nothing was changed.")
+    lst, why = _read_record(lctx.state_path(slug))
+    if why:
+        die(f"The lane's run state ({lctx.state_path(slug)}) can't be read ({why}), so integrate can't tell if the "
+            "run is finished. Have the lane's agent check it with status. Nothing was changed.")
+    phase = lst.get("phase")
+    if phase != "done":
+        die(f"The lane's run '{slug}' is not finished (it is in phase '{phase}'). Have the lane's agent finish it, "
+            "then run integrate again. Nothing was changed.")
+
+    def git(d, *a):
+        return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True, timeout=60)
+
+    def dirty(d, exclude):
+        top = Path(git(d, "rev-parse", "--show-toplevel").stdout.strip() or d)
+        prefix = git(d, "rev-parse", "--show-prefix").stdout.strip()
+        r = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames",
+                            "--untracked-files=no", "--", prefix or ".", *([f":(exclude){prefix}{RATCHET_DIR}"] if exclude else [])],
+                           cwd=top, capture_output=True, text=True, timeout=60)
+        return [x[3:][len(prefix):] if prefix and x[3:].startswith(prefix) else x[3:] for x in r.stdout.split("\0") if x]
+
+    if git(lane, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+        die(f"A merge is in progress in the lane '{name}'. Have the lane's agent finish or abort it there first, "
+            "then run integrate again. Nothing was changed.")
+    bad = dirty(lane, True)
+    if bad:
+        die(f"The lane '{name}' has uncommitted changes ({', '.join(bad[:5])}). Have the lane's agent commit or "
+            "discard them, then run integrate again. Nothing was changed.")
+    if git(main, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+        die("The main checkout has a merge in progress. Finish or abort it before integrating. Nothing was changed.")
+    carried = []
+    for path in dirty(main, False):
+        (carried if path in MERGE_SHARED else bad).append(path)
+    if bad:
+        die(f"The main checkout has uncommitted changes to project files ({', '.join(bad[:5])}). Ask the developer "
+            "to commit or stash them (integrate does not touch them), then run integrate again. Nothing was changed.")
+    mslug = mctx.active_slug()
+    if mslug and mctx.state_path(mslug).is_file():
+        mst, why = _read_record(mctx.state_path(mslug))
+        if why:
+            die(f"The main checkout's run state ({mctx.state_path(mslug)}) can't be read ({why}), so integrate can't "
+                "tell if its run is between steps. Check it with status first. Nothing was changed.")
+        # the same rule as lane F's merge guard: only a run that is building mid-step (or blocked) stops a merge;
+        # done, paused, cancelled and not-yet-approved plan phases do not
+        if mst.get("phase") in ("building", "blocked") and not _between_steps(mst, main):
+            die(f"The main checkout's own run '{mslug}' is in phase '{mst.get('phase')}', in the middle of a step. "
+                "Wait for the step to finish (or for the run to be unblocked), then run integrate again. Nothing was "
+                "changed.")
+    head = git(main, "rev-parse", "HEAD").stdout.strip()
+    lhead = git(lane, "rev-parse", "HEAD").stdout.strip()
+    target = git(main, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "HEAD"
+    commits = git(main, "log", "--format=%h %s", f"{head}..{lhead}").stdout.splitlines()
+    if not commits:
+        ok(f"Dry run: the lane '{name}' (run '{slug}') has nothing new to bring to {target}, so there is nothing to "
+           "merge. Nothing was changed.")
+        return
+    base = git(main, "merge-base", head, lhead).stdout.strip()
+    differ = [f for f in sorted(MERGE_SHARED)
+              if any(git(main, "diff", "--name-only", base, side, "--", f).stdout.strip() for side in (lhead, head))]
+    suite = mctx.config().get("regression_command")
+    lines = [f"Dry run: integrate would merge the lane '{name}' (run '{slug}', finished) into {target}.",
+             f"Commits it would bring to {target} ({len(commits)}):", *[f"  {c}" for c in commits],
+             "Ratchet's own files that differ since the lane branched (merged by Ratchet's rules): "
+             + (", ".join(differ) if differ else "none differ."),
+             "Uncommitted Ratchet files on main it would carry across (never committed): "
+             + (", ".join(sorted(carried)) if carried else "none."),
+             "Suite it would run on the merged code before main moves: "
+             + (suite if suite else "none (no regression_command is set)."),
+             "This was a dry run: nothing was changed, no merge was made and nothing was pushed."]
+    ok("\n".join(lines))
+
+
 def cmd_director_sign(args):
     require_director_session("director-sign")
     ctx = Ctx(find_root())
@@ -13158,7 +13274,7 @@ def _expand(cmd: str) -> str:
             continue
         cmd = re.sub(r"\$\{" + name + r"\}|\$" + name + r"(?![A-Za-z0-9_])", lambda _m: val, cmd)
     return cmd
-DIRECTOR_CALL_RE = re.compile(r"""ratchet\.py["']?\s+(?:--root\s+\S+\s+)?director-(sign|key|enroll)\b""")
+DIRECTOR_CALL_RE = re.compile(r"""ratchet\.py["']?\s+(?:--root\s+\S+\s+)?(?:director-(?:sign|key|enroll)|integrate)\b""")
 # Variables a builder session may read but never set. Each is matched however it is set: VAR=, export/declare/
 # typeset/local/readonly/setenv/fish `set -x`, a dict or kwargs entry (python3 -c os.environ / env=...), putenv-style
 # calls, or indirectly (the name stored in another variable, or built from pieces, then used by eval, env -S,
@@ -14670,6 +14786,21 @@ MERGE_AGAIN = ("RATCHET GUARD: finish this step before merging main again. An ea
                "merge yet. Run the step through `complete`, then merge main, then run `ratchet.py merged`.")
 
 
+def _between_steps(st, root: Path, merging: bool = False) -> bool:
+    """Whether a run is between steps: waiting for a review, or building at step 'tests' with a clean tree (while a
+    merge is in progress, only untracked files count as not clean). Used by the merge rule and by integrate."""
+    phase, cur = (st or {}).get("phase"), (st or {}).get("current")
+    if phase in ("awaiting_checkpoint_review", "awaiting_final_review"):
+        return True
+    if phase == "building" and cur and st["checkpoints"][cur].get("step") == "tests":
+        r = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain", "--", ".", f":(exclude){RATCHET_DIR}",
+                            *JUNK_PATHSPECS],
+                           cwd=root, capture_output=True, text=True, timeout=20)
+        return r.returncode == 0 and not any(ln for ln in r.stdout.splitlines()
+                                             if not merging or ln.startswith("??"))
+    return False
+
+
 def _merge_rule(cmd: str, cwd: str, root: Path) -> tuple[str, str | None]:
     """The merge rule, as (command for the other guard checks, refusal or None). In the middle of a step `git merge`
     and `git pull` are refused (finishing or aborting a merge already begun is not). Between steps, while a merge is in
@@ -14691,14 +14822,7 @@ def _merge_rule(cmd: str, cwd: str, root: Path) -> tuple[str, str | None]:
         phase, cur = (st or {}).get("phase"), (st or {}).get("current")
         g = lambda *a: subprocess.run(["git", *a], cwd=root, capture_output=True, text=True, timeout=20)
         merging = g("rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0
-        if phase in ("awaiting_checkpoint_review", "awaiting_final_review"):
-            between = True
-        elif phase == "building" and cur and st["checkpoints"][cur].get("step") == "tests":
-            r = g("status", "--porcelain", "--", ".", f":(exclude){RATCHET_DIR}", *JUNK_PATHSPECS)
-            between = r.returncode == 0 and not any(ln for ln in r.stdout.splitlines()
-                                                    if not merging or ln.startswith("??"))
-        else:
-            between = False
+        between = _between_steps(st, root, merging)
         if phase == "building" and not between and any(merge):
             return cmd, MERGE_MID_STEP
         last = next((e for e in reversed((st or {}).get("history") or [])
@@ -16259,6 +16383,10 @@ def main(argv=None):
     a.set_defaults(fn=cmd_lanes)
     a = sp.add_parser("director-key"); a.add_argument("--rotate", action="store_true"); a.set_defaults(fn=cmd_director_key)
     sp.add_parser("director-enroll").set_defaults(fn=cmd_director_enroll)
+    a = sp.add_parser("integrate", help="director only: check a finished lane before merging it into main")
+    a.add_argument("lane", help="the lane's folder (a git worktree) or its branch name")
+    a.add_argument("--dry-run", action="store_true", help="say what integrate would do; change nothing")
+    a.set_defaults(fn=cmd_integrate)
     a = sp.add_parser("director-sign"); a.add_argument("action", choices=["approve-plan", "human-approve", "feedback",
                                                                           "approve-changes", "cancel", "set-review",
                                                                           "hooks-waive", "ui-respec", "guardrail",

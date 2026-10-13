@@ -29,12 +29,11 @@
       "host-both"
     ],
     "normal": [
-      "host-standards",
       [
-        "codex-correctness",
-        "gemini-correctness",
-        "claude-correctness",
-        "copilot-correctness"
+        "host-alt-standards"
+      ],
+      [
+        "host-alt-correctness"
       ]
     ],
     "high": [
@@ -42,15 +41,17 @@
       "host-correctness",
       [
         "codex-correctness",
+        "opencode-kimi-correctness",
+        "opencode-glm-correctness",
+        "copilot-correctness",
         "gemini-correctness",
-        "claude-correctness",
-        "copilot-correctness"
+        "host-alt-correctness"
       ],
       [
+        "opencode-glm-standards",
+        "copilot-standards",
         "gemini-standards",
-        "claude-standards",
-        "codex-standards",
-        "copilot-standards"
+        "host-alt-standards"
       ]
     ]
   },
@@ -91,5 +92,17 @@
     "ratchet-implementer": "standard",
     "ratchet-fixer": "standard"
   },
-  "min_review_seconds": 20
+  "min_review_seconds": 20,
+  "host_models": {
+    "anthropic": {
+      "strong": "inherit",
+      "standard": "sonnet",
+      "light": "haiku",
+      "alternates": [
+        "sonnet",
+        "opus",
+        "fable"
+      ]
+    }
+  }
 }

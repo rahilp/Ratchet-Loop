@@ -439,6 +439,8 @@ The viewer server only serves the viewer, its live data and the prototype, never
 
 Director-signed approvals: the director's session runs in the director role (see the orchestrator's SKILL.md), creates a key once with `ratchet.py director-key`, then enrolls each lane with `ratchet.py --root <lane> director-enroll`. In an enrolled lane chat messages stop counting as approvals; approvals need `ratchet.py --root <lane> director-sign <action>` and `--director-token <t>`. Builder sessions cannot read the key or sign. The director's per-user folder (`RATCHET_HOME`) and key file must be the same ones the lane's hooks use: Ratchet refuses to run when they differ. `RATCHET_ROLE=director` alone is not enough either: the director commands run only where Ratchet's guard hook recorded a director session, so run the director's agent CLI with Ratchet's hooks, in its own folder (not a lane's), and reach lanes with `--root <lane>`. A builder that sets the variable, even inside a script, is refused. A missing record is refused too, whenever Ratchet's hooks are installed or have run there (restart the director's agent CLI so its hooks record the role). Only when no Ratchet hooks are in use at all is the variable taken at its word, and the command says so, because nothing else is enforced then either. The record of the director's session is written by Ratchet's hook command, so a script deliberately written to cheat, running as your own user, can still forge it by calling that command directly with made-up input; this check stops easy shortcuts, not a deliberate forgery.
 
+Merging a finished lane into main (director only, like `director-sign` and `director-enroll`): `ratchet.py --root <main> integrate <lane folder or branch> --dry-run` checks that the lane's run is finished, that the lane and main have no uncommitted project changes and no merge in progress, and that main's own run is not building in the middle of a step or blocked (a done, paused, cancelled or not-yet-approved run does not stop it). It prints the commits it would bring to main, which of Ratchet's own shared files differ, which uncommitted Ratchet files on main it would carry across (never committing them) and the suite it would run. It changes nothing and runs no git command that writes or pushes. Without `--dry-run` it does not merge yet.
+
 The person's override: if you ever need to approve or accept something yourself, outside the chat, run the command in your own terminal with `RATCHET_HUMAN_OVERRIDE=1` set. Ratchet shows a short code in that terminal and goes ahead only after you type it back. An agent's shell has no terminal, so setting the variable there approves nothing. Each use is written to `.ratchet/human_log.jsonl`; if Ratchet can't write that line, it refuses the override and changes nothing. Like the other protections, this stops easy shortcuts, not a script deliberately written to cheat: one running as your own user that starts its own pseudo-terminal, or forges Ratchet's records by calling its hook command directly, can still get past it.
 
 ### Running the tests
@@ -486,6 +488,8 @@ python3 tests/test_hooks.py
 python3 tests/test_hooks_status.py
 python3 tests/test_hooks_waiver.py
 python3 tests/test_install.py
+python3 tests/test_integrate_check.py
+python3 tests/test_integrate_phases.py
 python3 tests/test_lane_added_tests.py
 python3 tests/test_limits.py
 python3 tests/test_merge_guard.py
