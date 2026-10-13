@@ -34,6 +34,7 @@ import secrets
 import json
 import os
 import re
+import shlex
 import unicodedata
 import shutil
 import socket
@@ -151,6 +152,18 @@ DEFAULT_CONFIG = {
     "spec_archive": True,
     "spec_keep": None,              # no spec tool: keep a running spec (openspec/specs/<run>/spec.md)? None = not asked yet           # archive an OpenSpec change (merge its deltas into the specs) when the run is approved
     "regression_command": None,     # full suite run before a checkpoint can complete
+    # The quick path (`ratchet.py changes CPn`): a file matching doc_globs and not doc_exclude_globs (plus the
+    # configured design_md and standards files) counts as a doc, not code. A test file matching test_globs "names"
+    # a doc when its text contains the doc's repo-relative path or file name. doc_test_command (with a {files}
+    # placeholder) runs just those files; unset, the docs quick path is off. small_edit_lines is the line-count
+    # ceiling (git diff --numstat, added+removed) for a one-reviewer small fix.
+    # .mdx is left out by default because it can hold real JSX code (Next.js pages, Docusaurus, Storybook);
+    # a project whose .mdx files are prose only can add "*.mdx" to its own doc_globs.
+    "doc_globs": ["*.md", "*.rst", "*.adoc"],
+    "doc_exclude_globs": ["SKILL.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", "agents/*.md"],
+    "test_globs": ["test_*", "*_test.*", "*.test.*", "*.spec.*"],
+    "doc_test_command": None,
+    "small_edit_lines": 20,
     "commit_per_checkpoint": True,
     "design_md": "DESIGN.md",
     "standards": [".ratchet/standards.md"],
@@ -491,6 +504,390 @@ def touches_ui(files: list[str], globs: list[str]) -> list[str]:
         if any(fnmatch.fnmatch(name, g) or fnmatch.fnmatch(f, g) for g in globs):
             hits.append(f)
     return hits
+
+
+# --------------------------------------------------------------------------- quick path (`ratchet.py changes`)
+
+def _glob_hit(f: str, globs: list[str]) -> bool:
+    """True when f's basename or full repo-relative path matches one of globs — touches_ui's own rule. A
+    directory-shaped glob (one containing "/", e.g. "agents/*.md") also matches at any depth below the repo
+    root (e.g. "apps/bot/agents/x.md"), not only directly under a root-level directory of that name, so a
+    per-package instruction-file layout is a normal, expected match rather than a silent gap."""
+    name = os.path.basename(f)
+    return any(fnmatch.fnmatch(name, g) or fnmatch.fnmatch(f, g) or ("/" in g and fnmatch.fnmatch(f, "*/" + g))
+               for g in globs)
+
+
+def _project_files(root: Path, fp: dict) -> list[str]:
+    """Every file in fp's tree (tracked and untracked, minus .ratchet) — not just what git has staged or
+    committed — so a doc-naming test file still counts even before anyone runs `git add`."""
+    if fp.get("kind") == "git-tree":
+        r = subprocess.run(["git", "ls-tree", "-r", "--name-only", "--full-tree", fp["id"]], cwd=root,
+                           capture_output=True, text=True)
+        return [l for l in r.stdout.splitlines() if l]
+    return sorted(read_json(root / RATCHET_DIR / "manifests" / f"{fp['id']}.json", {},
+                            record="Ratchet treats it as naming no files (the fingerprint manifest cache, named "
+                                   "by its own hash)") or {})
+
+
+def _code_size(ctx: "Ctx", from_id: str, to_id: str, code_files: list[str]) -> tuple[int | None, list[str]]:
+    """git diff --numstat added+removed line count for code_files between two tree ids. Git prints "-\t-\tpath"
+    for a file it can't diff as text (binary): that size is unknown, not zero, so the total is reported as
+    `None` (never a partial sum that silently drops the unknown files) whenever any code file is uncountable.
+    Returns (total_or_None, the uncountable file paths)."""
+    if not code_files:
+        return 0, []
+    r = subprocess.run(["git", "diff", "--numstat", from_id, to_id, "--", *code_files], cwd=ctx.root,
+                       capture_output=True, text=True)
+    total, unknown = 0, []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            total += int(parts[0]) + int(parts[1])
+        except ValueError:
+            unknown.append(parts[2])  # binary file: numstat prints "-\t-\tpath"; size can't be counted
+    return (None if unknown else total), unknown
+
+
+def _tests_naming(ctx: "Ctx", cfg: dict, fp: dict, docs: list[str]) -> list[str]:
+    """Which test files (test_globs) name any of `docs` by its repo-relative path or file name (a plain
+    substring match, never guessed). Shared by both of classify_changes's ranges (base_tree and since_approval)
+    so a doc that is changed and then restored in one range, but not the other, still gets the tests that name
+    it from whichever range actually lists it as changed."""
+    if not docs:
+        return []
+    out = []
+    candidates = [t for t in _project_files(ctx.root, fp) if _glob_hit(t, cfg.get("test_globs") or [])]
+    for t in sorted(set(candidates)):
+        try:
+            text = (ctx.root / t).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(d in text or os.path.basename(d) in text for d in docs):
+            out.append(t)
+    return out
+
+
+def classify_changes(ctx: "Ctx", cp_id: str) -> dict:
+    """Read-only report of what changed since cp_id's base_tree: which files are docs (doc_globs, minus
+    doc_exclude_globs plus the configured design_md and standards files), which are code, how many code lines
+    changed in the code files (git diff --numstat, added+removed), which test files (test_globs) name a changed
+    doc by its repo-relative path or file name, and whether doc_test_command is configured at all. A code file
+    git can't diff as text (binary) makes `code_lines_changed` None and `code_lines_unknown` True: an unknown
+    size is reported plainly, never as zero, so it can never read as a small change. `since_approval` repeats
+    the same report (its own `doc_test_files` included, matched independently against its own `doc_files` so a
+    doc changed then restored in one range but not the other still gets the tests naming it from whichever
+    range actually lists it) for the narrower range from the adversarial gate's last recorded approval
+    fingerprint (when that gate has one) to now, plus a plain `docs_only`; when there is no recorded approval
+    yet (gate not required, or required but not yet passed), `approved` is False with a plain reason and the
+    rest are empty.
+    Never writes, and never gates: a locked reference file (DESIGN.md, standards) drifting since approval is
+    still just reported here as a changed file, not refused (that refusal is every other command's, not this
+    read-only report's). Which check (docs quick path, small fix, or full) applies to either range is not this
+    report's decision."""
+    st = ctx.state()
+    cps = (st.get("checkpoints") or {}).get(cp_id)
+    if cps is None:
+        die(f"{cp_id} is not a checkpoint in this run.")
+    cfg = ctx.config()
+    base = cps.get("base_tree")
+    fp = fingerprint(ctx.root)
+    files = sorted(changed_files(ctx.root, {"kind": "git-tree", "id": base}, fp)) if base else []
+    doc_files, code_files = _classify_doc_code(cfg, files)
+    code_lines, code_unknown = _code_size(ctx, base, fp["id"], code_files) if base else (0, [])
+    doc_test_files = _tests_naming(ctx, cfg, fp, doc_files)
+    doc_cmd = cfg.get("doc_test_command")
+    adv = (cps.get("gates") or {}).get("adversarial") or {}
+    approval_fp = adv.get("fingerprint")
+    if not approval_fp:
+        since_approval = {
+            "approved": False,
+            "reason": ("the adversarial gate is not required for this checkpoint" if not adv.get("required")
+                      else "the adversarial gate has not been approved yet for this checkpoint"),
+            "doc_files": [], "code_files": [], "code_lines_changed": 0, "code_lines_unknown": False,
+            "doc_test_files": [], "docs_only": None,
+        }
+    else:
+        a_files = sorted(changed_files(ctx.root, approval_fp, fp))
+        a_doc_files, a_code_files = _classify_doc_code(cfg, a_files)
+        a_lines, a_unknown = _code_size(ctx, approval_fp["id"], fp["id"], a_code_files)
+        since_approval = {
+            "approved": True,
+            "reason": None,
+            "doc_files": a_doc_files,
+            "code_files": a_code_files,
+            "code_lines_changed": a_lines,
+            "code_lines_unknown": bool(a_unknown),
+            "doc_test_files": _tests_naming(ctx, cfg, fp, a_doc_files),
+            "docs_only": len(a_code_files) == 0,
+        }
+    return {
+        "docs_only": len(code_files) == 0,
+        "doc_files": doc_files,
+        "code_files": code_files,
+        "code_lines_changed": code_lines,
+        "code_lines_unknown": bool(code_unknown),
+        "doc_test_files": doc_test_files,
+        "doc_quick_path": {"enabled": bool(doc_cmd),
+                            "reason": None if doc_cmd else "doc_test_command is not configured"},
+        "since_approval": since_approval,
+    }
+
+
+def cmd_changes(args):
+    """`ratchet.py changes CPn [--json]`: classify_changes, read-only (not in STATE_LOCKED_CMDS)."""
+    ctx = Ctx(find_root())
+    data = classify_changes(ctx, args.cp)
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2))
+        return
+    print(f"docs only: {data['docs_only']}")
+    print(f"doc files: {', '.join(data['doc_files']) or '(none)'}")
+    print(f"code files: {', '.join(data['code_files']) or '(none)'}")
+    print(f"code lines changed: {'unknown (binary code change)' if data['code_lines_unknown'] else data['code_lines_changed']}")
+    print(f"doc test files: {', '.join(data['doc_test_files']) or '(none)'}")
+    qp = data["doc_quick_path"]
+    print(f"docs quick path: {'on' if qp['enabled'] else 'off'}" + (f" ({qp['reason']})" if qp["reason"] else ""))
+    sa = data["since_approval"]
+    if not sa["approved"]:
+        print(f"since approval: not approved yet ({sa['reason']})")
+    else:
+        sa_lines = "unknown (binary code change)" if sa["code_lines_unknown"] else sa["code_lines_changed"]
+        print(f"since approval: docs only={sa['docs_only']}, doc files: {', '.join(sa['doc_files']) or '(none)'}, "
+              f"code files: {', '.join(sa['code_files']) or '(none)'}, code lines changed: {sa_lines}, "
+              f"doc test files: {', '.join(sa['doc_test_files']) or '(none)'}")
+
+
+# --------------------------------------------------------------------------- doc quick path at `complete` (CP2)
+# Doc edits made after a gate's own approval never reopen a review round: when every file changed since that
+# gate's recorded fingerprint is a doc (the one doc/code split in `_classify_doc_code`, also used by
+# classify_changes above so the two can never disagree) and doc_test_command is configured, `cmd_complete` runs
+# just the test files naming those docs instead of marking the gate stale. The same rule also lets a passing
+# full suite stay valid across a doc-only edit (`_skip_full_suite`), and every doc edit skipped this way is
+# recorded on the checkpoint (`doc_edits_unreviewed`) so the commit message, `status` and the final review can
+# all say so.
+
+def _classify_doc_code(cfg: dict, files: list[str]) -> tuple[list[str], list[str]]:
+    """The one doc/code split (doc_globs, minus doc_exclude_globs plus the configured design_md and standards
+    files) for an arbitrary file list. `classify_changes` above and `cmd_complete`'s quick path both call this
+    so what counts as a doc can never drift between the read-only report and the gate that skips review."""
+    exclude = [g for g in [*(cfg.get("doc_exclude_globs") or []), cfg.get("design_md"),
+                           *(cfg.get("standards") or [])] if g]
+    doc_globs = cfg.get("doc_globs") or []
+    doc_files = [f for f in files if _glob_hit(f, doc_globs) and not _glob_hit(f, exclude)]
+    code_files = [f for f in files if f not in doc_files]
+    return doc_files, code_files
+
+
+def _run_doc_test_command(ctx: "Ctx", cfg: dict, files: list[str], log_path: Path) -> tuple[int, str]:
+    """Runs doc_test_command with its {files} placeholder filled in by `files` (shlex-quoted, space-joined),
+    logged the same way _run_cmd logs regression_command. Returns (exit code, combined stdout+stderr)."""
+    cmd = cfg["doc_test_command"].replace("{files}", " ".join(shlex.quote(f) for f in files))
+    code, out, _ = _run_cmd(ctx, cmd, log_path, cfg["test_timeout_sec"])
+    return code, out
+
+
+def _skip_full_suite(ctx: "Ctx", cfg: dict, st: dict, fp: dict) -> tuple[bool, list[str]]:
+    """(True, the doc files involved) when regression_command already passed on a tree recorded at
+    st['regression_passed_fp'] that differs from `fp` only in docs (and doc_test_command is configured), so
+    `complete` can run just those docs' naming tests instead of the full suite again. (False, []) when there is
+    no recorded pass yet, the doc quick path is off, or anything that changed since is code."""
+    passed_fp = st.get("regression_passed_fp")
+    if not passed_fp or not cfg.get("doc_test_command"):
+        return False, []
+    changed = [f for f in changed_files(ctx.root, passed_fp, fp)
+              if f != RATCHET_DIR and not f.startswith(RATCHET_DIR + "/")]
+    if not changed:
+        return True, []
+    doc_files, code_files = _classify_doc_code(cfg, changed)
+    return (not code_files), doc_files
+
+
+def _doc_edit_status_lines(st: dict) -> list[str]:
+    """One plain line per checkpoint whose doc edit(s) after review were never re-reviewed (CP2's quick path),
+    for `status`, the commit message and the final review to all say the same thing about the same files."""
+    lines = []
+    for cid, c in (st.get("checkpoints") or {}).items():
+        docs = c.get("doc_edits_unreviewed")
+        if docs:
+            lines.append(f"{cid}: edited after review and not re-reviewed (doc quick path): {', '.join(docs)}.")
+    return lines
+
+
+# --------------------------------------------------------------------------- small-fix one-reviewer round (CP3)
+# After a checkpoint's adversarial gate has a clean, approved round, a small code fix made since that approval
+# (since_approval.code_lines_changed, the same measurement classify_changes/`changes --json` reports, at or
+# under config small_edit_lines) in a step that is not high risk opens its next review round with exactly one
+# reviewer instead of the step's normal full set, told to look only at the file(s) changed since approval
+# (review_rules' existing focus_files mechanism for round > 1 — unchanged). A fix over the limit, a code change
+# of unknown size (binary), or any fix in a high-risk step still opens the normal full round; a doc-only edit is
+# never downgraded here (docs_only stays on CP2's zero-reviewer quick path at `complete`, which runs before
+# `reviewers` would ever be called for it). `cmd_reviewers` sets `small_fix` on the round it opens;
+# `cmd_adv_record` records who did it on the checkpoint (`small_fix_review`) once that round is approved, so the
+# commit message and `status` can both say the fix was reviewed as a small fix by one reviewer, naming it.
+# The size is measured against the checkpoint's last FULL (non-small-fix) approval, not simply the gate's latest
+# one, so several small fixes in a row still add up: `cmd_adv_record` only updates `last_full_review_fingerprint`
+# on a full-round approval, never on a small-fix one, so the baseline stays put across a run of small fixes.
+
+def _is_small_fix_round(ctx: "Ctx", cfg: dict, cp_id: str, cp: dict, cps: dict, g: dict) -> bool:
+    if cp.get("risk", "normal") == "high":
+        return False
+    if cp.get("reviewers"):
+        return False  # the checkpoint pins its own reviewer list; that override always gets a normal full round
+    full_fp = cps.get("last_full_review_fingerprint")
+    if not full_fp:
+        return False  # no FULL-round approval recorded yet to measure a fix against (a user accept sets the
+        # gate fingerprint but never last_full_review_fingerprint, so it does not qualify): a "stale" status,
+        # set by `complete` once it detects the fix, does not disqualify it -- the approval itself still stands
+    fp = fingerprint(ctx.root)
+    files = sorted(changed_files(ctx.root, full_fp, fp))
+    doc_files, code_files = _classify_doc_code(cfg, files)
+    if not code_files:
+        return False  # nothing but docs changed since the last full review: not this round's concern
+    code_lines, code_unknown = _code_size(ctx, full_fp["id"], fp["id"], code_files)
+    if code_unknown:
+        return False
+    return code_lines <= cfg.get("small_edit_lines", 20)
+
+
+def _small_fix_reviewers(ctx: "Ctx", cfg: dict, cp: dict, exclude=None) -> list[dict] | None:
+    """Resolve a small-fix round's reviewer the one way it is ever allowed to be resolved: review_depth["low"],
+    accepted only when it comes back as exactly one both-lens reviewer. Used both when a small-fix round opens
+    and when cmd_reviewers re-resolves an already-open small-fix round (CP3 round-04 fix: the re-resolution
+    branch used to fall back to the step's own, possibly single-lens, risk instead of this). Returns None when
+    low-risk resolution can't produce a single both-lens reviewer, so the caller falls back to a normal round."""
+    low_resolved = resolve_reviewers(ctx, cfg, dict(cp, risk="low"), exclude=exclude)
+    if len(low_resolved) == 1 and (_roster_spec(cfg, low_resolved[0]["id"]) or {}).get("lens") == "both":
+        return low_resolved
+    return None
+
+
+def _small_fix_review_line(cid: str, cps: dict) -> str | None:
+    sf = cps.get("small_fix_review")
+    if not sf:
+        return None
+    who = sf.get("reviewer") or "a reviewer"
+    return f"{cid}: round {sf.get('round')} was reviewed as a small fix by one reviewer ({who})."
+
+
+def _small_fix_review_lines(st: dict) -> list[str]:
+    """One plain line per checkpoint whose last approved adversarial round was a one-reviewer small-fix review,
+    naming that reviewer, for `status` and the commit message to say the same thing about the same round."""
+    lines = []
+    for cid, c in (st.get("checkpoints") or {}).items():
+        line = _small_fix_review_line(cid, c)
+        if line:
+            lines.append(line)
+    return lines
+
+
+# --------------------------------------------------------------------------- docs-only step skips review (CP4)
+# When a checkpoint's own change since its base_tree (never the plan's claim -- the same real diff
+# `classify_changes` reports) is docs only, the step is not high risk, and doc_test_command is configured,
+# opening the checkpoint's adversarial review never opens a reviewer round: it runs the test files naming
+# those doc(s) instead (a failure names the test file and leaves the gate's status untouched) and, on success,
+# marks the adversarial gate passed directly, recording the skip (`docs_only_review_skip`) so the commit
+# message, `status` and the final review can all say which files were never reviewed and why. Reuses CP1's
+# `_classify_doc_code`/`_tests_naming` and CP2's `_run_doc_test_command` so the doc/code rule and the
+# doc-test-running logic never duplicate.
+
+def _docs_only_review_skip(ctx: "Ctx", st: dict, cfg: dict, cp: dict, cps: dict, cp_id: str,
+                           json_out: bool = False) -> bool:
+    """True once this call has handled the adversarial gate for a docs-only step (the caller returns without
+    opening a round); False when the normal full round still applies (code changed, high risk, a pinned
+    reviewer list, or the docs quick path is off)."""
+    if cp.get("risk", "normal") == "high" or not cfg.get("doc_test_command"):
+        return False
+    if cp.get("reviewers"):
+        return False  # the checkpoint pins its own reviewer list; that override always gets a normal full
+        # round, same as _is_small_fix_round
+    base = cps.get("base_tree")
+    if not base:
+        return False
+    fp = fingerprint(ctx.root)
+    files = sorted(changed_files(ctx.root, {"kind": "git-tree", "id": base}, fp))
+    if not files:
+        return False
+    doc_files, code_files = _classify_doc_code(cfg, files)
+    if code_files or not doc_files:
+        return False
+    doc_test_files = _tests_naming(ctx, cfg, fp, doc_files)
+    if doc_test_files:
+        dcode, dout = _run_doc_test_command(ctx, cfg, doc_test_files, ctx.evidence(cp_id) / "docs-only-review.log")
+        if dcode != 0:
+            die(f"{cp_id}: docs-only review check failed for {', '.join(doc_test_files)}:\n{_tail(dout)}", 2)
+        if fingerprint(ctx.root)["id"] != fp["id"]:
+            die("The doc test command changed files in the project. Those changes were never reviewed — find "
+                "out what wrote them (generated files? snapshots?) and either add them to .gitignore or "
+                "re-run the gates.", 2)
+    cps["gates"]["adversarial"].update(status="passed", fingerprint=fp, passed_at=now())
+    cps["docs_only_review_skip"] = {"files": doc_files, "doc_test_files": doc_test_files}
+    cps["step"] = _earliest_open_step(cps)
+    ctx.log(st, "adversarial_docs_only_skip", cp=cp_id, files=",".join(doc_files))
+    ctx.save_state(st)
+    build_viewer(ctx)
+    if json_out:
+        print(json.dumps({"checkpoint": cp_id, "docs_only_skip": {"files": doc_files,
+                                                                    "doc_test_files": doc_test_files}}, indent=2))
+    else:
+        print(f"{cp_id}: review skipped -- this step's change is docs only ({', '.join(doc_files)}); not reviewed. "
+              f"Doc test(s) run instead: {', '.join(doc_test_files) or '(no test file names these docs)'}")
+    return True
+
+
+def _docs_only_quick_path_off_note(ctx: "Ctx", cfg: dict, cp: dict, cps: dict) -> str | None:
+    """A plain note for `reviewers`' text output when this checkpoint's diff since base_tree is docs only but
+    doc_test_command is not configured, so the docs quick path is off and the normal full round still applies
+    -- visibility for why no skip happened, mirroring `changes`'s own doc_quick_path report."""
+    if cfg.get("doc_test_command") or cp.get("risk", "normal") == "high":
+        return None
+    base = cps.get("base_tree")
+    if not base:
+        return None
+    fp = fingerprint(ctx.root)
+    files = sorted(changed_files(ctx.root, {"kind": "git-tree", "id": base}, fp))
+    if not files:
+        return None
+    doc_files, code_files = _classify_doc_code(cfg, files)
+    if code_files or not doc_files:
+        return None
+    return (f"Docs quick path is off (doc_test_command is not configured): the changed file(s) "
+            f"({', '.join(doc_files)}) would otherwise skip review, so this round is the normal full review.")
+
+
+def _docs_only_skip_line(cid: str, cps: dict) -> str | None:
+    skip = cps.get("docs_only_review_skip")
+    if not skip:
+        return None
+    return (f"{cid}: review skipped because the step changed only docs ({', '.join(skip.get('files') or [])}); "
+            "not reviewed.")
+
+
+def _docs_only_skip_lines(st: dict) -> list[str]:
+    """One plain line per checkpoint whose adversarial review was skipped as docs only (CP4), naming the
+    file(s) never reviewed, for `status`, the commit message and the final review to all say the same thing."""
+    lines = []
+    for cid, c in (st.get("checkpoints") or {}).items():
+        line = _docs_only_skip_line(cid, c)
+        if line:
+            lines.append(line)
+    return lines
+
+
+# ----------------------------------------------------------- a full review clears skipped-review notes (CP5)
+# A record that a step's review was skipped or lightened (CP2's doc_edits_unreviewed, CP3's small_fix_review,
+# CP4's docs_only_review_skip) says less review happened than the step's history actually shows once a later
+# FULL round (every reviewer the step's own risk names) is recorded approved. `cmd_adv_record` calls this once,
+# on that full-round-approval branch only, next to where it sets `last_full_review_fingerprint` -- a small-fix
+# approval or a docs-only skip never clears any of these (they are not a full round), and a round that is not
+# approved is never reached here at all.
+
+def _clear_lighter_review_records(cps: dict) -> None:
+    cps.pop("docs_only_review_skip", None)
+    cps.pop("doc_edits_unreviewed", None)
+    cps.pop("small_fix_review", None)
 
 
 # --------------------------------------------------------------------------- tamper evidence
@@ -1569,7 +1966,8 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "fingerprint_include", "approver", "ui_single_reviewer_ok", "min_review_timeout_sec", "test_timeout_sec",
              "host_provider", "ui_reviewers", "design_md", "max_stop_blocks", "unavailable_ttl_hours",
              "verify_transcripts", "min_review_seconds", "commit_per_checkpoint", "blocking_severities",
-             "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round", "converge_after_round"]
+             "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round", "converge_after_round",
+             "doc_globs", "doc_exclude_globs", "test_globs", "doc_test_command", "small_edit_lines"]
 
 
 def _file_sha(p: Path) -> str | None:
@@ -2871,6 +3269,12 @@ def cmd_status_text(ctx: Ctx):
         print(note)
     for line in _accepted_findings_lines(st):
         print(line)
+    for line in _doc_edit_status_lines(st):
+        print(line)
+    for line in _small_fix_review_lines(st):
+        print(line)
+    for line in _docs_only_skip_lines(st):
+        print(line)
     w = live_wait(st)
     if w:
         print(f"Waiting on: {w['reason']} (until {w['until'][:16].replace('T', ' ')} UTC).")
@@ -3019,6 +3423,15 @@ def cmd_plan_summary(args):
           f"and kind of review count once, not twice; a round nobody reviewed yet costs nothing to replace; and "
           f"from round {converge_after + 1} on, a minor finding alone no longer blocks (it is still recorded, see "
           f"`ratchet.py deferred`).")
+    print(f"\nQuick paths: a step whose actual changes are docs only skips its review round entirely "
+          f"(the test files naming those docs run instead); once a step's review has approved, a doc edit "
+          f"made after that approval re-runs the test files naming that doc instead of opening a new review "
+          f"round; a small code fix (at or under {cfg.get('small_edit_lines', 20)} changed lines) in a step "
+          f"that is not high risk gets a one-reviewer check instead of the full round. A high-risk step, or "
+          f"any change that also touches code, always gets the normal full review and tests.")
+    if not cfg.get("doc_test_command"):
+        print("Note: doc_test_command is not configured, so the docs quick path is off right now: every step, "
+              "docs-only ones included, gets the normal full review and tests.")
     rows = dict(models_table(cfg))
     groups = {}
     for role, m in rows.items():
@@ -3191,6 +3604,82 @@ def _write_providers(ctx, plist):
     write_json(ctx.config_path, user)
 
 
+def _paid_provider_reply(model) -> str:
+    """The one exact reply that pays for a per-use (or unknown-cost) model, named in `ask paid-provider`'s
+    question. Never a generic listed yes (APPROVAL_REPLIES): this spends the developer's money, so the reply
+    must name the model it pays for, the same rule the learnings set for hooks-waive and accept-finding."""
+    return f"pay per use: {model}"
+
+
+def _needs_paid_ok(pv) -> str | None:
+    """'per-use' / 'unknown' when this `--add`'ed provider's model is billed per use (or its cost is
+    unknown, treated the same way) and so needs the developer's OK before it is probed; None when the
+    preset has no model lister (the cost check doesn't apply to it, e.g. a hand-written --command) or the
+    model is flat-rate."""
+    preset = pv.get("preset")
+    model = pv.get("model")
+    if not preset or preset not in MODEL_LISTERS or not model:
+        return None
+    cost = _listed_model_cost(model)
+    return cost if cost != "flat" else None
+
+
+def _paid_ok_refusal(tool, model) -> str:
+    return (f"{model} (via {tool}) costs money per use (or its cost is unknown, which Ratchet treats the same "
+            "way), including this one test request, so it was not added and nothing was sent to it. Ask the "
+            f"developer first: run `ratchet.py ask paid-provider {tool} {model}`, show them the question it "
+            "prints word for word, and wait for their exact reply before adding it.")
+
+
+def _consume_paid_ok(ctx, st, pv) -> str:
+    """The developer's one exact reply to `ask paid-provider <tool> <model>` for this exact tool and model,
+    consumed once (`providers --add` is state-locked whenever it may need this, so nothing else can spend it
+    at the same time). Dies, with nothing added and no request sent, when no such reply is on record, when
+    this lane is director-enrolled (a chat reply never counts as the developer's own OK to spend money, the
+    same rule as every other approval here), or when another question overtook this one before it was
+    answered."""
+    tool, model = pv.get("preset"), pv.get("model")
+    if approval_mode(ctx) == "director":
+        die(f"{model} (via {tool}) costs money per use (or its cost is unknown, treated the same way), and "
+            "this lane is director-enrolled: a chat reply here never counts as the developer's own OK to "
+            "spend money (unlike every other approval, paid-provider takes no director token). Nothing was "
+            "added and nothing was sent to it. The developer must give this OK themselves, in a lane that "
+            "isn't director-enrolled.")
+    p = st.get("pending") or {}
+    refusal = _paid_ok_refusal(tool, model)
+    if p.get("action") != "paid-provider" or p.get("tool") != tool or p.get("model") != model:
+        die(refusal)
+    if p.get("overtook"):
+        _clear_pending(st)
+        ctx.log(st, "paid_provider_unclear", tool=tool, model=model)
+        ctx.save_state(st)
+        die(f"This question was printed while another one (shall I "
+            f"{_question_what(p['overtook'], p.get('overtook_mode'))}?) was still waiting for the user's first "
+            "reply, so their reply could be meant for either. Nothing was added. Run `ratchet.py ask "
+            f"paid-provider {tool} {model}` again on its own.")
+    msgs = _replies(ctx, st, p.get("asked_at"), p)
+    if not msgs:
+        die(refusal)
+    entry = msgs[0]  # only the first reply after the question answers it
+    reply = entry.get("prompt", "")
+    exact = _paid_provider_reply(model)
+    if reply.strip().casefold() != exact.strip().casefold():
+        _spend_question(ctx, st, reply)
+        die(f"The user's first reply after the paid-provider question was not the exact reply \"{exact}\" (it "
+            f"was \"{reply[:120]}\"). Nothing was added. If they still want this, run `ratchet.py ask "
+            f"paid-provider {tool} {model}` again and show them the question word for word.")
+    if ctx.config().get("verify_transcripts", True):
+        good, why = _transcript_ok(entry, p.get("asked_at"))
+        if not good:
+            _spend_question(ctx, st, reply)
+            die(f"Couldn't confirm that reply came from the user ({why}). Nothing was added. Run `ratchet.py "
+                f"ask paid-provider {tool} {model}` again and ask them to reply again in this chat.")
+    _clear_pending(st)
+    ctx.log(st, "paid_provider_ok", tool=tool, model=model)
+    ctx.save_state(st)
+    return entry.get("at") or now()
+
+
 def cmd_providers(args):
     ctx = Ctx(find_root())
     ctx.ratchet.mkdir(exist_ok=True)
@@ -3226,6 +3715,12 @@ def cmd_providers(args):
         if not provider_company(pv):
             die(f"Can't tell which company's model '{args.add}' runs. Give --model (a model name from that tool) "
                 "or --company.")
+        paid_cost = _needs_paid_ok(pv)
+        if paid_cost:
+            # Never probed, checked or not, without the developer's own exact yes to THIS tool and model first
+            # (the paid-provider question); this runs before any request is sent, flat-rate adds are unaffected.
+            pv["paid_ok_at"] = _consume_paid_ok(ctx, ctx.state(), pv)
+            pv["cost"] = "per-use"
         if args.no_check:
             # an earlier result was about whatever had this id before
             p = _status_path(ctx)
@@ -3283,6 +3778,7 @@ def cmd_providers(args):
         rows.append({"id": pv["id"], "company": company, "model": pv.get("model"), "installed": installed,
                      "ok": bool(st_.get("ok")) and company not in (None, host), "state": state})
     found = []
+    paid_options = []
     if args.discover:
         known = {provider_binary(pv) for pv in plist}
         for name, pr in PRESETS.items():
@@ -3299,10 +3795,51 @@ def cmd_providers(args):
                 else:
                     rows.append({"id": name, "company": pr["company"], "model": None, "installed": True, "ok": False,
                                  "state": f"installed but failing: {detail}"})
-            elif not pr["company"]:
+            elif not pr["company"] and name not in MODEL_LISTERS:
                 found.append(name)
+            elif not pr["company"]:
+                lines, fmt, raw = _list_tool_models(name)
+                if fmt == "json" and raw:
+                    try:
+                        catalog = json.loads(raw)
+                    except (ValueError, TypeError):
+                        catalog = None
+                    lines = _model_catalog_lines(catalog) if isinstance(catalog, dict) else []
+                if not lines:
+                    found.append(name)
+                    continue
+                have = {r["company"] for r in rows if r.get("ok")}
+                picked = _pick_capable_listed_model(lines, host, have)
+                if picked:
+                    pv = {"id": f"{name}-{_model_family(_listed_model_name(picked))}", "preset": name,
+                          "model": picked, "cost": "flat"}
+                    good, detail, _saved = probe_provider(ctx, cfg, pv)
+                    if good:
+                        plist.append(pv)
+                        _write_providers(ctx, plist)
+                        rows.append({"id": pv["id"], "company": company_of_model(picked), "model": picked,
+                                     "installed": True, "ok": True, "cost": "flat",
+                                     "state": "working: added (flat-rate)"})
+                    else:
+                        rows.append({"id": pv["id"], "company": company_of_model(picked), "model": picked,
+                                     "installed": True, "ok": False, "cost": "flat",
+                                     "state": f"a flat-rate {name} model failed its test request: {detail}"})
+                else:
+                    # Every listed line was same-company, unmappable or a small/preview variant: nothing to
+                    # probe, but the tool is still installed and signed in, so keep it reachable by hand.
+                    found.append(name)
+                for (provider, company), group_lines in _paid_candidate_groups(lines, host).items():
+                    rep = _paid_pick(group_lines)
+                    if not rep:
+                        continue
+                    cost = _listed_model_cost(rep)
+                    label = "costs money per use" if cost == "per-use" else "cost unknown, treated as paid"
+                    paid_options.append({"tool": name, "provider": provider,
+                                         "model": _listed_model_name(rep), "add_model": rep, "cost": cost,
+                                         "text": f"{label}; ask the developer before this is used."})
     if args.json:
-        print(json.dumps({"host": host, "providers": rows, "needs_model": found}, indent=2))
+        print(json.dumps({"host": host, "providers": rows, "needs_model": found, "paid_options": paid_options},
+                         indent=2))
         return
     print(f"This agent runs on: {host}.")
     for r in rows:
@@ -3311,6 +3848,8 @@ def cmd_providers(args):
         print(f"  + {name:<10} {'?':<10} installed; it can run several companies' models. Pick a capable model from "
               f"a company other than {host} (the tool's own help lists them), then: "
               f"ratchet.py providers --add {name} --preset {name} --model <model>")
+    for p in paid_options:
+        print(f"  $ {p['tool']}/{p['provider']} {p['model']}: {p['text']}")
     if not any(r["ok"] for r in rows):
         print(f"No working provider from another company: reviews will come from {host}'s own models.")
 
@@ -3657,6 +4196,10 @@ PRESETS = {
                "command": ["cursor-agent", "-p", "{prompt}", "--output-format", "text", "--trust", "--mode", "ask"]},
     "opencode": {"bin": "opencode", "company": None, "stdin": False, "model_flag": ["-m"], "model_at": 2,
                  "command": ["opencode", "run", "{prompt}"]},
+    "omp": {"bin": "omp", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
+            "command": ["omp", "-p", "--no-session", "{prompt}"]},
+    "pi": {"bin": "pi", "company": None, "stdin": False, "model_flag": ["--model"], "model_at": 1,
+           "command": ["pi", "-p", "--no-session", "{prompt}"]},
 }
 SHIPPED_DEFAULT_HISTORY = {"review_depth": [OLD_DEFAULT_REVIEW_DEPTH], "reviewers": [OLD_DEFAULT_REVIEWERS]}
 PRESET_BINARIES = {k: v["bin"] for k, v in PRESETS.items()}
@@ -3693,6 +4236,217 @@ def company_of_model(model) -> str | None:
         if re.search(rx, m):
             return company
     return None
+
+
+# A multi-company preset (today: opencode, omp) can list what it can reach without spending anything, so discovery
+# can pick a capable other-company model itself instead of leaving it to "needs_model". MODEL_LISTERS: preset
+# name -> the read-only command that prints "provider/model" lines, one per line. PROVIDER_COST: the service
+# namespace before a listed model's first "/" -> "flat" (a subscription already paid for) or "per-use" (billed
+# per request); a namespace missing from this table is unknown and is treated as paid, never probed without the
+# developer's OK. Both are small fixed tables, not a live price lookup (out of scope for this checkpoint).
+MODEL_LISTERS = {
+    "opencode": (["opencode", "models"], 20),
+    "omp": (["omp", "models", "--json"], 20, "json"),
+}
+PROVIDER_COST = {
+    "opencode-go": "flat",     # OpenCode Go: flat-rate subscription
+    "opencode": "per-use",     # OpenCode Zen: billed per request
+    "openrouter": "per-use",   # OpenRouter: billed per request
+    "openai-codex": "flat",    # Codex via omp: the developer's own signed-in subscription, already paid for
+}
+# When more than one other-company flat model is available, these families win: GLM and Kimi have been this
+# project's working reviewers so far. A short ordered tuple of name substrings, not a live quality ranking;
+# any company whose models don't match one just ties at "no preference" and falls back to the existing
+# "no working reviewer yet, then listing order" rule.
+FAMILY_PREFERENCE = ("glm", "kimi")
+# Words that mark a listed model as never-pick, whatever picker is asking: a speed/preview/open-weight
+# sibling of a company's flagship (flash, mini, nano, lite, small, haiku, free, preview, oss, gemma) or a
+# model that cannot write a text review at all (guard: safety classifier; image/vision: image generation;
+# embed/tts/audio: not a chat model). A table, not one hand-built regex, so it stays easy to extend. Matched
+# as a name token with _B/_E (so "5-small-2603" matches but "smaller-than-life" as a whole word wouldn't
+# apply here since these are name tokens, not prose) and prefixes included: "[a-z]*" after the word lets a
+# suffix like "flashx" or "liteweight" still match on its "flash"/"lite" prefix.
+REJECT_WORDS = ("flash", "mini", "nano", "lite", "small", "haiku", "free", "preview", "oss", "gemma",
+                "guard", "image", "vision", "embed", "tts", "audio")
+_REJECT_VARIANT_RX = re.compile(_B + r"(?:" + "|".join(REJECT_WORDS) + r")[a-z]*" + _E)
+
+
+def _is_rejected_variant(line: str) -> bool:
+    return bool(_REJECT_VARIANT_RX.search(line.lower()))
+
+
+def _is_model_line(line: str) -> bool:
+    """True for a line shaped like 'provider/model' (non-empty text on both sides of the first '/'), the
+    shape every real model-listing command prints, one per line. A banner, warning or table line on stdout
+    has no such shape and is never a model candidate, flat or paid."""
+    provider, sep, rest = line.partition("/")
+    return bool(sep) and bool(provider.strip()) and bool(rest.strip())
+
+
+def _model_catalog_lines(data) -> list[str]:
+    """Pull 'provider/model' lines out of an already-parsed {"models": [{"provider": ..., "id": ...,
+    "selector": "<provider>/<id>"}, ...]} catalog (omp's `models --json` shape). Falls back to building
+    "<provider>/<id>" when a model has no selector of its own. A shape without a usable models list, or no
+    line shaped like 'provider/model', is just an empty list, the same contract as the plain-lines listing.
+    Takes already-parsed data, never text: the one place that may parse that text into JSON is
+    cmd_providers, the only caller of _list_tool_models (see _CP5R11_JSON_PARSE in test_trust_cp5_d.py)."""
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return []
+    lines = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        sel = m.get("selector")
+        if not sel:
+            provider, mid = m.get("provider"), m.get("id")
+            sel = f"{provider}/{mid}" if provider and mid else None
+        if sel and _is_model_line(str(sel)):
+            lines.append(str(sel))
+    return lines
+
+
+def _list_tool_models(preset_name) -> tuple[list[str], str, str]:
+    """Run a multi-company preset's read-only model-listing command. Returns (lines, fmt, raw).
+    When the MODEL_LISTERS entry names the "lines" format, `lines` already holds its 'provider/model' lines
+    (dropping any line that isn't shaped like one) and `raw` is "". When it names the "json" format (omp's
+    catalog), `lines` is [] and `raw` carries the raw stdout text for the caller (cmd_providers) to parse
+    with _model_catalog_lines, because cmd_providers is the sanctioned place to parse JSON that is not one
+    of Ratchet's own records. A listing failure (not installed, times out, non-zero exit, no output) is
+    just ([], fmt, ""): the caller falls back to today's needs_model line, never a crash and never a
+    garbage candidate."""
+    spec = MODEL_LISTERS.get(preset_name)
+    if not spec:
+        return [], "lines", ""
+    cmd, timeout = spec[0], spec[1]
+    fmt = spec[2] if len(spec) > 2 else "lines"
+    if not shutil.which(cmd[0]):
+        return [], fmt, ""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return [], fmt, ""
+    if r.returncode != 0:
+        return [], fmt, ""
+    if fmt == "json":
+        return [], fmt, r.stdout or ""
+    lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    return [ln for ln in lines if _is_model_line(ln)], fmt, ""
+
+
+def _listed_model_cost(line: str) -> str:
+    """flat / per-use / unknown for one listed 'provider/model' line, by its service namespace (PROVIDER_COST).
+    Missing from the table means unknown, treated as paid."""
+    return PROVIDER_COST.get(line.split("/", 1)[0], "unknown")
+
+
+def _listed_model_name(line: str) -> str:
+    """The model name shown to the developer for a listed line, its service namespace stripped: 'opencode/
+    gpt-5.1-codex' -> 'gpt-5.1-codex', 'openrouter/z-ai/glm-5' -> 'z-ai/glm-5' (only the first '/' is removed)."""
+    return line.split("/", 1)[1] if "/" in line else line
+
+
+def _model_family(model_name: str) -> str:
+    """The short family name used to build a new provider id ('glm-5.3' -> 'glm'): the first non-numeric token
+    of the model name, so 'opencode-glm' reads naturally next to 'opencode-glm-flash' etc."""
+    for part in re.split(r"[^a-z0-9]+", model_name.lower()):
+        if part and not part[0].isdigit():
+            return part
+    return "model"
+
+
+def _family_rank(line: str) -> int:
+    """Where a listed line's model name falls in FAMILY_PREFERENCE (0 = most preferred); a name matching
+    none of the preferred families ranks after all of them, at len(FAMILY_PREFERENCE)."""
+    name = line.lower()
+    for i, fam in enumerate(FAMILY_PREFERENCE):
+        if fam in name:
+            return i
+    return len(FAMILY_PREFERENCE)
+
+
+def _model_version_key(model_name: str) -> tuple:
+    """The "newest version" ranking key, shared by every picker that compares a company's models
+    (_best_capable_line, used by both the flat auto-pick and each paid entry): every number in the model
+    name (after the namespace), as a flat tuple of per-component integers, so '5.10' sorts above '5.9'
+    (comparing them as floats would do the opposite). A number stuck to a unit letter ('120b', '31b', a
+    parameter count) is dropped, and so is a date-shaped number (a lone 4-digit group such as '2507' or
+    '2603', or a 6-8 digit date) -- neither is a version, and left in, a date reliably outranks a real,
+    smaller version number."""
+    stripped = re.sub(r"\d+(?:\.\d+)?[bmkt](?=$|[^a-z0-9])", "", model_name, flags=re.I)
+    stripped = re.sub(r"(?<!\d)\d{4}(?!\d)|(?<!\d)\d{6,8}(?!\d)", "", stripped)
+    return tuple(int(p) for n in re.findall(r"\d+(?:\.\d+)?", stripped) for p in n.split("."))
+
+
+def _best_capable_line(lines) -> str | None:
+    """The one line among a single company's listed lines that discovery may offer as a reviewer, flat or
+    paid: this is the ONE shared ranking used by both the flat auto-pick and each paid entry, so a company
+    is never offered a weaker model one way than the other. A line matching the reject-words table
+    (_is_rejected_variant) is never a candidate, full stop -- there is no fallback to a rejected line, so a
+    company whose only listed models are all rejected variants is simply not offered, flat or paid. Among
+    the survivors, the highest real version wins (_model_version_key); there is no further tie-break (in
+    particular, no name-length tie-break: a longer, suffixed name must never win just by being longer).
+    None if every line was rejected."""
+    survivors = [ln for ln in lines if not _is_rejected_variant(ln)]
+    if not survivors:
+        return None
+    return max(survivors, key=lambda line: _model_version_key(_listed_model_name(line)))
+
+
+def _pick_capable_listed_model(lines, host, have_companies=()) -> str | None:
+    """The one listed 'provider/model' line discovery may itself test and add: flat-rate, a company Ratchet's
+    patterns recognise (company_of_model) that isn't the host's own, and capable (_best_capable_line). An
+    unknown company or an unknown/per-use cost is never a candidate here. Prefers a company with no working
+    reviewer yet (`have_companies`), then the preferred family order (FAMILY_PREFERENCE), then falls back to
+    listing order; within one company, _best_capable_line picks the representative."""
+    by_company: dict[str, list[str]] = {}
+    for line in lines:
+        if _listed_model_cost(line) != "flat":
+            continue
+        company = company_of_model(line)
+        if not company or company == host:
+            continue
+        by_company.setdefault(company, []).append(line)
+    reps = {c: _best_capable_line(ls) for c, ls in by_company.items()}
+    reps = {c: rep for c, rep in reps.items() if rep}
+    if not reps:
+        return None
+    order = list(reps)
+    company = min(order, key=lambda c: (
+        c in have_companies, min(_family_rank(ln) for ln in by_company[c]), order.index(c)))
+    return reps[company]
+
+
+def _paid_candidate_groups(lines, host) -> dict:
+    """Non-flat ('per-use' or unknown-cost) listed lines, grouped by (provider namespace, company), so a
+    provider with many listed models (hundreds of OpenRouter lines, say) collapses to one representative
+    per company instead of flooding paid_options. The host's own company is dropped (never offered as a
+    paid option to pay for a model the host already runs for free). In a namespace PROVIDER_COST already
+    prices (a known paid service such as opencode/ or openrouter/), a model whose company Ratchet can't map
+    is skipped: Ratchet never uses an unknown-company model as a reviewer, so naming one here would just ask
+    the developer to pay for something the engine would then refuse. A namespace PROVIDER_COST doesn't know
+    at all (an unlisted provider) still lists its unmappable models as before, grouped under "", so an
+    unknown provider isn't silently dropped."""
+    groups: dict[tuple[str, str], list[str]] = {}
+    for line in lines:
+        if _listed_model_cost(line) == "flat":
+            continue
+        namespace = line.split("/", 1)[0]
+        company = company_of_model(line) or ""
+        if company and company == host:
+            continue
+        if not company and namespace in PROVIDER_COST:
+            continue
+        groups.setdefault((namespace, company), []).append(line)
+    return groups
+
+
+def _paid_pick(group_lines) -> str | None:
+    """The one line from a (provider, company) group to show as that group's paid option: the same shared
+    ranking the flat picker uses (_best_capable_line), so a paid entry is never named for a model the flat
+    picker itself would have rejected. None if the whole group was rejected variants, in which case the
+    caller must show no paid option for that group rather than suggest paying for a rejected model."""
+    return _best_capable_line(group_lines)
 
 
 def providers(cfg) -> list[dict]:
@@ -4484,6 +5238,9 @@ ASKED_APPROVALS = ("approve-plan", "human-approve", "cancel", "set-review", "app
 
 
 def _ask_cmd(action, mode=None, eng="ratchet.py") -> str:
+    if action == "paid-provider" and mode and ":" in mode:
+        tool, model = mode.split(":", 1)  # `mode` is stored as "tool:model"; the real command takes two args
+        return f"`{eng} ask paid-provider {tool} {model}`"
     return f"`{eng} ask {action}{' ' + mode if mode else ''}`"
 
 
@@ -4491,6 +5248,10 @@ def _question_what(action, mode=None) -> str:
     """The question `ask <action>` put to the user, in the words it used ("shall I <this>?")."""
     if action == "set-review":
         return f"change how often they review to: {REVIEW_MODE_WORDS.get(mode, mode)}"
+    if action == "paid-provider" and mode and ":" in mode:
+        tool, model = mode.split(":", 1)
+        return (f"use {tool}'s {model} (costs money per use, or whose cost is unknown, treated the same way) "
+                "for reviews instead of only flat-rate ones")
     return ASKABLE.get(action, action)
 
 
@@ -4523,13 +5284,12 @@ def _spend_question(ctx, st, reply=""):
 def _asked_reply(ctx, st, action, p):
     """The user's answer to the question `ask <action>` printed, or die. Only their first reply after it counts."""
     want = p.get("action")
-    mode_txt = f" {p['mode']}" if p.get("mode") else ""
     if want != action:
         if want:
             what = _question_what(want, p.get("mode"))
             die(f"A different question is waiting for the user's answer: shall I {what}? Their reply answers THAT "
-                f"question, not this one. If they said yes to it, run `ratchet.py {PENDING_COMMAND.get(want, want)}"
-                f"{mode_txt}`. If they said no or moved on, run `ratchet.py ask withdraw`. Then print this question "
+                f"question, not this one. If they said yes to it, run `ratchet.py {_pending_followup(want, p.get('mode'))}"
+                "`. If they said no or moved on, run `ratchet.py ask withdraw`. Then print this question "
                 f"with {_ask_cmd(action)}, show it to them word for word, and wait for their reply.")
         die(f"Ratchet has not asked the user this question yet, so no reply counts as their answer. Run "
             f"{_ask_cmd(action)}, show them the question it prints word for word, and end your turn. Only their first "
@@ -6696,6 +7456,14 @@ def cmd_adv_record(args):
             "fix-list.json, re-run behavior (and UI if visible code changed), then re-run the adversaries."
             + (f" {ci_note}" if ci_note else ""), 2)
     g.update(status="passed", fingerprint=fp, passed_at=now(), evidence=str(dest.relative_to(ctx.root)))
+    if rnd.get("small_fix"):  # CP3: approved as a one-reviewer small-fix round -- named for the commit/status
+        cps["small_fix_review"] = {"round": rnd["round"], "reviewer": (rnd.get("reviewers") or [None])[0]}
+    else:
+        # CP3: anchor for `_is_small_fix_round` -- only a FULL round's approval moves this, so a run of small
+        # fixes keeps measuring against the same baseline and their sizes add up.
+        cps["last_full_review_fingerprint"] = fp
+        # CP5: this full round's own approval supersedes every lighter-review note recorded before it.
+        _clear_lighter_review_records(cps)
     cps["step"] = _earliest_open_step(cps)
     ctx.log(st, "adversarial_approved", cp=args.cp, round=g["attempts"])
     ctx.save_state(st)
@@ -8410,6 +9178,14 @@ def cmd_complete(args):
         _warn_if_foreground(ctx, cfg)
     fp = fingerprint(ctx.root)
     problems, stale = [], []
+    doc_edits = set()  # CP2 doc quick path: files found doc-only since behavior or adversarial passed, used only
+    # to pick which doc tests replace the staleness check -- never, on its own, a "not re-reviewed" record.
+    doc_edits_unreviewed_now = set()  # only files the ADVERSARIAL gate's own diff found doc-only: that gate's
+    # approval is the review the commit message/status/final review claim, so only this set is ever folded into
+    # cps["doc_edits_unreviewed"]. A file the behavior branch finds doc-only (to avoid the staleness block and
+    # help pick doc tests) is never added here on its own -- the adversarial round may since have reviewed and
+    # approved that exact edit (behavior always passes before the adversarial round opens). When the
+    # adversarial gate isn't required, this set stays empty and nothing is recorded as unreviewed from here.
     for name in ["behavior", "ui", "adversarial"]:
         g = cps["gates"][name]
         if not g["required"]:
@@ -8430,6 +9206,10 @@ def cmd_complete(args):
         if not changed:
             continue
         if name == "behavior":
+            doc_files, code_files = _classify_doc_code(cfg, changed)
+            if not code_files and cfg.get("doc_test_command"):
+                doc_edits.update(doc_files)
+                continue
             problems.append(f"code changed since behavior passed ({len(changed)} files) → re-run ratchet.py behavior {args.cp}")
             stale.append(name)
         elif name == "ui":
@@ -8438,6 +9218,11 @@ def cmd_complete(args):
                 problems.append(f"UI files changed since UI review ({', '.join(ui_changed[:5])}) → re-run ratchet-ui-compare")
                 stale.append(name)
         elif name == "adversarial":
+            doc_files, code_files = _classify_doc_code(cfg, changed)
+            if not code_files and cfg.get("doc_test_command"):
+                doc_edits.update(doc_files)
+                doc_edits_unreviewed_now.update(doc_files)
+                continue
             problems.append("code changed since adversarial approval → adversaries must review the final code")
             stale.append(name)
     if problems:
@@ -8448,7 +9233,45 @@ def cmd_complete(args):
         ctx.log(st, "complete_rejected", cp=args.cp, stale=stale)
         ctx.save_state(st)
         die(f"{args.cp} cannot complete:\n  - " + "\n  - ".join(problems), 2)
-    if cfg.get("regression_command"):
+    if doc_edits:
+        # CP2 doc quick path: every file changed since behavior/adversarial passed is a doc, so neither gate was
+        # marked stale above. Run only the test files that name those docs (never the full suite for this); a
+        # failure here leaves the gates' status exactly as it was and commits nothing, same as any other failed
+        # check below.
+        doc_test_files = _tests_naming(ctx, cfg, fp, sorted(doc_edits))
+        if doc_test_files:
+            dcode, dout = _run_doc_test_command(ctx, cfg, doc_test_files, ctx.evidence(args.cp) / "doc-tests.log")
+            if dcode != 0:
+                die(f"{args.cp} cannot complete: a doc test failed for the doc edit(s) made after review "
+                    f"({', '.join(sorted(doc_edits))}):\n  - " + "\n  - ".join(doc_test_files) + f"\n{_tail(dout)}", 2)
+            if fingerprint(ctx.root)["id"] != fp["id"]:
+                die("The doc test command changed files in the project. Those changes were never reviewed — find "
+                    "out what wrote them (generated files? snapshots?) and either add them to .gitignore or "
+                    "re-run the gates.", 2)
+        # Only files the ADVERSARIAL gate's own diff found doc-only (`doc_edits_unreviewed_now`) are ever
+        # recorded as "not re-reviewed": a file the behavior branch alone found doc-only may since have been
+        # reviewed and approved in the adversarial round itself, so it is never recorded here just for that.
+        if doc_edits_unreviewed_now:
+            cps["doc_edits_unreviewed"] = sorted(set(cps.get("doc_edits_unreviewed") or []) | doc_edits_unreviewed_now)
+        ctx.log(st, "doc_quick_path", cp=args.cp, files=sorted(doc_edits), tests=doc_test_files)
+    skip_full, full_doc_files = _skip_full_suite(ctx, cfg, st, fp) if cfg.get("regression_command") else (False, [])
+    if skip_full:
+        # Already passed on a tree that differs from now only in docs: run just those docs' naming tests
+        # instead of the full suite again. `full_doc_files` only selects which tests replace the full suite; it
+        # is never added to `doc_edits_unreviewed` (a file here may already have gone through, and passed, its
+        # own gate's normal adversarial round, so it was never actually skipped from review).
+        full_doc_tests = _tests_naming(ctx, cfg, fp, full_doc_files) if full_doc_files else []
+        if full_doc_tests:
+            dcode, dout = _run_doc_test_command(ctx, cfg, full_doc_tests,
+                                                ctx.evidence(args.cp) / "doc-tests-full-suite.log")
+            if dcode != 0:
+                die(f"{args.cp} cannot complete: the full suite already passed on a tree that differs only in "
+                    f"docs, but a doc test failed for {', '.join(full_doc_tests)}:\n{_tail(dout)}", 2)
+            if fingerprint(ctx.root)["id"] != fp["id"]:
+                die("The doc test command changed files in the project. Those changes were never reviewed — find "
+                    "out what wrote them (generated files? snapshots?) and either add them to .gitignore or "
+                    "re-run the gates.", 2)
+    if cfg.get("regression_command") and not skip_full:
         code, out, _ = _run_cmd(ctx, cfg["regression_command"], ctx.evidence(args.cp) / "regression.log",
                                 cfg["test_timeout_sec"])
         if code != 0 and not st.get("regression_flaky_used"):
@@ -8468,6 +9291,7 @@ def cmd_complete(args):
         if fingerprint(ctx.root)["id"] != fp["id"]:
             die("The regression command changed files in the project. Those changes were never reviewed — find out "
                 "what wrote them (generated files? snapshots?) and either add them to .gitignore or re-run the gates.", 2)
+        st["regression_passed_fp"] = fp
     if cp.get("guardrail"):
         probs = verify_guardrail(ctx, st, cp, cps, fp, cfg)
         if probs:
@@ -8492,6 +9316,15 @@ def cmd_complete(args):
             f"{n}={cps['gates'][n]['status']}" for n in ["behavior", "ui", "adversarial"])
         if cp.get("spec_refs"):
             msg += "\nSpec: " + ", ".join(_as_list(cp["spec_refs"]))[:600]
+        if cps.get("doc_edits_unreviewed"):
+            msg += ("\nDocs edited after review and not re-reviewed (doc quick path): "
+                    + ", ".join(cps["doc_edits_unreviewed"]))
+        small_fix_line = _small_fix_review_line(args.cp, cps)
+        if small_fix_line:
+            msg += "\n" + small_fix_line
+        docs_only_skip_line = _docs_only_skip_line(args.cp, cps)
+        if docs_only_skip_line:
+            msg += "\n" + docs_only_skip_line
         commit = _commit_reviewed(ctx.root, cps.get("base_tree"), fp, msg, extra=spec_files)
         if not commit:  # nothing new to commit: a run of complete that failed after its commit left it at HEAD
             commit = _head_commit_named(ctx.root, msg)
@@ -9102,12 +9935,26 @@ ASKABLE = {"approve-plan": "start building the plan as it is",
            "accept-finding": "accept the open finding(s) named above as a known limit, with your own reason, instead "
                              "of running another review round",
            "raise-limit": "raise this step's review-round limit by one round, with your own reason, so the "
-                          "reviewers can keep going (offered at most once per step, ever)"}
+                          "reviewers can keep going (offered at most once per step, ever)",
+           "paid-provider": "use a provider that costs money per use (or whose cost is unknown, treated the "
+                            "same way) for reviews, named above, instead of only flat-rate ones"}
 # the command that carries out a "yes" to each question
 PENDING_COMMAND = {"approve-plan": "approve-plan", "human-approve": "human-approve", "approve-changes": "approve-changes", "cancel": "cancel", "set-review": "set-review",
                    "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec", "choice": "choice",
                    "accept-finding": "accept-finding", "raise-limit": "raise-limit"}
 REVIEW_MODE_WORDS = {"end": "only at the end", "each": "after every step", "none": "never (fully autonomous)"}
+
+
+def _pending_followup(action, mode=None) -> str:
+    """The real command that carries out a developer's yes to a waiting question, for the re-ask/overtaken
+    hints that build it from PENDING_COMMAND and the question's mode. paid-provider's mode is "tool:model"
+    (joined only for display/comparison); its real follow-up needs them as separate --preset/--model flags
+    and an id for the new provider, not PENDING_COMMAND's plain command-plus-mode form."""
+    if action == "paid-provider" and mode and ":" in mode:
+        tool, model = mode.split(":", 1)
+        return f"providers --add <id> --preset {tool} --model {model}"
+    cmd = PENDING_COMMAND.get(action, action)
+    return cmd + (f" {mode}" if mode else "")
 
 
 def cmd_ask(args):
@@ -9136,7 +9983,10 @@ def cmd_ask(args):
         die("ask accept-finding needs the finding ids to accept, e.g. `ratchet.py ask accept-finding CP2 F1,F2`")
     if args.action == "raise-limit" and not (args.mode and args.mode in (st.get("checkpoints") or {})):
         die("ask raise-limit needs the checkpoint id, e.g. `ratchet.py ask raise-limit CP2`")
-    if args.action not in ("set-review", "ui-respec", "accept-finding", "raise-limit") and args.mode:
+    if args.action == "paid-provider" and not (args.mode and getattr(args, "ids", None)):
+        die("ask paid-provider needs the tool and model, e.g. `ratchet.py ask paid-provider opencode "
+            "openrouter/z-ai/glm-5`")
+    if args.action not in ("set-review", "ui-respec", "accept-finding", "raise-limit", "paid-provider") and args.mode:
         die(f"ask {args.action} takes no extra value")
     _bind_owner(ctx, st, args.action, asker)
     if args.action == "raise-limit":
@@ -9145,6 +9995,8 @@ def cmd_ask(args):
         return _ask_choice(ctx, st, args)
     if args.action == "accept-finding":
         return _ask_accept_finding(ctx, st, args)
+    if args.action == "paid-provider":
+        return _ask_paid_provider(ctx, st, args)
     detail = ""
     if args.action == "approve-changes":
         # integrity_problems (via approval_snapshot/_plan_hash) no longer raises KeyError for a checkpoint
@@ -9259,7 +10111,7 @@ def _overtake(ctx, st, action, mode, asker=None) -> dict:
     if not answered and action in ("approve-plan", "human-approve"):
         die(f"A different question is still waiting for the user's first reply: shall I "
             f"{_question_what(oa, old.get('mode'))}? One reply can't answer two questions. Get that one answered "
-            f"(if they say yes, run `ratchet.py {PENDING_COMMAND.get(oa, oa)}{' ' + old['mode'] if old.get('mode') else ''}`"
+            f"(if they say yes, run `ratchet.py {_pending_followup(oa, old.get('mode'))}`"
             ") or run `ratchet.py ask withdraw` if you no longer need it, then ask this question on its own.")
     ctx.log(st, "question_overtaken", action=oa, mode=old.get("mode"), by=action, answered=answered)
     if answered:
@@ -9509,6 +10361,31 @@ def _ask_accept_finding(ctx, st, args):
           "limit, with their reason, instead of running another review round? To accept them, their reply must be "
           "exactly: accept: <their reason>. Only their first reply counts, and only that exact form (starting with "
           "\"accept: \") accepts them; any other reply accepts nothing.")
+    print(ASK_ALONE)
+
+
+def _ask_paid_provider(ctx, st, args):
+    """`ask paid-provider <tool> <model>`: the developer's OK to spend money on this one model, through
+    `providers --add`, the next time it is run for this exact tool and model. This spends real money (a
+    per-use request, or an unknown-cost one treated the same way), so it needs its own exact reply naming the
+    model (_paid_provider_reply), never the generic listed-yes words used for every other question."""
+    tool, model = args.mode, args.ids
+    overtook = _overtake(ctx, st, "paid-provider", f"{tool}:{model}")
+    asked = now()
+    st["pending"] = {"action": "paid-provider", "mode": f"{tool}:{model}", "tool": tool, "model": model,
+                     "asked_at": asked, "prev_awaiting": st.get("awaiting_since"),
+                     "session": _asking_session(ctx, st, "paid-provider"), **overtook}
+    st["awaiting_since"] = asked
+    ctx.log(st, "question_asked", action="paid-provider", mode=f"{tool}:{model}")
+    ctx.save_state(st)
+    if overtook:
+        print(_not_asked_text(f"`ratchet.py ask paid-provider {tool} {model}`", overtook))
+        return
+    exact = _paid_provider_reply(model)
+    print(f"ASK THE USER: {tool}'s model {model} costs money per use (or its cost is unknown, which Ratchet "
+          "treats the same way), including one small test request right now to check it works, before it is "
+          f"ever used for a review. Shall I use it? Only one exact reply agrees: reply exactly \"{exact}\". Any "
+          "other reply means no.")
     print(ASK_ALONE)
 
 
@@ -10171,6 +11048,8 @@ def cmd_reviewers(args):
     obj_oneline = re.sub(r"\s*\n\s*", " ", objective_brief(plan))
     fp = fingerprint(ctx.root)["id"]
     g = cps["gates"]["adversarial"]
+    if g["status"] != "passed" and _docs_only_review_skip(ctx, st, cfg, cp, cps, args.cp, json_out=args.json):
+        return
     rnd = cps.get("adv_round")
     if not rnd or rnd.get("recorded") or rnd["fingerprint"] != fp:
         ci = _checkin_state(cps)
@@ -10221,6 +11100,20 @@ def cmd_reviewers(args):
                 if narrowed_resolved:
                     resolved = narrowed_resolved
                     narrow_now = True
+        # CP3: a small fix made since the checkpoint's last FULL review opens with exactly one reviewer, told
+        # (via review_rules' existing focus_files, below) to look only at what changed since that approval. That
+        # one reviewer must still cover both lenses, so it is resolved the same way a low-risk step's single
+        # reviewer is (review_depth["low"], an any-both/host-both slot), never the step's own (possibly
+        # single-lens) first slot. The override is only used, and small_fix only set, when that resolution
+        # actually comes back as exactly one both-lens reviewer -- a customized review_depth["low"] (two slots,
+        # or a single-lens id) falls back to the step's normal full round instead of mislabeling it.
+        small_fix = _is_small_fix_round(ctx, cfg, args.cp, cp, cps, g)
+        if small_fix:
+            low_resolved = _small_fix_reviewers(ctx, cfg, cp)
+            if low_resolved is not None:
+                resolved = low_resolved
+            else:
+                small_fix = False
         g["attempts"] += 1
         st["adv_rounds_total"] = int(st.get("adv_rounds_total", 0)) + 1
         prev = rnd["round"] if rnd else 0
@@ -10242,7 +11135,7 @@ def cmd_reviewers(args):
         else:
             prev_round_tree = rnd["fingerprint"] if rnd else None
         rnd = {"round": prev + 1, "nonce": secrets.token_hex(8), "fingerprint": fp, "opened_at": now(),
-               "reviewers": [r["id"] for r in resolved], "narrowed": narrow_now,
+               "reviewers": [r["id"] for r in resolved], "narrowed": narrow_now, "small_fix": small_fix,
                "prev_round_tree": prev_round_tree,
                "substitutions": [{"used": r["id"], "instead_of": r["fallback_for"], "why": r["reasons"]}
                                  for r in resolved if r["fallback_for"]],
@@ -10263,18 +11156,41 @@ def cmd_reviewers(args):
         # every other reviewer on the same CLI, keep running.
         out_dir_now = _review_round_dir(ctx, args.cp, "adv", rnd["round"])
         round_cutoff = {p.name[:-len(".cutoff.json")] for p in out_dir_now.glob("*.cutoff.json")}
-        fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff)}
         changed, swapped_in = False, []
-        for i, r in enumerate(rnd["resolved"]):
-            if (out_dir_now / f"{r['id']}.json").exists():
-                continue  # a finished review in this round is kept untouched, never re-resolved
-            okay, _why = reviewer_availability(ctx, cfg, r["id"])
-            if (not okay or r["id"] in round_cutoff) and r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
-                new_r = fresh[r["slot"]]
-                rnd["resolved"][i] = new_r
-                changed = True
-                if new_r["fallback_for"]:
-                    swapped_in.append({"used": new_r["id"], "instead_of": new_r["fallback_for"], "why": new_r["reasons"]})
+        if rnd.get("small_fix"):
+            # A small-fix round's one reviewer must always cover both lenses, so re-resolve it the same way
+            # the round was opened (_small_fix_reviewers), never via the step's own (possibly single-lens)
+            # risk. When that can't produce a both-lens replacement, this stops being a small-fix round.
+            cur = rnd["resolved"][0]
+            if not (out_dir_now / f"{cur['id']}.json").exists():  # a finished review is kept untouched
+                okay, _why = reviewer_availability(ctx, cfg, cur["id"])
+                if not okay or cur["id"] in round_cutoff:
+                    replacement = _small_fix_reviewers(ctx, cfg, cp, exclude=round_cutoff)
+                    if replacement is not None:
+                        if replacement[0]["id"] != cur["id"]:
+                            rnd["resolved"] = replacement
+                            changed = True
+                            if replacement[0]["fallback_for"]:
+                                swapped_in.append({"used": replacement[0]["id"], "instead_of": replacement[0]["fallback_for"],
+                                                    "why": replacement[0]["reasons"]})
+                    else:
+                        rnd["small_fix"] = False
+                        rnd["resolved"] = resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff)
+                        changed = True
+                        swapped_in.extend({"used": r["id"], "instead_of": r["fallback_for"], "why": r["reasons"]}
+                                           for r in rnd["resolved"] if r["fallback_for"])
+        else:
+            fresh = {r["slot"]: r for r in resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff)}
+            for i, r in enumerate(rnd["resolved"]):
+                if (out_dir_now / f"{r['id']}.json").exists():
+                    continue  # a finished review in this round is kept untouched, never re-resolved
+                okay, _why = reviewer_availability(ctx, cfg, r["id"])
+                if (not okay or r["id"] in round_cutoff) and r["slot"] in fresh and fresh[r["slot"]]["id"] != r["id"]:
+                    new_r = fresh[r["slot"]]
+                    rnd["resolved"][i] = new_r
+                    changed = True
+                    if new_r["fallback_for"]:
+                        swapped_in.append({"used": new_r["id"], "instead_of": new_r["fallback_for"], "why": new_r["reasons"]})
         if changed:
             rnd["reviewers"] = [r["id"] for r in rnd["resolved"]]
             if swapped_in:  # record the same-round swap the same shape a fresh round's own substitutions use
@@ -10310,6 +11226,7 @@ def cmd_reviewers(args):
            "risk": cp.get("risk", "normal"), "round": rnd["round"], "fingerprint": fp,
            "review_rules": rules, "focus_files": sorted(focus) if focus is not None else None,
            "round_nonce": rnd["nonce"], "output_dir": str(out_dir), "narrowed": rnd.get("narrowed", False),
+           "small_fix": rnd.get("small_fix", False),
            "fixes_md": str(fixes) if rnd["round"] > 1 else None,
            "run_rounds_used": st.get("adv_rounds_total", 0), "run_rounds_cap": cfg["max_adversarial_rounds_run"],
            "reviewers": rows}
@@ -10318,6 +11235,12 @@ def cmd_reviewers(args):
         return
     print(f"{args.cp} risk={res['risk']} round={rnd['round']} fingerprint={fp[:12]} nonce={rnd['nonce']} "
           f"(run rounds {res['run_rounds_used']}/{res['run_rounds_cap']})")
+    if res["small_fix"]:
+        print(f"Small fix since approval (at or under {cfg.get('small_edit_lines', 20)} changed code lines): "
+              "one reviewer, scoped to the files changed since approval.")
+    off_note = _docs_only_quick_path_off_note(ctx, cfg, cp, cps)
+    if off_note:
+        print(off_note)
     if isinstance(obj, dict) and obj:
         print(f"Who it's for: {obj.get('users', '')}")
         print(f"What they want: {obj.get('goal', '')}")
@@ -10387,6 +11310,8 @@ def status_json(ctx: Ctx) -> dict:
             "hooks": hs, "hook_errors": hook_errors_view(ctx.root, hs.get("host", "unknown")),
             "viewer_url": viewer_link(ctx)["url"], "viewer_live": viewer_link(ctx)["live"],
             "done": sum(1 for c in cps if c["status"] == "done"), "total": len(cps),
+            "small_fix_reviews": _small_fix_review_lines(st),
+            "docs_only_review_skips": _docs_only_skip_lines(st),
             "checkpoints": cps, "updated_at": st.get("updated_at")}
 
 
@@ -10949,7 +11874,16 @@ def normalize_hook(data: dict, host: str) -> dict:
         ti = {"value": ti}
     cmd = ti.get("command") or ti.get("cmd") or ti.get("script") or ""
     if isinstance(cmd, list):
-        cmd = " ".join(str(c) for c in cmd)
+        cmd = [str(c) for c in cmd]
+        # An argv-list Bash call some hosts send (Codex: ["bash", "-lc", "<script>"]) names its script as one
+        # argument; joining the list with spaces would run the script's own text (quotes, heredocs and all)
+        # through the word-by-word join, splitting it up and changing what the guard sees. Read the script as
+        # the command itself instead, exactly as a plain string Bash call would send it.
+        if (len(cmd) == 3 and re.fullmatch(r"[A-Za-z0-9_./-]*(bash|sh|zsh|dash|ksh)", cmd[0]) and
+                re.fullmatch(r"-[a-z]*c[a-z]*", cmd[1])):
+            cmd = cmd[2]
+        else:
+            cmd = " ".join(cmd)
     paths = [str(ti[k]) for k in ("file_path", "path", "absolute_path", "notebook_path", "filePath", "target_file")
              if isinstance(ti.get(k), str)]
     patch = ""
@@ -11299,7 +12233,7 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                f"`{eng} resume --claim` only if their first reply after it is one of the listed yes "
                                "replies. Otherwise leave the run alone and do what they asked.")
             if p.get("action") and p["action"] != "hooks-waive":
-                cmd = PENDING_COMMAND.get(p["action"], p["action"]) + (" " + p["mode"] if p.get("mode") else "")
+                cmd = _pending_followup(p["action"], p.get("mode"))
                 what = _question_what(p["action"], p.get("mode"))
                 again = _ask_cmd(p["action"], p.get("mode"), eng=eng)
                 asked_in = _question_session(st, p)
@@ -11327,6 +12261,16 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                    "already answered it, so this later message is not their answer: it does NOT "
                                    "approve the plan, a checkpoint or anything else. If you still need their yes, "
                                    f"print the question again ({again}).")
+                if p["action"] == "paid-provider":
+                    # This question's own exact reply (never the generic listed-yes words: it spends money).
+                    exact = _paid_provider_reply(p.get("model") or "")
+                    matched = n["prompt"].strip().casefold() == exact.strip().casefold()
+                    verdict = (f"It is the exact reply (\"{exact}\")" if matched
+                               else f"It is NOT the exact reply (\"{exact}\"), so it approves nothing")
+                    return False, (f"[ratchet] This reply answers your waiting question: shall I {what}? {verdict}. "
+                                   f"Only after that exact reply run `{eng} {cmd}` (pick an id for the new provider); "
+                                   f"otherwise run `{eng} ask withdraw` and do what they asked. This reply does NOT "
+                                   "approve the plan, a checkpoint or anything else.")
                 verdict = ("It is one of the listed yes replies" if is_listed_yes(n["prompt"])
                            else "It is NOT one of the listed yes replies, so it approves nothing")
                 if p["action"] in ("approve-plan", "human-approve"):
@@ -11375,21 +12319,159 @@ READ_ONLY_PROGRAMS = {"cat", "less", "more", "head", "tail", "grep", "egrep", "f
 READ_ONLY_GIT = {"diff", "log", "show", "status", "ls-files", "blame", "rev-parse", "cat-file"}
 RATCHET_TOKEN_RE = re.compile(r"""[^\s'"<>|;&()`]*\.ratchet(?:[/\\][^\s'"<>|;&()`]*)?""", re.I)
 REDIRECT_RE = re.compile(r"(?<![0-9&])>>?\s*(?!&)(\S+)")
+# sed's w/W command writes to a filename that can sit right against the command letter with no space
+# (`1w.ratchet/x`, a real GNU sed form) -- RATCHET_TOKEN_RE's mention then glues the address/letter onto the
+# path, so `_ratchet_rel` (which needs a path separator right before `.ratchet`) misses it for a relative
+# target. This recovers the real filename so it's checked too.
+SED_W_TARGET_RE = re.compile(r"(?:^|[;{}\s]|[0-9]|\$)[wW]\s*(\S+)")
+# CP4: every OUTPUT redirect operator form bash recognises -- `>`, `>>`, `N>`, `N>>`, `&>`, `&>>`, `>|`,
+# `N>|`, and `>&word` (word not a digit or `-`, which is fd duplication, not a file) -- unlike REDIRECT_RE
+# above, which a negative lookbehind keeps from ever matching a `>` right after a digit or `&` (so `2>`,
+# `&>`, `1>`, `>&word` were invisible to it entirely). This is the one shared helper both the fast path
+# (`_provably_read_only`) and the strict path (`_guard_shell`) use to find a command's real write targets.
+OUTPUT_REDIRECT_RE = re.compile(r"(?:\d+|&)?>>?\|?(&?)\s*([^\s;&|()<>]*)")
+
+
+def _redirect_targets(seg: str, masked: str | None = None) -> list[str]:
+    """Every real (unquoted) output-redirect target named in `seg`, for every form `OUTPUT_REDIRECT_RE`
+    recognises. `masked` -- the same text with every separator character that sits inside quotes replaced
+    (see `_mask_quoted_seps`), same length and character positions as `seg` -- is scanned for the operators
+    themselves, so a `>` sitting inside a quoted jq filter, grep alternation or awk/sed script is never
+    mistaken for a real redirect; the real (unmasked) target text is always sliced back out of `seg` itself.
+    When `masked` is omitted, `seg` is scanned directly. fd duplication (`2>&1`, `>&2`) and
+    /dev/null|/dev/stdout|/dev/stderr are never targets; a `>(` process substitution's own target position
+    is always empty here (its argument characters are excluded by the target's own character class), so it
+    never appears in this list -- see `_proc_subst_targets` for that case."""
+    base = masked if masked is not None else seg
+    out = []
+    for m in OUTPUT_REDIRECT_RE.finditer(base):
+        t = seg[m.start(2):m.end(2)].strip("'\"")
+        if m.group(1) == "&" and re.fullmatch(r"\d+|-", t):
+            continue  # fd duplication: no file
+        if not t or t in ("/dev/null", "/dev/stdout", "/dev/stderr"):
+            continue
+        out.append(t)
+    return out
+
+
+PROC_SUBST_RE = re.compile(r">\(([^()]*)\)")
+
+
+def _proc_subst_targets(seg: str, masked: str | None = None) -> list[str]:
+    """Every bare (non-flag) argument of the program inside each `>(...)` process substitution in `seg`,
+    treated as that program's own write target (CP4 design item 2: `cat x > >(tee <file>)` makes `tee`'s own
+    argument `<file>` a write target exactly as a bare `tee <file>` would). Only a single, non-nested
+    substitution body is read (no parens inside it); a substitution this can't read this simply contributes
+    no targets here, which sends the whole command to the slow, fail-safe mention checks that already run
+    beside this -- never narrowing what they refuse.
+
+    `masked` -- the same quote-aware mask `_redirect_targets` takes -- is scanned for `PROC_SUBST_RE` itself,
+    exactly like that sibling function, so a `>(...)` shape sitting inside an ordinary quoted string (a note
+    or commit message quoting this very example) is never mistaken for a real process substitution (CP4
+    round-04 host-alt-standards A1); the real (unmasked) text is always sliced back out of `seg` itself."""
+    base = masked if masked is not None else seg
+    out = []
+    for m in PROC_SUBST_RE.finditer(base):
+        toks = seg[m.start(1):m.end(1)].strip().split()
+        out += [t.strip("'\"") for t in toks[1:] if not t.startswith("-")]
+    return out
 ENGINE_CALL_RE = re.compile(r"""^\s*(?:(?:\S*python3?(?:\.\d+)?|py)\s+(?:-\S+\s+)*["']?\S*(ratchet|external_review|ui_review)\.py\b"""
                             r"""|\S*node\s+(?:-\S+\s+)*["']?\S*capture\.mjs\b)""")
 NESTED_AGENT_RE = re.compile(r"(^|[\s;&|(/])(claude|gemini|copilot)(?![\w.-])[^;&|\n]*\s(-p|--print|--prompt)\b"
                              r"|(^|[\s;&|(/])codex(?![\w.-])[^;&|\n]*\sexec\b")
-SELF_HOOK_RE = re.compile(r"\bhook\s+(stop|prompt|guard)\b|\bhook-(stop|prompt|guard)\b")
+SELF_HOOK_RE = re.compile(r"\bhook\b[\s'\",]+(stop|prompt|guard)\b|\bhook-(stop|prompt|guard)\b")
+# For a command the shell-word reader can't follow at all (a command substitution, a heredoc, $'...'): only refuse
+# it as a hook call when a hook word directly follows `ratchet.py` or a $VAR/${VAR} token, never on the hook words
+# alone -- that's what let a plain mention ("hook guard" inside a grep pattern or comment, with an unrelated $(...)
+# or "$f" elsewhere in the same unreadable command) get refused before. The separator between `hook` and its
+# subcommand also allows a quote or comma, so an argv-style call spelled out as separate quoted words
+# (`subprocess.run(['ratchet.py','hook','guard'])`) still counts, not just a literal space.
+UNREADABLE_HOOK_RE = re.compile(
+    r"(?:\bratchet\.py\b|\$\{?[A-Za-z_]\w*\}?)[^;&|\n]*?(?:" + SELF_HOOK_RE.pattern + ")", re.I)
+
+
+def _redact_literal_quotes(cmd: str) -> str:
+    """For UNREADABLE_HOOK_RE only: blank single-quoted text and the literal parts of double-quoted text (a
+    commit message, a note) so a mention saved as data there (`git commit -m 'document ratchet.py hook guard'`)
+    isn't mistaken for a call. A live command substitution inside double quotes ($(...) or `...`) is left in
+    place, since the shell still runs it. Everything else -- unquoted text, $'...', anything this can't account
+    for -- is left exactly as is and still fails safe."""
+    out, i, n = list(cmd), 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            i += 2
+        elif c == "'":
+            j = cmd.find("'", i + 1)
+            if j < 0:
+                break
+            for k in range(i, j + 1):
+                out[k] = "x"
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and cmd[j] != '"':
+                if cmd[j] == "\\" and j + 1 < n:
+                    out[j] = out[j + 1] = "x"
+                    j += 2
+                    continue
+                if cmd[j] == "`" or cmd.startswith("$(", j):
+                    if cmd[j] == "`":
+                        k = cmd.find("`", j + 1)
+                        j = (k + 1) if k >= 0 else n
+                    else:
+                        depth, k = 1, j + 2
+                        while k < n and depth:
+                            if cmd[k] == "(":
+                                depth += 1
+                            elif cmd[k] == ")":
+                                depth -= 1
+                            k += 1
+                        j = k
+                    continue
+                out[j] = "x"
+                j += 1
+            i = j + 1 if j < n else j
+        else:
+            i += 1
+    return "".join(out)
+
+
 ASSIGN_RE = re.compile(r"""(?:^|[\s;&|(])(?:export\s+)?([A-Za-z_]\w*)=("[^"]*"|'[^']*'|[^\s;&|]+)""")
 HEREDOC_RE = re.compile(r"""<<-?\s*(['"]?)(\w+)\1([^\n]*)\n.*?\n\s*\2\s*(?=\n|$)""", re.S)
 
 
+def _unbalanced_subst(val: str) -> bool:
+    """True when `val` holds a truncated `$(...)` capture: ASSIGN_RE's unquoted value stops at the first
+    whitespace, so an unquoted multi-word substitution (`RUN=$(find .ratchet/runs -maxdepth 1 -type d)`) is
+    captured as just `$(find`, an unbalanced fragment. Backticks must also come in pairs."""
+    if val.count("`") % 2:
+        return True
+    depth = 0
+    i = 0
+    while i < len(val):
+        if val[i] == "$" and val[i + 1:i + 2] == "(":
+            depth += 1
+            i += 2
+            continue
+        if val[i] == ")" and depth:
+            depth -= 1
+        i += 1
+    return depth != 0
+
+
 def _expand(cmd: str) -> str:
     """Drop heredoc bodies (they're data, not commands) and expand shell variables assigned in the same command,
-    so `RUN=.ratchet/runs/x; echo > $RUN/state.json` is judged as what it really writes."""
+    so `RUN=.ratchet/runs/x; echo > $RUN/state.json` is judged as what it really writes. A value that is a
+    truncated `$(...)` capture (see `_unbalanced_subst`) is left alone -- `$VAR` stays raw rather than being
+    replaced by that garbage fragment -- so `RUN=$(find .ratchet/runs -maxdepth 1 -type d) && cat "$RUN/x"`
+    isn't corrupted into an unparseable command; a value with no substitution, or a fully-captured one (no
+    internal space, or quoted), still expands normally."""
     cmd = HEREDOC_RE.sub(lambda m: "<<" + m.group(3), cmd)
     for name, val in ASSIGN_RE.findall(cmd):
         val = val.strip("\"'")
+        if _unbalanced_subst(val):
+            continue
         cmd = re.sub(r"\$\{" + name + r"\}|\$" + name + r"(?![A-Za-z0-9_])", lambda _m: val, cmd)
     return cmd
 DIRECTOR_CALL_RE = re.compile(r"""ratchet\.py["']?\s+(?:--root\s+\S+\s+)?director-(sign|key|enroll)\b""")
@@ -11416,37 +12498,115 @@ ENV_INDIRECT_RE = re.compile(
     r"|\b(putenv|setenv|Setenv|SetEnvironmentVariable)\s*\(|process\.env\s*\[[^\]]*\]\s*=(?!=)"
     r"|Object\.assign\s*\(\s*process\.env|\bENV\s*\[[^\]]*\]\s*=(?!=)|\$ENV\{[^}]*\}\s*=(?!=)|--(set)?env\b")
 ENV_TOKEN_RE = re.compile(r"(?<![\w$])(?<!\$\{)(?<!\$\{!)(?<!\$\{#)RATCHET\w*", re.I)
+LEADING_ASSIGN_TOKEN_RE = re.compile(r"^([A-Za-z_]\w*)=")
+
+
+def _leading_assign_names(seg: str) -> list[str]:
+    """Every name in `seg`'s leading assignment sequence: a run of bare `VAR=value` words before the actual
+    command, optionally after `export` (one) or `env` and its own no-argument options (`-i`, `-0`, ...). Checks
+    the whole sequence, not just the first assignment, so `FOO=1 RATCHET_ROLE=director ls` and
+    `env FOO=1 RATCHET_HOME=x ls` are seen whatever program (even a read-only one) follows them."""
+    toks = seg.strip().split()
+    if toks and toks[0] == "export":
+        toks = toks[1:]
+    elif toks and toks[0] == "env":
+        toks = toks[1:]
+        while toks and toks[0].startswith("-"):
+            toks.pop(0)
+    names = []
+    while toks:
+        m = LEADING_ASSIGN_TOKEN_RE.match(toks[0])
+        if not m:
+            break
+        names.append(m.group(1))
+        toks.pop(0)
+    return names
+PRINTF_V_RE = re.compile(r"(?:^|\s)-v\b")
+# Programs that take their own argument as code, not a note or a message, so that argument's quotes must stay
+# visible (`export "NAME=1"`, `env NAME="$(x)"`, `printf -v 'NAME' x`): everything else gets the literal-quote
+# redaction below.
+EXCEPT_PROGS = {"export", "declare", "typeset", "local", "readonly", "env", "set", "setenv"}
+_INTERPRETER_NAMES = r"python[\d.]*|py|node|deno|bun|bash|sh|zsh|dash|ksh|perl|ruby|php|osascript"
+# An interpreter given inline code to run, rather than a script file: -c/-e/-lc/a bare "-", nothing else on the
+# command line (reads from stdin), a here-string (`<<<`), or the target of a pipe (`echo ... | bash`), the
+# inline-code option itself possibly coming after a run of ordinary interpreter options first (`python3 -u -c`,
+# `python3 -X dev -c`, `bash -x -c`, `node --no-warnings -e`). A script FILE with its own arguments
+# (`python3 -u /path/ratchet.py learn "..."`) is not inline.
+INLINE_CODE_RE = re.compile(
+    r"(^|[\s;&|(/])(?:" + _INTERPRETER_NAMES + r")\b(?:"
+    r"\s+(?:-\S+(?:\s+[^-\s;&|()][^\s;&|()]*)?\s+)*(?:-[A-Za-z]*[ce][A-Za-z]*|-)(?=\s|$)"
+    r"|\s+<<<|\s*(?:[;&|)\n]|$))"
+    r"|(?<!\|)\|(?!\|)\s*(?:(?:sudo|env|command|exec|time|nice|nohup|timeout|xargs|stdbuf)\s+(?:-\S+\s+)*)?"
+    r"(?:" + _INTERPRETER_NAMES + r")\b")
+# eval, source or a dot command run whatever text they're given as code; so does `env -S`/`--split-string`.
+INLINE_RUNS_RE = re.compile(r"\beval\b|\bsource\s|(^|[;&|(]\s*)\.\s+\S|\benv\b[^;&|\n]*\s(-[A-Za-z]*S|--split-string)")
+
+
+def _leading_word(seg: str) -> str:
+    toks = seg.strip().split()
+    return os.path.basename(toks[0]) if toks else ""
 
 
 def _reserved_env_problem(cmd: str) -> str | None:
     """The guard message when a shell command sets (directly or indirectly) a variable only a person or the
-    director may set; None otherwise. The one detector for every reserved variable (plain reads stay allowed).
+    director may set; None otherwise. The one detector for every reserved variable (plain reads stay allowed,
+    and so is a heredoc body that only writes a file -- it's data, not code, unless the same command actually
+    feeds it to a shell or an interpreter).
+
+    A reserved name inside a program's own quoted text (a commit message, an echo/printf note, a heredoc note
+    saved to a file) sets nothing and is allowed, UNLESS the command also runs code inline -- an interpreter
+    given `-c`/`-e`/a bare `-`/nothing/a pipe/a here-string, `eval`, `source`, a dot command, or `env -S` -- in
+    which case every word is scanned exactly as written, with no exemption at all, since that quoted text is
+    then the code. Known limit: a reserved name quoted in the SAME command as inline interpreter code is refused
+    even when it sits in an unrelated argument, since this can't tell the two apart; it fails safe.
+
     Best-effort: a script written to a file first and run later is not seen here, which is why the engine also
     distrusts these values on its own (terminal code, hook-recorded folder, key file and director role)."""
-    indirect = bool(ENV_INDIRECT_RE.search(cmd) or ENV_INDIRECT_RE.search(_expand(cmd)))
-    texts = [cmd] + ([_expand(cmd)] if _expand(cmd) != cmd else [])
-    for text in texts:
-        for seg in _segments(text):
-            prog, _sub = _program(seg)
-            if prog in READ_ONLY_PROGRAMS and "$(" not in seg and "`" not in seg:
-                continue  # grep/cat/... only read; mentioning a name there sets nothing
-            for m in ENV_TOKEN_RE.finditer(seg):
-                tok = m.group(0)
-                full = next(((n, msg) for n, msg in RESERVED_ENV if tok.upper() == n), None)
-                if full:
-                    name, msg = full
-                    after = seg[m.end():]
-                    before = seg[:m.start()]
-                    if re.match(r"""['"\]}]*\s*\+?=(?!=)|['"]\s*:""", after) or \
-                            re.search(r"""(?:^|[\s;&|(])[A-Za-z_]\w*=\s*['"]?$""", before) or \
-                            re.search(r"\b(export|declare|typeset|local|readonly|setenv)\b|\bset\s+-[A-Za-z]*x",
-                                      before) or \
-                            re.search(r"\b(putenv|setenv|Setenv|SetEnvironmentVariable|setdefault|update|"
-                                      r"__setitem__)\s*\(\s*['\"]?$", before) or indirect:
-                        return msg
-                elif tok.startswith("RATCHET") and indirect and \
-                        any(n.startswith(tok) and n != tok for n, _m in RESERVED_ENV):
-                    return RESERVED_PIECES_MSG
+    heredoc_run = bool(INTERPRETER_RE.search(cmd) and HEREDOC_RE.search(cmd))
+    expanded = _expand(cmd)  # heredoc bodies not run as code are dropped here; variable assignments are substituted
+    raw_texts = [expanded] + ([cmd] if heredoc_run and cmd != expanded else [])
+    indirect = any(ENV_INDIRECT_RE.search(t) for t in raw_texts)
+    code = _redact_literal_quotes(expanded)  # literal quoted text blanked; a live $(...) or backtick stays visible
+    runs_inline = heredoc_run or bool(INLINE_CODE_RE.search(code) or INLINE_RUNS_RE.search(code))
+
+    if runs_inline:
+        seg_pairs = [(seg, seg) for text in raw_texts for seg in _segments(text)]
+    else:
+        code_segs, raw_segs = _segments(code), _segments(expanded)
+        if len(code_segs) != len(raw_segs):  # a quoted delimiter desynced the split: fail safe with raw text
+            code_segs = raw_segs
+        seg_pairs = list(zip(code_segs, raw_segs))
+
+    for scan_seg, raw_seg in seg_pairs:
+        for lead_name in _leading_assign_names(raw_seg):
+            full = next((msg for n, msg in RESERVED_ENV if lead_name.upper() == n), None)
+            if full:  # a leading reserved assignment (bare or after `env`), anywhere in that leading sequence,
+                return full  # is refused whatever follows it, read-only programs included
+        prog, sub = _program(raw_seg)
+        if prog in READ_ONLY_PROGRAMS:
+            continue  # grep/cat/ls/.../ only read; a name there sets nothing
+        if not runs_inline:
+            leading = _leading_word(raw_seg)
+            printf_v = leading == "printf" and bool(PRINTF_V_RE.search(raw_seg))
+            if leading in EXCEPT_PROGS or printf_v:
+                scan_seg = raw_seg  # this program's own argument is code: keep its quotes visible
+        for m in ENV_TOKEN_RE.finditer(scan_seg):
+            tok = m.group(0)
+            full = next(((n, msg) for n, msg in RESERVED_ENV if tok.upper() == n), None)
+            if full:
+                name, msg = full
+                after = scan_seg[m.end():]
+                before = scan_seg[:m.start()]
+                if re.match(r"""['"\]}]*\s*\+?=(?!=)|['"]\s*:""", after) or \
+                        re.search(r"""(?:^|[\s;&|(])[A-Za-z_]\w*=\s*['"]?$""", before) or \
+                        re.search(r"\b(export|declare|typeset|local|readonly|setenv)\b|\bset\s+-[A-Za-z]*x",
+                                  before) or \
+                        re.search(r"\b(putenv|setenv|Setenv|SetEnvironmentVariable|setdefault|update|"
+                                  r"__setitem__)\s*\(\s*['\"]?$", before) or indirect:
+                    return msg
+            elif tok.upper() != "RATCHET" and tok.startswith("RATCHET") and indirect and \
+                    any(n.startswith(tok) and n != tok for n, _m in RESERVED_ENV):
+                return RESERVED_PIECES_MSG
     return None
 
 
@@ -11454,7 +12614,24 @@ DANGEROUS_GIT_RE = re.compile(r"\bgit\s+(clean\b[^;&|\n]*\s-[a-zA-Z]*[xX]|stash\
 
 
 def _segments(cmd: str) -> list[str]:
-    return [p for p in re.split(r"\|\||&&|;|\||\n", cmd) if p.strip()]
+    """`cmd` split on top-level `;`/`&&`/`||`/`|`/newline -- never inside a single- or double-quoted span, the
+    same quote masking `_mask_quoted_seps` gives the fast path, so a `;` inside a python one-liner's own code
+    or a `|` inside a jq filter is never mistaken for a statement boundary and split away from the mention it
+    sits next to (CP3 round-01: a python -c argument's own `;` used to split `pathlib.Path(x).open('w')` into
+    its own segment, which then read as a bare `VAR=value` shell assignment with no spaces in it and was
+    skipped by `_guard_shell`'s own-nothing-to-check rule, missing the `.ratchet` mention inside it entirely).
+    Falls back to the old, quote-blind split only when `_mask_quoted_seps` gives up (a double-quoted span
+    holding a live $(...)/backtick -- see its own docstring); every caller already treats more segments as
+    fail-safe, never fewer, so that fallback never allows something this quote-aware split would have caught."""
+    masked = _mask_quoted_seps(cmd)
+    if masked is None:
+        return [p for p in re.split(r"\|\||&&|;|\||\n", cmd) if p.strip()]
+    parts, pos = [], 0
+    for sm in re.finditer(r"\|\||&&|;|\||\n", masked):
+        parts.append(cmd[pos:sm.start()])
+        pos = sm.end()
+    parts.append(cmd[pos:])
+    return [p for p in parts if p.strip()]
 
 
 def _program(seg: str) -> tuple[str, str]:
@@ -11571,10 +12748,19 @@ def _calls_own_hook(cmd: str, depth: int = 0) -> bool:
     """True when `cmd` really runs `ratchet.py hook ...` (directly, through python, a wrapper such as env or
     timeout, an unknown $PROGRAM, `bash -c` or eval). Text that only mentions a hook (a grep pattern, an echo, a
     commit message, a comment) is not a call. A command the shell-word reader can't follow (a command substitution,
-    a heredoc, $'...') is blocked whenever it mentions a hook at all, so what can't be read fails safe."""
+    a heredoc, $'...') is blocked only when a hook word directly follows `ratchet.py` or a `$VAR`/`${VAR}` token in
+    it, not when the hook words merely appear somewhere else (a grep pattern inside it, say); a mention saved as
+    literal data in a single-quoted argument, or the literal part of a double-quoted one (a commit message, a
+    note), doesn't count even when an unrelated command substitution sits elsewhere in the same command. What
+    can't be read this far still fails safe."""
     words = _shell_words(cmd)
     if words is None:
-        return bool(SELF_HOOK_RE.search(cmd))
+        # Same rule as _reserved_env_problem: quoted text is data unless the command also runs inline code
+        # (an interpreter given -c/-e/a pipe/here-string, eval, source, a dot command, env -S); then every word,
+        # quoted or not, is scanned, since that quoted text is the code actually being run.
+        redacted = _redact_literal_quotes(cmd)
+        runs_inline = bool(INLINE_CODE_RE.search(redacted) or INLINE_RUNS_RE.search(redacted))
+        return bool(UNREADABLE_HOOK_RE.search(cmd if runs_inline else redacted))
     for w in _simple_commands(words):
         while w and _ASSIGNMENT_RE.match(w[0]):
             w = w[1:]
@@ -11603,10 +12789,1002 @@ def _calls_own_hook(cmd: str, depth: int = 0) -> bool:
     return False
 
 
+# CP2: a narrow fast path for shell commands this guard can PROVE touch nothing but reads -- cat/grep/jq-style
+# filters, cd/pushd/popd (tracked so a later ordinary command in the same line after `cd .ratchet/...` isn't
+# refused), and a short list of other programs only when used in a form that cannot write (sort without -o,
+# uniq with at most one file, sed/awk without their in-place flag, find without a write action, xargs running
+# one of these programs, cp with no destination-directory flag). Anything this can't prove read-only (an
+# unrecognised program, a write flag, a redirect it can't resolve) returns False so the caller falls back to
+# the slower, fail-safe mention check below unchanged -- this never WIDENS what that check refuses, it only
+# narrows how often an agent has to detour around it for an ordinary read.
+# One allow-list for both paths: every program READ_ONLY_PROGRAMS already trusts (rg, less, more, egrep,
+# fgrep, file, cmp, md5sum, sha1sum, sha256sum, tree, du, ...) plus the few extra programs this fast path can
+# only prove read-only by checking their OWN argument shape.
+RO_TABLE = READ_ONLY_PROGRAMS | {"cut", "tr", "echo", "printf", "test", "[", "read", "basename", "dirname",
+                                  "realpath", "sort", "uniq", "awk", "sed", "find", "xargs", "cp"}
+# sort/uniq/awk/sed/find/xargs/cp only prove read-only by checking their OWN argument shape (an -o, a file
+# count, an -i flag, a write action, a destination argument); run as xargs's inner program, that shape isn't
+# the whole story -- xargs appends more arguments from stdin that this guard can't see, which could change
+# what they write to. Only a program whose read-only-ness never depends on argument shape at all is safe there.
+RO_XARGS_INNER_OK = RO_TABLE - {"sort", "uniq", "awk", "sed", "find", "xargs", "cp"}
+RO_KEYWORDS = {"while", "until", "if", "then", "else", "elif", "do", "done", "fi", "!", "{", "}"}
+RO_WRAP = {"sudo", "env", "command", "exec", "time", "nice", "nohup"}
+RO_FIND_WRITE_RE = re.compile(r"(?:^|\s)-(?:delete|fprint0?|fprintf|fls|ok|okdir)\b")
+RO_FIND_EXEC_RE = re.compile(r"(?:^|\s)-(?:exec|execdir)\s+(\S+)")
+RO_SEP_RE = re.compile(r"\$\(|<\(|>\(|`|\(|\)|(?<!\\);|&&|\|\||\||\n|&")
+GIT_CMD_START_RE = re.compile(r"\bgit\s+(?:commit|tag|notes|merge)\b")
+# -m/--message, or a combined short-flag cluster ending in m (-am, -qm, -sm, ...): git commit takes several
+# single-letter flags (-a, -q, -s, ...) that are routinely combined with -m on one dash. The negative
+# lookbehind keeps this from matching the second dash of --message as if it were its own "-m" cluster.
+# \s* is part of the match so its end lands right on a following quote, the same way the old single-flag
+# regex did.
+GIT_MSG_FLAG_RE = re.compile(r"(?:--message=?|(?<!-)-[A-Za-z]*m\b)\s*")
+# sed: only -n (optionally combined with -E/-r) and a single print-only address script -- no write command
+# (w/W/e/r), no -i/--in-place/-f/-e beyond that.
+RO_SED_OPT_RE = re.compile(r"^-[nEr]+$")
+RO_SED_PRINT_RE = re.compile(r"^(\d+|\$|/[^/]*/)(,(\d+|\$|/[^/]*/))?p$")
+# awk: a script with no redirect, pipe or process/stream side effect.
+RO_AWK_BAD_SCRIPT_RE = re.compile(r">|\||\bsystem\b|\bgetline\b|\bclose\b|\bfflush\b")
+
+
+def _git_stmt_end(cmd: str, start: int) -> int:
+    """End offset of the git statement beginning at `start`: the next ;, &, | or newline that isn't inside a
+    single- or double-quoted span, or len(cmd). Keeps a later -m's search from running past this git call
+    into unrelated, later commands."""
+    i, n = start, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            i += 2
+        elif c == "'":
+            j = cmd.find("'", i + 1)
+            i = (j + 1) if j >= 0 else n
+        elif c == '"':
+            j = i + 1
+            while j < n and cmd[j] != '"':
+                j += 2 if cmd[j] == "\\" and j + 1 < n else 1
+            i = (j + 1) if j < n else n
+        elif c in ";&|\n":
+            return i
+        else:
+            i += 1
+    return n
+
+
+def _blank_commit_messages(cmd: str) -> str:
+    """Blank the quoted value of every -m/--message (and combined short flag ending in m, like -am) on a git
+    commit/tag/notes/merge command (quote-aware), on the whole command before any later split -- so a
+    message that merely names a run path (`git commit -m 'guard: block writes to .ratchet/runs/x/state.json'`,
+    or a two-part `-m subject -m body`, or `-am`) is data, not a path mention, and the message's own
+    punctuation (;, &&, |) never desyncs the segmentation that follows. A value holding a live command
+    substitution ($(...) or a backtick) is left visible, since the shell still runs it."""
+    out, n = list(cmd), len(cmd)
+    for gm in GIT_CMD_START_RE.finditer(cmd):
+        end = _git_stmt_end(cmd, gm.end())
+        pos = gm.end()
+        while pos < end:
+            fm = GIT_MSG_FLAG_RE.search(cmd, pos, end)
+            if not fm:
+                break
+            j = fm.end()
+            if j >= end or cmd[j] not in "'\"":
+                pos = fm.end() + 1
+                continue
+            if cmd[j] == "'":
+                k = cmd.find("'", j + 1, end)
+                if k < 0:
+                    pos = j + 1
+                    continue
+                for p in range(j, k + 1):
+                    out[p] = "x"
+                pos = k + 1
+                continue
+            k, live = j + 1, False
+            while k < end and cmd[k] != '"':
+                if cmd[k] == "\\" and k + 1 < end:
+                    k += 2
+                    continue
+                if cmd[k] == "`" or cmd.startswith("$(", k):
+                    live = True
+                    if cmd[k] == "`":
+                        k2 = cmd.find("`", k + 1, end)
+                        k = (k2 + 1) if k2 >= 0 else end
+                    else:
+                        depth, k2 = 1, k + 2
+                        while k2 < end and depth:
+                            if cmd[k2] == "(":
+                                depth += 1
+                            elif cmd[k2] == ")":
+                                depth -= 1
+                            k2 += 1
+                        k = k2
+                    continue
+                k += 1
+            if not live and k < end:
+                for p in range(j, k + 1):
+                    out[p] = "x"
+            pos = (k + 1) if k < end else end
+    return "".join(out)
+
+
+def _ro_bad_target(t: str, cwd: str, cmd_unsafe: bool) -> bool:
+    """True when a redirect or cp destination argument `t` can't be proven to land outside .ratchet/: empty,
+    a live substitution ($ or a backtick), a relative path while `cmd_unsafe` is set (the session cwd is
+    inside .ratchet/, or this command carries a cd/pushd/popd `_cmd_only_safe_cds` can't fully vouch for --
+    see its own comment), or a path that does resolve into .ratchet/."""
+    t = t.strip("'\"")
+    if not t or "$" in t or "`" in t:
+        return True
+    if not os.path.isabs(os.path.expanduser(t)) and cmd_unsafe:
+        return True
+    return _ratchet_rel(t, cwd) is not None
+
+
+def _ro_strip_words(words: list) -> list:
+    """`words` with any leading shell keyword, `VAR=value` assignment or wrapper word (sudo, env, ...)
+    removed, the same stripping both `_ro_prog_ok` and `_provably_read_only`'s own cd-tracking need."""
+    while words and words[0] in RO_KEYWORDS:
+        words = words[1:]
+    while words and re.match(r"^[A-Za-z_]\w*=", words[0]):
+        words = words[1:]
+    while words and words[0] in RO_WRAP:
+        words = words[1:]
+    return words
+
+
+def _ro_awk_script(raw: str) -> str | None:
+    """awk's own script argument (the first non -F-option bare word after its own name), read with the
+    proper shell-word tokenizer (`_shell_words`/`_simple_commands`) rather than the plain whitespace split
+    this fast path otherwise works from, so a script that itself holds whitespace
+    (`'BEGIN{f=".ratchet/x"; print "{}" > f}'`) comes back whole and unmangled -- never split on that
+    internal whitespace, and never first corrupted by the generic, quote-blind redirect-removal regex this
+    module's per-piece word-building applies before this would otherwise see it. None when `raw` can't be
+    read this way (a command substitution, an unbalanced quote) or its leading program isn't awk."""
+    words = _shell_words(raw)
+    if words is None:
+        return None
+    cmds = _simple_commands(words)
+    if not cmds or not cmds[0]:
+        return None
+    toks = _ro_strip_words(cmds[0])
+    if not toks or os.path.basename(toks[0]) != "awk":
+        return None
+    args, i = toks[1:], 0
+    while i < len(args):
+        a = args[i]
+        if a == "-F":
+            i += 2
+            continue
+        if re.match(r"^-F.+$", a):
+            i += 1
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        return a
+    return None
+
+
+def _uniq_operands(args: list) -> list:
+    """uniq's own positional operands from `args` (its arguments, program name already removed): a bare
+    `-` (the conventional stdin/stdout placeholder) counts as one even though it starts with "-"; -f/-s/-w
+    (skip-fields/skip-chars/check-chars) and their attached/`=`/separate numeric values are skipped, not
+    counted. Shared by the fast path's `_ro_prog_ok` and the loop check's `_loop_body_stage_writes` so both
+    treat uniq's arguments the same way (CP4 round-02 X2/A2/C3: a second, drifted copy had dropped the bare
+    `-` fix in the loop check)."""
+    bare, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-f", "-s", "-w"):
+            i += 2
+        elif re.match(r"^--(skip-fields|skip-chars|check-chars)=", a):
+            i += 1
+        elif re.fullmatch(r"--(skip-fields|skip-chars|check-chars)", a):
+            i += 2
+        else:
+            if not a.startswith("-") or a == "-":
+                bare.append(a)
+            i += 1
+    return bare
+
+
+_REDIR_OP_RE = re.compile(r"^(?:\d*|&)(?:<<<|<<|<|>>|>\||>)$")
+_REDIR_ATTACHED_RE = re.compile(r"^(?:\d*|&)(?:<<<|<<|<|>>|>\||>)\S+$")
+
+
+def _strip_redirect_args(args: list) -> list:
+    """`args` (already whitespace-split shell words) with every input/output redirection removed: a bare
+    operator token (`<`, `<<`, `<<<`, `>`, `>>`, `>|`, with an optional leading fd digits or `&`) together
+    with the word right after it, and an operator glued directly onto its own target in one token
+    (`<file`, `2>file`). Without this, a redirect sharing a statement with a program's own operands (`uniq
+    - "$f" < /tmp/new.json`) gets its target miscounted as one of that program's positional arguments (CP4
+    round-02 A2: `<` was being read as uniq's second operand instead of `"$f"`)."""
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if _REDIR_OP_RE.match(a):
+            i += 2
+            continue
+        if _REDIR_ATTACHED_RE.match(a):
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def _ro_prog_ok(words: list, cwd: str, maybe_inside: bool, has_subst: bool = False, raw: str | None = None) -> bool:
+    """Is this one piece's leading program (after stripping shell keywords, a leading VAR=, and a wrapper
+    word) one this fast path can prove reads only, used in a form with no write flag or unresolved
+    destination. `raw` (when given) is this piece's own unaltered text, used only to re-derive awk's script
+    argument properly (see `_ro_awk_script`)."""
+    words = _ro_strip_words(words)
+    if not words:
+        return True
+    if words[0] == "for":
+        return True  # `for X in LIST` runs nothing by itself; LIST is never executed here
+    p, args = os.path.basename(words[0]), words[1:]
+    s = " ".join(args)
+    if p not in RO_TABLE:
+        return False
+    if p == "sort":
+        return not any(re.match(r"^-[A-Za-z]*o|^--o", a) for a in args)
+    if p == "uniq":
+        # CP4: a bare `-` (the conventional stdin/stdout placeholder) counts as an operand too, even though
+        # it starts with "-" -- without this, `uniq - <target>` looked like a single-operand (read-only)
+        # call. `_uniq_operands` is shared with the loop check so both count uniq's arguments the same way.
+        return len(_uniq_operands(args)) <= 1
+    if p == "awk":
+        # only -F<sep> (attached, or as its own argument with the separator in the next one); no -i/-f/-v/
+        # --inplace or any other option; no bare `var=value` operand; the script itself (the first bare
+        # argument) must hold no redirect, pipe or process/stream side effect.
+        i, parts = 0, []
+        while i < len(args):
+            a = args[i]
+            if a == "-F":
+                i += 2
+                continue
+            if re.match(r"^-F.+$", a):
+                i += 1
+                continue
+            if a.startswith("-"):
+                return False
+            parts.append(a)
+            i += 1
+        if not parts:
+            return False
+        script = parts[0].strip("\"'")
+        if any(re.match(r"^[A-Za-z_]\w*=", a) for a in parts[1:]):
+            return False
+        if raw is not None:
+            full_script = _ro_awk_script(raw)
+            if full_script is not None:
+                script = full_script
+        return not RO_AWK_BAD_SCRIPT_RE.search(script)
+    if p == "sed":
+        # only -n (optionally combined with -E/-r) and a single print-only address script; no -i/--in-place/
+        # -f/-e beyond that, no w/W/e/r commands.
+        opts = [a for a in args if a.startswith("-")]
+        bare = [a for a in args if not a.startswith("-")]
+        if not opts or "n" not in "".join(opts) or not all(RO_SED_OPT_RE.match(o) for o in opts):
+            return False
+        if not bare:
+            return False
+        return bool(RO_SED_PRINT_RE.match(bare[0].strip("\"'")))
+    if p == "find":
+        if RO_FIND_WRITE_RE.search(" " + s):
+            return False
+        return all(os.path.basename(m.group(1)) in RO_XARGS_INNER_OK
+                   for m in RO_FIND_EXEC_RE.finditer(" " + s))
+    if p == "xargs":
+        i = 0
+        while i < len(args) and args[i].startswith("-"):
+            i += 2 if args[i] in ("-I", "-n", "-P", "-L", "-s", "-d", "-a", "-E") else 1
+        if i >= len(args):
+            return True
+        return os.path.basename(args[i]) in RO_XARGS_INNER_OK and _ro_prog_ok(args[i:], cwd, maybe_inside, has_subst)
+    if p == "cp":
+        # only a plain `cp SOURCE DEST`: no options at all, no command substitution anywhere in the command,
+        # and DEST a literal absolute path outside .ratchet/.
+        if has_subst or any(a.startswith("-") for a in args) or len(args) != 2:
+            return False
+        dest = args[1].strip("\"'")
+        return os.path.isabs(os.path.expanduser(dest)) and not _ro_bad_target(dest, cwd, maybe_inside)
+    return True
+
+
+def _mask_quoted_seps(s: str) -> str | None:
+    """`s` with every | ; & ( ) ` $ > and newline that sits inside a single-quoted span, or inside a
+    double-quoted span that holds no live substitution, replaced by 'x', so the statement split and redirect
+    scan below can keep using plain regexes without themselves being quote-aware, yet a quoted pipe,
+    ampersand, `>` (a jq filter, a grep alternation, an awk -F separator, a `>` inside a single-quoted
+    awk/sed script) or a newline (a python -c argument's own code spread over several lines, CP3 round-02) is
+    never mistaken for a statement separator or a real redirect. Length and every other character's position
+    are unchanged, so offsets found in the result line up exactly with `s` and the real (unmasked) text can
+    still be sliced out of `s` itself.
+
+    A double-quoted span may itself hold a live `$(...)` or backtick substitution, which the shell still runs
+    at the time this statement executes -- its own `|`/`;`/`&`/`>` are real shell syntax for that inner
+    command, not inert quoted text, so masking them (or just leaving them be and risking a false split) would
+    either hide a real write or desync the split. Returns None for the whole string in that case, so the
+    caller gives up on the fast path and falls back to the slow, fail-safe mention check instead of guessing."""
+    out, i, n = list(s), 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = i + 1
+            while j < n and s[j] != "'":
+                if s[j] in "|;&()`$>\n":
+                    out[j] = "x"
+                j += 1
+            i = j + 1
+        elif c == '"':
+            j, has_live = i + 1, False
+            while j < n and s[j] != '"':
+                if s[j] == "\\" and j + 1 < n:
+                    # CP4 round-05 B1: a backslash-escaped separator (`\|` in a grep/sed BRE alternation) is
+                    # still inert quoted text, not live shell syntax, so mask BOTH the backslash and the
+                    # escaped character itself (not skip past them unmasked) when the escaped character is
+                    # one of the separator set -- otherwise a double-quoted `"a\|b"` left its own `|`
+                    # unmasked and got split like a real pipe.
+                    if s[j + 1] in "|;&()`$>\n":
+                        out[j] = "x"
+                        out[j + 1] = "x"
+                    j += 2
+                    continue
+                if s[j] == "`" or s.startswith("$(", j):
+                    has_live = True
+                if s[j] in "|;&()`$>\n":
+                    out[j] = "x"
+                j += 1
+            if has_live:
+                return None
+            i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _mask_quoted_text(s: str) -> str | None:
+    """Like `_mask_quoted_seps`, but blanks EVERY character inside a quoted span (not only the separator set),
+    so a whole-word search for a shell keyword -- `_loop_write_problem`'s search for the loop-closing `done`
+    -- never matches that word sitting inside a quoted jq filter or echoed string (CP4 round-04 A1: `jq
+    '.phase="done"' "$f"` or `echo "all done" > "$f"` used to end the loop body early, right at the quoted
+    `done`, before the real write that follows it). Same length/position contract and the same None-on-live-
+    double-quoted-substitution escape as `_mask_quoted_seps`; see that function's own docstring."""
+    out, i, n = list(s), 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = i + 1
+            while j < n and s[j] != "'":
+                out[j] = "x"
+                j += 1
+            i = j + 1
+        elif c == '"':
+            j, has_live = i + 1, False
+            while j < n and s[j] != '"':
+                if s[j] == "\\" and j + 1 < n:
+                    # CP4 round-05 B1: blank the escaped pair too (this function blanks everything inside
+                    # quotes anyway), matching `_mask_quoted_seps`'s own fix for the same escape-skip gap.
+                    out[j] = "x"
+                    out[j + 1] = "x"
+                    j += 2
+                    continue
+                if s[j] == "`" or s.startswith("$(", j):
+                    has_live = True
+                out[j] = "x"
+                j += 1
+            if has_live:
+                return None
+            i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _mask_quoted_text_coarse(s: str) -> str:
+    """Like `_mask_quoted_text`, but never gives up: a double-quoted span that holds a live `$(...)`/backtick
+    substitution is blanked right along with the rest of that span's characters instead of making the whole
+    call return None. Same length/position contract (every character inside a single- or double-quoted span
+    becomes 'x', the quote characters themselves stay put) -- this is the coarse stand-in the loop checks
+    (`_normalize_loop_seps`, `_loop_write_problem`'s own loop-head match) fall back to precisely when
+    `_mask_quoted_text`/`_mask_quoted_seps` bail on that live substitution, so a loop whose body merely
+    stamps a `$(date)`/`$(basename ...)` into its own output is still structurally recognised as a loop (CP4
+    round-06 A1/C1/X1/X2: the old `_loop_write_problem_fallback` gave up on this entirely and scanned raw,
+    unmasked text for writer-program words instead, which both missed real writes like a quoted-substitution
+    `sed -i`/`uniq`/python write and flagged quoted DATA -- a writer-program word sitting inside a grep
+    pattern or echoed string -- as if it were a command)."""
+    out, i, n = list(s), 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = i + 1
+            while j < n and s[j] != "'":
+                out[j] = "x"
+                j += 1
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and s[j] != '"':
+                if s[j] == "\\" and j + 1 < n:
+                    out[j] = "x"
+                    out[j + 1] = "x"
+                    j += 2
+                    continue
+                out[j] = "x"
+                j += 1
+            i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _strip_group_prefix(tok: str) -> str:
+    """`tok` with any leading subshell/grouping/negation characters (`(`, `{`, `!`) removed, so the common
+    `(cd DIR && ...)` subshell idiom's first word reads as `cd`, not `(cd`. Shared by every cd/pushd/popd
+    tracker below (CP4 round-04 A3: all of them missed this form, a regression from main)."""
+    return tok.lstrip("({!")
+
+
+def _cmd_only_safe_cds(cmd: str) -> bool:
+    """True when `cmd` carries no cd/pushd/popd this fast path can't fully account for: no popd at all (its
+    target directory depends on an earlier pushd this function doesn't track), and every cd/pushd target is a
+    literal path (no $, backtick, bare `-`, or option) that, once `~` is expanded, is absolute and resolves
+    outside .ratchet/. Vacuously true when `cmd` has no cd/pushd/popd at all. A single all-or-nothing fact
+    about the whole command, not a position-by-position walk: CP2 round-06 found that walking cd state and
+    judging each redirect against only the FINAL state let `cd .ratchet/runs/hk && echo '{}' > state.json; cd
+    /tmp` through, since the trailing `cd /tmp` cleared the flag before the redirect was ever judged. Any cd
+    this function can't vouch for this way makes the whole command fall back to the slow, fail-safe path."""
+    for seg in _segments(cmd):
+        toks = _ro_strip_words(seg.strip().split())
+        if toks:
+            toks[0] = _strip_group_prefix(toks[0])
+        if not toks or toks[0] not in ("cd", "pushd", "popd"):
+            continue
+        if toks[0] == "popd":
+            return False
+        target = toks[1].strip("'\"") if len(toks) > 1 else ""
+        if not target or target == "-" or target.startswith("-") or "$" in target or "`" in target:
+            return False
+        target = os.path.expanduser(target)
+        if not os.path.isabs(target) or _ratchet_rel(target, "") is not None:
+            return False
+    return True
+
+
+# CP3: python/python3 is a reader too, but only in a few forms this fast path can prove never write -- a
+# `-c` one-liner, a bare-interpreter heredoc, or `-m json.tool` with at most one input file and no output
+# file -- and only when the code/body itself holds none of PY_WRITE_MARKER_RE's markers and no write-mode
+# open call. A write-mode open call is judged by one simple, fail-safe, whole-code rule rather than by
+# parsing any call's argument positions (round-03 found that position-aware parsing missed a mode sitting
+# next to a nested call, such as `open(Path('.ratchet/runs/x/state.json'), 'w')`, because excluding
+# parentheses from the matched arguments text also excluded the nested call's own parentheses, hiding the
+# mode that followed them): if the code contains an open-style call opener at all (`open(`, `.open(`,
+# `io.open(`, `codecs.open(`, `os.open(`, `os.fdopen(`) and anywhere in the code there is a quoted string
+# literal (a single or double quote, an optional one- or two-character b/r/f prefix, closed by the same
+# quote) whose whole content is made only of the characters r, w, a, x, b, t and + and holds at least one w,
+# a, x or +, the code counts as a write -- fail-safe, so a mode-shaped literal is enough by itself, even one
+# that is only assigned to a variable rather than proven to be that particular call's own mode argument. A
+# `mode=` keyword followed by something other than a quote (a variable, an expression) counts as a write
+# too, the same fail-safe way. A read with no mode, or with a mode literal made only of r/b/t characters
+# (`'r'`, `'rb'`, `'rt'`), still passes. This intentionally no longer tracks which argument of which call a
+# mode literal belongs to (the argument-splitting code that did this is gone with it): a non-literal,
+# non-`mode=` positional mode argument (`open(file, some_var)`) is not specially caught here any more and
+# relies on this same literal/opener rule and on PY_WRITE_MARKER_RE instead -- see CP3 round-03's fixes.md
+# for why this is the accepted, documented trade for closing the nested-call gap with the smallest change.
+# Anything this rule doesn't resolve as a write simply isn't flagged by it, which sends the whole command to
+# the slow, fail-safe path below exactly as before this checkpoint -- never widening what that path refuses.
+PY_PROG_RE = re.compile(r"^python[0-9.]*$|^py$")
+PY_SAFE_FLAGS = {"-B", "-E", "-I", "-s", "-u"}
+PY_HEREDOC_PREFIX_RE = re.compile(r"^(?:\S*/)?(?:python[0-9.]*|py)(?:\s*-)?$")
+PY_WRITE_MARKER_RE = re.compile(
+    r"\.write\(|\.writelines\(|write_text\(|write_bytes\(|json\.dump\(|pickle\.dump|"
+    r"os\.remove|os\.unlink|os\.rename|os\.replace|os\.rmdir|os\.removedirs|os\.makedirs|"
+    r"os\.mkdir|os\.truncate|os\.system|os\.popen|os\.exec|os\.spawn|os\.fdopen|shutil\.|subprocess|"
+    r"\.touch\(|\.unlink\(|\.rename\(|\.replace\(|\.mkdir\(|\.rmdir\(|\.symlink_to\(|\.hardlink_to\(|"
+    r"\.writerow\(|\.writerows\(|"
+    r"\bexec\(|\beval\(|__import__|importlib|getattr\(\s*os\b|sys\.stdout\s*=|\bfile\s*=|"
+    r"fileinput|inplace\s*=|os\.chmod|\.chmod\(|os\.(?:sym)?link\(|"
+    r"O_(?:WRONLY|RDWR|TRUNC|CREAT|APPEND)"
+)
+PY_OPEN_CALL_OPENER_RE = re.compile(
+    r"(?<![\w.])open\(|\bio\.open\(|\bcodecs\.open\(|\bos\.open\(|\bos\.fdopen\(|\.open\("
+)
+PY_MODE_LITERAL_RE = re.compile(r"""(?<![\w])[bBrRfF]{0,2}(['"])([rwaxbt+]+)\1""")
+PY_MODE_KWARG_NONLITERAL_RE = re.compile(r"""mode\s*=\s*(?!['"])""")
+# round-05: PY_WRITE_MARKER_RE only matched dotted uses (`os.remove`, `shutil.`, ...), so importing one of
+# these modules under a plain or aliased name and calling it undotted (`from os import remove; remove(...)`,
+# `import os as o; o.remove(...)`) passed this fast path. These two checks close that class, staying a text
+# deny-list and fail-safe like the rest of this file. PY_FROM_IMPORT_RE finds every `from <module> import
+# <names>` clause naming one of os/os.path/shutil/subprocess/pathlib/io/fileinput/tempfile; is_write below
+# treats each as a write except the four read-only shapes named in CP3 round-05's finding: `from os import
+# path`, `from os.path import ...` (any names), `from pathlib import Path` alone, and `from pathlib import
+# PurePath` alone. PY_IMPORT_AS_WRITE_RE and PY_IMPORT_PLAIN_WRITE_RE cover `import os/shutil/subprocess as
+# ...` (aliased, so the module's own dotted name never appears again) and bare `import shutil`/`import
+# subprocess` (so an unused or not-yet-dotted import of either is still a write); plain `import os` with no
+# alias stays a read, since `os.path...` usage is already a dotted marker on its own.
+PY_FROM_IMPORT_RE = re.compile(
+    r"\bfrom\s+(os\.path|os|shutil|subprocess|pathlib|io|fileinput|tempfile)\s+import\s+([^\n;#]+)"
+)
+PY_IMPORT_AS_WRITE_RE = re.compile(r"\bimport\s+(?:os|shutil|subprocess)\s+as\b")
+PY_IMPORT_PLAIN_WRITE_RE = re.compile(r"\bimport\s+(?:shutil|subprocess)\b")
+
+
+def _py_from_import_is_write(module: str, names: str) -> bool:
+    """True when a `from <module> import <names>` clause (matched by PY_FROM_IMPORT_RE) counts as a write for
+    this fast path. `from os.path import ...` is always a read, whatever names it imports. `from os import
+    path` (that single name, alone) is a read; any other name or combination from `os` is a write. `from
+    pathlib import Path` or `from pathlib import PurePath` (either, alone) is a read; any other name or
+    combination from `pathlib` is a write. Everything from shutil, subprocess, io, fileinput or tempfile is a
+    write, with no exemption."""
+    names = names.strip()
+    if module == "os.path":
+        return False
+    if module == "os":
+        return names != "path"
+    if module == "pathlib":
+        return names not in ("Path", "PurePath")
+    return True
+
+
+def _py_code_has_write_marker(code: str) -> bool:
+    """True when `code` (a python -c argument or heredoc body) holds any marker this fast path treats as a
+    write: see PY_WRITE_MARKER_RE's own comment for the full list, plus (only when the code also holds an
+    open-style call opener: `open(`, `.open(`, `io.open(`, `codecs.open(`, `os.open(`, `os.fdopen(`) either a
+    quoted mode literal made only of r/w/a/x/b/t/+ characters that holds a w, a, x or +, found anywhere in
+    the code, or a `mode=` keyword whose value is not a quoted literal at all; plus any `from <module>
+    import <names>` clause PY_FROM_IMPORT_RE finds that _py_from_import_is_write judges a write, any aliased
+    `import os/shutil/subprocess as ...` (PY_IMPORT_AS_WRITE_RE), and any bare `import shutil`/`import
+    subprocess` (PY_IMPORT_PLAIN_WRITE_RE). See the block comment above PY_PROG_RE for why this is a
+    whole-code, fail-safe rule rather than an argument-position-aware one."""
+    if PY_WRITE_MARKER_RE.search(code):
+        return True
+    if PY_IMPORT_AS_WRITE_RE.search(code) or PY_IMPORT_PLAIN_WRITE_RE.search(code):
+        return True
+    for m in PY_FROM_IMPORT_RE.finditer(code):
+        if _py_from_import_is_write(m.group(1), m.group(2)):
+            return True
+    if not PY_OPEN_CALL_OPENER_RE.search(code):
+        return False
+    if PY_MODE_KWARG_NONLITERAL_RE.search(code):
+        return True
+    for m in PY_MODE_LITERAL_RE.finditer(code):
+        if any(ch in m.group(2) for ch in "wax+"):
+            return True
+    return False
+
+
+def _ro_python_ok(piece: str) -> bool:
+    """Is this one piece's python/python3 call one of the forms this fast path can prove reads only: `-c` with
+    exactly one code argument (and no options besides -B/-E/-I/-s/-u), or `-m json.tool` with at most one
+    input file and no output-file argument -- and only when that code holds no PY_WRITE_MARKER_RE / open()-
+    mode marker. Any other shape (another module, extra args, an unreadable quote) returns False."""
+    words = _shell_words(piece)
+    if words is None:
+        return False
+    cmds = _simple_commands(words)
+    if len(cmds) != 1:
+        return False
+    toks = _ro_strip_words(cmds[0])
+    if not toks or not PY_PROG_RE.match(os.path.basename(toks[0])):
+        return False
+    args = toks[1:]
+    i = 0
+    while i < len(args) and args[i] in PY_SAFE_FLAGS:
+        i += 1
+    args = args[i:]
+    if args[:1] == ["-c"]:
+        return len(args) == 2 and not _py_code_has_write_marker(args[1])
+    if args[:2] == ["-m", "json.tool"]:
+        return len(args) - 2 <= 1
+    return False
+
+
+def _heredoc_py_pieces(cmd: str):
+    """Yield (match, sep_pos, prefix, body) for every heredoc in `cmd`, where `prefix` is the command text
+    immediately before it (back to the previous statement separator) and `body` is its text between the
+    opening and closing markers. Shared by `_strip_safe_python_heredocs` and `_guard_shell`'s own-run-state
+    check, so both agree on what "fed to a bare python/python3 invocation" means."""
+    pos = 0
+    for m in HEREDOC_RE.finditer(cmd):
+        sep_pos = pos - 1
+        for c in ";&|\n(":
+            p = cmd.rfind(c, pos, m.start())
+            if p > sep_pos:
+                sep_pos = p
+        prefix = cmd[sep_pos + 1:m.start()].strip()
+        lines = m.group(0).split("\n")
+        body = "\n".join(lines[1:-1])
+        yield m, sep_pos, prefix, body
+        pos = m.end()
+
+
+def _is_ro_python_heredoc(prefix: str, body: str) -> bool:
+    """True when `prefix` (the command text right before a heredoc) is a bare python/python3 invocation (no
+    other option, no script file) and `body` holds no PY_WRITE_MARKER_RE / open()-mode marker -- the rule
+    that lets a heredoc be treated as a proven read, shared by `_strip_safe_python_heredocs` and
+    `_guard_shell`'s own-run-state check below."""
+    return bool(PY_HEREDOC_PREFIX_RE.match(prefix)) and not _py_code_has_write_marker(body)
+
+
+def _strip_safe_python_heredocs(cmd: str) -> str:
+    """`cmd` with every heredoc fed to a bare `python3`/`python3 -` invocation (no other option, no script
+    file) replaced by a harmless `true` when its body holds no PY_WRITE_MARKER_RE / open()-mode marker, so the
+    piece-by-piece scan below never has to treat that body's own lines as separate shell statements. A
+    heredoc fed to anything else, or whose body does hold a marker, is left completely untouched here -- it
+    falls through to the existing, unchanged strict checks exactly as it did before this checkpoint."""
+    out, pos = [], 0
+    for m, sep_pos, prefix, body in _heredoc_py_pieces(cmd):
+        if not _is_ro_python_heredoc(prefix, body):
+            continue  # not a bare, proven-read-only python heredoc: leave it (and its body) for the strict checks
+        out.append(cmd[pos:sep_pos + 1])
+        out.append(" true")
+        pos = m.end()
+    out.append(cmd[pos:])
+    return "".join(out)
+
+
+def _provably_read_only(cmd: str, cwd: str) -> bool:
+    """True only when every statement in `cmd` can be PROVEN to write nothing. Anything this can't account for
+    returns False, so the caller falls back to the slower, fail-safe mention check that follows -- this never
+    allows a command that check would refuse, it only skips that check for commands proven safe here."""
+    # a command substitution or backtick ANYWHERE in the command can smuggle a .ratchet path into an
+    # unrecognised program's argument as plain output text (`unknown_cmd "$(echo .ratchet/x)"`), split away
+    # from the piece that names it by the separator split below; the unrecognised-program exemption in the
+    # loop must never fire on a command like that, so this is checked once, command-wide.
+    has_subst = bool(re.search(r"\$\(|`", cmd))
+    # `masked` keeps `cmd`'s own length and every character's position, with every | ; & ( ) ` $ > that sits
+    # inside quotes replaced -- so both the redirect scan and the statement split below can use plain regexes
+    # on it without being quote-aware themselves, yet a `>`, `|` or `;` sitting inside a quoted awk/sed
+    # script, a jq filter or a note is never mistaken for a real redirect or a statement boundary. A double-
+    # quoted span holding a live `$(...)`/backtick can't be masked this way (the shell still runs it), so
+    # `_mask_quoted_seps` returns None then and this whole command is left to the slow, fail-safe path.
+    masked = _mask_quoted_seps(cmd)
+    if masked is None:
+        return False
+    # CP4 round-04 host-alt-standards A1: a `>(` process substitution OUTSIDE quotes anywhere makes this
+    # command not provably read-only, whatever program sits inside it or where its target resolves -- the
+    # slow, fail-safe mention check judges it instead (see `_proc_subst_targets`). Checked on `masked`, not
+    # raw `cmd`, so a `>(...)` shape sitting inside an ordinary quoted string (a note or commit message
+    # quoting this very example) is never mistaken for a real one and sent needlessly to that slower path.
+    if ">(" in masked:
+        return False
+    # One all-or-nothing fact about the whole command (never a position-by-position walk -- see
+    # `_cmd_only_safe_cds`'s own comment for why): a relative redirect, cp destination, or unrecognised
+    # program's piece can only be proven to run outside .ratchet/ when the session's own cwd already is, AND
+    # every cd/pushd/popd in `cmd` is one `_cmd_only_safe_cds` can fully vouch for. Otherwise this whole
+    # command is "unsafe" for every relative target in it, command-wide, and falls back to the slow,
+    # fail-safe mention check below.
+    cmd_unsafe = _ratchet_rel(cwd, "") is not None or not _cmd_only_safe_cds(cmd)
+    # CP4: `_redirect_targets` (shared with the strict path's own scan in `_guard_shell`) replaces this
+    # function's own former inline use of RO_REDIRECT_RE, so both paths recognise every redirect operator
+    # form (`>`, `>>`, `N>`, `N>>`, `&>`, `&>>`, `>|`, `N>|`, `>&word`) the same way.
+    for t in _redirect_targets(cmd, masked):
+        if _ro_bad_target(t, cwd, cmd_unsafe):
+            return False
+    # Split on statement separators only outside quotes: a pipe inside a jq filter, a grep -E alternation or
+    # an awk -F'|' separator is quoted text, not a boundary between statements. `masked` finds those
+    # boundaries (it never changes length or position), and the pieces are then sliced from `cmd` itself so
+    # the quoted text (and any redirect) each piece carries stays intact, exactly as if the split had never
+    # touched it.
+    parts, pos = [], 0
+    for sm in RO_SEP_RE.finditer(masked):
+        parts.append(cmd[pos:sm.start()])
+        pos = sm.end()
+    parts.append(cmd[pos:])
+    # Iterate `parts` directly -- do not rejoin with "\n" and re-split, which used to be a no-op (every
+    # separator, including a quoted newline, used to end a part) but would now re-shred a part that carries a
+    # real newline preserved from inside its own quotes (CP3 round-02: a python -c argument's own line
+    # breaks), undoing the quote-aware split just performed above.
+    for piece in parts:
+        words = re.sub(r"(\d*|&)>>?\|?&?\s*\S*|<\s*\S*", " ", piece).split()
+        words = [w for w in words if w.strip("'\"")]
+        if not words:
+            continue
+        words2 = _ro_strip_words(words)
+        if not words2:
+            continue  # only keywords/assignments/wrappers survived stripping; nothing left runs
+        prog = os.path.basename(words2[0])
+        if prog in ("cd", "pushd", "popd"):
+            continue  # already accounted for, command-wide, in `cmd_unsafe` above
+        if PY_PROG_RE.match(prog):
+            # python's own read-only-ness never depends on cwd/cd (it's proven from the code/args alone), so
+            # this is judged on its own, same as the cd/pushd/popd branch above -- see `_ro_python_ok`.
+            if not _ro_python_ok(piece):
+                return False
+            continue
+        if prog != "for" and prog not in RO_TABLE:
+            # an unrecognised program: only provably safe when this piece is a plain top-level statement (no
+            # keyword/assignment/wrapper stripped off it -- a loop or conditional body can carry an unseen
+            # .ratchet path through its own variable, the same blind spot xargs has), holds no live
+            # substitution, names no .ratchet path itself, and the whole command isn't "unsafe" above
+            if words2 != words or has_subst or cmd_unsafe or "$" in piece or "`" in piece or \
+                    RATCHET_TOKEN_RE.search(piece):
+                return False
+            continue
+        if not _ro_prog_ok(words, cwd, cmd_unsafe, has_subst, piece):
+            return False
+    return True
+
+
+def _cmd_has_unresolved_cd(cmd: str) -> bool:
+    """True when some cd/pushd segment's target can't be resolved at all (a variable, a command substitution,
+    a backtick, a bare '-', or an option). Used only to judge a redirect's OWN relative target below -- never
+    to gate whether a whole segment with no .ratchet mention is looked at at all, which is what caused the
+    false refusals on ordinary commands (npm test, make, git push) after an everyday `cd "$REPO"`/`cd -`."""
+    for seg in _segments(cmd):
+        toks = _ro_strip_words(seg.strip().split())
+        if toks:
+            toks[0] = _strip_group_prefix(toks[0])
+        if not toks or toks[0] not in ("cd", "pushd"):
+            continue
+        target = toks[1].strip("'\"") if len(toks) > 1 else ""
+        if not target or target == "-" or target.startswith("-") or "$" in target or "`" in target:
+            return True
+    return False
+
+
+def _cmd_cd_names_ratchet(cmd: str) -> bool:
+    """True when some cd/pushd segment in `cmd` has a literal (resolvable) target whose text names
+    .ratchet/. Used only by the loop-write check's own narrow 'inside .ratchet' signal (CP4 round-02
+    X1/A3/C1): an ordinary relative cd to an unrelated directory (`cd docs`) must not count as inside, so
+    this never reuses `_cmd_only_safe_cds`'s broader 'this fast path can't fully vouch for this cd' signal,
+    which is also False for that harmless case."""
+    for seg in _segments(cmd):
+        toks = _ro_strip_words(seg.strip().split())
+        if toks:
+            toks[0] = _strip_group_prefix(toks[0])
+        if not toks or toks[0] not in ("cd", "pushd"):
+            continue
+        target = toks[1].strip("'\"") if len(toks) > 1 else ""
+        if target and _ratchet_rel(target, "") is not None:
+            return True
+    return False
+
+
+# CP4 design item 4: a `while`/`until ...; do ... done` or `for VAR in LIST; do ... done` loop whose own
+# input (a pipe into the while/until, a `< file`/`< <(...)` redirect after its `done`, or the for-list
+# itself) names a .ratchet path, or whose session's/command's own cd state is already inside .ratchet/, and
+# whose body (any stage, see `_loop_body_segments`) writes anything at all, is refused -- whatever the
+# writer program, whatever its arguments, and whether or not it even touches a loop variable. Check-in
+# decision (CP4 round 2): the earlier per-argument, loop-variable-as-destination analysis (`_loop_vars`,
+# `_loop_var_is_destination`, `_loop_body_writes_via_var`) kept leaking narrower and narrower cases each
+# review round, so this is deliberately simpler and stricter -- a loop that reads run files in its input and
+# writes ANYTHING in its body is refused; there is no longer a "this write's source/destination happens not
+# to be the loop variable" exemption. Narrow and line-shaped on purpose (a single, non-nested loop per
+# match, `do`/`done` as plain words, a loop header's own newline before `do` normalised to a `;` first) --
+# not a general shell parser; a loop shaped some other way simply isn't matched here and is left to the rest
+# of this guard's existing mention-based checks.
+LOOP_HEAD_RE = re.compile(
+    r"(?P<sep>^|[;&|\n])\s*(?:(?:while|until)\s+(?P<cond>.+?)|"
+    r"for\s+(?P<fvar>[A-Za-z_]\w*)\s+in\s+(?P<flist>[^;\n]+?))\s*;\s*do\b", re.S)
+# writer programs: whatever arguments they're given, each of these changes a file it's pointed at, so any of
+# them appearing in a loop body stage (see `_loop_body_stage_writes`) is a write, with no per-argument
+# source/destination analysis.
+LOOP_WRITER_PROGS = {"rm", "rmdir", "touch", "truncate", "tee", "chmod", "chown", "cp", "mv", "ln", "install",
+                      "dd", "sponge"}
+
+
+def _normalize_loop_seps(cmd: str) -> str:
+    """`cmd` with every newline that sits outside single/double quotes replaced by `;`, same length and
+    position as `cmd` (see `_mask_quoted_seps`, whose masked newlines mark exactly the ones inside quotes),
+    so `LOOP_HEAD_RE` only ever has to recognise a `;`-separated loop header, whether the agent wrote
+    `while ...; do` on one line or `while ...`/`do` split across several. Falls back to the coarse mask
+    (`_mask_quoted_text_coarse`, which never gives up) when `_mask_quoted_seps` itself gives up (a
+    double-quoted span with a live substitution) -- CP4 round-06: giving up here used to mean "skip the
+    whole loop check, hand the command to a crude raw-text fallback instead", which both missed real writes
+    and flagged quoted writer-program words as if they were commands. The coarse mask still tells us exactly
+    which newlines sit inside a quoted span (blanked, so no longer `\\n`) versus outside it (left alone), so
+    this never needs to give up at all.
+
+    A newline that follows an unquoted trailing `|`, `&` or `&&`/`||` (skipping only spaces/tabs in between)
+    feeds the next line into the SAME statement -- it is not a new statement at all, so it is left as plain
+    whitespace instead (CP4 round-04 A2: converting it to `;` turned `find ... |\\nwhile read f; do ... done`
+    into `... |;while ...`, which made `;`, not `|`, the separator `LOOP_HEAD_RE` captured, so the pipe-input
+    test below never saw the pipe)."""
+    masked = _mask_quoted_seps(cmd)
+    if masked is None:
+        masked = _mask_quoted_text_coarse(cmd)
+    out = list(cmd)
+    for i, ch in enumerate(masked):
+        if ch == "\n":  # an outside-quotes newline: _mask_quoted_seps leaves these alone, masking only ones
+            j = i - 1
+            while j >= 0 and masked[j] in " \t":
+                j -= 1
+            if j >= 0 and masked[j] in "|&":
+                out[i] = " "  # feeds the next line into this same pipeline/list: not a statement separator
+                continue
+            out[i] = ";"  # that sit inside quotes (to "x") -- see that function's own docstring.
+    return "".join(out)
+
+
+_LOOP_BODY_SEP_RE = re.compile(r"\|\||&&|;|\||&|\n")
+
+
+def _loop_body_segments(body: str) -> list:
+    """`body` split on every top-level `;`, `&&`, `||`, `|`, bare `&`, or newline -- quote-aware via
+    `_mask_quoted_seps` (same split `_segments` already gives the rest of this guard, with a bare `&` added
+    too), so every pipeline/statement stage of a loop body is checked on its own, not just the first stage
+    before a `|` (CP4 round-02 A1/C2: `cat /tmp/new.json | tee "$f"` is two stages; the first is read-only,
+    the second is the real write, and the old `[;\\n]`-only split never looked past the first)."""
+    masked = _mask_quoted_seps(body)
+    if masked is None:
+        return [p for p in _LOOP_BODY_SEP_RE.split(body) if p.strip()]
+    # CP4 round-04 minor A4: a `>|` (or `N>|`) clobber redirect is a single operator, not a pipe into a
+    # second stage -- mask its own `|` character here the same way a quoted one already is (same length, so
+    # positions stay aligned), so the split below never splits a write like `echo x >| "$f"` into a harmless-
+    # looking `echo x >` stage and a second stage that loses the operator and its own real target.
+    masked = re.sub(r">\|", ">x", masked)
+    parts, pos = [], 0
+    for sm in _LOOP_BODY_SEP_RE.finditer(masked):
+        parts.append(body[pos:sm.start()])
+        pos = sm.end()
+    parts.append(body[pos:])
+    return [p for p in parts if p.strip()]
+
+
+def _loop_body_stage_writes(seg: str) -> bool:
+    """True when loop body stage `seg` writes anything, whatever its own arguments (CP4 round-02 check-in
+    SIMPLIFY decision: the earlier per-argument, loop-variable-as-destination analysis kept leaking narrower
+    cases every round, so this no longer asks whether a write's source or destination happens to be the
+    loop's own variable -- any writer program or any output redirect in the stage is enough). An output
+    redirect is safe only when its target is a literal absolute path outside .ratchet/ with no `$` (fd
+    duplication and /dev/null are never targets at all -- see `_redirect_targets`)."""
+    masked = _mask_quoted_seps(seg)
+    # CP4 round-03 A1: a `>(...)` process substitution hides its own write target from `_redirect_targets`
+    # by design (its argument characters are excluded from the target's own character class -- see that
+    # function's docstring), so `cat SRC > >(tee "$f")` inside a loop body was judged read-only. Any `>(`
+    # outside quotes in a loop body stage counts as a write outright, the same rule `_provably_read_only`
+    # already applies at the top level.
+    if ">(" in (masked if masked is not None else seg):
+        return True
+    # CP4 round-03 X1: pass the quote-aware mask into `_redirect_targets`, matching the other two call
+    # sites (`_provably_read_only` and the strict path in `_guard_shell`), so a `>` sitting inside a quoted
+    # jq filter or grep pattern (`jq '.count > 0'`, `grep -c 'a=>b'`) is never mistaken for a real redirect.
+    for t in _redirect_targets(seg, masked):
+        tt = t.strip("'\"")
+        if "$" in tt or "`" in tt or not os.path.isabs(os.path.expanduser(tt)) or _ratchet_rel(tt, "") is not None:
+            return True
+    prog, _ = _program(seg)
+    if prog in LOOP_WRITER_PROGS:
+        return True
+    if prog in ("sed", "perl") and re.search(r"(?:^|\s)(-[A-Za-z]*i\b|--in-place\b)", seg):
+        return True
+    if prog in ("awk", "gawk") and re.search(r"(?:^|\s)-i\b", seg):
+        return True
+    if re.fullmatch(r"python[0-9.]*|py|node", prog) and WRITE_CODE_RE.search(seg):
+        return True
+    if prog == "uniq":
+        # CP4 round-02 A2/C3: strip any redirect sharing this statement (`uniq - "$f" < /tmp/new.json`)
+        # before counting uniq's own operands with the same shared helper `_ro_prog_ok` uses, so a bare
+        # `-` is counted and a redirect target is never mistaken for uniq's own second operand.
+        return len(_uniq_operands(_strip_redirect_args(seg.split()[1:]))) >= 2
+    return False
+
+
+def _loop_write_problem(cmd: str, cwd: str) -> bool:
+    """True when `cmd` holds a loop `LOOP_HEAD_RE` recognises whose input/list names a .ratchet path (or
+    whose own cd state is already inside .ratchet/) and whose body (any stage `_loop_body_segments` finds)
+    writes anything at all (see `_loop_body_stage_writes`). Check-in decision (CP4 round 2): there is no
+    longer any "this write doesn't touch the loop variable" exemption -- a loop proven to read run files is
+    refused the moment any stage of its body writes anything.
+
+    CP4 round-06 SIMPLIFY (deletes the old `_loop_write_problem_fallback`): a live `$(...)`/backtick
+    substitution inside a double-quoted span anywhere in `cmd` no longer sends this whole check to a crude,
+    unmasked text scan for writer-program words -- that scan both missed real writes (a `sed -i`/`uniq`/
+    python write paired with an unrelated `$(date)` stamp elsewhere in the same loop) and flagged quoted DATA
+    as if it were a command (a writer-program word sitting inside a grep pattern or echoed string). Instead,
+    `_normalize_loop_seps` and the loop-head match below fall back to the coarse mask
+    (`_mask_quoted_text_coarse`, which never gives up) so this one loop checker always runs the same
+    structural walk; only the quote mask gets cruder when a live substitution is present."""
+    norm = _normalize_loop_seps(cmd)
+    # CP4 round-02 X1/A3/C1: "inside .ratchet" here means only the session's own cwd is inside .ratchet/,
+    # or this command carries a cd/pushd whose literal target names .ratchet, or one whose target can't be
+    # resolved at all ($var, `-`, a substitution) -- never "any cd `_cmd_only_safe_cds` can't fully prove
+    # absolute-and-safe", which is also true of a perfectly ordinary relative cd to an unrelated directory
+    # (`cd docs`) and would refuse that loop for no reason connected to .ratchet/ at all.
+    cwd_inside = (_ratchet_rel(cwd, "") is not None or _cmd_cd_names_ratchet(cmd) or _cmd_has_unresolved_cd(cmd))
+    # CP4 round-05 A2: match the loop head on a fully quote-blanked copy of `norm` (same contract
+    # `_redirect_targets`/`_proc_subst_targets` already use elsewhere), not on `norm` itself -- otherwise a
+    # `|`/`while ... do ... done` shape sitting inside a quoted echo/printf argument (plain documentation
+    # text, never real shell syntax) was read as a genuine loop header and body. Real text for every group is
+    # still sliced out of `norm` itself by position, since masking never changes length or position.
+    head_mask = _mask_quoted_text(norm)
+    if head_mask is None:
+        # CP4 round-06: `norm` itself still carries the live substitution verbatim (masking never changes
+        # the real text, only normalizes separators), so the precise mask gives up here too -- fall back to
+        # the coarse one (never None) instead of scanning raw, unmasked text.
+        head_mask = _mask_quoted_text_coarse(norm)
+    for m in LOOP_HEAD_RE.finditer(head_mask):
+        rest = norm[m.end():]
+        # CP4 round-04 A1: find the loop's closing `done` on quote-masked text (see `_mask_quoted_text`), and
+        # only as a whole word right after a statement separator (`;`, `&`, a newline -- already normalised
+        # to `;` above -- or the very start of `rest`), so a `done` sitting inside a quoted jq filter or
+        # echoed string (`jq '.phase="done"' "$f"`, `echo "all done" > "$f"`) is never mistaken for the real
+        # loop end. Falls back to the plain (unmasked) text only when masking itself gives up (a double-
+        # quoted span with a live substitution), same fail-safe default as every other caller of the mask.
+        rest_masked = _mask_quoted_text(rest)
+        hay = rest_masked if rest_masked is not None else rest
+        done_m = re.search(r"(?:^|[;&\n])\s*(done)\b", hay, re.S)
+        if not done_m:
+            continue
+        body = rest[:done_m.start(1)]
+        if m.group("fvar"):
+            flist = norm[m.start("flist"):m.end("flist")] if m.group("flist") is not None else ""
+            input_ok = cwd_inside or bool(RATCHET_TOKEN_RE.search(flist))
+        else:
+            before = norm[:m.start("sep")]
+            input_ok = cwd_inside or (m.group("sep") == "|" and bool(RATCHET_TOKEN_RE.search(before)))
+            if not input_ok:
+                tail = rest[done_m.end(1):]
+                redir_m = re.match(r"\s*<\s*(<\(.*?\)|\S+)", tail)
+                input_ok = bool(redir_m and RATCHET_TOKEN_RE.search(redir_m.group(1)))
+        if input_ok and any(_loop_body_stage_writes(seg) for seg in _loop_body_segments(body)):
+            return True
+    return False
+
+
+def _mask_subst_free_spans(raw: str) -> str:
+    """`raw` with the spans a `$(`/backtick substitution check should ignore replaced by inert text: every
+    single-quoted span (`_mask_quoted_seps` already blanks a backtick/$ there, since bash never expands
+    either inside single quotes) and the body of any heredoc whose delimiter is itself quoted (`<<'EOF'`,
+    `<<"EOF"`, `<<-'EOF'`) -- bash never expands that body either. A Markdown backtick in a quoted brief or
+    heredoc, or a literal `$(...)` example quoted in a commit message, is therefore not a real command
+    substitution. A double-quoted span and an unquoted-delimiter heredoc body are left exactly as they are:
+    the shell still expands those, so a `$(`/backtick there must still count.
+
+    Falls back to `raw` itself when `_mask_quoted_seps` gives up (a double-quoted span elsewhere in the
+    command holds a live substitution) -- that case is still refused correctly, because `raw` itself still
+    carries the unmasked `$(`/backtick. Same length and position as `raw`, so the mention test run against
+    `raw` and the substitution test run against this result always agree on where each character sits."""
+    masked = _mask_quoted_seps(raw)
+    out = list(masked if masked is not None else raw)
+    for m in HEREDOC_RE.finditer(raw):
+        if not m.group(1):
+            continue  # unquoted delimiter: bash still expands this body
+        lines = m.group(0).split("\n")
+        body = "\n".join(lines[1:-1])
+        body_start = m.start(0) + len(lines[0]) + 1
+        for k in range(body_start, body_start + len(body)):
+            out[k] = "x"
+    return "".join(out)
+
+
 def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
     raw = cmd
-    if INTERPRETER_RE.search(raw):  # heredoc bodies fed to an interpreter are code, not data: check what they touch
-        for m in HEREDOC_RE.finditer(raw):
+    if HEREDOC_RE.search(raw):
+        for m, _sep_pos, prefix, body in _heredoc_py_pieces(raw):
+            # CP4 round-05 B2/S1: a heredoc is also code when the INTERPRETER it's fed to comes AFTER the
+            # heredoc operator on the same opening line (`cat <<'EOF' | python3`, `cat <<'EOF' | bash`), not
+            # only when it comes before (`python3 <<EOF`). `m.group(3)` is `HEREDOC_RE`'s own capture of the
+            # rest of that opening line (already holds the `| python3`/`| bash`); check it the same way as
+            # `prefix`, the text before the heredoc.
+            trailer = m.group(3) or ""
+            if not INTERPRETER_RE.search(prefix) and not INTERPRETER_RE.search(trailer):
+                # CP4 round-04 host-alt-correctness A1: this heredoc's own feeding program (`prefix`, the
+                # command text right before it, or `trailer`, the text piping it onward) isn't an
+                # interpreter, so its body is data, not code -- even when some OTHER word in the command
+                # (including a bare interpreter name sitting inside this same heredoc's own body, which is
+                # plain prose) happens to match INTERPRETER_RE. A `cat > file << EOF` heredoc whose body
+                # merely mentions "sh"/"python"/... in prose stays data here.
+                continue
+            if _is_ro_python_heredoc(prefix, body):
+                # same rule `_strip_safe_python_heredocs` uses below to prove this heredoc reads only: a bare
+                # python/python3 invocation whose body holds no write marker. Let it skip this earlier
+                # run-state refusal so a read-only full-path open() on a run file isn't blocked before that
+                # pass-through ever runs. A write marker, or any other interpreter (bash, node, ...), still
+                # falls through to the checks below exactly as before.
+                continue
             for t in RATCHET_TOKEN_RE.findall(m.group(0)):
                 if not _write_allowed(t, cwd):
                     return ("RATCHET GUARD: this script touches Ratchet's run state (.ratchet/). Gate state, evidence, "
@@ -11615,7 +13793,16 @@ def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
                 why = _owner_problem(t, cwd, who)
                 if why:
                     return why
+    # CP3: a bare python3/python3 - heredoc whose body holds no write marker is swapped for a harmless `true`
+    # here, before `_expand` below drops every heredoc body as data -- `_provably_read_only` never sees the
+    # original heredoc syntax at all, so this must run first. The RATCHET_TOKEN mention check just above now
+    # skips the same proven-read-only heredocs (see `_is_ro_python_heredoc`), so a full-path read of a run
+    # file in one of those heredocs reaches this substitution instead of being refused there; any heredoc
+    # that doesn't qualify (a write marker, or fed to bash/sh/node/...) is still refused there first, exactly
+    # as before.
+    cmd = _strip_safe_python_heredocs(cmd)
     cmd = _expand(cmd)
+    cmd = _blank_commit_messages(cmd)
     if NESTED_AGENT_RE.search(cmd):
         return ("RATCHET GUARD: launching another agent session (claude -p, codex exec, gemini -p, copilot -p) from "
                 "the shell is blocked while Ratchet is active — it could impersonate the user. Use sub-agents, "
@@ -11625,19 +13812,95 @@ def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
                 "yourself would forge a user message or a gate event.")
     if DANGEROUS_GIT_RE.search(cmd):
         return "RATCHET GUARD: this git command would delete or stash Ratchet's run state (ignored files)."
-    inside = any(re.match(r"^\s*(cd|pushd)\s+\S*\.ratchet", seg, re.I) for seg in _segments(cmd))
+    # CP4 (director decision, round 6): a command substitution ($(...) or a backtick, quoted or not) can hide a
+    # write inside what looks like a read, and this guard does not parse shells well enough to see through it.
+    # Fail closed with no parsing: a command that names Ratchet's run folder at all (the same RATCHET_TOKEN_RE
+    # mention test used elsewhere, applied to the raw, untouched command text) and contains `$(` or a backtick
+    # anywhere is refused outright, before the loop check and the read-only fast path below ever run. A command
+    # that never mentions .ratchet is untouched by this check.
+    # CP4 round 7 (director decision): bash never expands a `$(`/backtick that sits inside a single-quoted
+    # span, or inside the body of a heredoc whose own delimiter is quoted (<<'EOF', <<"EOF", <<-'EOF') -- so a
+    # Markdown brief, a quoted heredoc example or a single-quoted commit message that merely mentions a run
+    # path in backticks is not a real substitution. `_mask_subst_free_spans` blanks exactly those two inert
+    # spans (and only falls back to `raw` unmasked when it can't, which still refuses correctly); a `$(` or
+    # backtick that is unquoted, inside double quotes, or inside an unquoted-delimiter heredoc body still
+    # counts. The mention test above still runs on `raw` itself, unchanged.
+    subst_text = _mask_subst_free_spans(raw)
+    if RATCHET_TOKEN_RE.search(raw) and ("$(" in subst_text or "`" in subst_text):
+        return ("RATCHET GUARD: this command names Ratchet's run folder and contains a command substitution "
+                "($(...) or backticks). Run the substitution as its own command first, then use its result in "
+                "a separate command.")
+    if _loop_write_problem(cmd, cwd):
+        return ("RATCHET GUARD: this loop reads Ratchet's run files and writes inside its own body. Gate "
+                "state, evidence, approvals and config are owned by ratchet.py — use its commands instead. "
+                "Inside such a loop, only a redirect to a literal absolute path outside .ratchet/ with no $ "
+                "is safe, for example cat \"$f\" >> /tmp/summary.txt; tee, cp, mv, rm, sponge and other "
+                "writer programs are refused in the body whatever their arguments.")
+    if _provably_read_only(cmd, cwd):
+        return None
+    base_deny = ("RATCHET GUARD: this command could change Ratchet's run state (.ratchet/). Gate state, evidence, "
+                 "approvals and config are owned by ratchet.py — use its commands (behavior / ui-record / "
+                 "adv-record / complete / config) instead. To read run files, use cat, jq, grep, head/tail, "
+                 "sed -n or awk without -i; python and other programs that name a run path are refused.")
+    cwd_inside = _ratchet_rel(cwd, "") is not None
+    cmd_inside = any(re.match(r"^\s*[({!]*\s*(cd|pushd)\s+\S*\.ratchet", seg, re.I) for seg in _segments(cmd))
+    if cwd_inside:
+        # the fast path above already let through anything it can prove reads only, cd included; reaching
+        # here means this command isn't provably read-only, and the session's shell is already inside
+        # .ratchet/, so a bare relative argument (rm state.json, echo x > state.json) could land on a run
+        # file with no .ratchet token anywhere in the command text for the mention checks below to catch.
+        return ("RATCHET GUARD: your shell is inside .ratchet/; cd back to the project root first, then run "
+                "the command. To read run files from here, use cat, jq, grep, head/tail, sed -n or awk "
+                "without -i; everything else needs the shell back at the project root.")
+    deny = base_deny if not cmd_inside else (
+        base_deny + " Run commands that change files in a separate call, after cd-ing back out of .ratchet/.")
+    inside = cmd_inside
+    any_mention = any(RATCHET_TOKEN_RE.search(s) for s in _segments(cmd))
+    cd_unresolved = _cmd_has_unresolved_cd(cmd)
     for seg in _segments(cmd):
         if re.fullmatch(r"\s*(export\s+)?[A-Za-z_]\w*=\S*\s*", seg):
             continue  # a bare assignment writes nothing; its uses were expanded above
         prog, sub = _program(seg)
+        # CP4 round-06: `for X in LIST` runs nothing by itself (LIST is never executed here) -- the same rule
+        # `_ro_prog_ok` already gives the precise path. Reached only when this command's own live substitution
+        # elsewhere (not in this segment) sent the whole command to this slow path; without this, a for-loop
+        # whose list names a run path (an ordinary read-only diagnostic) was refused on that mention alone.
+        if prog == "for":
+            continue
         mentions = RATCHET_TOKEN_RE.findall(seg)
-        if not mentions and not inside:
+        if prog == "sed":
+            mentions += [t.strip("'\"") for t in SED_W_TARGET_RE.findall(seg) if ".ratchet" in t.lower()]
+        if prog == "xargs" and not mentions and any_mention:
+            # the write program's real targets come from an earlier pipeline stage's output, which this guard
+            # can't see; that earlier stage (anywhere in the command) named a .ratchet path, so fail safe
+            # unless the program xargs runs is itself read-only (closes `find .ratchet | xargs rm`)
+            inner = [t for t in seg.strip().split()[1:] if not t.startswith("-")]
+            inner_prog = os.path.basename(inner[0]) if inner else ""
+            if inner_prog and inner_prog not in READ_ONLY_PROGRAMS:
+                return deny
+        # a redirect target can be quoted ('...' or "..."); unquote it before resolving/checking it below, so a
+        # quoted literal path into a run file (`jq ... > ".ratchet/runs/hk/state.json"`) is judged on its real
+        # path, not left unresolved by the quote characters. A target that still holds `$` or a backtick after
+        # unquoting stays unresolvable, same as before (it never matched a literal .ratchet path either way).
+        # CP4: `_redirect_targets` recognises every operator form (`>`, `>>`, `N>`, `N>>`, `&>`, `&>>`, `>|`,
+        # `N>|`, `>&word`), not just the plain `>`/`>>` the old REDIRECT_RE-based list caught; `_proc_subst_targets`
+        # adds a `>(...)` process substitution's own inner program's arguments (`tee <file>`) as write targets
+        # too, exactly as a bare call to that program would get.
+        seg_masked = _mask_quoted_seps(seg)
+        targets = _redirect_targets(seg, seg_masked) + _proc_subst_targets(seg, seg_masked)
+        # an earlier cd/pushd in this command whose target can't be resolved at all leaves this redirect's own
+        # relative target unproven -- but only the target itself is judged on that, never the broad mentions/
+        # inside skip below (that broad use is what caused ordinary commands with no .ratchet mention at all,
+        # such as `cd "$REPO" && npm test`, to be refused; see CP2 round-05 finding A1).
+        unresolved_target = cd_unresolved and any(not os.path.isabs(os.path.expanduser(t.strip("'\"")))
+                                                   for t in targets)
+        if not mentions and not inside and not unresolved_target:
             continue
         if ENGINE_CALL_RE.match(seg):
-            if not REDIRECT_RE.search(seg):
+            if not targets:
                 continue  # ratchet.py / reviewer scripts write their own files
-        for t in mentions + REDIRECT_RE.findall(seg):
-            if prog in READ_ONLY_PROGRAMS and t not in REDIRECT_RE.findall(seg):
+        for t in mentions + targets:
+            if prog in READ_ONLY_PROGRAMS and t not in targets:
                 continue  # reading a review is fine
             why = _owner_problem(t, cwd, who)
             if why:
@@ -11645,17 +13908,15 @@ def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
         read_only = prog in READ_ONLY_PROGRAMS or (prog == "git" and sub in READ_ONLY_GIT) or \
             (prog == "find" and not re.search(r"\s-(delete|exec|execdir|ok|fprint)\b", seg)) or \
             (prog in ("mkdir",) and all(_write_allowed(t, cwd) for t in mentions))
-        targets = [t for t in REDIRECT_RE.findall(seg) if t not in ("/dev/null", "/dev/stderr", "/dev/stdout")]
         if read_only and not targets:
             continue
-        if read_only and targets and all(_write_allowed(t, cwd) and not inside for t in targets):
+        if read_only and targets and all(_write_allowed(t, cwd) and not inside and not unresolved_target
+                                          for t in targets):
             continue
-        if not inside and mentions and all(_write_allowed(t, cwd) for t in mentions) and \
+        if not inside and not unresolved_target and mentions and all(_write_allowed(t, cwd) for t in mentions) and \
                 all(_write_allowed(t, cwd) for t in targets):
             continue  # e.g. writing a review JSON or a capture spec
-        return ("RATCHET GUARD: this command could change Ratchet's run state (.ratchet/). Gate state, evidence, "
-                "approvals and config are owned by ratchet.py — use its commands (behavior / ui-record / adv-record "
-                "/ complete / config) instead. Reading those files is fine.")
+        return deny
     return None
 
 
@@ -12473,7 +14734,8 @@ STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "re
                      "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
                      "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait", "accept-finding",
                      "raise-limit", "check-in", "triage", "merged")
-LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers", "merged")  # tests, checks, a regression suite, provider probes
+LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers", "providers", "merged")  # tests, checks, a regression
+                                                                                          # suite, provider probes (--add included)
 # The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
 OVERRIDE_CMDS = ("approve-plan", "human-approve", "approve-changes", "cancel", "set-review", "resume", "hooks-waive",
                  "ui-respec", "choice", "feedback", "accept-state", "init")
@@ -12490,6 +14752,11 @@ def _changes_state(args) -> bool:
         return bool(getattr(args, "offered", None))
     if args.cmd == "spec":
         return getattr(args, "spec_cmd", None) in ("import", "keep")
+    if args.cmd == "providers":
+        # --add is the only form that can consume the developer's one-time paid-provider OK (_consume_paid_ok)
+        # and send a real test request; locking it the same way every other question-consuming command is
+        # locked means two `providers --add` calls for the same tool/model never both spend that one OK.
+        return bool(getattr(args, "add", None))
     return args.cmd in STATE_LOCKED_CMDS
 
 
@@ -13188,10 +15455,12 @@ def main(argv=None):
     a.add_argument("--claim", action="store_true"); a.set_defaults(fn=cmd_resume)
     a = sp.add_parser("ask", help="record and print the question you're about to ask the user (needed before approve-plan, "
                                   "human-approve, cancel, set-review, approve-changes, hooks-waive, resume --claim, "
-                                  "ui-respec, accept-finding)")
+                                  "ui-respec, accept-finding, paid-provider)")
     a.add_argument("action", choices=list(ASKABLE) + ["withdraw"])
-    a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec/accept-finding: the checkpoint id")
-    a.add_argument("ids", nargs="?", help="accept-finding: the finding ids to accept, comma-separated (e.g. F1,F2)")
+    a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec/accept-finding: the checkpoint "
+                                           "id; paid-provider: the tool (preset)")
+    a.add_argument("ids", nargs="?", help="accept-finding: the finding ids to accept, comma-separated (e.g. F1,F2); "
+                                          "paid-provider: the exact model name")
     a.add_argument("--options", help="choice: the option letters, e.g. A,B,C")
     a.add_argument("--guardrail", action="append", metavar="LETTER=KIND",
                    help="choice: picking LETTER adds a guardrail step (an automatic check) for this kind of finding")
@@ -13273,6 +15542,9 @@ def main(argv=None):
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_receipt)
     sp.add_parser("next").set_defaults(fn=cmd_next)
     a = sp.add_parser("status"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_status)
+    a = sp.add_parser("changes", help="which changes since a checkpoint's start are docs, how many code lines "
+                       "changed, which test files name a doc, and whether the docs quick path is on")
+    a.add_argument("cp"); a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_changes)
     sp.add_parser("plan-summary", help="plain per-step summary of the plan, to show the user before they approve"
                   ).set_defaults(fn=cmd_plan_summary)
     a = sp.add_parser("brief", help="print a sub-agent's opening text: the plan's objective, then that role's own "
