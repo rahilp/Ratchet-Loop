@@ -37,6 +37,7 @@ import re
 import shlex
 import unicodedata
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -254,6 +255,19 @@ _SAFE_SLUG_RE = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]+$")  # a run folder name:
 _STATE_LOCK_HELD = False  # set by main() while this process holds the state lock for its whole command
 
 
+def config_from_user(user: dict) -> dict:
+    """The effective config for a config.json's content: the shipped defaults with the file's settings on top."""
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if user.get("review_depth") == OLD_DEFAULT_REVIEW_DEPTH:
+        user = {k: v for k, v in user.items() if k != "review_depth"}  # untouched old default: use the new one
+    for k, v in user.items():
+        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+            cfg[k].update(v)
+        else:
+            cfg[k] = v
+    return cfg
+
+
 class Ctx:
     def __init__(self, root: Path):
         self.root = root
@@ -265,16 +279,7 @@ class Ctx:
         return self.ratchet / "config.json"
 
     def config(self):
-        cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-        user = read_json(self.config_path, {}) or {}
-        if user.get("review_depth") == OLD_DEFAULT_REVIEW_DEPTH:
-            user = {k: v for k, v in user.items() if k != "review_depth"}  # untouched old default: use the new one
-        for k, v in user.items():
-            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-                cfg[k].update(v)
-            else:
-                cfg[k] = v
-        return cfg
+        return config_from_user(read_json(self.config_path, {}) or {})
 
     # --- active run
     def active_slug(self):
@@ -396,6 +401,12 @@ def fingerprint(root: Path) -> dict:
     return {"kind": "manifest", "id": fid}
 
 
+def _head_sha(root: Path) -> str:
+    """HEAD's commit sha, or "" when there is none (no git, or no commit yet)."""
+    r = subprocess.run(["git", "rev-parse", "-q", "--verify", "HEAD"], cwd=root, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str, extra: dict | None = None):
     """Commit exactly what this checkpoint changed, byte for byte as reviewed: HEAD plus the difference between the
     checkpoint's starting tree and the reviewed tree. Unrelated work already in the tree, and anything the user has
@@ -407,6 +418,9 @@ def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str, extra: dict | No
     paths = changed_files(root, {"kind": "git-tree", "id": base_tree}, fp)
     if not paths and not extra:
         return None
+    # the index takes repo-root-relative paths; the project folder may sit below the git root
+    pre = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=root, capture_output=True, text=True).stdout.strip()
+    top = root.joinpath(*[".."] * pre.count("/"))
     shared = []  # the .ratchet files people edit and share ride along with the checkpoint (never run state)
     for name in (".gitignore", "config.json", "standards.md", "learnings.md"):
         f = root / RATCHET_DIR / name
@@ -414,7 +428,7 @@ def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str, extra: dict | No
             oid = subprocess.run(["git", "hash-object", "-w", "--", str(f)], cwd=root, capture_output=True,
                                  text=True).stdout.strip()
             if oid:
-                shared.append((f"{RATCHET_DIR}/{name}", oid))
+                shared.append((f"{pre}{RATCHET_DIR}/{name}", oid))
     for rel, text in (extra or {}).items():  # files Ratchet itself updated after review (spec task ticks), as given
         oid = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=root, capture_output=True,
                              input=text.encode("utf-8", "surrogateescape")).stdout.decode().strip()
@@ -453,7 +467,7 @@ def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str, extra: dict | No
         new = git("commit-tree", tree, *(["-p", head] if head else []), "-m", msg).strip()
     git("update-ref", "HEAD", new, *([head] if head else []))
     # the real index now lags behind HEAD for these paths: bring just those entries up to date
-    subprocess.run(["git", "reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], cwd=root,
+    subprocess.run(["git", "reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], cwd=top,
                    capture_output=True, input="\0".join(paths + [r for r, _ in shared]).encode("utf-8", "surrogateescape"),
                    env=dict(os.environ, GIT_LITERAL_PATHSPECS="1"))
     return new[:7]
@@ -888,7 +902,7 @@ _ABSENT = object()  # pass as _read_record's `missing` to tell a file that is no
 _FRESH = object()  # _read_record's default for `missing`: a new empty record ({}, or [] for lines)
 
 
-def _read_record(path: Path, kind=dict, missing=_FRESH, lines: bool = False, tail: int | None = None):
+def _read_record(path: Path, kind=dict, missing=_FRESH, lines: bool = False, tail: int | None = None, data=None):
     """The one reader of Ratchet's records (every file under .ratchet/ and in RATCHET_HOME that the hooks or the
     engine read for state, approvals, crashes, notes, hashes, director folders, stop errors or active runs).
     Returns (data, None), or (None, why) when the file can't be read, is not valid JSON, or is not a `kind` (a JSON
@@ -896,9 +910,12 @@ def _read_record(path: Path, kind=dict, missing=_FRESH, lines: bool = False, tai
     empty record unless the caller passes its own marker. With `lines`, a JSON-lines file: (the JSON objects on its
     lines, None), skipping lines that are not one; `tail` reads only its last `tail` bytes.
     It never exits or raises, so no hook or command can crash on a damaged record: each caller fails safe on its own
-    terms (a damaged record that grants trust grants nothing), and says so with _note_unreadable."""
+    terms (a damaged record that grants trust grants nothing), and says so with _note_unreadable.
+    With `data` (bytes): parse those bytes instead of reading `path` (for a file's content taken from git)."""
     try:
-        if tail is None:
+        if data is not None:
+            raw = data
+        elif tail is None:
             raw = path.read_bytes()
         else:
             with open(path, "rb") as f:
@@ -1026,8 +1043,12 @@ class _BreakerLock:
 
     def _is_stale(self, st) -> bool:
         """Whether a lock file with this lstat() result was left by a command that stopped: a regular file older
-        than _stale_after() seconds."""
-        return stat.S_ISREG(st.st_mode) and time.time() - st.st_mtime > self._stale_after()
+        than _stale_after() seconds, or one whose owner is provably gone (_owner_gone)."""
+        return stat.S_ISREG(st.st_mode) and (time.time() - st.st_mtime > self._stale_after() or self._owner_gone())
+
+    def _owner_gone(self) -> bool:
+        """Whether the process that made the lock file is provably gone. False unless a subclass can tell."""
+        return False
 
     def _take_breaker(self, wait: float) -> bool:
         """True once this process holds the breaker file; False when another process holds it for longer than
@@ -2153,10 +2174,14 @@ ROLE_BRIEFS = {
                      "asked; run only this checkpoint's own tests. Never edit, skip or weaken a test."),
     "fixer": ("Rules: make the smallest change that resolves each finding you were handed. Add no new mechanism or "
               "file unless the finding itself needs it. If a proper fix needs a redesign, stop and say so instead "
-              "of improvising one. Never weaken, skip or delete a test. Don't run the full test suite unless asked."),
+              "of improvising one. Never weaken, skip or delete a planned test, a test that existed before "
+              "the run, or anything a planned test uses; a Python test this lane added that no planned test uses may be "
+              "adjusted. Don't run the full test suite unless asked."),
     "test-writer": ("Rules: turn the checkpoint's planned test cases into real, runnable tests tagged with their "
                      "case ids, written before the implementation exists, so at least one fails on an assertion. "
-                     "Test behavior through public entry points, not internals. Never write a test that can't fail."),
+                     "Test behavior through public entry points, not internals. Never write a test that can't fail. "
+                     "An extra Python test you add that no planned test uses may be adjusted later; planned "
+                     "tests, what they use and tests from before the run stay locked."),
     "reviewer": ("Rules: judge every finding against the realistic-use bar: this project's users run a cooperative "
                  "agent, not an attacker, and a finding must describe real harm to them in realistic, normal use, "
                  "not a case no real user would hit. Every blocking finding (blocker or major) must say who is hurt "
@@ -2642,6 +2667,107 @@ def new_cp_state(cp):
 
 # --------------------------------------------------------------------------- next action
 
+MERGED_FIRST = ("A merge of main landed in this lane that Ratchet has not checked yet. Run ratchet.py merged first: "
+                "it re-runs the earlier steps' tests on the merged code and keeps main's changes out of this step's "
+                "review. Nothing was changed.")
+
+
+SECOND_MERGE = ("An earlier merge of main in this step was resolved by hand, and that resolution is still waiting for "
+                "this step's review, so a second merge cannot be accepted yet.")
+
+
+def _same_commit(short, full) -> bool:
+    return bool(short) and bool(full) and str(full).startswith(str(short))
+
+
+def _fast_forwarded(g, last, ref, since=None):
+    """The short id HEAD stood at before a `git merge` / `git pull` of this run fast-forwarded it (no merge commit),
+    else "". Read from HEAD's reflog, newest first, back to the commit the last finished step or accepted merge
+    made, or to the commit whose tree is the step's starting tree (`ref`), or to a reflog entry that was made before
+    the run was created (`since`, a unix time; the entry's own time, which is when HEAD moved, never a commit's date:
+    main's tip is often older than the run). The entry's own text tells a merge or pull fast-forward from anything
+    else. The oldest fast-forward in that stretch wins. None when the reflog cannot be read (the caller then flags,
+    the safe side)."""
+    r = g("log", "-g", "--date=unix", "--format=%H%x09%T%x09%gs%x09%gd", "HEAD")
+    log = r.stdout.splitlines()
+    if r.returncode != 0 or not log:
+        return None
+    old = ""
+    for i, line in enumerate(log):
+        h, tree, subj, sel = (line.split("\t", 3) + ["", "", ""])[:4]
+        when = re.search(r"@\{(\d+)\}$", sel)
+        if _same_commit(last and last.get("commit"), h) or tree == ref or (
+                since is not None and when and int(when.group(1)) < since):
+            break
+        if subj.endswith(": Fast-forward") and subj.startswith(("merge", "pull")) and i + 1 < len(log):
+            old = log[i + 1].split("\t")[0][:7]
+    return old
+
+
+def _merge_unaccepted(ctx: Ctx, st: dict) -> str:
+    """The refusal text when HEAD holds main's changes that `merged` has not accepted, else "". Either HEAD is a merge
+    commit made during this run (not the last commit a step finished or `merged` accepted), or a fast-forward of this
+    run left HEAD on main's commits with no merge commit; and in both cases HEAD's tree differs from the step's
+    starting tree in something added, changed or removed outside the run folder (a removed git-ignored file is left
+    out: it is what a file named in fingerprint_include looks like). A lane that never merges gets "". Any doubt
+    gets ""."""
+    try:
+        cur = st.get("current")
+        ref = ((st.get("checkpoints") or {}).get(cur) or {}).get("base_tree") if cur else None
+        if st.get("phase") != "building" or not ref:
+            return ""
+        g = lambda *a: subprocess.run(["git", *a], cwd=ctx.root, capture_output=True, text=True, timeout=30)
+        parts = g("rev-list", "--parents", "-n", "1", "HEAD").stdout.split()
+        if len(parts) not in (2, 3):
+            return ""
+        last = next((e for e in reversed(st.get("history") or [])
+                     if e.get("event") in ("checkpoint_complete", "merged_main")), None)
+        if _same_commit(last and last.get("commit"), parts[0]):
+            return ""
+        old = ""
+        if len(parts) == 3:
+            made = _dt.datetime.fromisoformat(g("show", "-s", "--format=%cI", "HEAD").stdout.strip())
+            if made < _dt.datetime.fromisoformat(st["created_at"]) - _dt.timedelta(seconds=2):
+                return ""
+        else:
+            old = _fast_forwarded(g, last, ref, int(_dt.datetime.fromisoformat(st["created_at"]).timestamp()))
+            if old == "":
+                return ""
+        prefix = g("rev-parse", "--show-prefix").stdout.strip() + RATCHET_DIR + "/"
+        top = g("rev-parse", "--show-toplevel").stdout.strip()
+        diff = g("diff-tree", "-r", "--no-renames", "--name-only", "--diff-filter=ACMRT", ref, f"{parts[0]}^{{tree}}")
+        gone = g("diff-tree", "-r", "--no-renames", "--name-only", "--diff-filter=D", ref, f"{parts[0]}^{{tree}}")
+        if diff.returncode != 0 or gone.returncode != 0:
+            return ""
+        changed = any(f and not f.startswith(prefix) for f in diff.stdout.split("\n"))
+        names = [f for f in gone.stdout.split("\n") if f and not f.startswith(prefix)]
+        start = old or (parts[1] if len(parts) == 3 else "") or (last or {}).get("commit") or ""
+        if names:   # a path that was not in the commit HEAD stood at when the step began was only uncommitted then
+            tracked = g("ls-tree", "-r", "--full-tree", "--name-only", start) if start else None
+            there = set(tracked.stdout.split("\n")) if tracked is not None and tracked.returncode == 0 else set()
+            names = [f for f in names if f in there]
+        if names and not changed:
+            ig = subprocess.run(["git", "check-ignore", "-z", "--stdin"], cwd=top, capture_output=True, text=True,
+                                input="\0".join(names) + "\0", timeout=30)
+            changed = bool(set(names) - set(ig.stdout.split("\0")))
+        if not changed:
+            return ""
+        if old is None:
+            return MERGED_FIRST
+        if old:
+            return (f"Main was fast-forwarded into this lane (HEAD moved on from {old} with no merge commit), so "
+                    "Ratchet cannot tell main's changes from this step's own and its reviewers would see them as "
+                    f"the step's work. Undo it with `git reset --keep {old}`, merge again with `git merge --no-ff "
+                    "main` (use `git fetch`, then `git merge --no-ff <branch>`, instead of `git pull`), then run "
+                    "ratchet.py merged. Nothing was changed.")
+        if last and last["event"] == "merged_main" and last.get("by_hand"):
+            return (SECOND_MERGE + f" Undo this second merge with `git reset --keep {parts[1][:7]}` (its first "
+                    "parent), finish this step through complete, then merge main again. Nothing was changed.")
+        return MERGED_FIRST
+    except Exception:
+        return ""
+
+
 def next_action(ctx: Ctx, st=None, compute_accept_note: bool = True) -> dict:
     """`compute_accept_note=False` skips `_blocked_accept_note` (and the working-tree fingerprint it can trigger
     via `_code_changed_since_round`) for callers that never read `accept_note` from the result: the Stop hook
@@ -2724,6 +2850,9 @@ def next_action(ctx: Ctx, st=None, compute_accept_note: bool = True) -> dict:
                          f"variants in {gr['variants_dir']}/bad and look-alike good code in {gr['variants_dir']}/good; "
                          "then " + msgs["tests"].split(": ", 1)[1])
     na = {"phase": phase, "checkpoint": cur, "step": step, "action": msgs.get(step, step), "stop_ok": False}
+    held = _merge_unaccepted(ctx, st) if step == "tests" else ""
+    if held:
+        na["action"] = "First: " + held + " Then: " + na["action"]
     reps = repeat_candidates(ctx, st) if approval_mode(ctx) != "director" else []
     if reps:
         na["guardrail_candidates"] = reps
@@ -3008,6 +3137,89 @@ def exit_code_only_note(plan, st):
                                      if c.get("id") == st.get("current")), None))
 
 
+QUESTION_WORDS = {"approve-plan": "the plan", "human-approve": "an approval", "approve-changes": "changes to the approved plan files",
+                  "cancel": "cancelling the run", "set-review": "how often to review", "claim": "continuing the run in this chat",
+                  "hooks-waive": "building without the hooks", "ui-respec": "a change to the UI check",
+                  "choice": "a choice between options", "accept-finding": "accepting a review finding as a known limit",
+                  "raise-limit": "raising the review limit by one round"}
+
+
+GATING_QUESTIONS = ("approve-plan", "human-approve", "choice")  # while the run is at a pause or blocked
+ALWAYS_GATING_QUESTIONS = ("accept-finding", "raise-limit")  # a step whose review round blocked waits on them
+GATING_PHASES = ("awaiting_plan_approval", "awaiting_checkpoint_review", "awaiting_final_review", "blocked",
+                 "paused")
+CARRY_ON_QUESTIONS = ("cancel", "set-review", "claim", "hooks-waive", "ui-respec", "choice")
+
+
+def _question_waiter(ctx: Ctx, claim=False) -> str:
+    """Who a waiting question is put to: 'director' in a director-enrolled lane, else 'user'. Read-only: unlike
+    approval_mode it never exits and never writes a note, so a damaged enrollment file cannot break `status`; any
+    problem reading it counts as enrolled ('director'). A claim has no director action (a director cannot sign
+    it), so it is always put to the 'user'."""
+    if claim:
+        return "user"
+    try:
+        enr, why = _read_record(ctx.ratchet / "director.json", missing=None)
+        if why is not None or enr:
+            return "director"
+        data, why = _read_record(_enrolled_path())
+        if why is not None or data.get(str(ctx.root.resolve())):
+            return "director"
+        return "director" if ctx.config().get("approver", "human") == "director" else "user"
+    except Exception:
+        return "director"
+
+
+def _question_answered(ctx: Ctx, st, p) -> bool:
+    """The user has already replied in the question's own chat (the same recorded replies `ask` counts), so it is no
+    longer waiting for an answer, whether or not the agent has acted on the reply yet. Read-only: a human log that
+    can't be read or vouched for holds no reply."""
+    try:
+        return bool(_replies(ctx, st, p.get("asked_at"), p))
+    except (Exception, SystemExit):
+        return False
+
+
+def waiting_question(ctx: Ctx, st):
+    """The question that has been asked (`ratchet.py ask ...`) and not yet answered or withdrawn, or None. Read-only.
+    A question asked in an earlier phase no longer applies (as in `_asked_reply`), so it is None. In a user lane a
+    question the user has replied to is answered, so it is dropped even before the agent runs the command that
+    clears `pending`; in a director lane a chat reply answers nothing, so the question shows until `pending`
+    clears. `stops_run` says whether the run really waits for it: only the approval pauses, a blocked run's
+    questions and the accept-a-finding / raise-the-limit questions of a blocked review round do (True); the others
+    (a review-frequency or cancel question, a building-phase choice...) leave a building run building (False);
+    approve-changes and the like, and the carry-on kinds outside the building phase, are left unsaid (None)."""
+    p = st.get("pending")
+    if not isinstance(p, dict) or not p.get("action") or not p.get("asked_at"):
+        return None
+    if p.get("phase") and p["phase"] != st.get("phase"):
+        return None
+    if p.get("overtook"):  # printed as NOT ASKED: it never reached the user, and the question it replaced is gone too
+        return None
+    waiting_on = _question_waiter(ctx, p["action"] == "claim")
+    if waiting_on == "user" and _question_answered(ctx, st, p):
+        return None
+    about = p.get("mode") if p["action"] in ("accept-finding", "raise-limit", "ui-respec") else None
+    stops = None
+    if p["action"] in ALWAYS_GATING_QUESTIONS or (p["action"] in GATING_QUESTIONS and st.get("phase") in GATING_PHASES):
+        stops = True
+    elif p["action"] in CARRY_ON_QUESTIONS and st.get("phase") == "building":
+        stops = False
+    return {"kind": p["action"], "since": p["asked_at"], "waiting_on": waiting_on, "about": about,
+            "stops_run": stops}
+
+
+def question_line(q):
+    """The one plain-status line for a waiting question."""
+    t = _dt.datetime.fromisoformat(q["since"]).astimezone(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    who = "the director's" if q["waiting_on"] == "director" else "the user's"
+    about = f" for {q['about']}" if q.get("about") else ""
+    tail = {True: " The run will not move until it is answered.",
+            False: " The run can carry on meanwhile."}.get(q.get("stops_run"), "")
+    return (f"Waiting for {who} answer: a question about {QUESTION_WORDS.get(q['kind'], q['kind'])}{about} "
+            f"was asked at {t}.{tail}")
+
+
 def cmd_status_text(ctx: Ctx):
     st = ctx.state()
     plan = ctx.plan() or {"checkpoints": []}
@@ -3041,6 +3253,9 @@ def cmd_status_text(ctx: Ctx):
     print(f"Run: {st['slug']}  -  {st['feature']}")
     print(f"Phase: {PHASE_PLAIN.get(st.get('phase'), st.get('phase'))}")
     print(plain_now(ctx, st, plan))
+    q = waiting_question(ctx, st)
+    if q:
+        print(question_line(q))
     cur = (st.get("checkpoints") or {}).get(st.get("current")) or {}
     if st.get("phase") == "building" and any(g.get("status") in ("stale", "invalid")
                                              for g in (cur.get("gates") or {}).values()):
@@ -3798,12 +4013,14 @@ def _note_fresh(note) -> bool:
             and bool(note["session"]) and fresh < str(note.get("at", "")) <= _in_a_minute())
 
 
-def _note_engine_call(root: Path, cmd: str, session: str | None):
-    """Guard hook: for every `ratchet.py init` / `ask` / `wait` call `cmd` really runs, note which chat is about
-    to run it here, with its exact arguments. Best effort; never blocks the call."""
+def _note_engine_call(root: Path, cmd: str, session: str | None, tool_input: dict | None = None):
+    """Guard hook: for every `ratchet.py init` / `ask` / `wait` / `complete` call `cmd` really runs, note which chat
+    is about to run it here, with its exact arguments. A `complete` note also carries the host's run_in_background
+    and timeout for the call (`bg`, `timeout`), which `complete` reads to warn about a foreground run. Best effort;
+    never blocks the call."""
     if not session:
         return
-    calls = [a for a in _engine_invocations(cmd) if _engine_subcommand(a) in ("init", "ask", "wait")]
+    calls = [a for a in _engine_invocations(cmd) if _engine_subcommand(a) in ("init", "ask", "wait", "complete")]
     if not calls:
         return
     try:
@@ -3813,7 +4030,12 @@ def _note_engine_call(root: Path, cmd: str, session: str | None):
             for argv in calls:
                 key = f"{root.resolve()}|{_engine_subcommand(argv)}"
                 kept = [x for x in (notes.get(key) if isinstance(notes.get(key), list) else []) if _note_fresh(x)]
-                notes[key] = kept + [{"session": session, "argv": argv, "at": now()}]
+                note = {"session": session, "argv": argv, "at": now()}
+                if _engine_subcommand(argv) == "complete":
+                    ti = tool_input if isinstance(tool_input, dict) else {}
+                    note["bg"] = ti.get("run_in_background") is True
+                    note["timeout"] = ti.get("timeout") if isinstance(ti.get("timeout"), (int, float)) else None
+                notes[key] = kept + [note]
             return notes
         # can't be had: note nothing (the owner rules without a note apply); damaged (a crash mid-write, say): no
         # note in it counts, and this write replaces it
@@ -3823,10 +4045,11 @@ def _note_engine_call(root: Path, cmd: str, session: str | None):
         pass
 
 
-def _noted_session(root: Path, which: str) -> str | None:
+def _noted_session(root: Path, which: str, whole: bool = False):
     """The chat the guard hook saw run exactly this `ratchet.py <which> ...` call (same arguments) in this project in
     the last ENGINE_NOTE_SECONDS. A matching note is used up; stale or malformed notes are dropped. None when there
-    is no such note, or when more than one chat noted the same call (Ratchet can't tell which one this is)."""
+    is no such note, or when more than one chat noted the same call (Ratchet can't tell which one this is).
+    whole=True gives the whole note (a dict) instead of just its chat."""
     mine = list(_ENGINE_ARGV) if _ENGINE_ARGV is not None else list(sys.argv[1:])
     try:
         p = _engine_notes_path()
@@ -3855,7 +4078,8 @@ def _noted_session(root: Path, which: str) -> str | None:
     except Exception:
         return None
     sessions = {x["session"] for x in match}
-    return sessions.pop() if len(sessions) == 1 else None
+    note = match[-1] if len(sessions) == 1 else None
+    return note if whole or note is None else note["session"]
 
 
 def cmd_init(args):
@@ -5200,6 +5424,7 @@ def cmd_approve_plan(args):
     first["status"] = "in_progress"
     first["started_at"] = now()
     first["base_tree"] = fingerprint(ctx.root)["id"]
+    first["base_head"] = _head_sha(ctx.root)  # the commit `merged` counts the lane's own commits from
     st["awaiting_since"] = None
     ctx.log(st, "plan_approved", by=msg["by"], note=msg.get("prompt", "")[:200])
     ctx.save_state(st)
@@ -5267,6 +5492,9 @@ def cmd_tests_written(args):
     st = ctx.state()
     cps = _cur(ctx, st, args.cp)
     _expect_step(cps, ["tests", "red"], args.cp)
+    held = _merge_unaccepted(ctx, st)
+    if held:
+        die(held)
     cp = cp_by_id(ctx.plan(), args.cp)
     if not cp["gates"].get("behavior"):
         cps["step"] = "implement"
@@ -5531,26 +5759,13 @@ def _py_start(n) -> int:
     return min([n.lineno] + [d.lineno for d in n.decorator_list])
 
 
-def _py_frozen(old: str, new: str, ids) -> list[str] | None:
-    """The structural freeze for a Python test file (None when the red snapshot is not Python). Each planned case
-    id belongs to the innermost def or class around it (or right after its comment line); that definition, with its
-    decorators and its enclosing classes' decorators, must be unchanged (compared as ast.dump) and no later
-    definition in its scope may reuse its name. An id found in no def or class at all (only in a header comment,
-    say) makes the file's top-level code the test:
-    each old top-level statement must still be there, unchanged and in order, and no old def or class name may be
-    defined again. New tests and helpers may be added anywhere else."""
-    try:
-        t_old = ast.parse(old)
-    except (SyntaxError, ValueError):
-        return None
-    try:
-        t_new = ast.parse(new)
-    except (SyntaxError, ValueError) as e:
-        return [f"it no longer parses as Python ({type(e).__name__}), so its planned tests can't be checked"]
-    lines = old.splitlines()
-    defs = list(_py_defs(t_old.body))
+def _py_place(lines, defs, ids):
+    """Where each planned case id sits, the one way the freeze reads it (shared by the freeze and by the lane-added
+    test check, so the two never disagree). Each id belongs to the innermost def or class around it (or right after
+    its comment line). Returns ({def path: first case id}, ids found in no def or class at all, ids found at least
+    once outside every def or class)."""
     starts = {_py_start(n): (p, n) for p, n in defs}
-    units, module_ids = {}, []
+    units, module_ids, loose_ids = {}, [], []
     for cid in ids:
         pat, placed, loose = _case_id_re(cid), False, False
         for no, line in enumerate(lines, 1):
@@ -5568,8 +5783,30 @@ def _py_frozen(old: str, new: str, ids) -> list[str] | None:
                 placed = True
             else:
                 loose = True
+        if loose:
+            loose_ids.append(cid)
         if loose and not placed:  # only an id found in no def or class makes the top-level code the test
             module_ids.append(cid)
+    return units, module_ids, loose_ids
+
+
+def _py_frozen(old: str, new: str, ids) -> list[str] | None:
+    """The structural freeze for a Python test file (None when the red snapshot is not Python). Each planned case
+    id belongs to the innermost def or class around it (or right after its comment line); that definition, with its
+    decorators and its enclosing classes' decorators, must be unchanged (compared as ast.dump) and no later
+    definition in its scope may reuse its name. An id found in no def or class at all (only in a header comment,
+    say) makes the file's top-level code the test:
+    each old top-level statement must still be there, unchanged and in order, and no old def or class name may be
+    defined again. New tests and helpers may be added anywhere else."""
+    try:
+        t_old = ast.parse(old)
+    except (SyntaxError, ValueError):
+        return None
+    try:
+        t_new = ast.parse(new)
+    except (SyntaxError, ValueError) as e:
+        return [f"it no longer parses as Python ({type(e).__name__}), so its planned tests can't be checked"]
+    units, module_ids, _loose = _py_place(old.splitlines(), list(_py_defs(t_old.body)), ids)
     out = []
 
     def count(tree, nodes, name):
@@ -5700,6 +5937,327 @@ def _frozen_test_problems(rel: str, old: str, new: str, ids) -> list[str]:
     return _text_frozen(old, new, ids) if got is None else got
 
 
+# --- tests the lane added: free to change after red (Python files only) -----------------------------------------
+# A top-level def (or a test method in a class) is free when it was not in the file as the run started (the run's
+# base tree), is no planned case of any step, and no planned case uses it, directly or through other code. Free defs
+# are cut out of both the red snapshot and the file now before the usual freeze checks run, so those checks stay
+# exactly as strict on everything else. Freedom comes from the base tree and the plan, never from the latest
+# snapshot, so an approve-changes re-snapshot does not freeze a lane-added test.
+_PY_IMPLICIT = frozenset({
+    "setUp", "tearDown", "setUpClass", "tearDownClass", "setUpModule", "tearDownModule", "load_tests", "setup",
+    "teardown", "setup_module", "teardown_module", "setup_function", "teardown_function", "setup_method",
+    "teardown_method", "setup_class", "teardown_class", "conftest"})
+
+
+def _all_planned_ids(ctx):
+    plan = ctx.plan() or {}
+    return [c["id"] for cp in plan.get("checkpoints") or [] for c in _planned_cases(ctx, cp["id"])]
+
+
+def _file_at(ctx, rev, rel):
+    """The file as it stands in the tree or commit `rev`: its text, "" when the file is not there, or None when it
+    can't be read (no git, no such tree or commit)."""
+    if not rev or not re.fullmatch(r"[0-9a-f]{40,64}", str(rev)) or not _is_git(ctx.root):
+        return None
+    try:
+        t = subprocess.run(["git", "rev-parse", "-q", "--verify", f"{rev}^{{tree}}"], cwd=ctx.root,
+                           capture_output=True, text=True, timeout=30)
+        tree = t.stdout.strip()
+        if t.returncode != 0 or not tree:
+            return None
+        # The tree is the whole repo's, so a Ratchet root below the repo root needs the repo-relative path.
+        pre = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=ctx.root, capture_output=True, text=True,
+                             timeout=30)
+        if pre.returncode != 0:
+            return None
+        path = f"{pre.stdout.strip()}{rel}"
+        ls = subprocess.run(["git", "ls-tree", "--full-tree", tree, "--", path], cwd=ctx.root, capture_output=True,
+                            text=True, timeout=30)
+        if ls.returncode != 0:
+            return None
+        if not ls.stdout.strip():
+            return ""  # the file really was not there when the run started
+        r = subprocess.run(["git", "cat-file", "blob", f"{tree}:{path}"], cwd=ctx.root, capture_output=True,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
+
+
+def _origin_file_texts(ctx, st, rel):
+    """The texts of file `rel` that decide what the lane added: at the run's base tree, at the first step's starting
+    tree (set when the plan was approved, so a merge or fast-forward made before that is in it), and at every
+    non-first parent of a merge commit made on HEAD's history since the run began (what main brought in). None when
+    any of them can't be read: nothing in the file then counts as lane-added (any doubt locks)."""
+    first = ((ctx.plan() or {}).get("checkpoints") or [{}])[0].get("id")
+    trees = [st.get("base_tree"), ((st.get("checkpoints") or {}).get(first) or {}).get("base_tree")]
+    try:
+        since = int(_dt.datetime.fromisoformat(st["created_at"]).timestamp()) - 2
+        ml = subprocess.run(["git", "rev-list", "--parents", "--merges", f"--since={since}", "HEAD"], cwd=ctx.root,
+                            capture_output=True, text=True, timeout=60)
+    except (KeyError, ValueError, OSError, subprocess.SubprocessError):
+        return None
+    if ml.returncode != 0:
+        return None
+    for line in ml.stdout.splitlines():
+        trees += line.split()[2:]
+    texts = [_file_at(ctx, t, rel) for t in dict.fromkeys(trees)]
+    if texts and texts[0] is not None and trees[1] and texts[1:2] == [None] and trees[1] != trees[0]:
+        # The first step's tree is gone: it only matters if the lane fast-forwarded to main since the run began.
+        g = lambda *a: subprocess.run(["git", *a], cwd=ctx.root, capture_output=True, text=True, timeout=30)
+        if _fast_forwarded(g, None, None, since + 2) == "":
+            texts.pop(1)
+    return None if not texts or any(t is None for t in texts) else texts
+
+
+def _py_uses(node, loads=False) -> set:
+    """Every name a piece of code could use: names, attributes, parameter names, imported names and string
+    constants that look like names (a fixture asked for by string). Over-counting only locks more, never less.
+    With `loads`, a name the code only assigns (a Store) is not counted."""
+    out = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name):
+            if not (loads and isinstance(n.ctx, ast.Store)):
+                out.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            out.add(n.attr)
+        elif isinstance(n, ast.arg):
+            out.add(n.arg)
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.isidentifier():
+            out.add(n.value)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            out.update((a.asname or a.name).split(".")[0] for a in n.names)
+    return out
+
+
+def _py_top_names(tree) -> set:
+    names = {nm for nm, _ in _py_scope_items(tree.body)}
+    for s in ast.walk(tree):
+        if isinstance(s, (ast.Import, ast.ImportFrom)):
+            names.update((a.asname or a.name).split(".")[0] for a in s.names)
+    return names
+
+
+def _py_deco_kw(n, key):
+    """The keyword arguments named `key` in a def's decorators (such as autouse=True or name="cart")."""
+    return [k for d in n.decorator_list for k in ast.walk(d) if isinstance(k, ast.keyword) and k.arg == key]
+
+
+def _py_aliases(n):
+    """The def's own name plus any fixture name= alias in its decorators."""
+    return [n.name] + [k.value.value for k in _py_deco_kw(n, "name")
+                       if isinstance(k.value, ast.Constant) and isinstance(k.value.value, str)]
+
+
+def _other_py_index(ctx):
+    """{word: set of project .py files naming it} over the project's own .py files (git ls-files: tracked plus
+    untracked, .gitignore respected; nothing under a dependency, build or dot folder), or None when git cannot list
+    them (the caller then locks everything: Ratchet never walks the tree instead)."""
+    try:
+        r = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "*.py"],
+                           cwd=ctx.root, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    index = {}
+    for raw in r.stdout.split(b"\0"):
+        f = os.path.normpath(os.fsdecode(raw))
+        parts = Path(f).parts
+        if not raw or any(d in FINGERPRINT_EXCLUDES or d.startswith(".") for d in parts[:-1]):
+            continue
+        try:
+            text = (Path(ctx.root) / f).read_text(errors="replace")
+        except OSError:
+            continue
+        for w in set(re.findall(r"\w+", text)):
+            index.setdefault(w, set()).add(f)
+    return index
+
+
+def _py_free_defs(ctx, st, rel, old):
+    """(free top-level def names, free (class, test method) pairs, names a planned case reaches) in the red snapshot
+    `old` of file `rel`. Any doubt locks: when nothing is free the names come back as None (the caller then guards
+    every def and class name), and a file where a planned case id sits outside every def (module data, a header
+    docstring, a comment not directly above a def) is not touched at all, exactly as the freeze reads it."""
+    none = (set(), set(), None)
+    bases = _origin_file_texts(ctx, st, rel)
+    if bases is None or os.path.basename(rel) == "conftest.py" or not any(_case_id_re(i).search(old) for i in _all_planned_ids(ctx)):
+        return none  # a file with no planned case id in it (a shared helper file) keeps the whole-file freeze
+    try:
+        t_old = ast.parse(old)
+        t_bases = [ast.parse(b) for b in bases]
+    except (SyntaxError, ValueError):
+        return none
+    base_names, base_members = set(), set()  # what was in the file before the lane: at the run's base or from main
+    for t_base in t_bases:
+        base_names |= _py_top_names(t_base)
+        for s in t_base.body:
+            if isinstance(s, ast.ClassDef):
+                base_members.update((s.name, nm) for nm, _ in _py_scope_items(s.body))
+    defs = list(_py_defs(t_old.body))
+    units, _module_ids, loose = _py_place(old.splitlines(), defs, _all_planned_ids(ctx))
+    if loose:
+        return none
+    by_path = dict(defs)
+    planned = [by_path[p] for p in units]
+
+    def span(n):
+        return _py_start(n), n.end_lineno or n.lineno
+
+    def has_planned(n):  # n holds a planned node, or sits inside one (every method of a planned class)
+        a, b = span(n)
+        return any((a <= span(p)[0] and span(p)[1] <= b) or (span(p)[0] <= a and b <= span(p)[1]) for p in planned)
+
+    def special(n):  # an autouse fixture or a pytest_ hook (they run for planned tests unnamed), or a name we can't read
+        return bool(_py_deco_kw(n, "autouse")) or n.name.startswith("pytest_") or any(not (isinstance(k.value, ast.Constant) and
+                                                           isinstance(k.value.value, str))
+                                                      for k in _py_deco_kw(n, "name"))
+
+    src_defs, src_top, locked_tops = [], [], set()  # code whose names a planned test (or the run) leans on
+    for s in t_old.body:
+        if not isinstance(s, _PY_DEFS):
+            src_top.append(s)
+            continue
+        if has_planned(s):
+            locked_tops.add(s.name)
+            if isinstance(s, ast.ClassDef):  # the class's setUp and helpers count, its other tests do not
+                src_defs += s.bases + s.keywords + s.decorator_list
+                for m in s.body:
+                    if not (isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and m.name.lower().startswith("test")
+                            and not has_planned(m)):
+                        src_defs.append(m)
+            else:
+                src_defs.append(s)
+        elif special(s):
+            src_defs.append(s)
+        if isinstance(s, ast.ClassDef):
+            src_defs += [m for m in s.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and special(m)]
+    by_name = {}
+    for nm, n in _py_scope_items(t_old.body):
+        if isinstance(n, _PY_DEFS):
+            for alias in _py_aliases(n):
+                by_name.setdefault(alias, []).append(n)
+
+    def closure(sources, loads):  # every name reachable from the sources, through the defs of those names
+        reach, todo = set(), set(_PY_IMPLICIT).union(*[_py_uses(x, loads) for x in sources])
+        while todo:
+            nm = todo.pop()
+            if nm in reach:
+                continue
+            reach.add(nm)
+            for n in by_name.get(nm, []):
+                todo |= _py_uses(n, loads) - reach
+        return reach
+
+    reach = closure(src_defs + src_top, False)  # what no lane-added def may be: used by a planned case or top-level code
+    reached = closure(src_defs, True)  # the names a planned case reads (an assignment may not rebind these)
+
+    skip, found = os.path.normpath(rel), []  # found: the index, built once and only when a def needs it
+
+    def named_elsewhere(alias):  # another project .py file names it as a whole word (no index: assume it does)
+        if not found:
+            found.append(_other_py_index(ctx))
+        if found[0] is None or not re.fullmatch(r"\w+", alias):
+            return True
+        return any(f != skip for f in found[0].get(alias, ()))
+
+    def plain(n):  # a def nothing outside the lane can lean on, and no other .py file mentions by name
+        return (not any(a in reach for a in _py_aliases(n)) and n.name not in _PY_IMPLICIT and not has_planned(n)
+                and not special(n) and not any(named_elsewhere(a) for a in _py_aliases(n)))
+
+    items = [nm for nm, _ in _py_scope_items(t_old.body)]
+    free_top = {s.name for s in t_old.body if isinstance(s, _PY_DEFS) and s.name not in base_names
+                and s.name not in locked_tops and plain(s) and items.count(s.name) == 1}
+    free_meth = set()
+    for s in t_old.body:
+        if isinstance(s, ast.ClassDef) and s.name not in free_top:
+            inner = [nm for nm, _ in _py_scope_items(s.body)]
+            cand = {m.name for m in s.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and m.name.lower().startswith("test") and (s.name, m.name) not in base_members
+                    and plain(m) and inner.count(m.name) == 1}
+            if len(cand) < len(s.body):  # a class is never left with an empty body
+                free_meth |= {(s.name, nm) for nm in cand}
+    return free_top, free_meth, reached | locked_tops | {p.name for p in planned}
+
+
+def _py_strip(text, free_top, free_meth):
+    """`text` without the free defs (and the comment lines right above them), or None when it doesn't parse."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+    lines = text.splitlines(keepends=True)
+    drop = set()
+
+    def cut(n):
+        a = _py_start(n)
+        while a > 1 and lines[a - 2].lstrip().startswith("#"):
+            a -= 1
+        drop.update(range(a, (n.end_lineno or n.lineno) + 1))
+
+    for s in tree.body:
+        if isinstance(s, _PY_DEFS) and s.name in free_top:
+            cut(s)
+        elif isinstance(s, ast.ClassDef):
+            for m in s.body:
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and (s.name, m.name) in free_meth:
+                    cut(m)
+    out = "".join(l for i, l in enumerate(lines, 1) if i not in drop)
+    try:
+        ast.parse(out)
+    except (SyntaxError, ValueError):
+        return None
+    return out
+
+
+def _py_without_free(ctx, st, rel, old, new):
+    """(old, new, names a planned case reaches) with the lane's free defs cut out of both; the texts are unchanged
+    when there are none or anything is unclear (the names are None when the analysis was not possible)."""
+    free_top, free_meth, locked = _py_free_defs(ctx, st, rel, old)
+    if not (free_top or free_meth):
+        return old, new, locked
+    a, b = _py_strip(old, free_top, free_meth), _py_strip(new, free_top, free_meth)
+    return (a, b, locked) if a is not None and b is not None else (old, new, locked)
+
+
+def _py_name_reuse(old, new, locked=None):
+    """Why `new` defines again a name `old` defines in the same scope, so that the later definition would replace
+    the earlier one; None when it doesn't. Top-level scope and every class body. A def or class of any name counts;
+    a plain assignment counts only for a name a planned case reaches (`locked`) or a name that is also a def or
+    class in that scope, so rebinding an ordinary variable in a test the lane added stays allowed."""
+    try:
+        t_old, t_new = ast.parse(old), ast.parse(new)
+    except (SyntaxError, ValueError):
+        return None
+
+    def stores(n, nm):  # n is an assignment that binds the plain name nm
+        return isinstance(n, (ast.Assign, ast.AnnAssign)) and any(
+            isinstance(x, ast.Name) and x.id == nm and isinstance(x.ctx, ast.Store)
+            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]) for x in ast.walk(t))
+
+    def counts(body, watch):
+        c = {}
+        for nm, n in _py_scope_items(body):
+            if isinstance(n, _PY_DEFS) or (nm in watch and stores(n, nm)):
+                c[nm] = c.get(nm, 0) + 1
+        return c
+
+    scopes = [("", t_old.body, t_new.body)]
+    for path, n in _py_defs(t_old.body):
+        if isinstance(n, ast.ClassDef):
+            got = _py_lookup(t_new, path)
+            if got:
+                scopes.append((".".join(x for x, _ in path) + ".", n.body, got[-1].body))
+    for pre, b_old, b_new in scopes:
+        watch = (locked or set()) | {nm for nm, n in _py_scope_items(b_old) if isinstance(n, _PY_DEFS)}
+        c_old, c_new = counts(b_old, watch), counts(b_new, watch)
+        again = next((nm for nm in c_old if c_new.get(nm, 0) > c_old[nm]), None)
+        if again is not None:
+            return f"{pre}{again} is defined again since the red run (the later definition replaces it)"
+    return None
+
+
 def weakened_tests(ctx, st) -> list[str]:
     cur = st.get("current")
     cps = (st.get("checkpoints") or {}).get(cur) or {}
@@ -5716,7 +6274,11 @@ def weakened_tests(ctx, st) -> list[str]:
         if new is None:
             out.append(f"test file {rel} (lines changed or removed since the red run)")
             continue
+        if rel.endswith(".py"):  # tests this lane added are cut out of both sides first (see _py_free_defs)
+            old, new, locked = _py_without_free(ctx, st, rel, old, new)
         frozen = _frozen_test_problems(rel, old, new, ids)
+        if not frozen and rel.endswith(".py"):
+            frozen = [w] if (w := _py_name_reuse(old, new, locked)) else []
         if frozen:
             # Non-Python messages (_text_frozen) already carry whatever guidance applies (the approve-changes
             # note only when a planned test itself is at risk); only Python messages (_py_frozen) need it added.
@@ -8590,6 +9152,21 @@ def cmd_receipt(args):
         print("No findings were accepted, left for later or fixed later in this run.")
 
 
+def _warn_if_foreground(ctx, cfg):
+    """complete runs the whole regression suite. Unless the guard hook noted that the host runs this exact call in
+    the background, say first (stderr, flushed) that a tool timeout could cut it off. No note, or a note that does
+    not say, counts as foreground. Never changes what complete does."""
+    note = _noted_session(ctx.root, "complete", whole=True)
+    if note and note.get("bg") is True:
+        return
+    secs = int(cfg.get("test_timeout_sec") or DEFAULT_CONFIG["test_timeout_sec"])
+    span = f"{secs // 60} minutes" if secs >= 120 else f"{secs} seconds"
+    print(f"WARNING: a tool timeout could cut this complete call off. It runs the whole regression suite, which "
+          f"can take up to {span}, and after a failure it may run the suite a second time, so up to about "
+          f"twice that. Run it in the background instead (run_in_background), then wait for it to "
+          f"finish.", file=sys.stderr, flush=True)
+
+
 def cmd_complete(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -8597,6 +9174,8 @@ def cmd_complete(args):
     _expect_step(cps, ["complete"], args.cp)
     cp = cp_by_id(ctx.plan(), args.cp)
     cfg = ctx.config()
+    if cfg.get("regression_command"):
+        _warn_if_foreground(ctx, cfg)
     fp = fingerprint(ctx.root)
     problems, stale = [], []
     doc_edits = set()  # CP2 doc quick path: files found doc-only since behavior or adversarial passed, used only
@@ -8750,7 +9329,14 @@ def cmd_complete(args):
         if not commit:  # nothing new to commit: a run of complete that failed after its commit left it at HEAD
             commit = _head_commit_named(ctx.root, msg)
     cps.update(status="done", completed_at=now(), commit=commit)
-    ctx.log(st, "checkpoint_complete", cp=args.cp, commit=commit)
+    # With no commit made, the reviewed tree (after the spec ticks) is what `merged` compares the lane's own commits with.
+    reviewed = fingerprint(ctx.root) if not commit and _is_git(ctx.root) else {}
+    # HEAD is recorded with it: `merged` uses it to tell a file that was never committed (untracked, then deleted)
+    # from a file a lane commit removed.
+    head_now = _head_sha(ctx.root) if reviewed.get("kind") == "git-tree" else ""
+    ctx.log(st, "checkpoint_complete", cp=args.cp, commit=commit,
+            **({"tree": reviewed["id"], **({"head": head_now} if head_now else {})}
+               if reviewed.get("kind") == "git-tree" else {}))
     order = [c["id"] for c in ctx.plan()["checkpoints"]]
     remaining = [c for c in order if st["checkpoints"][c]["status"] != "done"]
     mode = st.get("human_review", "end")
@@ -8759,7 +9345,7 @@ def cmd_complete(args):
         st["awaiting_since"] = now()
         st["review_target"] = args.cp
     elif remaining:
-        _advance(st, remaining[0], fingerprint(ctx.root)["id"])
+        _advance(st, remaining[0], fingerprint(ctx.root)["id"], _head_sha(ctx.root))
     else:
         st["current"] = None
         st["phase"] = "awaiting_final_review" if mode != "none" else "done"
@@ -8777,6 +9363,305 @@ def cmd_complete(args):
     print(json.dumps(next_action(ctx, st), indent=2))
 
 
+def cmd_merged(args):
+    """`merged`: between steps, after the agent merged main into the lane with git. Re-runs the earlier steps' checks
+    on the merged code and, when they pass, moves the run's and the next step's starting tree to the merge commit (so
+    reviewers and the step's commit see only that step's own changes) and makes standards, design-file and config-rule
+    changes that are exactly main's version the new approved baseline. Anything else that changed stays unapproved.
+    Approves nothing and asks nothing; ratchet never runs the merge itself."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    root, phase, cur = ctx.root, st.get("phase"), st.get("current")
+    if phase == "building" and cur:
+        if st["checkpoints"][cur].get("step") != "tests":
+            die(f"{cur} is in the middle of its work (step '{st['checkpoints'][cur].get('step')}'). Finish {cur} "
+                f"first (run it through complete), then merge main and run merged. Nothing was changed.")
+    elif phase not in ("awaiting_checkpoint_review", "awaiting_final_review"):
+        die(f"merged runs between steps, after a step is complete and before the next one starts (the run is in "
+            f"phase '{phase}'). Nothing was changed.")
+    if not _is_git(root):
+        die("merged needs a git project: it checks the merge commit. Nothing was changed.")
+
+    def git(*a):
+        return subprocess.run(["git", *a], cwd=root, capture_output=True, text=True, timeout=60)
+
+    if git("rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+        die("A merge is not finished. Resolve the conflicts, finish the merge with a commit, then run merged. "
+            "Nothing was changed.")
+    sp = git("rev-parse", "--show-prefix")
+    tl = git("rev-parse", "--show-toplevel")
+    if sp.returncode != 0 or tl.returncode != 0:
+        die("merged could not read where the project folder sits in the git repository "
+            f"({(sp.stderr + tl.stderr).strip()[:200] or 'no answer'}). Nothing was changed.")
+    # Paths here are repo-root-relative (the project folder may sit below the git root), the way git's index takes them.
+    # Every git call below that takes or returns such paths runs from the repo top through tgit, so none of them
+    # mixes them with project-relative ones. The two calls that take project-relative input (git here, git add of the
+    # fingerprint_include names) say so.
+    prefix, top = sp.stdout.strip(), Path(tl.stdout.strip())
+    run_dir = prefix + RATCHET_DIR
+
+    def tgit(*a, inp=None, env=None, text=True):
+        return subprocess.run(["git", *a], cwd=top, capture_output=True, text=text and inp is None, input=inp, env=env,
+                              timeout=60)
+
+    def nul_paths(r):   # git's path lists come NUL-separated (-z): names with spaces or non-ASCII letters stay whole
+        return [x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x]
+
+    dirty = [x[3:] for x in nul_paths(tgit("status", "--porcelain", "-z", "--no-renames", "--untracked-files=no", "--",
+                                           prefix or ".", f":(exclude){run_dir}", text=False))]
+    if dirty:
+        die(f"Tracked files have edits that are not committed ({', '.join(dirty[:5])}). Undo them, or finish the "
+            "step they belong to first (committing them now would be lane work no one reviewed), then run merged. "
+            "Nothing was changed.")
+
+    parents = git("rev-list", "--parents", "-n", "1", "HEAD").stdout.split()
+    if len(parents) != 3:
+        die("HEAD is not a finished merge of main into this lane. Merge main first (git merge --no-ff main), "
+            "finish the merge, then run merged. Nothing was changed.")
+    head, p1, p2 = parents
+    tree = git("rev-parse", f"{head}^{{tree}}").stdout.strip()
+    last = next((e for e in reversed(st.get("history") or [])
+                 if e.get("event") in ("checkpoint_complete", "merged_main")), None)
+    if last and last["event"] == "merged_main" and last.get("commit") == head:
+        ok("This merge was already checked and accepted. Nothing to do.")
+        return
+    # Nothing may sit between the step's starting tree and the merge's first parent: that would be lane work no one
+    # reviewed, and moving the starting tree would hide it from the reviewers.
+    # While building, the step's starting tree is a fingerprint tree (it also holds the gitignored files named in
+    # fingerprint_include, which no commit can hold). After an earlier merge accepted in this step, compare with that
+    # merge's commit instead: its tree is what the lane's next merge starts from, hand-resolved files included.
+    from_merge = bool(phase == "building" and cur and last and last["event"] == "merged_main" and last.get("commit"))
+    if from_merge and last.get("by_hand"):
+        die("An earlier merge in this step was resolved by hand, and that resolution is still waiting for this step's "
+            "review. A second merge now would fold it into the starting tree and hide it from the reviewers. Finish "
+            f"{cur} first (run it through complete), then merge main again and run merged. To get out now, undo the "
+            f"second merge with `git reset --keep {p1[:7]}` (its first parent). Nothing was changed.")
+    ref = st["checkpoints"][cur].get("base_tree") if phase == "building" and cur and not from_merge else (
+        git("rev-parse", f"{last['commit']}^{{tree}}").stdout.strip() if last and last.get("commit") else None)
+    fp_ref = bool(ref and phase == "building" and cur and not from_merge)  # a fingerprint tree, not a commit's tree
+    if not ref and last and re.fullmatch(r"[0-9a-f]{40,64}", str(last.get("tree") or "")):
+        ref, fp_ref = last["tree"], True   # complete made no commit (commit_per_checkpoint is false): the reviewed tree
+    if not ref:
+        undo = f"Run `git reset --keep {p1[:7]}` (the merge's first parent) to undo the merge. "
+        die("merged cannot tell which work the last step's reviewers saw: that step finished without a commit and "
+            "no reviewed tree was recorded for it (it finished before Ratchet recorded one). So it cannot check that "
+            "the lane has no commits no step reviewed. Nothing was changed. " + undo
+            + ("Then ask the user for a step of its own through feedback, and merge main once that step has started."
+               if phase == "awaiting_final_review" else
+               "Then get the waiting review approved, and merge main again once the next step has started."
+               if phase == "awaiting_checkpoint_review" else
+               "Then finish this step (complete), and merge main again once the next step has started."))
+    loose = nul_paths(tgit("ls-files", "-z", "--others", "--exclude-standard", "--", prefix or ".",
+                           f":(exclude){run_dir}", *JUNK_PATHSPECS, text=False))
+    if phase == "building" and ref:   # the step's own new files (its tests) are its own changes; older ones are not
+        in_ref = set(nul_paths(tgit("ls-tree", "-r", "-z", "--name-only", ref, text=False)))
+        loose = [f for f in loose if f in in_ref]
+    if loose:
+        die(f"There are files git does not track yet ({', '.join(loose[:5])}). Commit them in a reviewed step, "
+            "delete them, or add them to .git/info/exclude (not .gitignore: a new or edited .gitignore is itself "
+            "an untracked file or lane work), then run merged: otherwise the next step's reviewers and commit "
+            "would pick them up as its own changes. Nothing was changed.")
+    if ref:
+        own = [f for f in nul_paths(tgit("diff-tree", "-r", "-z", "--no-renames", "--name-only", ref,
+                                         f"{p1}^{{tree}}", text=False))
+               if f != run_dir and not f.startswith(run_dir + "/")]
+        if own and fp_ref:   # a fingerprint tree also holds files no commit ever held (untracked, ignored ones)
+            # Only a path some commit since the step's starting commit touched is a lane commit's work; the rest
+            # (a stray untracked file, a gitignored file named in fingerprint_include) is not.
+            if phase == "building":
+                start = str(st["checkpoints"][cur].get("base_head") or "")
+            else:
+                start = str((last or {}).get("head") or "") if (last or {}).get("event") == "checkpoint_complete" else ""
+            undo = f"Undo the merge with `git reset --keep {p1[:7]}` (the merge's first parent). "
+            if not re.fullmatch(r"[0-9a-f]{40,64}", start) or git("cat-file", "-e", f"{start}^{{commit}}").returncode != 0:
+                die("merged cannot tell which commits the lane made since the last step: this step's starting commit "
+                    "was not recorded (the run began before Ratchet recorded it) or is gone. So it cannot check that "
+                    "the lane has no commits no step reviewed. Nothing was changed. " + undo
+                    + ("Then ask the user for a step of its own through feedback, and merge main once that step has "
+                       "started." if phase == "awaiting_final_review" else
+                       "Then get the waiting review approved, and merge main again once the next step has started."
+                       if phase == "awaiting_checkpoint_review" else
+                       "Then finish this step (complete), and merge main again once the next step has started."))
+            anc = git("merge-base", "--is-ancestor", start, p1)
+            if anc.returncode == 1:
+                die(f"The lane's history no longer includes the commit this step started from ({start[:7]}): commits "
+                    "were reset or rebased away since then, so merged cannot tell what the lane changed. Nothing was "
+                    "changed. Undo the merge with git, put the lane's history back, then merge main and run merged.")
+            if anc.returncode != 0:
+                die(f"git could not compare the lane with the step's starting commit ({anc.stderr.strip()[:200]}). "
+                    "Nothing was changed.")
+            touched = []
+            for f in own:
+                r = tgit("rev-list", "-1", "--full-history", f"{start}..{p1}", "--", f":(literal){f}")
+                if r.returncode != 0:
+                    die(f"git could not list the lane's commits that touch {f} ({r.stderr.strip()[:200]}). "
+                        "Nothing was changed.")
+                if r.stdout.strip():
+                    touched.append(f)
+            own = touched
+        if own:
+            die(f"The lane has commits since the last step finished that never went through the gates "
+                f"({', '.join(own[:5])}; added, changed or removed), so merged cannot hide them from the reviewers. "
+                "Undo those commits (and the merge) with git, then merge main into the lane right after the last "
+                "step's own commit. Nothing was changed.")
+
+    # Files the agent changed while making the merge (a conflict resolved by hand, or anything the merge commit added
+    # or removed on its own) are not main's or the lane's reviewed work. They are the paths whose merged mode and
+    # content differ from git's own clean merge of the two parents. A clean automatic merge of a file both sides
+    # edited in different places is not among them. A merge made with -X or -s options may show up here too; that is
+    # safe (the files just go to the next step's review).
+    def entries(rev):
+        r = tgit("ls-tree", "-r", "-z", "--full-tree", rev, text=False)
+        if r.returncode != 0:
+            die(f"git ls-tree failed on the merge ({r.stderr.decode('utf-8', 'replace').strip()[:200]}). "
+                "Nothing was changed.")
+        out = {}
+        for rec in r.stdout.split(b"\0"):
+            if rec:
+                meta, _, path = rec.partition(b"\t")
+                mode, _, oid = meta.split(b" ")
+                out[path] = (mode, oid)
+        return out
+
+    def in_run_dir(f):
+        t = f.decode("utf-8", "replace")
+        return t == run_dir or t.startswith(run_dir + "/")
+
+    mt = git("merge-tree", "--write-tree", "--no-messages", p1, p2)
+    clean = mt.stdout.split("\n")[0].strip() if mt.returncode in (0, 1) else ""
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", clean):
+        die("merged could not work out git's own clean merge of the two parents (`git merge-tree --write-tree` "
+            f"needs git 2.38 or newer; this one said: {(mt.stderr or mt.stdout).strip()[:200] or 'nothing'}). "
+            "Update git, then run merged. Nothing was changed.")
+    e_m, e_c, e_2 = entries(head), entries(clean), entries(p2)
+    by_hand = sorted(f for f in set(e_m) | set(e_c) if e_m.get(f) != e_c.get(f) and not in_run_dir(f))
+    if by_hand and phase != "building":
+        names = ", ".join(f.decode("utf-8", "replace") for f in by_hand[:10]) + (" and more" if len(by_hand) > 10 else "")
+        die(f"This merge changed files beyond what git merges on its own ({names}): a conflict resolved by hand, or "
+            "a merge made with -X or -s options. That code has to be reviewed with a step, and none is starting "
+            f"(the run is in phase '{phase}'). Undo the merge with `git reset --keep {p1[:7]}` (not ORIG_HEAD, "
+            "which later git commands can overwrite; --keep refuses instead of discarding edits to the run's files). "
+            + ("Then get the waiting review approved, and merge main again once the next step has started. "
+               if phase == "awaiting_checkpoint_review" else
+               "Then either merge main again in a way git merges on its own, or ask the user for a step of its own "
+               "for the resolution through feedback, and merge once that step has started. ")
+            + "Nothing was changed.")
+    # The step's starting tree is built the way every step's is (a fingerprint tree): the merge's tree plus the
+    # git-ignored files named in fingerprint_include, so those never show up as the step's own change. The paths the
+    # agent resolved by hand go back to main's version on top, so they stay in the step's review.
+    base = tree
+    extra = ctx.config().get("fingerprint_include") or []
+    if by_hand or extra:
+        index_info = b"".join(b"%s %s\t%s\0" % ((e_2[f][0], e_2[f][1], f) if f in e_2 else (b"0", b"0" * len(tree), f))
+                              for f in by_hand)
+        with tempfile.TemporaryDirectory() as td:
+            env = dict(os.environ, GIT_INDEX_FILE=str(Path(td) / "index"))
+            steps = [(["git", "read-tree", tree], None, True, top)]
+            if extra:   # the names in fingerprint_include are project-relative, so this one runs from the project folder
+                steps.append((["git", "add", "-f", "--", *extra], None, False, root))   # may match nothing
+            if by_hand:
+                steps.append((["git", "update-index", "-z", "--index-info"], index_info, True, top))
+            steps.append((["git", "write-tree"], None, True, top))
+            for cmd, inp, must, cwd in steps:
+                r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, input=inp, timeout=60)
+                if r.returncode != 0 and must:
+                    die(f"git {cmd[1]} failed while preparing the next step's starting tree "
+                        f"({r.stderr.decode('utf-8', 'replace').strip()[:200]}). Nothing was changed.")
+            base = r.stdout.decode().strip()
+
+    cfg = ctx.config()
+    sha = head[:7]
+    failure = None
+    if cfg.get("regression_command"):
+        rlog = ctx.evidence("merged") / f"regression-{sha}.log"
+        code, out, _ = _run_cmd(ctx, cfg["regression_command"], rlog, cfg["test_timeout_sec"])
+        if code != 0:
+            failure = (f"The regression command ({cfg['regression_command']}) failed on the code merged from main "
+                       f"(exit {code}): an earlier behaviour broke.", out, rlog)
+    else:
+        for c in ctx.plan()["checkpoints"]:
+            if st["checkpoints"][c["id"]]["status"] != "done" or not (c.get("tests") or {}).get("command"):
+                continue
+            tlog = ctx.evidence(c["id"]) / f"merged-{sha}.log"
+            code, out, _ = _run_cmd(ctx, c["tests"]["command"], tlog, cfg["test_timeout_sec"])
+            if code != 0:
+                failure = (f"{c['id']} ({c['title']}): its tests ({c['tests']['command']}) fail on the code merged "
+                           f"from main (exit {code}).", out, tlog)
+                break
+    if failure:
+        reason, out, log = failure
+        _set_blocked(st, reason)
+        ctx.save_state(st)
+        build_viewer(ctx)
+        print(_tail(out))
+        die(f"{reason} Log: {log.relative_to(root)}. The run is stopped. To recover: undo the merge with git "
+            f"(`git reset --keep {p1[:7]}`, the merge's first parent; --keep refuses instead of discarding edits to "
+            "the run's files), fix what broke on "
+            "main or in the lane, and once the user lets the run go on (tell them; the stopped-run options apply), "
+            "merge main again and run merged. A fix committed on top of this merge does not work: merged only "
+            "accepts a merge that is HEAD. Or give the user's feedback with `ratchet.py feedback` to add a fix step.",
+            2)
+
+    # Accepted from main only where the merged file or rule is exactly main's version.
+    def main_blob(rel):
+        r = tgit("show", f"{p2}:{prefix}{rel}", text=False)
+        return r.stdout if r.returncode == 0 else None
+
+    now_, snap, accepted, still = approval_snapshot(ctx, st), st.get("approved") or {}, [], []
+    for f, h in (snap.get("files") or {}).items():
+        if now_["files"].get(f) == h:
+            continue
+        theirs, mine = main_blob(f), _file_bytes(root / f)
+        if theirs is not None and theirs == mine:
+            snap["files"][f] = now_["files"][f]
+            accepted.append(f)
+        else:
+            still.append(f"reference file {f}")
+    main_cfg = main_blob(f"{RATCHET_DIR}/config.json")
+    main_cfg = _read_record(root, data=main_cfg)[0] if main_cfg is not None else None
+    main_cfg = config_from_user(main_cfg) if main_cfg is not None else None
+    for k, h in (snap.get("rules") or {}).items():
+        if now_["rules"].get(k) == h:
+            continue
+        if main_cfg is not None and _sha(main_cfg.get(k)) == now_["rules"].get(k):
+            snap["rules"][k] = now_["rules"][k]
+            accepted.append(f"config rule '{k}'")
+        else:
+            still.append(f"config rule '{k}'")
+    if "custom_providers" in snap and snap["custom_providers"] != now_["custom_providers"]:
+        still.append("custom review commands in config 'providers'")
+    if snap.get("spec") and snap["spec"] != now_.get("spec"):
+        still.append("the spec this run was built from")
+    st["base_tree"] = base
+    if phase == "building":
+        st["checkpoints"][cur]["base_tree"] = base
+        st["checkpoints"][cur]["base_head"] = head
+    ctx.log(st, "merged_main", commit=head, tree=tree, accepted=accepted,
+            by_hand=[f.decode("utf-8", "replace") for f in by_hand] if phase == "building" else [])
+    ctx.save_state(st)
+    build_viewer(ctx)
+    ok(f"Merge of main ({sha}) checked and accepted: earlier steps still pass on the merged code"
+       + (f"; {cur} starts from the merge, so its reviewers see only its own changes." if phase == "building"
+          else "; the next step will start from the merge."))
+    if by_hand:
+        names = [f.decode("utf-8", "replace") for f in by_hand]
+        print(f"Resolved by hand in the merge, will be reviewed with the next step: {', '.join(names[:10])}"
+              + (" and more" if len(names) > 10 else ""))
+    for a in accepted:
+        print(f"Accepted from main as the new baseline: {a}")
+    for s_ in still:
+        print(f"Still changed after approval (not exactly main's version): {s_}. Show the user what changed; "
+              "the lane cannot go on past it without their yes.")
+    print(json.dumps(next_action(ctx, st), indent=2))
+
+
+def _file_bytes(p: Path):
+    try:
+        return p.read_bytes()
+    except OSError:
+        return None
+
+
 def _earliest_open_step(cps):
     for name in ["behavior", "ui", "adversarial"]:
         g = cps["gates"][name]
@@ -8785,13 +9670,14 @@ def _earliest_open_step(cps):
     return "complete"
 
 
-def _advance(st, cp_id, base_tree=None):
+def _advance(st, cp_id, base_tree=None, base_head=None):
     st["current"] = cp_id
     st["phase"] = "building"
     st["checkpoints"][cp_id]["status"] = "in_progress"
     st["checkpoints"][cp_id]["started_at"] = now()
     if base_tree:
         st["checkpoints"][cp_id]["base_tree"] = base_tree  # what reviewers diff against
+        st["checkpoints"][cp_id]["base_head"] = base_head or ""  # HEAD then: where `merged` starts counting lane commits
 
 
 def cmd_human_approve(args):
@@ -8817,7 +9703,7 @@ def cmd_human_approve(args):
         remaining = [c for c in order if st["checkpoints"][c]["status"] != "done"]
         st["review_target"] = None
         if remaining:
-            _advance(st, remaining[0], fingerprint(ctx.root)["id"])
+            _advance(st, remaining[0], fingerprint(ctx.root)["id"], _head_sha(ctx.root))
         else:
             st["phase"] = "done"
             st["current"] = None
@@ -8895,7 +9781,7 @@ def cmd_plan_extend(args):
     for cid in new_ids:
         st["checkpoints"][cid] = new_cp_state(cp_by_id(plan, cid))
     st["plan_hash"] = _plan_hash(plan, ctx)
-    _advance(st, new_ids[0], fingerprint(ctx.root)["id"])
+    _advance(st, new_ids[0], fingerprint(ctx.root)["id"], _head_sha(ctx.root))
     st["approved"] = approval_snapshot(ctx, st)  # the user's feedback is the approval for the appended checkpoints
     register_active(ctx.root, st["slug"])
     ctx.log(st, "plan_extended", added=new_ids)
@@ -9801,7 +10687,7 @@ def _unblock(ctx, st, by, note) -> str:
     if back == "building" and not cur:  # nothing current: pick up the next unfinished checkpoint
         pending = [c for c in order if st["checkpoints"][c]["status"] != "done"]
         if pending:
-            _advance(st, pending[0], fingerprint(ctx.root)["id"])
+            _advance(st, pending[0], fingerprint(ctx.root)["id"], _head_sha(ctx.root))
         else:
             st["phase"] = "awaiting_final_review"
     elif cur:
@@ -10126,6 +11012,7 @@ def cmd_next(args):
     ctx = Ctx(find_root())
     st = ctx.state()
     na = next_action(ctx, st)
+    na["question"] = waiting_question(ctx, st)
     na["wait"] = live_wait(st)  # what the owner chat said it is waiting on (`ratchet.py wait`), until when
     hs = hooks_view(ctx)
     hw = hooks_warning(ctx, hs)
@@ -10416,7 +11303,7 @@ def status_json(ctx: Ctx) -> dict:
             "blocked_reason_plain": plain_reason(st.get("blocked_reason")),
             "accept_note": na.get("accept_note"),
             "awaiting_since": st.get("awaiting_since"), "approval_mode": approval_mode(ctx),
-            "wait": live_wait(st),
+            "wait": live_wait(st), "question": waiting_question(ctx, st),
             "adv_rounds_used": st.get("adv_rounds_total", 0),
             "unavailable_reviewers": unavailable_reviewers(ctx), "host_provider": detect_host(ctx.config()),
             "hooks_warning": hw, "hook_heartbeat": read_heartbeat(ctx.root),
@@ -13089,6 +13976,66 @@ def _brief_guard(n: dict, root: Path) -> str | None:
             f"output of `$RATCHET brief {cp} --role {role}`, then the rest of the prompt.")
 
 
+MERGE_SHARED = {f"{RATCHET_DIR}/{f}" for f in ("config.json", "standards.md", "learnings.md", ".gitignore")}
+MERGE_MID_STEP = ("RATCHET GUARD: finish this step before merging main. A merge in the middle of a step would mix "
+                  "main's changes into the step's own work and into what its reviewers see. Run the step through "
+                  "`complete`, then merge main, then run `ratchet.py merged`.")
+
+MERGE_AGAIN = ("RATCHET GUARD: finish this step before merging main again. An earlier merge in this step was resolved "
+               "by hand and its resolution is still waiting for this step's review, so Ratchet cannot accept a second "
+               "merge yet. Run the step through `complete`, then merge main, then run `ratchet.py merged`.")
+
+
+def _merge_rule(cmd: str, cwd: str, root: Path) -> tuple[str, str | None]:
+    """The merge rule, as (command for the other guard checks, refusal or None). In the middle of a step `git merge`
+    and `git pull` are refused (finishing or aborting a merge already begun is not). Between steps, while a merge is in
+    progress, a plain git add / checkout / commit that touches only Ratchet's shared files is let through by handing
+    the other checks `true` in its place. Any other command is returned unchanged. Fails open to 'unchanged'."""
+    try:
+        segs = _segments(cmd)
+        info = [_program(s) for s in segs]
+        merge = [i[0] == "git" and i[1] in ("merge", "pull") and not re.search(r"--(abort|continue|quit)\b", s)
+                 for s, i in zip(segs, info)]
+        shared = [i[0] == "git" and i[1] in ("add", "checkout", "commit") and not re.search(r"[<>$`()]", s)
+                  and bool(RATCHET_TOKEN_RE.search(s)) for s, i in zip(segs, info)]
+        if not any(merge) and not any(shared):
+            return cmd, None
+        ctx = Ctx(root)
+        if not (ctx.ratchet / "active.json").exists():
+            return cmd, None
+        st, _why = _read_record(ctx.state_path())
+        phase, cur = (st or {}).get("phase"), (st or {}).get("current")
+        g = lambda *a: subprocess.run(["git", *a], cwd=root, capture_output=True, text=True, timeout=20)
+        merging = g("rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0
+        if phase in ("awaiting_checkpoint_review", "awaiting_final_review"):
+            between = True
+        elif phase == "building" and cur and st["checkpoints"][cur].get("step") == "tests":
+            r = g("status", "--porcelain", "--", ".", f":(exclude){RATCHET_DIR}", *JUNK_PATHSPECS)
+            between = r.returncode == 0 and not any(ln for ln in r.stdout.splitlines()
+                                                    if not merging or ln.startswith("??"))
+        else:
+            between = False
+        if phase == "building" and not between and any(merge):
+            return cmd, MERGE_MID_STEP
+        last = next((e for e in reversed((st or {}).get("history") or [])
+                     if e.get("event") in ("checkpoint_complete", "merged_main")), None)
+        if phase == "building" and any(merge) and last and last["event"] == "merged_main" and last.get("by_hand"):
+            return cmd, MERGE_AGAIN
+        if not (between and merging and any(shared)):
+            return cmd, None
+        out, changed = [], False
+        for s, sh in zip(segs, shared):
+            rel = [os.path.relpath(os.path.normpath(os.path.join(cwd, t.strip("'\""))), root).replace("\\", "/")
+                   for t in RATCHET_TOKEN_RE.findall(s)]
+            if sh and rel and all(r in MERGE_SHARED for r in rel):
+                out, changed = out + ["true"], True
+            else:
+                out.append(s)
+        return (" ; ".join(out) if changed else cmd), None
+    except Exception:
+        return cmd, None
+
+
 def decide_guard(n: dict) -> tuple[bool, str]:
     cmd, cwd = n["command"], n["cwd"]
     if not _is_director_session():
@@ -13121,10 +14068,11 @@ def decide_guard(n: dict) -> tuple[bool, str]:
         marks = isinstance(read_heartbeat(root).get("agent_marks"), dict)
     who = {"enforce": marks and _host_names_subagent(n["host"]), "agent_type": n.get("agent_type")}
     if n["kind"] == "shell" and cmd:
-        why = _guard_shell(cmd, cwd, who)
+        gcmd, why = _merge_rule(cmd, cwd, root)
+        why = why or _guard_shell(gcmd, cwd, who)
         if why:
             return True, why
-        _note_engine_call(root, cmd, n.get("session"))  # which chat runs `init` / `ask` / `wait` here (_noted_session)
+        _note_engine_call(root, cmd, n.get("session"), n.get("input"))  # which chat runs `init` / `ask` / `wait` / `complete` here (_noted_session)
     if who["enforce"] and not n.get("agent_type") and _run_phase(root) == "building" and _orchestrator_edit(n, root):
         return True, ORCH_EDIT_MSG
     if n["kind"] == "write":
@@ -13785,9 +14733,9 @@ STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "re
                      "ui-record", "adv-record", "complete", "human-approve", "feedback", "plan-extend", "pause",
                      "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
                      "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait", "accept-finding",
-                     "raise-limit", "check-in", "triage")
-LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers", "providers")  # tests, checks, a regression suite,
-                                                                               # provider probes (--add included)
+                     "raise-limit", "check-in", "triage", "merged")
+LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers", "providers", "merged")  # tests, checks, a regression
+                                                                                          # suite, provider probes (--add included)
 # The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
 OVERRIDE_CMDS = ("approve-plan", "human-approve", "approve-changes", "cancel", "set-review", "resume", "hooks-waive",
                  "ui-respec", "choice", "feedback", "accept-state", "init")
@@ -13827,29 +14775,103 @@ def _lock_pause():
     time.sleep(0.05)
 
 
+def _lock_host() -> str:
+    """This machine's name as written into a state lock ('' when it has none or has a space in it: such a lock is
+    written without it and keeps the timed rule)."""
+    try:
+        host = socket.gethostname()
+    except OSError:
+        return ""
+    return "" if not host or re.search(r"\s", host) else host
+
+
+def _lock_where() -> tuple[str, str]:
+    """(pid namespace, boot id) of this process as written into a state lock: 'pid:[4026531836]' from
+    /proc/self/ns/pid and the contents of /proc/sys/kernel/random/boot_id. A process id means something only inside
+    one pid namespace on one boot (an agent's sandbox on Linux has its own namespace but the same machine name), so
+    a part that can't be read comes back '' and the lock is written without it (it keeps the timed rule)."""
+    if not sys.platform.startswith("linux"):
+        return "", ""
+    try:
+        ns = os.readlink("/proc/self/ns/pid")
+    except OSError:
+        ns = ""
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    except (OSError, ValueError):
+        boot = ""
+    return ("" if re.search(r"\s", ns) else ns), ("" if re.search(r"\s", boot) else boot)
+
+
+def _lock_fields(parts: list[str]) -> tuple[str, str, str, list[str]]:
+    """Split lock text words `<pid> <token> [@host] [pidns=..] [boot=..] <command...>` into (host, pid namespace,
+    boot id, the command's words); a missing field is ''."""
+    host = ns = boot = ""
+    rest = parts[2:]
+    if rest and rest[0].startswith("@"):
+        host, rest = rest[0][1:], rest[1:]
+        if rest and rest[0].startswith("pidns="):
+            ns, rest = rest[0][6:], rest[1:]
+        if rest and rest[0].startswith("boot="):
+            boot, rest = rest[0][5:], rest[1:]
+    return host, ns, boot, rest
+
+
+def _pid_is_ratchet(pid: int) -> bool | None:
+    """Whether process `pid` on this machine is a live ratchet.py command: False when it is gone (or a zombie) or is a
+    non-python program that was handed the same id; None when that can't be told (not Linux, /proc can't be read or is
+    another namespace's, an empty command line, or any python process that is not running ratchet.py: python -c,
+    python -m, a copy of the script under another name)."""
+    if pid == os.getpid():
+        return True
+    try:
+        # a mounted /proc that is another pid namespace's (a bound host /proc) says nothing about our process ids
+        if not sys.platform.startswith("linux") or int(os.readlink("/proc/self")) != os.getpid():
+            return None
+    except (OSError, ValueError):
+        return None
+    try:
+        argv = [a for a in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if a]
+        if not argv:  # a zombie is gone; a process that is not yet or no longer showing its arguments is not judged
+            return False if Path(f"/proc/{pid}/stat").read_bytes().rpartition(b")")[2].split()[:1] == [b"Z"] else None
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except OSError:
+        return None
+    if any(os.path.basename(a) == b"ratchet.py" for a in argv):
+        return True
+    return None if re.match(rb"python[0-9.]*(\.exe)?$", os.path.basename(argv[0])) else False
+
+
 class _StateLock(_BreakerLock):
     """O_CREAT|O_EXCL lock file, state.lock in the Ratchet folder (works the same on POSIX and Windows), around one
-    command. It holds the process id, a random token and the command's name. Every failure to take it (another
-    command holds it, the folder can't be written, something other than a lock file sits at that path) is retried
-    after a pause until the wait runs out, then refused with a plain message; behind a long command the wait is cut
-    short. The breaker protocol is _BreakerLock's, shared with the per-user locks: the lock file is only ever removed
+    command. Every failure to take it (another command holds it, the folder can't be written, something other than a
+    lock file sits at that path) is retried after a pause until the wait runs out, then refused with a plain message;
+    behind a long command the wait is cut short. The breaker protocol is _BreakerLock's, shared with the per-user locks: the lock file is only ever removed
     (a stale one, or an owner releasing its own) while holding a second O_EXCL file, state.lock.break, so the file
     judged stale is the file removed: two waiters can't both clear it, and none can remove a newer, live lock; a
     breaker file left by a process that died is cleared after BREAKER_STALE seconds. With `refresh`, the holder
     touches its lock while it runs, so a long, live command is never judged stale. With `create_dir` (init: the
     first command of a project), the Ratchet folder is made first, so two first inits are serialised like every
-    other command instead of both running unlocked."""
+    other command instead of both running unlocked. The lock text is `<pid> <token> @<machine> pidns=<pid namespace>
+    boot=<boot id> <command>`; on Linux, a lock whose machine, boot and pid namespace are this process's and whose
+    process is gone (or is some other non-python program) is stale at once, not after the timed limit. An older lock
+    text, one from another machine, another system than Linux, or a process that can't be told keeps the timed rule."""
 
     def __init__(self, root: Path, wait: float | None = None, cmd: str | None = None, refresh: bool = False,
                  create_dir: bool = False):
+        host = _lock_host()  # "@<this machine's name>": what lets a later command judge whether this process is gone
+        ns, boot = _lock_where() if host else ("", "")  # ... but only in the same pid namespace on the same boot
         super().__init__(root / RATCHET_DIR / "state.lock",
-                         f"{os.getpid()} {secrets.token_hex(8)}" + (f" {cmd}" if cmd else ""))
+                         f"{os.getpid()} {secrets.token_hex(8)}" + (f" @{host}" if host else "")
+                         + (f" pidns={ns}" if ns else "") + (f" boot={boot}" if boot else "") + (f" {cmd}" if cmd else ""))
         self.root = root
         self.create_dir = create_dir
         self.wait = wait
         self.refresh = refresh
         self._beat = None
         self.holder = None  # the command holding the lock at the last try (None: not known)
+        self._cleared = False  # the last try cleared a leftover lock, so the next try need not wait
 
     def _stale_after(self) -> float:
         return _lock_stale_seconds(self.root)
@@ -13869,7 +14891,28 @@ class _StateLock(_BreakerLock):
             parts = self.path.read_text(encoding="utf-8", errors="replace").split()
         except OSError:
             return None
-        return " ".join(parts[2:]) if len(parts) > 2 else None
+        rest = _lock_fields(parts)[3]  # the machine's name, pid namespace and boot id are not part of the command
+        return " ".join(rest) if rest else None
+
+    def _owner_alive(self) -> bool | None:
+        """Whether the process named in the lock text is a live ratchet.py command: False when the text says this
+        machine and that process is provably gone, True when it is live, None when that can't be told (older text,
+        another machine, not Linux, unreadable): the timed rule."""
+        try:
+            parts = self.path.read_text(encoding="utf-8", errors="replace").split()
+        except OSError:
+            return None
+        host = _lock_host()
+        ns, boot = _lock_where()
+        lhost, lns, lboot, _rest = _lock_fields(parts)
+        # the id means something only on the same machine, same boot and same pid namespace; any other or missing: unknown
+        if (len(parts) < 3 or not host or lhost != host or not ns or lns != ns or not boot or lboot != boot
+                or not parts[0].isdigit() or int(parts[0]) <= 0):
+            return None
+        return _pid_is_ratchet(int(parts[0]))
+
+    def _owner_gone(self) -> bool:
+        return self._owner_alive() is False
 
     def live_holder(self) -> str | None:
         """Who holds a live (not stale) lock right now, without waiting or changing anything; None when no command
@@ -13887,9 +14930,10 @@ class _StateLock(_BreakerLock):
         self.holder = self._holder_cmd()
         stale_after = _lock_stale_seconds(self.root)
         busy = (f"Ratchet is busy running {self.holder or 'another command'}; try again when it finishes. Nothing was "
-                f"done: another Ratchet command is still changing this run (lock file {self.path}). If no Ratchet "
-                f"command is running, the lock clears itself {int(stale_after // 60)} minutes after its command last "
-                f"refreshed it, or remove {self.path}.")
+                f"done: another Ratchet command is still changing this run (lock file {self.path}).")
+        if self._owner_alive() is not True:  # its owner can't be checked: say how an old lock goes away
+            busy += (f" If no Ratchet command is running, the lock clears itself {int(stale_after // 60)} minutes "
+                     f"after its command last refreshed it, or remove {self.path}.")
         try:
             st = os.lstat(self.path)
         except FileNotFoundError:
@@ -13902,7 +14946,9 @@ class _StateLock(_BreakerLock):
         if not self._is_stale(st):
             return busy
         try:  # judged again while holding the breaker file: nobody else can remove it meanwhile
-            self._clear_stale()
+            if self._clear_stale():
+                self._cleared = True  # gone now: the caller takes the lock at once
+                return busy
         except OSError as e:
             return self._cant(e)
         return (f"A lock file left by a Ratchet command that stopped ({self.path}) could not be cleared, so nothing "
@@ -13928,7 +14974,10 @@ class _StateLock(_BreakerLock):
                 self._start_refresh()
                 return None
             except FileExistsError:
+                self._cleared = False
                 why = self._why_busy()
+                if self._cleared:
+                    continue  # a leftover lock was just removed: take it now, whatever the wait
                 if self.holder in LONG_LOCKED_CMDS:  # it may run for many minutes: refuse rather than wait it out
                     deadline = min(deadline, start + STATE_LOCK_BUSY_WAIT_SECONDS)
             except OSError as e:
@@ -14388,6 +15437,8 @@ def main(argv=None):
     a.set_defaults(fn=cmd_adv_record)
     a = sp.add_parser("complete"); a.add_argument("cp")
     a.set_defaults(fn=cmd_complete)
+    sp.add_parser("merged", help="between steps, after merging main into the lane: re-check earlier steps and "
+                  "accept the merge").set_defaults(fn=cmd_merged)
     a = sp.add_parser("human-approve"); a.add_argument("--director-token"); a.set_defaults(fn=cmd_human_approve)
     a = sp.add_parser("feedback"); a.add_argument("--text"); a.add_argument("--learning", action="append")
     a.add_argument("--director-token")
