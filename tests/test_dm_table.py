@@ -180,7 +180,12 @@ def _step(d, i, cases, findings=None):
     r = g.rx(d, "behavior", cp)
     assert r.returncode == 0, r.stdout + r.stderr
     rnd = g.open_round(d, cp)
-    p = g.write_review(d, rnd, g.R0(rnd), findings or [])
+    # CP3's rule: a finding that names a done-means line blocks its step at any severity, so a line-naming minor
+    # can no longer reach the left-for-later list through adv-record. The minor is recorded WITHOUT done_means
+    # (deferred by the low-risk rule as before), and _force_dm() then adds the line number onto the recorded
+    # deferred entry in state through mutate(), which is all this checkpoint's table reads.
+    p = g.write_review(d, rnd, g.R0(rnd), [{k: v for k, v in f.items() if k != "done_means"}
+                                           for f in (findings or [])])
     r = g.rx(d, "adv-record", cp, "--reviews", p)
     assert r.returncode == 0, r.stdout + r.stderr
     r = g.rx(d, "complete", cp)

@@ -126,14 +126,17 @@ DEFAULT_CONFIG = {
     "probe_ttl_minutes": 120,       # a provider that answered a test request this recently isn't tested again
     "probe_timeout_sec": 120,
     # Which finding severities block approval, by checkpoint risk. "all" = every finding must be fixed. On a low-risk
-    # checkpoint minor findings are recorded for later (`ratchet.py deferred`) instead of starting another round.
+    # checkpoint minor findings are recorded for later (`ratchet.py deferred`) instead of starting another round,
+    # except a finding that names a done-means line (`names_done_means`), which blocks at any severity.
     "blocking_severities": {"low": ["blocker", "major"], "normal": "all", "high": "all"},
-    # From round 2 on, a minor finding only blocks if it is in code changed since the previous round; blocker and
-    # major findings block wherever they are. Stops each round from turning into a fresh review of everything.
+    # From round 2 on, a minor finding only blocks if it is in code changed since the previous round, unless it
+    # names a done-means line (`names_done_means`); blocker and major findings block wherever they are. Stops each
+    # round from turning into a fresh review of everything.
     "scope_later_rounds": True,
     # From round converge_after_round + 1 on (default: round 3), a minor finding never blocks, even in code changed
-    # since the previous round; it is recorded for later instead (`ratchet.py deferred`). Blocker and major
-    # findings always block, at any round. Keeps reviews converging instead of chasing ever-narrower nits.
+    # since the previous round, unless it names a done-means line (`names_done_means`); it is recorded for later
+    # instead (`ratchet.py deferred`). Blocker and major findings always block, at any round. Keeps reviews
+    # converging instead of chasing ever-narrower nits.
     "converge_after_round": 2,
     # After this many blocking adversarial rounds in a row (or a second round where an unseen finding kind shows
     # up in a file an earlier round already flagged), pause for a check-in (`ratchet.py check-in CPn`) before
@@ -805,8 +808,20 @@ def _docs_only_review_skip(ctx: "Ctx", st: dict, cfg: dict, cp: dict, cps: dict,
                            json_out: bool = False) -> bool:
     """True once this call has handled the adversarial gate for a docs-only step (the caller returns without
     opening a round); False when the normal full round still applies (code changed, high risk, a pinned
-    reviewer list, or the docs quick path is off)."""
+    reviewer list, the docs quick path is off, or, CP3, the step's latest RECORDED round still has an open
+    finding that names a done-means line (`names_done_means`, while `_dm_findings_block` applies to this plan):
+    a miss against what done means is fixed, re-reviewed or accepted by the user, never passed over because the
+    diff that remains is docs only). That round is read from the gate's own `rounds` list, not from
+    `cps['adv_round']`: `reviewers` replaces that pointer with a newer, unrecorded round the moment one opens
+    (and again after a reviewer times out and it is re-run), and the earlier round's finding is still open
+    until a later round records it fixed or the user accepts it."""
     if cp.get("risk", "normal") == "high" or not cfg.get("doc_test_command"):
+        return False
+    recorded = ((cps.get("gates") or {}).get("adversarial") or {}).get("rounds") or []
+    last_no = recorded[-1].get("round") if recorded else None
+    last_rec = {"round": last_no, "recorded": True} if last_no is not None else None
+    if last_rec and _dm_findings_block(ctx, st, ctx.plan() or {}) \
+            and any(names_done_means(f) for f in _adv_open_findings(ctx, cp_id, last_rec, cps)):
         return False
     if cp.get("reviewers"):
         return False  # the checkpoint pins its own reviewer list; that override always gets a normal full
@@ -2159,7 +2174,10 @@ def objective_brief(plan, proof_notes=None) -> str:
     `_done_means_proof_notes` builds: {1-based done_means line number: one note line}), each done-means bullet is
     followed by its note (`Proved by: <case ids>`, or the plain `Heads up` for a line no case proves yet); this is
     the one rendering `plan-summary`, `brief` and the launch guard share, so a brief's objective matches
-    plan-summary's word for word. A plan with no objective at all (a run approved before CP1's
+    plan-summary's word for word. Done-means lines are numbered 1..N (`  - 1. <line>`, still a "- " bullet so
+    the objective block reads the same as the other bullets), the same 1-based numbers a test case's "proves"
+    and a review finding's `done_means` (CP3) use, so a reviewer can name the line a finding contradicts. A
+    plan with no objective at all (a run approved before CP1's
     objective_problems() existed) gets a plain note instead of a crash, so a legacy run keeps reviewing normally."""
     obj = plan.get("objective") if isinstance(plan, dict) else None
     if not isinstance(obj, dict) or not obj:
@@ -2169,7 +2187,7 @@ def objective_brief(plan, proof_notes=None) -> str:
     if dm:
         lines.append("Done means:")
         for i, x in enumerate(dm, 1):
-            lines.append(f"  - {x}")
+            lines.append(f"  - {i}. {x}")
             if proof_notes and proof_notes.get(i):
                 lines.append(f"    {proof_notes[i]}")
     oos = obj.get("out_of_scope") or []
@@ -2200,7 +2218,11 @@ ROLE_BRIEFS = {
     "reviewer": ("Rules: judge every finding against the realistic-use bar: this project's users run a cooperative "
                  "agent, not an attacker, and a finding must describe real harm to them in realistic, normal use, "
                  "not a case no real user would hit. Every blocking finding (blocker or major) must say who is hurt "
-                 "and how; leave that out and it does not block. Approve only when you genuinely find nothing."),
+                 "and how; leave that out and it does not block. The one exception: a finding that names a done-means "
+                 "line of the objective (done_means) blocks at any severity and any round, with no separate "
+                 "user_impact needed, so name a line only when that line is not met in normal use; a plan approved "
+                 "before that rule keeps the older severity and round rules, and the round's review rules say so when "
+                 "that is the case. Approve only when you genuinely find nothing."),
     "scout": ("Rules: verify the app, its tests and its dev server actually run before anyone else relies on your "
               "report; don't guess. Record what's already green, what's already broken, and what's missing, so a "
               "later checkpoint is never blamed for a problem that was there before the build started."),
@@ -3425,7 +3447,8 @@ def _unproven_done_means(ctx, plan) -> list[tuple]:
     case's "proves" names, across every checkpoint. Empty when the plan has no objective or no done_means at
     all (nothing to flag). One consumer: unlinked_done_means_problems, the refusal plan-submit applies to every
     line and plan-extend applies to the lines feedback added since the approval snapshot. The Proved by / Heads
-    up notes plan-summary and brief print come from _done_means_proof_notes, not from here."""
+    up notes plan-summary and brief print come from _done_means_proof_notes, not from here, and CP3's
+    `_dm_findings_block` reads the approval marker (`_approved_after_dm`), never today's links."""
     links = _done_means_links(ctx, plan)
     dm = (plan.get("objective") or {}).get("done_means") if links else []
     return [(i, t) for i, t in enumerate(dm, 1) if not links.get(i)]
@@ -3449,7 +3472,8 @@ def _approved_done_means(st) -> list[str]:
     """The objective.done_means lines the approved plan had, read from the approval snapshot
     (st["approved"]["objective"], written by approve-plan and refreshed by plan-extend). [] for a run that has no
     approval yet or whose approved plan had no objective or no done_means list. Used by plan-extend (which lines
-    feedback added) and _unlinked_done_means_note."""
+    feedback added) and _unlinked_done_means_note; CP3's `_dm_findings_block` does not read it (it reads the
+    `done_means_rules` marker through `_approved_after_dm`)."""
     obj = (st.get("approved") or {}).get("objective")
     dm = obj.get("done_means") if isinstance(obj, dict) else None
     return [t for t in dm if isinstance(t, str)] if isinstance(dm, list) else []
@@ -3509,7 +3533,8 @@ def cmd_plan_summary(args):
         print(f"\n{i}. {cp['title']}")
         print(f"   Done when: {(cp.get('done_when') or [''])[0]}")
         print(f"   UI review: {'yes' if (cp.get('gates') or {}).get('ui') else 'no'}")
-        print(f"   Risk: {risk}" + ("" if bar == "all" else f" (only {' and '.join(bar)} findings block; minor ones are noted for later)"))
+        print(f"   Risk: {risk}" + ("" if bar == "all" else f" (only {' and '.join(bar)} findings block; minor ones are noted for later, "
+                                                             "unless one names a done-means line, which always blocks)"))
         print(f"   Reviewed by: {'; '.join(who)}")
         ecl = exit_code_only_line(cp)
         if ecl:
@@ -6077,6 +6102,7 @@ def cmd_approve_plan(args):
     if (st.get("pending") or {}).get("action") == "approve-plan":
         st.pop("pending", None)  # answered
     st["approved"] = approval_snapshot(ctx, st)  # the owner chat is unchanged: only `resume --claim` moves a run
+    st["approved"]["done_means_rules"] = DM_RULES_VERSION  # written once, here: this plan is under the done-means rules
     st["phase"] = "building"
     st["current"] = plan["checkpoints"][0]["id"]
     first = st["checkpoints"][st["current"]]
@@ -7776,7 +7802,10 @@ def _checkin_brief(ctx, plan, cp_id, cps, g, ci) -> dict:
             "objective": obj if isinstance(obj, dict) and obj else NO_OBJECTIVE_NOTE,
             "findings": [{"id": _finding_key(f), "severity": f.get("severity"),
                           "file": f.get("file") or f.get("path") or f.get("location"), "kind": finding_kind(f),
-                          "description": f.get("description"), "user_impact": f.get("user_impact")}
+                          "description": f.get("description"), "user_impact": f.get("user_impact"),
+                          # CP3: the done-means line(s) the finding names, as written, so a line-naming minor is
+                          # never read as a plain "(minor)" at a decision point
+                          "done_means": f.get("done_means") if names_done_means(f) else None}
                          for f in findings],
             "kinds_by_file": _checkin_kinds_by_file(ctx, findings),
             "options": CHECKIN_OPTIONS, "decided": ci.get("decided") or []}
@@ -7792,11 +7821,14 @@ def _print_checkin_brief(brief: dict):
     else:
         print(f"Note: {obj}.")
     print("Open findings:")
+    dm_lines = (obj.get("done_means") if isinstance(obj, dict) else None) or []
     for f in brief["findings"]:
         line = f"  - {f['id']} ({f.get('severity', '?')}) {f.get('file') or ''}: {f.get('description', '') or ''}"
         print(line.rstrip())
         if f.get("user_impact"):
             print(f"      user impact: {f['user_impact']}")
+        if f.get("done_means") is not None:
+            print(f"      {_dm_named_text(dm_lines, f).strip().strip('[]')}")
     if brief["kinds_by_file"]:
         print("Finding kinds by file:")
         for fl, kinds in brief["kinds_by_file"].items():
@@ -8059,27 +8091,38 @@ def cmd_adv_record(args):
                       and str(f.get("severity", "")).strip().lower() not in MINOR_SEVERITIES})
     for kind in escaped:
         _auto_strengthen(ctx, st, cfg, kind, args.cp)
+    # CP3: a finding that names a done-means line blocks at any severity, round or scope, but only for a plan
+    # approved since that rule exists (`_dm_findings_block`); an older plan keeps the rules it was approved under
+    # and gets a plain note (DM_LEGACY_FINDINGS_NOTE) instead of a surprise block.
+    dm_blocks = _dm_findings_block(ctx, st, ctx.plan())
+    dm_named = [f for f in all_findings if names_done_means(f)]
+    legacy_note = f"Note: {DM_LEGACY_FINDINGS_NOTE}." if dm_named and not dm_blocks else ""
     covered_minor = [dict(f, deferred_because=f"an automatic check already covers '{finding_kind(f)}'")
                      for f in all_findings if finding_kind(f) in covered
-                     and str(f.get("severity", "")).strip().lower() in MINOR_SEVERITIES]
+                     and str(f.get("severity", "")).strip().lower() in MINOR_SEVERITIES
+                     and not (dm_blocks and names_done_means(f))]
     # only MINOR findings of a covered kind step aside (their check runs at the behavior gate); blocker and major
-    # findings always block, whatever label they carry
+    # findings always block, whatever label they carry, and so does a minor one that names a done-means line
+    # (CP3, `names_done_means`): a check covering its kind does not prove the line is met
     all_findings = [f for f in all_findings if not any(f is c or (f.get("id"), f.get("reviewer")) == (c.get("id"), c.get("reviewer"))
                                                        for c in covered_minor)]
     # Realistic-use bar: a blocker, major or unknown-severity finding that does not say who is hurt and how
     # (user_impact) never blocks, at any round and any risk. It is recorded for the final review instead. This
     # is narrower than the existing minor-severity rules below: minor findings keep following those, whether or
-    # not they carry a user_impact.
+    # not they carry a user_impact. A finding that names a done-means line (CP3, `names_done_means`) is exempt:
+    # the named line stands in for user_impact, since the plan's objective already says who is hurt when that
+    # line is not met.
     no_impact = [f for f in all_findings
                  if str(f.get("severity", "")).strip().lower() not in MINOR_SEVERITIES
-                 and not str(f.get("user_impact") or "").strip()]
+                 and not str(f.get("user_impact") or "").strip()
+                 and not (dm_blocks and names_done_means(f))]
     if no_impact:
         all_findings = [f for f in all_findings if not any(f is n for n in no_impact)]
     no_impact_deferred = [dict(f, deferred_because="no user impact stated") for f in no_impact]
     changed_since = _changed_since_last_round(ctx, cfg, g, fp["id"])
     raw_count = len(all_findings)
     all_findings, deferred = split_findings(cfg, cp.get("risk", "normal"), all_findings, changed_since, ctx.root,
-                                             round_no=rnd["round"])
+                                             round_no=rnd["round"], dm_blocks=dm_blocks)
     deferred = covered_minor + no_impact_deferred + deferred
     if deferred:
         write_json(dest / "deferred-findings.json", deferred)
@@ -8108,7 +8151,11 @@ def cmd_adv_record(args):
         build_viewer(ctx)
         write_json(dest / "open-findings.json", all_findings)
         _announce_repeats(ctx, st)
+        if legacy_note:
+            print(legacy_note)
+        open_named = sum(1 for f in all_findings if names_done_means(f))
         die(f"Gate 3 (adversarial) NOT approved: {len(all_findings)} blocking finding(s)"
+            + (f", {open_named} of them naming a done-means line (these block at any severity)" if open_named and dm_blocks else "")
             + (f" ({len(deferred)} minor ones recorded for later)" if deferred else "") + " → "
             f"{(dest / 'open-findings.json').relative_to(ctx.root)}. Decide fix or rebut for each (`ratchet.py "
             f"triage {args.cp} <id>=fix:\"reason\"` or `=rebut:\"reason\"`), then spawn ratchet-fixer with "
@@ -8131,6 +8178,8 @@ def cmd_adv_record(args):
     note = (f" {len(deferred)} minor finding(s) were recorded for later instead of blocking (`ratchet.py deferred`)."
             if deferred else "")
     _announce_repeats(ctx, st)
+    if legacy_note:
+        print(legacy_note)
     ok(f"Gate 3 (adversarial) APPROVED by all {need} reviewer(s) for {args.cp}.{note} Next: ratchet.py complete {args.cp}")
 
 
@@ -8170,13 +8219,15 @@ def _adv_open_findings(ctx, cp_id: str, rnd, cps=None) -> list:
     return [f for f in raw if _finding_key(f) not in accepted_keys]
 
 
-def _open_blocking_lenses(ctx, cfg, cp_id: str, rnd, cps=None) -> set:
-    """Lenses with a still-open BLOCKER or MAJOR finding (never a minor one) in a checkpoint's latest recorded
-    adversarial round. `reviewers` narrows the next round to just these lenses; a lens whose only open finding
-    was minor doesn't keep it in the loop, and a lens that approved isn't in here at all."""
+def _open_blocking_lenses(ctx, cfg, cp_id: str, rnd, cps=None, dm_blocks: bool = True) -> set:
+    """Lenses with a still-open BLOCKER or MAJOR finding, or a still-open finding of any severity that names a
+    done-means line (CP3, `names_done_means`; only while `dm_blocks`, i.e. `_dm_findings_block` for this plan),
+    in a checkpoint's latest recorded adversarial round. `reviewers` narrows the next round to just these
+    lenses; a lens whose only open finding was a plain minor (naming no line) doesn't keep it in the loop, and
+    a lens that approved isn't in here at all."""
     out = set()
     for f in _adv_open_findings(ctx, cp_id, rnd, cps):
-        if str(f.get("severity", "")).strip().lower() in MINOR_SEVERITIES:
+        if str(f.get("severity", "")).strip().lower() in MINOR_SEVERITIES and not (dm_blocks and names_done_means(f)):
             continue
         spec = _roster_spec(cfg, f.get("reviewer")) if f.get("reviewer") else None
         if spec and spec.get("lens"):
@@ -8198,6 +8249,114 @@ def _learnings_text(ctx) -> str:
 
 
 MINOR_SEVERITIES = {"minor", "nit", "nitpick", "trivial", "info", "suggestion", "low", "style"}
+
+
+def _dm_line_number(x) -> bool:
+    """`x` is a line number as a reviewer writes one: an int (not a bool), a float with an integer value (3.0),
+    or a string with a run of digits in it ("3", "3, 4", "line 3", "#3"). A string with no digit ("none",
+    "N/A", "") is not one."""
+    if isinstance(x, bool):
+        return False
+    if isinstance(x, int) or (isinstance(x, float) and x.is_integer()):
+        return True
+    return isinstance(x, str) and re.search(r"\d", x) is not None
+
+
+def _dm_line_values(x) -> list[int]:
+    """The line numbers one `done_means` value carries (`_dm_line_number`): [3] for 3, "3" or 3.0; every run of
+    digits for a string such as "3, 4" or "line 3"; [] for a value that names none."""
+    if not _dm_line_number(x):
+        return []
+    if isinstance(x, (int, float)):
+        return [int(x)]
+    return [int(m) for m in re.findall(r"\d+", x)]
+
+
+def names_done_means(f) -> bool:
+    """True when a finding names the done-means line(s) it contradicts in its optional `done_means` field (CP3,
+    schemas.md section 7): a line number (`_dm_line_number`: an int, a float with an integer value, or a string
+    with a run of digits in it such as "3", "3, 4" or "line 3"; never a bool) or a list holding at least one. A
+    value with no number in it (`false`, `"none"`, `"N/A"`, `[null]`, `[""]`, `[]`, `null`) names nothing, so a
+    reviewer that fills the field with a "no line" value does not turn every plain finding into a blocking one,
+    while a value that does carry a number never slips through as a plain minor. A number is taken exactly as the reviewer wrote it: a bare number, or one that is not a real
+    line of the plan's objective (0, past the end), names a line too and the finding is shown as written; the
+    engine never judges the number here, so a reviewer's miscount still blocks rather than slipping through.
+    `_finding_dm_lines` is the other reader of the field: the final review's done-means table keeps only real
+    line numbers and ignores the rest, while this blocking rule does not. `cmd_adv_record` (covered-kind and
+    no-user_impact set-asides), `split_findings` (risk bar, converge round, later-round scope),
+    `_open_blocking_lenses` and `_docs_only_review_skip` all read it, each only while `_dm_findings_block` says
+    the rule applies to this plan: such a finding blocks at any severity and any round, and its lens is asked
+    again next round. The display readers (`_checkin_brief`'s per-finding `done_means`, `_dm_named_text` for
+    `ask accept-finding`'s question and the check-in brief, and `adv-record`'s open count) read it whether or
+    not `_dm_findings_block` applies: the line a finding names is always shown."""
+    dm = f.get("done_means") if isinstance(f, dict) else None
+    vals = dm if isinstance(dm, list) else [dm]
+    return any(_dm_line_number(x) for x in vals)
+
+
+DM_LEGACY_FINDINGS_NOTE = ("this plan was approved before a finding naming a done-means line always blocked; "
+                           "such findings follow the older severity, round and scope rules here")
+
+# The done-means rules a plan was approved under. `approve-plan` writes this version into the approval snapshot
+# (`st["approved"]["done_means_rules"]`, schemas.md section 7) once, at approval; `plan-extend`, `approve-changes`
+# and `merged` keep the value the snapshot already has and never add one to a run approved without it. A snapshot
+# with no such key was approved before this change (older rules, a plain note). Two readers: `_approved_after_dm`
+# (does the rule apply?) and `_approval_snapshot_keeping_dm` (the carry-forward plan-extend and approve-changes use).
+DM_RULES_VERSION = 1
+
+
+def _approved_after_dm(st) -> bool:
+    """True when the run's plan was approved since the done-means rules exist: the approval snapshot carries the
+    `done_means_rules` marker `approve-plan` writes (DM_RULES_VERSION). False for a run with no approval yet or
+    one approved before this change (the snapshot has no marker; nothing infers the era from today's links).
+    The marker's one reader that judges it; `_dm_findings_block` (CP3) and the later done-means checks share it.
+    Its other reader, `_approval_snapshot_keeping_dm`, only copies it forward."""
+    return bool((st.get("approved") or {}).get("done_means_rules"))
+
+
+def _approval_snapshot_keeping_dm(ctx, st) -> dict:
+    """A fresh `approval_snapshot` that keeps the `done_means_rules` marker the run's current snapshot already
+    carries, and adds none when it has none: the one carry-forward `plan-extend` and `approve-changes` share, so a
+    run approved under the done-means rules stays under them and a run approved before them never gains the
+    marker (`merged` does not rewrite the snapshot, so it needs no carry)."""
+    dm_rules = (st.get("approved") or {}).get("done_means_rules")
+    snap = approval_snapshot(ctx, st)
+    if dm_rules:
+        snap["done_means_rules"] = dm_rules
+    return snap
+
+
+def _dm_findings_block(ctx, st, plan) -> bool:
+    """CP3: whether a finding that names a done-means line (`names_done_means`) blocks at any severity, round and
+    scope for this run. True for a plan with done-means lines whose approval snapshot carries the
+    `done_means_rules` marker (`_approved_after_dm`), i.e. one approved since that rule exists. False for a plan
+    approved without the marker (before this change), and for one with no objective or no done_means lines at
+    all (nothing to contradict): line-naming findings then follow exactly the older rules (`blocking_severities`,
+    `converge_after_round`, `scope_later_rounds`, covered kinds, `user_impact`), with no crash, and `adv-record`
+    prints DM_LEGACY_FINDINGS_NOTE instead of blocking. Never inferred from today's "proves" links: an older
+    plan with every line linked stays older, and a newer plan whose approved test-plan change dropped a link
+    stays newer. Read by `cmd_adv_record`, `review_rules`, `cmd_reviewers` (for `_open_blocking_lenses`) and
+    `_docs_only_review_skip`."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    dm = obj.get("done_means") if isinstance(obj, dict) else None
+    if not isinstance(dm, list) or not dm:
+        return False
+    return _approved_after_dm(st)
+
+
+def _dm_named_text(dm_lines: list, f) -> str:
+    """' [contradicts done-means line 3: "<line text>"]' for a finding that names a line (number and the line's
+    own text from `dm_lines`, the plan's objective.done_means; a number that is not a real line is shown as
+    written, with no text), '' for a finding that names none. Shown wherever a decision is made on the finding:
+    `ask accept-finding`'s question and the check-in brief."""
+    if not names_done_means(f):
+        return ""
+    dm = f.get("done_means")
+    parts = []
+    for n in [n for x in (dm if isinstance(dm, list) else [dm]) for n in _dm_line_values(x)]:
+        text = dm_lines[n - 1] if 1 <= n <= len(dm_lines) and isinstance(dm_lines[n - 1], str) else None
+        parts.append(f"{n}: \"{text}\"" if text is not None else f"{n} (not a line of this plan, shown as written)")
+    return f" [contradicts done-means line{'s' if len(parts) > 1 else ''} {'; '.join(parts)}]"
 
 
 def _norm_path(p, root=None) -> str:
@@ -8235,20 +8394,23 @@ def _in_scope(path: str, scope: set) -> bool:
 
 
 def split_findings(cfg, risk: str, findings: list, changed_since: set | None, root=None,
-                    round_no: int | None = None) -> tuple[list, list]:
+                    round_no: int | None = None, dm_blocks: bool = True) -> tuple[list, list]:
     """(blocking, deferred). Severities not known to be minor always block (a reviewer can't escape the bar by
     inventing a severity name). `changed_since` is the round's scope: files changed since the previous round plus
     files that had a blocking finding last round (a finding the fixer ignored can't be waved through). `round_no`
     is this round's own number; from round `converge_after_round` + 1 (config, default 2, so round 3 by default)
     a minor finding never blocks any more, whatever its scope — blocker and major findings keep blocking at every
-    round."""
+    round. While `dm_blocks` (the caller's `_dm_findings_block` answer for this plan; False for a plan approved
+    before CP3), a finding that names a done-means line (CP3, `names_done_means`) is never deferred here,
+    whatever its severity, round or scope: a line of the objective not met in normal use blocks until it is
+    fixed or the user accepts it. Findings that name no line follow exactly the rules above."""
     bar = (cfg.get("blocking_severities") or {}).get(risk, "all")
     bar_l = [str(x).strip().lower() for x in (bar or [])] if bar != "all" else None
     converge_after = int(cfg.get("converge_after_round", 2))
     blocking, deferred = [], []
     for f in findings:
         sev = str(f.get("severity", "")).strip().lower()
-        minor = sev in MINOR_SEVERITIES
+        minor = sev in MINOR_SEVERITIES and not (dm_blocks and names_done_means(f))
         where = _norm_path(f.get("file") or f.get("path") or f.get("location"), root)
         if minor and bar_l is not None and sev not in bar_l:
             deferred.append(dict(f, deferred_because=f"{risk}-risk step: only {' and '.join(bar)} findings block"))
@@ -8407,23 +8569,38 @@ def cmd_repeats(args):
 
 
 def review_rules(ctx, cfg, cp, g, rnd, fp_id) -> tuple[set | None, list[str]]:
-    """What the reviewers of this round are told about the severity bar and the round's focus."""
+    """What the reviewers of this round are told about the severity bar and the round's focus. CP3: when the
+    plan's done-means lines are under the always-block rule (`_dm_findings_block`), every rule that sets a minor
+    finding aside carries the exception (a finding naming a done-means line always blocks), and one rule says so
+    outright; for a plan approved before that rule the older wording stands, no exception is claimed, and one
+    rule says plainly that this plan predates the rule (the qualifier the reviewer role brief,
+    agents/ratchet-adversary.md and the external prompt point at)."""
     focus = _changed_since_last_round(ctx, cfg, g, fp_id) if rnd["round"] > 1 else None
     bar = (cfg.get("blocking_severities") or {}).get(cp.get("risk", "normal"), "all")
+    dm_blocks = _dm_findings_block(ctx, ctx.state(), ctx.plan() or {})
+    dm_x = " (unless one names a done-means line in done_means, which always blocks)" if dm_blocks else ""
     rules = []
     if bar != "all":
         rules.append(f"This is a {cp.get('risk', 'normal')}-risk step: only {' and '.join(bar)} findings block; "
-                     "report minor ones too, they are recorded for later.")
+                     f"report minor ones too, they are recorded for later{dm_x}.")
     kinds = sorted(enforced_kinds(cfg))
     if kinds:
         rules.append("These kinds of mistake are already caught by automatic checks that run with the tests: "
                      + ", ".join(kinds) + ". Still report a blocker or major problem of these kinds (it still blocks); "
-                     "minor ones of these kinds are noted, not fixed.")
+                     f"minor ones of these kinds are noted, not fixed{dm_x}.")
     if focus is not None:
         rules.append("Round " + str(rnd["round"]) + ": look hardest at the code changed since the last round ("
                      + (", ".join(sorted(focus)[:20]) or "nothing changed") + "). Re-raise any earlier finding that "
                      "still isn't fixed, wherever it is. Beyond that, a new minor problem outside those files is "
-                     "recorded, not fixed; blocker and major problems count anywhere.")
+                     f"recorded, not fixed{dm_x}; blocker and major problems count anywhere.")
+    if dm_blocks:
+        rules.append("A finding that names a done-means line it contradicts (done_means, the numbers in front of "
+                     "the objective's Done means lines above) always blocks, at any severity, round or scope, and "
+                     "needs no separate user_impact; raise it wherever you find it, and name a line only when that "
+                     "line is not met in normal use.")
+    elif (ctx.plan() or {}).get("objective"):
+        rules.append(f"This plan was approved before a finding naming a done-means line always blocked: "
+                     f"{DM_LEGACY_FINDINGS_NOTE}. Still fill in done_means when a line is not met in normal use.")
     if rnd["round"] > 1:
         prev_triage = _read_triage(_adv_round_dir(ctx, cp["id"], rnd["round"] - 1))
         for ref, dec in prev_triage.items():
@@ -9715,7 +9892,9 @@ def _dm_case_status(ctx, cp_id: str, case: dict, behavior_status: str | None = N
 def _finding_dm_lines(f: dict, n: int) -> set:
     """The 1-based done-means line numbers a review finding names in its optional "done_means" field: one
     number or a list of them (the shapes "proves" takes). Anything that is not a real line of this plan (a
-    string, a bool, 0, a number past the last line) names nothing and is ignored."""
+    string, a bool, 0, a number past the last line) names nothing here and is ignored by the final review's
+    done-means table; the blocking rule in `names_done_means` (CP3) does not ignore such a number, so that
+    finding still blocks its round and is shown as written."""
     v = f.get("done_means")
     vals = v if isinstance(v, list) else [v]
     return {x for x in vals if isinstance(x, int) and not isinstance(x, bool) and 1 <= x <= n}
@@ -10534,7 +10713,7 @@ def cmd_plan_extend(args):
         st["checkpoints"][cid] = new_cp_state(cp_by_id(plan, cid))
     st["plan_hash"] = _plan_hash(plan, ctx)
     _advance(st, new_ids[0], fingerprint(ctx.root)["id"], _head_sha(ctx.root))
-    st["approved"] = approval_snapshot(ctx, st)  # the user's feedback is the approval for the appended checkpoints
+    st["approved"] = _approval_snapshot_keeping_dm(ctx, st)  # the user's feedback is the approval for the appended checkpoints
     register_active(ctx.root, st["slug"])
     ctx.log(st, "plan_extended", added=new_ids)
     ctx.save_state(st)
@@ -11053,10 +11232,13 @@ def _ask_raise_limit(ctx, st, args):
 def _ask_accept_finding(ctx, st, args):
     """`ask accept-finding CPn F1,F2` (or 'reviewer/F1' when a bare id is ambiguous): only when that checkpoint's
     latest adversarial round blocked, and only for ids that are still open (blocking) findings of that round. An id
-    that never existed, or that was only ever a deferred/minor finding, is refused here; an id already accepted is
-    left to `accept-finding` itself to refuse (so this can be asked again without first re-deriving which ids are
-    already done). A bare id matching more than one reviewer's finding here is refused too, naming the colliding
-    reviewers: say which one as 'reviewer/id'."""
+    that never existed, or that was only ever deferred (set aside, never blocking; a minor that names a done-means
+    line is open, not deferred, so it can be asked here), is refused here; an id already accepted is left to
+    `accept-finding` itself to refuse (so this can be asked again without first re-deriving which ids are already
+    done). A bare id matching more than one reviewer's finding here is refused too, naming the colliding
+    reviewers: say which one as 'reviewer/id'. CP3: a finding that names a done-means line is shown in the
+    question with the line's number and text (`_dm_named_text`), never as a bare severity, so the user knows the
+    accept closes a miss against what done means."""
     cp = args.mode
     ids = list(dict.fromkeys(i.strip() for i in (args.ids or "").split(",") if i.strip()))  # de-dupe repeated ids
     if not ids:
@@ -11107,8 +11289,12 @@ def _ask_accept_finding(ctx, st, args):
     if overtook:
         print(_not_asked_text(f"`ratchet.py ask accept-finding {cp} {','.join(canon_ids)}`", overtook))
         return
+    obj = (ctx.plan() or {}).get("objective")
+    dm_lines = obj.get("done_means") if isinstance(obj, dict) else None
+    dm_lines = dm_lines if isinstance(dm_lines, list) else []
     named = "; ".join(f"{key} ({by_key[key].get('severity', '?')}): "
-                      f"{str(by_key[key].get('description', '')).strip()[:160]}" for key in canon_ids)
+                      f"{str(by_key[key].get('description', '')).strip()[:160]}"
+                      f"{_dm_named_text(dm_lines, by_key[key])}" for key in canon_ids)
     print(f"ASK THE USER: {cp}'s review is blocked on: {named}. Shall I accept {', '.join(canon_ids)} as a known "
           "limit, with their reason, instead of running another review round? To accept them, their reply must be "
           "exactly: accept: <their reason>. Only their first reply counts, and only that exact form (starting with "
@@ -11288,7 +11474,7 @@ def cmd_approve_changes(args):
         _validate_new_checkpoints(ctx, plan, new_ids)
     for cid in new_ids:
         st["checkpoints"][cid] = new_cp_state(cp_by_id(plan, cid))
-    st["approved"] = approval_snapshot(ctx, st)
+    st["approved"] = _approval_snapshot_keeping_dm(ctx, st)
     cur = st.get("current")
     if cur and (st["checkpoints"].get(cur) or {}).get("red_tests") is not None:
         st["checkpoints"][cur]["red_tests"] = _snapshot_tests(ctx, cp_by_id(ctx.plan(), cur))
@@ -11833,11 +12019,14 @@ def cmd_reviewers(args):
             die(st["blocked_reason"], 2)
         provider_share(cfg)  # a bad provider_share setting stops here, before anything is opened or reserved
         # Narrow after round 1: when the round being replaced was recorded (it blocked) and was itself NOT
-        # narrowed, the next round only asks the lens(es) that still had an open blocker/major finding — a lens
-        # that approved isn't re-run. A narrowed round whose fix still left a blocker open brings back the full
-        # set for the round after it (narrow_now stays False), rather than narrowing further.
+        # narrowed, the next round only asks the lens(es) that still had an open blocker/major finding, or an
+        # open finding of any severity that names a done-means line (CP3, `names_done_means`, while
+        # `_dm_findings_block` applies to this plan) — a lens that approved isn't re-run. A narrowed round whose
+        # fix still left a blocker open brings back the full set for the round after it (narrow_now stays
+        # False), rather than narrowing further.
         was_narrowed = bool(rnd.get("narrowed")) if rnd else False
-        open_lenses = _open_blocking_lenses(ctx, cfg, args.cp, rnd, cps) if rnd and rnd.get("recorded") and not was_narrowed else set()
+        open_lenses = (_open_blocking_lenses(ctx, cfg, args.cp, rnd, cps, dm_blocks=_dm_findings_block(ctx, st, plan))
+                       if rnd and rnd.get("recorded") and not was_narrowed else set())
         narrow_now = False
         # CP3: a small fix made since the checkpoint's last FULL review opens with exactly one reviewer, told
         # (via review_rules' existing focus_files, below) to look only at what changed since that approval. That
