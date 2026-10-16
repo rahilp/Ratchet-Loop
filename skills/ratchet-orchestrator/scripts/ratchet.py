@@ -6494,8 +6494,10 @@ class _Watch:
     """The code-under-the-run watch for one command: the tree (`fp`) it started on, how often to look (`every`
     seconds), and the command the agent should run again if the code changes. `changed()` is the one check: a
     fingerprint, and only when its id differs, the list of files the run started with that were edited or deleted
-    meanwhile (Ratchet's own folder and the agent's chat transcript never count; a file that only appeared is left
-    to the command's own 'changed files' check, since suites write snapshots and reports of their own). A periodic
+    meanwhile, plus the new project source files that appeared (_new_source: a source extension outside every
+    build, cache, report, snapshot and scratch folder). Ratchet's own folder and the agent's chat transcript never
+    count, and neither does any other file that only appeared: suites write snapshots and reports of their own,
+    and those are left to the command's own 'changed files' check. A periodic
     look (`final=False`) builds its tree in one private index kept across looks, so git rehashes only the files
     whose stat changed since the last look, and a look git cannot take (a file the command created and removed
     under git's walk, one it cannot read, a failed diff-tree) is skipped and noted in `skipped`, never fatal with
@@ -6508,6 +6510,7 @@ class _Watch:
         self.extra = list(extra or [])   # the config's fingerprint_include, so a look's tree is fingerprint()'s
         self.skipped: list = []      # one reason per look that could not be taken (noted in the command's log)
         self.found_at_end = False
+        self.added: list = []        # the changed files that are new source (not in the tree the run started on)
         self._index = None           # the private index for periodic looks (git projects only), seeded on first use
 
     def _look_fp(self) -> dict:
@@ -6527,7 +6530,9 @@ class _Watch:
             now_fp = fingerprint(self.ctx.root) if final else self._look_fp()
             if now_fp["id"] == self.fp["id"]:
                 return []
-            files = _edited_or_deleted(self.ctx.root, self.fp, now_fp)
+            added = []
+            files = _edited_or_deleted(self.ctx.root, self.fp, now_fp, added)
+            self.added = added
         except _LookFailed as e:
             if final:  # the tree differs, so this is a change; what changed could not be listed: say so, never pass
                 return [f"(the files could not be listed: {e})"]
@@ -6537,19 +6542,51 @@ class _Watch:
         return [f for f in files if f != RATCHET_DIR and not f.startswith(RATCHET_DIR + "/") and f not in chat]
 
 
-def _edited_or_deleted(root: Path, fp_a: dict, fp_b: dict) -> list:
-    """The files in fp_a's tree that fp_b's tree changed or lacks (never the ones fp_b added), named relative to
-    `root` (diff-tree's `--relative`: a project below the repository's top gets project-relative names, the way
-    `.ratchet/` and the chat transcript paths are named). For two git trees a failed diff-tree raises _LookFailed:
-    the trees are known to differ, so the answer is never 'nothing'; only two manifests are compared as manifests,
-    and a manifest that is missing or damaged raises _LookFailed the same way (read through _read_record)."""
+# A new file counts as a code change under a running suite only when it looks like project source: one of these
+# extensions, no folder on its path that holds generated output (FINGERPRINT_EXCLUDES, these, or any dot folder),
+# and not a generated name. Everything else that appears (snapshots, reports, logs, scratch) is the suite's own.
+_WATCH_SOURCE_EXT = {
+    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts", ".vue", ".svelte", ".go", ".rs",
+    ".java", ".kt", ".kts", ".scala", ".groovy", ".rb", ".php", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh",
+    ".m", ".mm", ".swift", ".cs", ".fs", ".ex", ".exs", ".erl", ".hrl", ".clj", ".dart", ".lua", ".pl", ".pm",
+    ".sh", ".bash", ".zsh", ".sql", ".css", ".scss", ".sass", ".less",
+}
+_WATCH_GENERATED_DIRS = {
+    "__snapshots__", "__generated__", "generated", "htmlcov", "reports", "report", "test-results", "test-reports",
+    "junit", "logs", "log", "tmp", "temp", "scratch", "artifacts", "bin", "obj", "lib-cov",
+}
+_WATCH_GENERATED_NAMES = ("*.min.*", "*.map", "*.bundle.*", "*.pyc", "*.pyo", ".#*", "*~")
+
+
+def _new_source(path: str) -> bool:
+    """Whether a file that appeared under a running suite is a new project source file (a change that stops the
+    run) rather than generated build, cache, report, snapshot or scratch output (never a change)."""
+    parts = path.split("/")
+    name = parts[-1]
+    if any(d in FINGERPRINT_EXCLUDES or d in _WATCH_GENERATED_DIRS or d.startswith(".") for d in parts[:-1]):
+        return False
+    if any(fnmatch.fnmatch(name, g) for g in _WATCH_GENERATED_NAMES):
+        return False
+    return os.path.splitext(name)[1].lower() in _WATCH_SOURCE_EXT
+
+
+def _edited_or_deleted(root: Path, fp_a: dict, fp_b: dict, added: list | None = None) -> list:
+    """The files in fp_a's tree that fp_b's tree changed or lacks, plus the files fp_b added that are new project
+    source (_new_source; any other added file is left out), named relative to `root` (diff-tree's `--relative`:
+    a project below the repository's top gets project-relative names, the way `.ratchet/` and the chat
+    transcript paths are named). The new source files are also put in `added` when it is given. For two git
+    trees a failed diff-tree raises _LookFailed: the trees are known to differ, so the answer is never 'nothing'; only two manifests are compared as manifests, and a manifest that is
+    missing or damaged raises _LookFailed the same way (read through _read_record)."""
     if fp_a["kind"] == fp_b["kind"] == "git-tree":
-        r = subprocess.run(["git", "diff-tree", "-r", "-z", "--no-renames", "--name-status", "--diff-filter=a",
+        r = subprocess.run(["git", "diff-tree", "-r", "-z", "--no-renames", "--name-status",
                             "--relative", fp_a["id"], fp_b["id"]], cwd=root, capture_output=True)
         if r.returncode != 0:
             raise _LookFailed(f"git diff-tree failed: {r.stderr.decode('utf-8', 'replace').strip()}")
         parts = r.stdout.decode("utf-8", "surrogateescape").split("\0")
-        return [parts[i + 1] for i in range(0, len(parts) - 1, 2) if parts[i]]
+        pairs = [(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2) if parts[i]]
+        if added is not None:
+            added.extend(f for st, f in pairs if st == "A" and _new_source(f))
+        return [f for st, f in pairs if st != "A" or _new_source(f)]
     mdir = root / RATCHET_DIR / "manifests"
     sides = []
     for fp in (fp_a, fp_b):  # a manifest that is missing or damaged cannot say 'nothing changed': a failed look
@@ -6558,7 +6595,10 @@ def _edited_or_deleted(root: Path, fp_a: dict, fp_b: dict) -> list:
             raise _LookFailed(f"fingerprint manifest {fp['id']} cannot be read ({why or 'missing'})")
         sides.append(data)
     a, b = sides
-    return sorted(k for k in a if b.get(k) != a[k])
+    new = [k for k in b if k not in a and _new_source(k)]
+    if added is not None:
+        added.extend(new)
+    return sorted([k for k in a if b.get(k) != a[k]] + new)
 
 
 def _signal_group(proc, sig) -> None:
@@ -6772,7 +6812,8 @@ def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None, watch:
     dur = (_dt.datetime.now() - t0).total_seconds()
     if changed:
         names = ", ".join(changed[:5]) + (f" and {len(changed) - 5} more" if len(changed) > 5 else "")
-        guidance = _restore_guidance(ctx.root, changed, watch.fp.get("id") if watch.fp.get("kind") == "git-tree" else None)
+        guidance = _restore_guidance(ctx.root, changed, watch.fp.get("id") if watch.fp.get("kind") == "git-tree" else None,
+                                     added=watch.added)
         if watch.found_at_end:
             # the command ended on its own and the tree it ended on is not the one it started on: the writer cannot
             # be told (the command itself, or an edit while it ran), so name both and refuse; never a stop, never
@@ -6821,15 +6862,20 @@ def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None, watch:
     return code, out, dur
 
 
-def _restore_guidance(root: Path, files: list, tree: str | None) -> str:
-    """What to do about files a watched command's tree lost or changed, never at the cost of the agent's own work.
-    Every named file was in the tree the run started on (`tree`, the git tree id `fingerprint()` wrote: the step's
+def _restore_guidance(root: Path, files: list, tree: str | None, added: list | None = None) -> str:
+    """What to do about files a watched command's tree lost, changed or gained, never at the cost of the agent's
+    own work. A new source file (`added`: not in the tree the run started on) is kept if the agent added it, and
+    removed or ignored if the command wrote it (_added_guidance). Every other named file was in the tree the run started on (`tree`, the git tree id `fingerprint()` wrote: the step's
     uncommitted work included, files untracked at HEAD included, never HEAD or the index), so the advice is the
     same for all of them: an edit the agent made is kept (run again); a file the command wrote is put back from
     that tree, and the command is fixed or the file taken out of the fingerprint (.gitignore, `git rm --cached`
     first when git tracks it). Nothing is ever told to be deleted. The `(the files could not be listed: ...)`
     marker gets no per-file advice."""
-    named = [f for f in files if not f.startswith("(")]
+    new = [f for f in files if f in (added or [])]
+    named = [f for f in files if not f.startswith("(") and f not in new]
+    if new:
+        tail = _added_guidance(new)
+        return f"{_restore_guidance(root, named, tree)} {tail}" if named else tail
     if not named:
         return "Find out what wrote them, and restore the files before running again."
     if not _is_git(root):
@@ -6842,6 +6888,15 @@ def _restore_guidance(root: Path, files: list, tree: str | None) -> str:
             f"If the command wrote them, put them back as they were when the run began ({back}), then stop the "
             f"command writing into the tree, or take them out of the fingerprint: add them to .gitignore (and "
             f"git rm --cached {q} first if git tracks them). Never delete a file the run started with.")
+
+
+def _added_guidance(files: list) -> str:
+    """What to do about new source files that appeared while a watched command ran: they were not there when it
+    began, so an edit is kept and a file the command wrote is taken out again (removed, or ignored)."""
+    q = " ".join(shlex.quote(f) for f in files)
+    return (f"{', '.join(files)} did not exist when the run began. If you added them, keep them and run again. If "
+            f"the command wrote them, remove them (rm {q}) or add them to .gitignore, and stop the command writing "
+            "source files into the project.")
 
 
 def _report_path(ctx, cp):

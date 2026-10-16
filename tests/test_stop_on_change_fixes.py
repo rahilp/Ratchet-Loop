@@ -21,12 +21,18 @@ machine (RATCHET_FAKE_LOADAVG=0).
               nothing running and no lock; whatever escapes the wait kills the command's group first; the
               skipped-look note is per command, never carried into the next command's log
   - [CP4-A3]  a failed diff-tree between two differing trees is never 'nothing changed'
-  - [CP4-A4]  a deleted file stops the run; a file that only appeared (untracked, not ignored) does not; a
-              suite_watch_seconds change after plan approval is refused as a locked rule
+  - [CP4-A4]  a deleted file stops the run; a generated file that only appeared (a snapshot: untracked, not
+              ignored, not project source) does not; a suite_watch_seconds change after plan approval is refused
+              as a locked rule
   - [CP4-A5]  the test-runner agent knows the stopped outcome
   - [CP4-C3]  the stop's grace covers the whole group, not only the shell leader
   - [CP4-C4]  a project below the repository top: a chat line in its transcript never stops a run, an edit does
   - [CP4-C5]  a periodic look reuses one kept index (the same tree id as the full fingerprint)
+  - [CP4-A6]  a new project source file added while the suite runs stops it within the watch interval (behavior
+              and complete), naming the file, freeing the lock and counting nothing; generated build, cache,
+              report, snapshot and scratch output written all through a run (not gitignored) never stops it; a
+              quick suite that itself writes a new source file is refused when it ends, with remove-or-ignore
+              guidance for that file, uncounted
 
 Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set.
 """
@@ -153,6 +159,24 @@ if mode == "unreadable-exit":    # a file git cannot open is left behind as the 
     p = root / "secret.txt"
     p.write_text("x")
     p.chmod(0)
+    sys.exit(0)
+if mode == "gen-output":         # for ~3 s the command keeps writing generated output, none of it gitignored
+    targets = ["build/gen.js", "dist/app.js", "out/main.py", "coverage/lcov-report/x.js", "htmlcov/index.py",
+               ".cache/mod.py", ".pytest_cache/v/x.py", "node_modules/pkg/index.js", "__pycache__/m.py",
+               "tests/__snapshots__/a.test.js.snap", "src/__snapshots__/b.js", "reports/junit.xml",
+               "test-results/r.json", "tmp/scratch.py", "scratch/note.js", "logs/run.log", "src/app.min.js",
+               "src/app.js.map", "results.xml", "notes.txt"]
+    end = time.time() + 3.0
+    i = 0
+    while time.time() < end:
+        i += 1
+        for t in targets:
+            (root / t).parent.mkdir(parents=True, exist_ok=True)
+            (root / t).write_text("// gen %d at %f\n" % (i, time.time()))
+        time.sleep(0.3)
+    sys.exit(0)
+if mode == "write-source":       # the command itself adds a new source file to the project, then ends at once
+    (root / "src/made_by_suite.js").write_text("export const m = %f;\n" % time.time())
     sys.exit(0)
 if mode == "slow-cleanup":       # on SIGTERM: half a second of cleanup, a marker, then exit
     def on_term(signum, frame):
@@ -488,7 +512,7 @@ def a4_appeared():
     d, env, fk = behavior_project2(["exit:1", "appear"], ["suite_watch_seconds=0.3"])
     r = q4.rx(d, env, "behavior", "CP1", cap=60)
     g = q4.gate(d)
-    check("[CP4-A4] a file that only appeared (untracked, not ignored) during the run is not a change: the run passes",
+    check("[CP4-A4] a generated file that only appeared (untracked, not ignored, not source) during the run is not a change: the run passes",
           r.rc == 0 and g.get("status") == "passed" and not q4.says_changed(r.text), (r.rc, g, r.text[-400:]))
     check("[CP4-A4] (setup) the file really is there, untracked and not ignored",
           (d / "tests/__snapshots__/x.snap").exists()
@@ -634,13 +658,125 @@ def c5_kept_index():
         check("[CP4-C5] a look through the kept index still equals a fresh fingerprint after the edit",
               w._look_fp()["id"] == m.fingerprint(d)["id"])
         (d / "c.txt").write_text("new\n")
-        check("[CP4-C5] a file that only appeared is still not a change through the kept index",
+        check("[CP4-C5] a new non-source file that only appeared is still not a change through the kept index",
               w.changed() == ["b.txt"], w.changed())
         check("[CP4-C5] the index was kept across all of those looks: one folder, seeded by one read-tree, never rebuilt",
               w._index is kept and (Path(kept.name) / "index").exists()
               and sum(1 for f in seeds if f.startswith(kept.name)) == 1, seeds)
     finally:
         m.subprocess.run = real_run
+
+
+# ---- CP4-A6: a new source file stops the run; generated output never does ---------------------------------------------------
+
+def add_source(dd):
+    (dd / "src/b.js").write_text("export const b = 2;\n")  # the "agent edit": a brand-new project source file
+
+
+def a6_new_source_behavior():
+    d, env, fk = behavior_project2(["exit:1", "slow", "exit:0"], ["suite_watch_seconds=0.3"])
+    try:
+        before = q4.gate(d)
+        st0 = q4.state(d)
+        r = q4.run_then_edit(d, env, ["behavior", "CP1"], fk, 2, edit=add_source)
+        check("[CP4-A6] (setup) src/b.js was not in the tree the run started on",
+              "src/b.js" not in tt.git(d, "ls-tree", "-r", "--name-only", "HEAD").stdout)
+        check("[CP4-A6] a new source file added while the tests run stops them within the watch interval, naming it",
+              r.ready and r.rc == 2 and q4.says_stopped_for_change(r.text) and "src/b.js" in r.text
+              and r.after is not None and r.after < q4.STOP_BOUND, (r.rc, r.after, r.text[-500:]))
+        check("[CP4-A6] it says to run `behavior CP1` again", "behavior CP1" in r.text and q4.says_again(r.text), r.text[-500:])
+        g = q4.gate(d)
+        check("[CP4-A6] nothing counted: the gate (status, attempts, flaky allowance) is exactly as before the call",
+              q4.no_runs(g) == q4.no_runs(before) and g.get("attempts") == 0 and not g.get("flaky_used")
+              and not q4.history(d, "behavior_failed"), (before, g))
+        check("[CP4-A6] the step and phase are unchanged", q4.state(d).get("phase") == st0.get("phase"),
+              (st0.get("phase"), q4.state(d).get("phase")))
+        check("[CP4-A6] no lock is left and nothing of the stopped tests is running",
+              q4.locks(d) == [] and not q4.wait_untagged(env[q4.TAG_VAR]) and not q4.wait_dead(fk.pids(2)),
+              (q4.locks(d), q4.tagged(env[q4.TAG_VAR])))
+        logs = q4.behavior_logs(d)
+        text = q4.read(logs[-1]) if logs else ""
+        check("[CP4-A6] the log says the run was stopped because the code changed, naming the new file",
+              q4.says_stopped_for_change(text) and "src/b.js" in text, text[:400])
+        check("[CP4-A6] the new file is left where the agent put it", q4.read(d / "src/b.js") == "export const b = 2;\n")
+        r2 = q4.rx(d, env, "behavior", "CP1", cap=60)
+        check("[CP4-A6] the next run starts at once and passes on its first counted attempt, with the new file in place",
+              r2.rc == 0 and q4.gate(d).get("status") == "passed" and q4.gate(d).get("attempts") == 1,
+              (r2.rc, q4.gate(d), r2.text[-300:]))
+    finally:
+        q4.reap(fk.work, env[q4.TAG_VAR])
+
+
+def a6_new_source_complete():
+    d, env, fk_r, _ = q4.complete_project(["slow"], ["suite_watch_seconds=0.3"])
+    try:
+        h = q4.head(d)
+        r = q4.run_then_edit(d, env, ["complete", "CP1"], fk_r, 1, edit=add_source)
+        check("[CP4-A6] complete: a new source file added while the full suite runs stops it within the watch interval",
+              r.ready and r.rc not in (None, 0) and q4.says_changed(r.text) and "src/b.js" in r.text
+              and r.after is not None and r.after < q4.STOP_BOUND, (r.rc, r.after, r.text[-500:]))
+        st = q4.state(d)
+        check("[CP4-A6] complete: nothing committed, the step not done, no flaky allowance spent, no lock left",
+              q4.head(d) == h and q4.cps(d).get("status") != "done" and not st.get("regression_flaky_used")
+              and not q4.cps(d).get("regression_flaky") and q4.locks(d) == [],
+              (q4.head(d), h, q4.cps(d).get("status"), st.get("regression_flaky_used"), q4.locks(d)))
+        check("[CP4-A6] complete: the gates are left as they were (behavior and adversarial still passed)",
+              q4.gate(d).get("status") == "passed" and q4.gate(d, "adversarial").get("status") == "passed", q4.cps(d)["gates"])
+    finally:
+        q4.reap(fk_r.work, env[q4.TAG_VAR])
+
+
+def a6_generated_output():
+    d, env, fk = behavior_project2(["exit:1", "gen-output"], ["suite_watch_seconds=0.3"])
+    r = q4.rx(d, env, "behavior", "CP1", cap=60)
+    g = q4.gate(d)
+    check("[CP4-A6] generated build, cache, report, snapshot and scratch output written all through the run never stops it: it passes",
+          r.rc == 0 and g.get("status") == "passed" and g.get("attempts") == 1 and not q4.says_changed(r.text),
+          (r.rc, g, r.text[-400:]))
+    status = tt.git(d, "status", "--porcelain", "--untracked-files=all").stdout
+    check("[CP4-A6] (setup) the generated files really are there, untracked and not ignored, in source-looking places too",
+          all(x in status for x in ("dist/app.js", "tmp/scratch.py", "src/__snapshots__/b.js", "src/app.min.js",
+                                    "reports/junit.xml", "scratch/note.js")), status)
+    logs = q4.behavior_logs(d)
+    text = q4.read(logs[-1]) if logs else ""
+    check("[CP4-A6] the log is an ordinary pass, with no stop and no skipped look",
+          "exit=0" in text and "stop" not in text.split("\n", 1)[-1].lower() and "skipped" not in text, text[:400])
+
+
+def a6_suite_writes_source():
+    d, env, fk = behavior_project2(["exit:1", "write-source", "write-source", "sleep:1"], ["suite_watch_seconds=30"])
+    before = q4.gate(d)
+    r1 = q4.rx(d, env, "behavior", "CP1", cap=60)
+    check("[CP4-A6] a quick suite that itself adds a new source file is refused when it ends, naming the file, both causes",
+          r1.rc == 2 and q4.says_changed(r1.text) and "src/made_by_suite.js" in r1.text and says_both_causes(r1.text),
+          (r1.rc, r1.text[-600:]))
+    check("[CP4-A6] the guidance for a new file: it did not exist when the run began; keep it if you added it, else remove or ignore it",
+          "did not exist when the run began" in r1.text and "keep them" in r1.text
+          and "rm src/made_by_suite.js" in r1.text and ".gitignore" in r1.text
+          and not re.search(r"git checkout [0-9a-f]{40} -- src/made_by_suite\.js", r1.text), r1.text[-600:])
+    check("[CP4-A6] nothing counted and no lock left",
+          q4.no_runs(q4.gate(d)) == q4.no_runs(before) and q4.locks(d) == [], (q4.gate(d), q4.locks(d)))
+    (d / "src/made_by_suite.js").unlink()  # the agent follows the guidance: the command wrote it
+    r2 = q4.rx(d, env, "behavior", "CP1", cap=60)
+    check("[CP4-A6] the same refusal while the command keeps writing it, still uncounted",
+          r2.rc == 2 and "src/made_by_suite.js" in r2.text and q4.gate(d).get("attempts") == 0, (r2.rc, r2.text[-400:]))
+    (d / "src/made_by_suite.js").unlink()
+    r3 = q4.rx(d, env, "behavior", "CP1", cap=60)
+    check("[CP4-A6] once the command stops writing source, the next run passes on its first counted attempt",
+          r3.rc == 0 and q4.gate(d).get("status") == "passed" and q4.gate(d).get("attempts") == 1, (r3.rc, r3.text[-300:]))
+
+
+def a6_engine_rule():
+    m = _engine()
+    src = ["src/b.js", "lib/x.py", "app/models/user.rb", "cmd/main.go", "tests/test_new.py", "styles/site.scss", "b.ts"]
+    gen = ["build/x.js", "dist/x.js", "out/x.py", "coverage/x.js", "htmlcov/x.py", ".cache/x.py", "node_modules/p/i.js",
+           "__pycache__/m.py", "src/__snapshots__/a.js", "tests/__snapshots__/a.snap", "reports/junit.xml",
+           "test-results/r.json", "tmp/s.py", "scratch/s.js", "logs/run.log", "src/app.min.js", "src/app.js.map",
+           "results.xml", "notes.txt", "src/.#a.js", "src/a.js~", "target/x.rs"]
+    check("[CP4-A6] the engine's rule: project source files count as new source",
+          all(m._new_source(f) for f in src), [f for f in src if not m._new_source(f)])
+    check("[CP4-A6] the engine's rule: generated build/cache/report/snapshot/scratch files do not",
+          not any(m._new_source(f) for f in gen), [f for f in gen if m._new_source(f)])
 
 
 TESTS = [
@@ -654,6 +790,8 @@ TESTS = [
     ("CP4-C3", c3_group_grace),
     ("CP4-C4", c4_subfolder),
     ("CP4-C5", c5_kept_index),
+    ("CP4-A6", a6_new_source_behavior), ("CP4-A6", a6_new_source_complete), ("CP4-A6", a6_generated_output),
+    ("CP4-A6", a6_suite_writes_source), ("CP4-A6", a6_engine_rule),
 ]
 
 
