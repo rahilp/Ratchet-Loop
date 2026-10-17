@@ -94,3 +94,22 @@ has no PR. No Ratchet gate was run or claimed.
 - **Open decision for the director**: watched source patterns are a fixed
   list. They could be a config key locked at plan approval instead.
 - Checkpoints 5 and 6 have not started.
+
+### Follow-up after local review (2026-10-17)
+
+- `_new_source("src/bin/main.rs")` returned false because every `bin` folder
+  was treated as generated. Now a `bin` folder counts as build output only
+  as .NET's `bin/Debug/` or `bin/Release/`. Rust's `src/bin/`, a package's
+  `bin/cli.js` and similar paths are source. `obj/` and every other
+  generated folder are still excluded. New regression `a6_rust_bin_watch`
+  drives a real `_Watch`: a new `src/bin/main.rs` is a change, and
+  `bin/Debug/net8.0/Gen.cs` is not. `a6_engine_rule` adds the Rust and `bin`
+  paths as positive cases and .NET `bin/Debug`, `bin/Release` and `obj`
+  output as negative cases. These checks fail on `257e5a4`.
+- `a6_generated_output` failed once when the suite's rewrite of
+  `reports/junit.xml` made a periodic look fail, and the watcher skipped
+  that look as it is designed to. The test now accepts the documented
+  skipped-look header line and rejects any other header line besides
+  `# exit=`. It still requires: no stop, no "found when it ended" refusal,
+  the run passes on its first counted attempt, and no lock or process is
+  left behind (new check).

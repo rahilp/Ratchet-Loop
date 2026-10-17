@@ -32,7 +32,8 @@ machine (RATCHET_FAKE_LOADAVG=0).
               and complete), naming the file, freeing the lock and counting nothing; generated build, cache,
               report, snapshot and scratch output written all through a run (not gitignored) never stops it; a
               quick suite that itself writes a new source file is refused when it ends, with remove-or-ignore
-              guidance for that file, uncounted
+              guidance for that file, uncounted; a `bin` folder holds source (Rust's src/bin/main.rs is a change)
+              unless it is .NET's bin/Debug or bin/Release output
 
 Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set.
 """
@@ -739,8 +740,16 @@ def a6_generated_output():
                                     "reports/junit.xml", "scratch/note.js")), status)
     logs = q4.behavior_logs(d)
     text = q4.read(logs[-1]) if logs else ""
-    check("[CP4-A6] the log is an ordinary pass, with no stop and no skipped look",
-          "exit=0" in text and "stop" not in text.split("\n", 1)[-1].lower() and "skipped" not in text, text[:400])
+    # A look git cannot take while the suite rewrites its own output (reports/junit.xml mid-write) is skipped and
+    # noted, which the watch allows; any other header line would be a change, a stop or a failure.
+    head = [l for l in text.split("\n\n", 1)[0].splitlines() if l.startswith("#")]
+    extra = [l for l in head if not l.startswith("# exit=")
+             and not re.match(r"# \d+ look\(s\) at the code could not be taken and were skipped \(last reason: ", l)]
+    check("[CP4-A6] the log is an ordinary pass with no stop (a skipped look, if any, only in its documented note)",
+          "# exit=0" in text and not extra and not q4.says_stopped_for_change(text) and "found when it ended" not in text,
+          (extra, text[:400]))
+    check("[CP4-A6] no lock is left and nothing of the run is still running",
+          q4.locks(d) == [] and not q4.wait_untagged(env[q4.TAG_VAR]), (q4.locks(d), q4.tagged(env[q4.TAG_VAR])))
 
 
 def a6_suite_writes_source():
@@ -768,15 +777,40 @@ def a6_suite_writes_source():
 
 def a6_engine_rule():
     m = _engine()
-    src = ["src/b.js", "lib/x.py", "app/models/user.rb", "cmd/main.go", "tests/test_new.py", "styles/site.scss", "b.ts"]
+    src = ["src/b.js", "lib/x.py", "app/models/user.rb", "cmd/main.go", "tests/test_new.py", "styles/site.scss", "b.ts",
+           "src/bin/main.rs", "src/bin/tool/main.rs", "bin/cli.js", "tools/bin/run.sh", "src/bin/release.rs"]
     gen = ["build/x.js", "dist/x.js", "out/x.py", "coverage/x.js", "htmlcov/x.py", ".cache/x.py", "node_modules/p/i.js",
            "__pycache__/m.py", "src/__snapshots__/a.js", "tests/__snapshots__/a.snap", "reports/junit.xml",
            "test-results/r.json", "tmp/s.py", "scratch/s.js", "logs/run.log", "src/app.min.js", "src/app.js.map",
-           "results.xml", "notes.txt", "src/.#a.js", "src/a.js~", "target/x.rs"]
+           "results.xml", "notes.txt", "src/.#a.js", "src/a.js~", "target/x.rs", "bin/Debug/net8.0/Gen.cs",
+           "App/bin/Release/net8.0/x.js", "obj/Debug/net8.0/App.AssemblyInfo.cs", "target/debug/build/out.rs"]
     check("[CP4-A6] the engine's rule: project source files count as new source",
           all(m._new_source(f) for f in src), [f for f in src if not m._new_source(f)])
     check("[CP4-A6] the engine's rule: generated build/cache/report/snapshot/scratch files do not",
           not any(m._new_source(f) for f in gen), [f for f in gen if m._new_source(f)])
+
+
+def a6_rust_bin_watch():
+    """Regression (local review): src/bin/ is a standard Rust source folder, never generated output, so a new file
+    there is a change to the running watch; .NET's bin/Debug output beside it still is not."""
+    m = _engine()
+    d = Path(_tmp.mkdtemp(prefix="ratchet-q4f-rs-"))
+    tt.git(d, "init", "-q")
+    (d / "src").mkdir()
+    (d / "src/lib.rs").write_text("pub fn a() {}\n")
+    tt.git(d, "add", "-A")
+    tt.git(d, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
+    ctx = types.SimpleNamespace(root=d, ratchet=d / ".ratchet")
+    w = m._Watch(ctx, m.fingerprint(d), 30.0, "x")
+    (d / "bin/Debug/net8.0").mkdir(parents=True)
+    (d / "bin/Debug/net8.0/Gen.cs").write_text("// generated\n")
+    check("[CP4-A6] .NET build output (bin/Debug/...) that appears is not a change", w.changed() == [], (w.changed(), w.skipped))
+    (d / "src/bin").mkdir()
+    (d / "src/bin/main.rs").write_text("fn main() {}\n")
+    found = w.changed()
+    check("[CP4-A6] a new Rust binary source file (src/bin/main.rs) is a change to the running watch, named alone",
+          found == ["src/bin/main.rs"] and w.added == ["src/bin/main.rs"], (found, w.skipped))
+    check("[CP4-A6] the last look agrees", w.changed(final=True) == ["src/bin/main.rs"])
 
 
 TESTS = [
@@ -791,7 +825,7 @@ TESTS = [
     ("CP4-C4", c4_subfolder),
     ("CP4-C5", c5_kept_index),
     ("CP4-A6", a6_new_source_behavior), ("CP4-A6", a6_new_source_complete), ("CP4-A6", a6_generated_output),
-    ("CP4-A6", a6_suite_writes_source), ("CP4-A6", a6_engine_rule),
+    ("CP4-A6", a6_suite_writes_source), ("CP4-A6", a6_engine_rule), ("CP4-A6", a6_rust_bin_watch),
 ]
 
 

@@ -6553,8 +6553,11 @@ _WATCH_SOURCE_EXT = {
 }
 _WATCH_GENERATED_DIRS = {
     "__snapshots__", "__generated__", "generated", "htmlcov", "reports", "report", "test-results", "test-reports",
-    "junit", "logs", "log", "tmp", "temp", "scratch", "artifacts", "bin", "obj", "lib-cov",
+    "junit", "logs", "log", "tmp", "temp", "scratch", "artifacts", "obj", "lib-cov",
 }
+# `bin` holds source in many projects (Rust's src/bin/, a package's bin/ scripts): it is build output only as .NET's
+# bin/<configuration>/
+_WATCH_BUILD_CONFIGS = {"debug", "release"}
 _WATCH_GENERATED_NAMES = ("*.min.*", "*.map", "*.bundle.*", "*.pyc", "*.pyo", ".#*", "*~")
 
 
@@ -6564,6 +6567,8 @@ def _new_source(path: str) -> bool:
     parts = path.split("/")
     name = parts[-1]
     if any(d in FINGERPRINT_EXCLUDES or d in _WATCH_GENERATED_DIRS or d.startswith(".") for d in parts[:-1]):
+        return False
+    if any(d == "bin" and nxt.lower() in _WATCH_BUILD_CONFIGS for d, nxt in zip(parts[:-2], parts[1:-1])):
         return False
     if any(fnmatch.fnmatch(name, g) for g in _WATCH_GENERATED_NAMES):
         return False
