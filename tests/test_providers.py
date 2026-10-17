@@ -142,19 +142,24 @@ def severity_and_scope():
     rnd = open_round(d)
     check("normal risk asks two reviewers", len(ids(rnd)) == 2, ids(rnd))
     minor_f = [{"id": "M1", "severity": "minor", "file": "src/f.js", "description": "tiny"}]
-    paths = [write_review(d, rnd, ids(rnd)[0], minor_f), write_review(d, rnd, ids(rnd)[1])]
+    rid0 = ids(rnd)[0]  # lane H CP5: this is the reviewer every later round below ties back to, round after round
+    paths = [write_review(d, rnd, rid0, minor_f), write_review(d, rnd, ids(rnd)[1])]
     r = rx(d, "adv-record", "CP1", "--reviews", *paths)
     check("normal risk: a minor finding blocks in round 1", r.returncode == 2, r.stdout + r.stderr)
     (d / "src/f.js").write_text("export const f = () => 1; // fixed\n")
     rx(d, "behavior", "CP1")
     rnd = open_round(d)
+    check("round 2 is a fix round naming only the reviewer who raised round 1's finding (lane H CP5)",
+          rnd.get("fix_round") is True and ids(rnd) == [rid0], rnd.get("reviewers"))
     check("round 2 tells reviewers where to look and what blocks",
           rnd["focus_files"] == ["src/f.js"] and any("changed since the last round" in x for x in rnd["review_rules"]),
           (rnd.get("focus_files"), rnd.get("review_rules")))
+    # both findings now come from the one reviewer round 2 names -- the scope rule below (untouched vs. just-
+    # changed code) applies the same way whichever reviewer reports a finding, so one review combining them
+    # exercises it exactly as the previous two-reviewer version did.
     elsewhere = [{"id": "M2", "severity": "minor", "file": "src/a.js", "description": "old code nit"}]
     here = [{"id": "M3", "severity": "minor", "file": "./src/f.js", "description": "new code nit"}]
-    r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], elsewhere),
-           write_review(d, rnd, ids(rnd)[1], here))
+    r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, rid0, elsewhere + here))
     check("round 2: a minor finding in the changed code still blocks", r.returncode == 2, r.stdout + r.stderr)
     open_f = json.loads(next((d / ".ratchet/runs/f/evidence/CP1/adversarial").glob("round-02/open-findings.json")).read_text())
     check("… while a minor finding in untouched code is noted, not sent to the fixer",
@@ -162,10 +167,11 @@ def severity_and_scope():
     (d / "src/f.js").write_text("export const f = () => 1; // fixed again\n")
     rx(d, "behavior", "CP1")
     rnd = open_round(d)
+    check("round 3 is still a fix round tied to the same reviewer (M3, round 2's only open finding, was its own)",
+          rnd.get("fix_round") is True and ids(rnd) == [rid0], rnd.get("reviewers"))
     major_elsewhere = [{"id": "B1", "severity": "major", "file": "src/a.js", "description": "real bug",
                         "user_impact": "x"}]
-    r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], major_elsewhere),
-           write_review(d, rnd, ids(rnd)[1]))
+    r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, rid0, major_elsewhere))
     check("round 3: a major finding in untouched code still blocks", r.returncode == 2, r.stdout + r.stderr)
 
 
@@ -179,20 +185,33 @@ def review_holes():
     g.approve_plan(d)
     g.to_adversarial(d)
     rnd = open_round(d)
+    rid0 = ids(rnd)[0]  # the reviewer every round below ties back to once the fix-round mechanism (lane H CP5)
+    # takes over at round 3, below, once the code has actually changed
     nit = [{"id": "M1", "severity": "minor", "file": "src/f.js", "description": "unchecked input"}]
-    rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], nit), write_review(d, rnd, ids(rnd)[1]))
-    rnd = open_round(d)                                      # the fixer changed nothing
-    r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], nit), write_review(d, rnd, ids(rnd)[1]))
+    rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, rid0, nit), write_review(d, rnd, ids(rnd)[1]))
+    rnd = open_round(d)                                      # the fixer changed nothing: not a fix round (lane H
+    # CP5 only applies once the code differs from the blocked round's fingerprint), so round 2 is still the full
+    # two-reviewer set, same as before
+    check("(fixture sanity) round 2 is still the full two-reviewer set: the code hasn't changed yet",
+          rnd.get("fix_round") is not True and len(ids(rnd)) == 2, rnd.get("reviewers"))
+    r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, rid0, nit), write_review(d, rnd, ids(rnd)[1]))
     check("a minor finding the fixer ignored still blocks in round 2", r.returncode == 2, r.stdout + r.stderr)
     # path spellings of a changed file can't move a finding out of scope
     (d / "src/f.js").write_text("export const f = () => 1; // touched\n")
     rx(d, "behavior", "CP1")
-    for label, path in (("absolute", str(d / "src/f.js")), ("with #L12", "src/f.js#L12"), ("(line 3)", "src/f.js (line 3)"),
-                        ("bare name", "f.js"), ("no file", None)):
+    for i, (label, path) in enumerate((("absolute", str(d / "src/f.js")), ("with #L12", "src/f.js#L12"),
+                                       ("(line 3)", "src/f.js (line 3)"), ("bare name", "f.js"), ("no file", None))):
         rnd = open_round(d)
+        # the code changed just before this round opened (the edit at the end of the previous iteration, or the
+        # "touched" edit above the loop for the first one), so every round here is a fix round (lane H CP5)
+        # naming only rid0, the reviewer round 2's minor finding was tied to
+        check(f"({label}) round is a fix round naming only rid0", rnd.get("fix_round") is True and ids(rnd) == [rid0],
+              rnd.get("reviewers"))
         f = [{"id": "M9", "severity": "minor", "description": "nit", **({"file": path} if path else {})}]
-        r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], f), write_review(d, rnd, ids(rnd)[1]))
+        r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, rid0, f))
         check(f"a minor finding in changed code given as {label} still blocks", r.returncode == 2, r.stdout + r.stderr)
+        (d / "src/f.js").write_text(f"export const f = () => 1; // touched again {i}\n")  # keeps the next round
+        rx(d, "behavior", "CP1")                                                          # a fix round too
 
     # a provider that runs its own command can't be slipped in after approval
     b = fake_bin("codex")

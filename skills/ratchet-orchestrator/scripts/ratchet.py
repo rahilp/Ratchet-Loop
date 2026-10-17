@@ -1132,21 +1132,52 @@ def _small_fix_review_lines(st: dict) -> list[str]:
 
 
 # --------------------------------------------------------------------------- fix round: one reviewer (lane H CP5)
-# After a round BLOCKS and the fixer changes the code, the next round is a fix round: exactly one reviewer, the one
-# who raised the finding(s) triaged `fix`, whatever the fix's size or the step's risk. "A fixer ran" means the
-# blocked round has at least one open finding triaged `fix` and the code differs from that round's fingerprint.
-# The reviewer is tied to the finding: the same reviewer id is preferred for the same slot it filled in the blocked
-# round (resolved against the same slot list that round used), and only when it can't run does that slot's own
-# normal fallback order pick a stand-in. When the findings being fixed came from more than one reviewer, or a
-# finding names no reviewer the blocked round listed, there is no single reviewer the existing rules point to:
-# the round falls back to the existing narrowing rules and `reviewers` says why (no tie-break rule is invented).
-# The existing converge rule is kept: the round after a narrowed or fix round that still blocked gets the full set,
-# never another fix round, so a stuck finding still gets every lens looking again.
+# After a round BLOCKS and the fixer changes the code, the next round is a fix round: exactly one reviewer, tied to
+# the finding(s) triaged `fix`, whatever the fix's size or the step's risk. "A fixer ran" means the blocked round
+# has at least one open finding triaged `fix` and the code differs from that round's fingerprint. This supersedes
+# the older convergence rule for fix rounds specifically: a fix round that blocks again (repeatedly, as many times
+# as it takes) is followed by another fix round, never the full set -- a stuck finding keeps going back to the
+# reviewer who raised it, not to every lens. A step that pins its own `reviewers` list is the one approved
+# exception: it always gets its normal full round, the fix-round mechanism never applies to it (same exemption
+# `_is_small_fix_round` and the docs-only skip already give a pinned list).
+#
+# The reviewer is tied to the finding(s) being fixed, never to one a fixer only rebutted:
+#   - One reviewer raised every finding triaged `fix`: that reviewer, in the slot it filled in the blocked round.
+#   - More than one reviewer did: prefer whichever of them is NOT the same company as the host (the host's own
+#     sub-agents, and a command reviewer whose company matches the host's, both count as "the host"); among the
+#     preferred ones (or, if none differ from the host, among all of them), the lowest slot number in the blocked
+#     round wins the tie. That reviewer's own slot is used, so if it can no longer run, the slot's normal fallback
+#     order (same as any other slot) picks a stand-in -- never a different reviewer's slot.
+#   - A finding names no reviewer the blocked round listed (bad data): skipped from consideration; if none of the
+#     findings being fixed name a listed reviewer at all, there is nothing to tie a fix round to.
+# When nothing above resolves to a reviewer, the round falls back to the existing narrowing rules and `reviewers`
+# says why (no further tie-break rule is invented).
 
-def _fix_round_target(ctx: "Ctx", cp_id: str, rnd: dict | None, cps: dict, fp_id: str) -> dict | None:
+def _fix_round_pick(cfg, who: list[str], resolved: list[dict]) -> dict | None:
+    """The one reviewer a fix round is tied to, from `who` (reviewer ids that raised a finding triaged `fix`),
+    tie-broken by company then slot. Returns the chosen entry of `resolved` ({"id", "slot", ...}), or None when
+    none of `who` is actually in `resolved` (a finding naming a reviewer the blocked round never listed)."""
+    by_id = {r["id"]: r for r in resolved}
+    candidates = [by_id[w] for w in who if w in by_id]
+    if not candidates:
+        return None
+    host_company = detect_host(cfg)
+
+    def company_of(r):
+        spec = _roster_spec(cfg, r["id"]) or {}
+        return host_company if spec.get("kind") == "agent" else norm_company(spec.get("vendor"))
+    diff_company = [c for c in candidates if company_of(c) != host_company]
+    pool = diff_company or candidates
+    return min(pool, key=lambda r: r["slot"])
+
+
+def _fix_round_target(ctx: "Ctx", cfg: dict, cp_id: str, cp: dict, rnd: dict | None, cps: dict,
+                      fp_id: str) -> dict | None:
     """What the next round's single fix-round reviewer is tied to, or None when the next round is not a fix round.
-    Returns {"reviewer", "slot", "low", "findings"} for a fix round, or {"ambiguous": "<plain reason>"} when the
-    findings being fixed don't point at exactly one reviewer of the blocked round."""
+    Returns {"reviewer", "slot", "low", "findings", "round"} for a fix round, or {"ambiguous": "<plain reason>"}
+    when the findings being fixed don't point at a reviewer of the blocked round."""
+    if cp.get("reviewers"):
+        return None  # the checkpoint pins its own reviewer list: the approved exception, always a normal full round
     ff = (rnd or {}).get("fix_for")
     if rnd and rnd.get("fix_round") and not rnd.get("recorded") and ff and rnd.get("resolved"):
         # a fix round replaced before it was recorded (the fixer changed the code again): still the same fix
@@ -1154,8 +1185,8 @@ def _fix_round_target(ctx: "Ctx", cp_id: str, rnd: dict | None, cps: dict, fp_id
                 "findings": list(ff.get("findings") or []), "round": ff.get("round")}
     if not rnd or not rnd.get("recorded") or rnd.get("fingerprint") == fp_id:
         return None
-    if rnd.get("narrowed") or rnd.get("fix_round"):
-        return None
+    if rnd.get("narrowed"):
+        return None  # a narrowed round (the pinned-reviewer fallback above) still converges the old way if it blocks
     open_findings = _adv_open_findings(ctx, cp_id, rnd, cps)
     if not open_findings:
         return None
@@ -1164,15 +1195,15 @@ def _fix_round_target(ctx: "Ctx", cp_id: str, rnd: dict | None, cps: dict, fp_id
     if not fixing:
         return None
     keys = sorted(_finding_key(f) for f in fixing)
-    who = sorted({str(f.get("reviewer") or "") for f in fixing})
-    if len(who) != 1:
-        return {"ambiguous": f"the findings being fixed ({', '.join(keys)}) came from {len(who)} reviewers "
-                             f"({', '.join(w or '(none)' for w in who)}), so no single reviewer is tied to the fix"}
-    slot = next((r.get("slot") for r in rnd.get("resolved") or [] if r.get("id") == who[0]), None)
-    if not who[0] or slot is None:
-        return {"ambiguous": f"the reviewer of the findings being fixed ({who[0] or '(none)'}) is not one round "
-                             f"{rnd['round']} listed"}
-    return {"reviewer": who[0], "slot": slot, "low": bool(rnd.get("small_fix")), "findings": keys,
+    who = sorted({str(f.get("reviewer") or "") for f in fixing if f.get("reviewer")})
+    if not who:
+        return {"ambiguous": f"the findings being fixed ({', '.join(keys)}) carry no reviewer, so no single "
+                             "reviewer is tied to the fix"}
+    pick = _fix_round_pick(cfg, who, rnd.get("resolved") or [])
+    if pick is None:
+        return {"ambiguous": f"the reviewer(s) of the findings being fixed ({', '.join(who)}) are not in round "
+                             f"{rnd['round']}'s own reviewer list"}
+    return {"reviewer": pick["id"], "slot": pick["slot"], "low": bool(rnd.get("small_fix")), "findings": keys,
             "round": rnd["round"]}
 
 
@@ -8873,6 +8904,13 @@ def cmd_adv_record(args):
     g.update(status="passed", fingerprint=fp, passed_at=now(), evidence=str(dest.relative_to(ctx.root)))
     if rnd.get("small_fix"):  # CP3: approved as a one-reviewer small-fix round -- named for the commit/status
         cps["small_fix_review"] = {"round": rnd["round"], "reviewer": (rnd.get("reviewers") or [None])[0]}
+    elif rnd.get("fix_round"):
+        # Lane H CP5: a fix round's one-reviewer approval is not a full review either -- it is tied to whatever
+        # finding it re-checked, never every lens, so it must never advance last_full_review_fingerprint (a later
+        # small fix still measures against the step's last FULL, every-lens approval) and must never clear an
+        # existing lighter-review note (small_fix_review, docs_only_review_skip, doc_edits_unreviewed): those stay
+        # exactly as a small-fix round's own approval above leaves them.
+        pass
     else:
         # CP3: anchor for `_is_small_fix_round` -- only a FULL round's approval moves this, so a run of small
         # fixes keeps measuring against the same baseline and their sizes add up.
@@ -12504,7 +12542,10 @@ def cmd_reviewers(args):
         # Narrow after round 1: when the round being replaced was recorded (it blocked) and was itself NOT
         # narrowed, the next round only asks the lens(es) that still had an open blocker/major finding — a lens
         # that approved isn't re-run. A narrowed round whose fix still left a blocker open brings back the full
-        # set for the round after it (narrow_now stays False), rather than narrowing further.
+        # set for the round after it (narrow_now stays False), rather than narrowing further. This path is only
+        # ever reached below when the fix-round mechanism (below) doesn't apply -- a pinned reviewer list (its
+        # own approved exception) or an ambiguous fix target -- so it is the only convergence rule those cases
+        # still follow; everywhere else, the fix round below supersedes it, repeating as many times as it blocks.
         was_narrowed = bool(rnd.get("narrowed") or rnd.get("fix_round")) if rnd else False
         open_lenses = _open_blocking_lenses(ctx, cfg, args.cp, rnd, cps) if rnd and rnd.get("recorded") and not was_narrowed else set()
         narrow_now = False
@@ -12520,9 +12561,11 @@ def cmd_reviewers(args):
         if small_fix and _small_fix_reviewers(ctx, cfg, cp) is None:
             small_fix = False
         # Lane H CP5: a round that follows a blocked round and a fixer run is a fix round with exactly one reviewer,
-        # tied to the finding being fixed (_fix_round_target), whatever the fix's size or the step's risk. It takes
-        # precedence over the small-fix and narrowing rules; an ambiguous target keeps those rules and is reported.
-        fix_target = _fix_round_target(ctx, args.cp, rnd, cps, fp)
+        # tied to the finding being fixed (_fix_round_target), whatever the fix's size or the step's risk, and
+        # whether or not it is itself following an earlier fix round that blocked again. It takes precedence over
+        # the small-fix and narrowing rules; a pinned reviewer list or an ambiguous target keeps those rules and
+        # (for an ambiguous one) reports why.
+        fix_target = _fix_round_target(ctx, cfg, args.cp, cp, rnd, cps, fp)
         fix_ambiguous = (fix_target or {}).get("ambiguous")
         if fix_ambiguous:
             fix_target = None

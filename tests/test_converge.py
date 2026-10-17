@@ -7,7 +7,11 @@ reviewer (same company, model, lens) run once and the approval message names the
 replaced before anyone wrote a review into its folder is free (does not count toward either round cap) while a
 round where a review was already written still counts; and from a configurable round (default: round 3,
 `converge_after_round` + 1) a minor finding no longer blocks, even in code that just changed, and is listed in
-`ratchet.py deferred`.
+`ratchet.py deferred`. CP5-T03 covers the case where the fix-round mechanism (lane H CP5, tests/test_fix_round.py)
+supersedes this: once a round blocks and a fixer runs, every round after it stays a one-reviewer fix round tied
+to the same reviewer, however many times it blocks again, never the full set -- the lens-narrowing rule above
+only still governs a step that pins its own reviewer list (the fix round's one approved exception) or a block
+whose fix round can't tie to a single reviewer.
 
 Reuses tests/test_gates.py (`project`, `approve_plan`, `write_tests`, `to_adversarial`, `open_round`, `write_review`,
 `rx`, `R0`) for the throwaway git projects, the same real-CLI-subprocess, private-RATCHET_HOME way every suite in
@@ -128,12 +132,18 @@ def t02_open_major_lens_rerun_alone():
           len(rnd2["reviewers"]) == 1 and rnd2["reviewers"][0]["lens"] == "standards", rnd2["reviewers"])
 
 
-def t03_unresolved_blocker_restores_full_set():
-    # two blocking rounds in a row would otherwise trip CP4's check-in before round 3 can open; that check-in
-    # itself is out of scope here, so disable it (checkin_round=99) and focus purely on reviewer selection.
+def t03_unresolved_blocker_stays_a_one_reviewer_fix_round():
+    # Lane H CP5 (revised): a fix round that still blocks is followed by ANOTHER fix round, tied to the same
+    # reviewer, not the full set -- however many times it repeats. Two blocking rounds in a row would otherwise
+    # trip CP4's check-in before round 3 can open; that check-in itself is out of scope here, so disable it
+    # (checkin_round=99) and focus purely on reviewer selection.
     d = _round1_block("t03", config=["checkin_round=99"])
     rnd2 = g.open_round(d)
     lens2 = _lens_ids(rnd2)
+    check("[CP5-T03] (fixture sanity) round 2 is already a one-reviewer fix round, tied to the standards "
+          "reviewer who raised round 1's major finding",
+          rnd2.get("fix_round") is True and len(rnd2["reviewers"]) == 1
+          and rnd2["reviewers"][0]["id"] == lens2["standards"], rnd2["reviewers"])
     paths = [g.write_review(d, rnd2, rid, MAJOR if ln == "standards" else []) for ln, rid in lens2.items()]
     r = g.rx(d, "adv-record", "CP1", "--reviews", *paths)
     assert r.returncode == 2, r.stdout + r.stderr  # the same major is still open
@@ -141,8 +151,11 @@ def t03_unresolved_blocker_restores_full_set():
     r = g.rx(d, "behavior", "CP1")
     assert r.returncode == 0, r.stdout + r.stderr
     rnd3 = g.open_round(d)
-    check("[CP5-T03] a fix that leaves the blocker open brings back the full reviewer set in round 3",
-          sorted(r["lens"] for r in rnd3["reviewers"]) == ["correctness", "standards"], rnd3["reviewers"])
+    check("[CP5-T03] a fix that leaves the blocker open a SECOND time still stays a one-reviewer fix round, "
+          "not the full set: round 3 names exactly one reviewer",
+          len(rnd3["reviewers"]) == 1, rnd3["reviewers"])
+    check("[CP5-T03] ...and it is the same reviewer the finding is tied to (standards), with fix_round recorded",
+          rnd3.get("fix_round") is True and rnd3["reviewers"][0]["id"] == lens2["standards"], rnd3)
 
 
 def t04_duplicate_slot_runs_once():
@@ -295,7 +308,7 @@ def t12_fixer_told_to_fix_listed_findings_only():
 TESTS = [
     ("CP5-T01", t01_approved_lens_not_rerun),
     ("CP5-T02", t02_open_major_lens_rerun_alone),
-    ("CP5-T03", t03_unresolved_blocker_restores_full_set),
+    ("CP5-T03", t03_unresolved_blocker_stays_a_one_reviewer_fix_round),
     ("CP5-T04", t04_duplicate_slot_runs_once),
     ("CP5-T05", t05_free_replacement_before_any_review),
     ("CP5-T06", t06_replacement_after_a_review_still_counts),
