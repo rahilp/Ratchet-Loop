@@ -8825,6 +8825,15 @@ def cmd_adv_record(args):
     subs = rnd.get("substitutions") or []
     reviews = {}
     round_dir = _review_round_dir(ctx, args.cp, "adv", rnd["round"])
+    # Lane H CP6: a scoped round (fix_round or small_fix) was shown only the diff since the last round actually
+    # reviewed, so both the minimum review time and the files_reviewed sanity check below are judged against
+    # THAT scope, never the whole checkpoint's base_tree -- the reviewer could never list a file it was never
+    # shown. Every other round (first, narrowed, full) is unaffected: scope is None and both checks fall back to
+    # the pre-CP6 behavior exactly.
+    scope = _scope_for_round(ctx, args.cp, rnd, cps, fp["id"])
+    min_seconds = (_scoped_min_review_seconds(ctx, cfg, scope["since_tree"], fp["id"], scope["changed_files"])
+                  if scope is not None else cfg.get("min_review_seconds", 20))
+    scoped_changed = set(scope["changed_files"]) if scope is not None else None
     for rp in args.reviews:
         rpath, raw, fst = _read_round_review(
             ctx, rp, round_dir, f"Adversarial reviews for round {rnd['round']}",
@@ -8841,13 +8850,14 @@ def cmd_adv_record(args):
         origin = check_review_origin(ctx, cfg, st, args.cp, rnd["round"], rp, rpath, r, rid, rnd["nonce"])
         r = clean_review_text(r)  # its signature is checked: from here on it only feeds records and messages
         age = fst.st_mtime - _iso(rnd["opened_at"])
-        if age < cfg.get("min_review_seconds", 20):
+        if age < min_seconds:
             die(f"{rp} ({rid}) was written {age:.0f}s after the round opened — too fast to be a real review. "
                 "Launch the reviewer and let it do the work.")
         if not r.get("findings"):
             seen = set(r.get("files_reviewed") or [])
-            changed = set(changed_files(ctx.root, {"kind": "git-tree", "id": cps.get("base_tree")}, fp)) \
-                if cps.get("base_tree") else set()
+            changed = scoped_changed if scoped_changed is not None else \
+                (set(changed_files(ctx.root, {"kind": "git-tree", "id": cps.get("base_tree")}, fp))
+                 if cps.get("base_tree") else set())
             if not seen or (changed and not (seen & changed)):
                 die(f"{rp} ({rid}) approves without listing the changed files it reviewed (files_reviewed). "
                     f"Changed in this checkpoint: {', '.join(sorted(changed)[:8]) or '(none recorded)'}.")
@@ -9007,6 +9017,81 @@ def _adv_open_findings(ctx, cp_id: str, rnd, cps=None) -> list:
         return raw
     accepted_keys = {_finding_key(f) for f in _round_deferred(cps, rnd["round"]) if f.get("accepted")}
     return [f for f in raw if _finding_key(f) not in accepted_keys]
+
+
+# --------------------------------------------------------------------------- scoped diff & timing (lane H CP6)
+# A fix round, and a small fix opened after an approval, show their one reviewer only what changed since the
+# last round actually reviewed -- never the whole checkpoint diff -- plus, for a fix round, the specific
+# findings still open in the round it answers (full details: id, reviewer, severity, location, description,
+# suggested fix, and any rebuttal reason already recorded for it). A first round, a narrowed round (the old
+# convergence fallback), and any full round (including a fix over small_edit_lines after an approval, and every
+# high-risk step's own full round) are never scoped this way: they keep the whole step diff exactly as CP5 left
+# it. `prev_round_tree` (already carried forward through a free replacement -- see cmd_reviewers) is reused
+# as-is for the scope boundary, so a second fix round in a row scopes to just that second fix, and a round that
+# replaces one nobody reviewed yet scopes to everything since the last round actually reviewed, not just the
+# latest edit.
+
+def _scope_for_round(ctx: "Ctx", cp_id: str, rnd: dict | None, cps: dict, fp_id: str) -> dict | None:
+    """The CP6 scope for `rnd`, or None when it keeps the whole step diff. Returns {"since_tree", "changed_files",
+    "findings"}: `since_tree` is the tree id the diff is scoped since (the last round actually reviewed, or the
+    checkpoint's own base_tree if that is somehow unset); `changed_files` is sorted; `findings` is the full
+    finding dicts still open in the round a fix round answers (each with "rebuttal_reason" added when that
+    round's own triage rebutted it), or [] for a small fix after a clean approval -- nothing to re-check."""
+    if not rnd or not (rnd.get("fix_round") or rnd.get("small_fix")):
+        return None
+    since_tree = rnd.get("prev_round_tree") or cps.get("base_tree")
+    if not since_tree:
+        return None
+    changed = sorted(changed_files(ctx.root, {"kind": "git-tree", "id": since_tree},
+                                   {"kind": "git-tree", "id": fp_id}))
+    findings = []
+    ff = rnd.get("fix_for")
+    if ff and ff.get("round"):
+        raw = _adv_open_findings(ctx, cp_id, {"round": ff["round"], "recorded": True}, cps)
+        triage = _read_triage(_adv_round_dir(ctx, cp_id, ff["round"]))
+        for f in raw:
+            entry = dict(f)
+            dec = triage.get(_finding_key(f)) or {}
+            if dec.get("decision") == "rebut":
+                entry["rebuttal_reason"] = dec.get("reason")
+            findings.append(entry)
+    return {"since_tree": since_tree, "changed_files": changed, "findings": findings}
+
+
+def _render_finding_line(f: dict) -> str:
+    """One plain line naming a finding's id, reviewer, severity, location, description, suggested fix and any
+    rebuttal reason -- used both in a host sub-agent's launch instructions and in an external reviewer's prompt,
+    so the two ways a fix round's reviewer is told about an open finding always say the same things about it."""
+    loc = str(f.get("file") or f.get("path") or f.get("location") or "(no file)")
+    if f.get("line"):
+        loc = f"{loc}:{f['line']}"
+    line = (f"finding id={f.get('id', '?')} reviewer={f.get('reviewer', '?')} severity={f.get('severity', '?')} "
+            f"location={loc} description={json.dumps(str(f.get('description') or ''))} "
+            f"fix={json.dumps(str(f.get('fix') or ''))}")
+    if f.get("rebuttal_reason"):
+        line += f" rebuttal={json.dumps(str(f['rebuttal_reason']))}"
+    return line
+
+
+_FIX_ROUND_MIN_REVIEW_FLOOR_SEC = 1       # never below this once ANY code changed, so a 0-second review always fails
+_FIX_ROUND_MIN_REVIEW_SEC_PER_LINE = 0.05  # 20 changed lines/second: a ~400-line fix reaches a 20s minimum
+
+
+def _scoped_min_review_seconds(ctx: "Ctx", cfg: dict, since_tree: str, fp_id: str, files: list[str]) -> int | float:
+    """The minimum age a scoped round's (lane H CP6: fix_round or small_fix) review must have, scaled down from
+    the configured `min_review_seconds` by how much actually changed in its own scope -- a tiny fix is never
+    held to the same wait as a full review, while a fix large enough to approach the configured minimum still
+    gets it in full. Never exceeds the configured minimum, whatever it is (a config of 5, or even 0, seconds is
+    still the hard ceiling). A change of unknown size (a binary file) gets the full configured minimum, never a
+    shortcut -- there is nothing here to measure it against."""
+    configured = cfg.get("min_review_seconds", 20)
+    lines, unknown = _code_size(ctx, since_tree, fp_id, files) if files else (0, [])
+    if unknown or lines is None:
+        return configured  # size can't be measured (a binary file): no shortcut, the full configured minimum applies
+    if lines <= 0:
+        return min(configured, 0)  # nothing to measure; never above the configured ceiling either
+    scaled = max(_FIX_ROUND_MIN_REVIEW_FLOOR_SEC, round(lines * _FIX_ROUND_MIN_REVIEW_SEC_PER_LINE))
+    return min(configured, scaled)
 
 
 def _open_blocking_lenses(ctx, cfg, cp_id: str, rnd, cps=None) -> set:
@@ -9245,9 +9330,13 @@ def cmd_repeats(args):
         print(f"- {r['kind']}: found {r['times']} times ({', '.join(r['checkpoints'])}); e.g. {r['example']}")
 
 
-def review_rules(ctx, cfg, cp, g, rnd, fp_id) -> tuple[set | None, list[str]]:
-    """What the reviewers of this round are told about the severity bar and the round's focus."""
-    focus = _changed_since_last_round(ctx, cfg, g, fp_id) if rnd["round"] > 1 else None
+def review_rules(ctx, cfg, cp, g, rnd, fp_id, cps=None) -> tuple[set | None, list[str], dict | None]:
+    """What the reviewers of this round are told about the severity bar, the round's focus and (lane H CP6) its
+    scope. `cps` (the checkpoint's own state dict) is needed to compute the CP6 scope; omit it only for a caller
+    that only wants the pre-CP6 fields (focus, rules) and is not itself a fix_round/small_fix round, since
+    `_scope_for_round` needs it to find `base_tree`."""
+    scope = _scope_for_round(ctx, cp["id"], rnd, cps or {}, fp_id) if cps is not None else None
+    focus = _changed_since_last_round(ctx, cfg, g, fp_id) if rnd["round"] > 1 and scope is None else None
     bar = (cfg.get("blocking_severities") or {}).get(cp.get("risk", "normal"), "all")
     rules = []
     if bar != "all":
@@ -9263,14 +9352,31 @@ def review_rules(ctx, cfg, cp, g, rnd, fp_id) -> tuple[set | None, list[str]]:
                      + (", ".join(sorted(focus)[:20]) or "nothing changed") + "). Re-raise any earlier finding that "
                      "still isn't fixed, wherever it is. Beyond that, a new minor problem outside those files is "
                      "recorded, not fixed; blocker and major problems count anywhere.")
-    if rnd["round"] > 1:
+    elif scope is not None:
+        since_short = scope["since_tree"][:10]
+        if scope["findings"]:
+            rules.append(f"This is a fix round (lane H CP6): you are shown ONLY the diff since {since_short} (the "
+                         "last round actually reviewed), never the whole checkpoint, plus the open finding(s) "
+                         "below from the round you are fixing. Judge only this diff and these findings: re-check "
+                         "whether each one is actually fixed, re-raising any that isn't. A new problem outside "
+                         "this diff is out of scope for this round.")
+            for f in scope["findings"]:
+                rules.append(_render_finding_line(f))
+        else:
+            rules.append(f"This is a small fix made after an approval (lane H CP6): you are shown ONLY the new "
+                         f"lines since {since_short} (the last round actually reviewed), never the whole "
+                         "checkpoint. There are no open findings to re-check for this round; judge only this diff.")
+    if rnd["round"] > 1 and scope is None:
+        # A scoped round's own rebuttal info (if any) is already attached to each finding in `scope["findings"]`
+        # above (its "rebuttal_reason"), so this generic, round-number-based block would only ever duplicate it;
+        # it stays only for a narrowed or full round, exactly as before CP6.
         prev_triage = _read_triage(_adv_round_dir(ctx, cp["id"], rnd["round"] - 1))
         for ref, dec in prev_triage.items():
             if dec.get("decision") == "rebut":
                 rules.append(f"Rebuttal from the last round on {ref}: {dec.get('reason', '')} — withdraw this "
                              "finding if the rebuttal holds up, or re-raise it with a stronger user_impact if it "
                              "doesn't.")
-    return focus, rules
+    return focus, rules, scope
 
 
 def _announce_repeats(ctx, st):
@@ -12857,7 +12963,7 @@ def cmd_reviewers(args):
     fixes = ctx.run_dir() / "reviews" / args.cp / f"adv-round-{rnd['round'] - 1:02d}" / "fixes.md"
     fixes_arg = f" --fixes {fixes}" if rnd["round"] > 1 else ""
     ext_script = SKILL_DIR.parent / "ratchet-adversarial-loop" / "scripts" / "external_review.py"
-    focus, rules = review_rules(ctx, cfg, cp, g, rnd, fp)
+    focus, rules, scope = review_rules(ctx, cfg, cp, g, rnd, fp, cps)
     rows = []
     for res_r in rnd["resolved"]:
         rid = res_r["id"]
@@ -12866,9 +12972,16 @@ def cmd_reviewers(args):
         if spec["kind"] == "agent":
             want = ("a model DIFFERENT from yours: " + " or ".join(host_model_map(cfg).get("alternates") or [])
                     if spec.get("alt") else role_model(cfg, "ratchet-adversary"))
+            # Lane H CP6: a scoped round (fix_round or small_fix) tells the host sub-agent the SAME scope an
+            # external reviewer's own prompt gets -- the prior reviewed tree, this round's fingerprint (already
+            # above), and the files changed since then; the open findings themselves (or "no open findings") are
+            # already in `rules` below (review_rules appends one line per finding via _render_finding_line).
+            scope_note = (f", since {scope['since_tree'][:10]}, changed files: "
+                         f"{', '.join(scope['changed_files']) or '(none)'}" if scope is not None else "")
             spec["how"] = (f"Objective: {obj_oneline} | Spawn a ratchet-adversary sub-agent (model: {want}): "
                            f"lens={spec['lens']}, reviewer id '{rid}', "
                            f"fingerprint {fp}, round_nonce {rnd['nonce']}, checkpoint {args.cp}, output {spec['output']}"
+                           + scope_note
                            + (f", fixes.md {fixes}" if rnd["round"] > 1 else "")
                            + ("" if not rules else ". Review rules for this round (tell it): " + " ".join(rules)))
         else:
@@ -12877,6 +12990,7 @@ def cmd_reviewers(args):
     res = {"checkpoint": args.cp, "objective": obj if isinstance(obj, dict) and obj else NO_OBJECTIVE_NOTE,
            "risk": cp.get("risk", "normal"), "round": rnd["round"], "fingerprint": fp,
            "review_rules": rules, "focus_files": sorted(focus) if focus is not None else None,
+           "scope": scope,
            "round_nonce": rnd["nonce"], "output_dir": str(out_dir), "narrowed": rnd.get("narrowed", False),
            "small_fix": rnd.get("small_fix", False),
            "fix_round": rnd.get("fix_round", False), "fix_for": rnd.get("fix_for"),

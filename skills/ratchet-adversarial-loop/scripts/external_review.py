@@ -205,6 +205,20 @@ def collect_diff(root: Path, base_tree: str | None, current_tree: str | None, pr
     return "".join(parts)
 
 
+def collect_scoped_diff(root: Path, since_tree: str, current_tree: str) -> str:
+    """Lane H CP6: the diff for a SCOPED round (a fix round, or a small fix made after an approval) -- ONLY what
+    changed since `since_tree` (the last round actually reviewed), never the whole checkpoint. Unlike
+    `collect_diff`, nothing before `since_tree` is included even when the size limit isn't reached: a fix
+    round's reviewer sees exactly this diff, nothing more. New and deleted files are included as git's own diff
+    format already marks them (new/deleted file mode), with no special-casing needed."""
+    header = f"# Changes since the last round actually reviewed ({since_tree[:10]} → {current_tree[:10]})\n"
+    diff = git(root, "diff-tree", "-r", "-p", "--no-color", since_tree, current_tree)
+    text = header + (diff or "(no file content differs here -- the change was likely a rename or mode-only edit)\n")
+    if len(text) > MAX_DIFF:
+        text = text[:MAX_DIFF] + f"\n\n[diff truncated at {MAX_DIFF} chars — flag anything you could not see]"
+    return text
+
+
 def read_doc(root: Path, rel: str) -> str:
     p = root / rel
     if not p.exists():
@@ -223,7 +237,7 @@ def adversary_instructions() -> str:
 
 
 def build_prompt(eng, ctx, cfg, cp, rid, spec, fp, fixes_path, base_tree=None, nonce=None, rules=None,
-                 prev_round_tree=None) -> str:
+                 prev_round_tree=None, scope=None) -> str:
     root = ctx.root
     docs = "".join(read_doc(root, s) for s in cfg.get("standards", []))
     docs += read_doc(root, ".ratchet/learnings.md")
@@ -233,6 +247,12 @@ def build_prompt(eng, ctx, cfg, cp, rid, spec, fp, fixes_path, base_tree=None, n
     if fixes_path and Path(fixes_path).exists():
         fixes = "\n\n## Fixer rebuttals from the previous round (fixes.md)\n" + Path(fixes_path).read_text()[:MAX_DOC]
     objective = eng.objective_brief(ctx.plan())
+    # Lane H CP6: a scoped round (fix_round, or a small fix made after an approval) gets ONLY the diff since the
+    # last round actually reviewed -- never the whole checkpoint diff `collect_diff` would otherwise build. Its
+    # open findings (or the fact that there are none, for a small fix) are already in `rules` above (one line
+    # per finding from `_render_finding_line`, via review_rules).
+    code_under_review = (collect_scoped_diff(root, scope["since_tree"], fp) if scope is not None
+                         else collect_diff(root, base_tree, fp, prev_round_tree))
     return f"""## {objective}
 
 ---
@@ -255,7 +275,7 @@ Code fingerprint: {fp}
 {("## Rules for this round" + chr(10) + chr(10).join("- " + r for r in rules)) if rules else ""}
 
 ## Code under review
-{collect_diff(root, base_tree, fp, prev_round_tree)}
+{code_under_review}
 
 ---
 Reply with ONLY one JSON object, no markdown fences, exactly this shape:
@@ -388,9 +408,9 @@ def main():
     if not rnd or rnd.get("recorded") or rnd.get("fingerprint") != fp or a.reviewer not in rnd.get("reviewers", []):
         sys.exit(f"No open review round for {a.cp} that includes '{a.reviewer}' at the current code. "
                  f"Run `ratchet.py reviewers {a.cp}` first and launch exactly the reviewers it lists.")
-    _focus, rules = eng.review_rules(ctx, cfg, cp, cps["gates"]["adversarial"], rnd, fp)
+    _focus, rules, scope = eng.review_rules(ctx, cfg, cp, cps["gates"]["adversarial"], rnd, fp, cps)
     prompt = build_prompt(eng, ctx, cfg, cp, a.reviewer, spec, fp, a.fixes, cps.get("base_tree"), rnd["nonce"], rules,
-                          prev_round_tree=rnd.get("prev_round_tree"))
+                          prev_round_tree=rnd.get("prev_round_tree"), scope=scope)
 
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -401,12 +421,12 @@ def main():
         print(f"prompt written: {prompt_file} ({len(prompt)} chars)")
         return
     try:
-        _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, prompt_file, out_file)
+        _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, prompt_file, out_file, scope)
     finally:  # the prompt and the CLI's reply are not kept: the review (or its .raw.txt) is the record
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, prompt_file, out_file):
+def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, prompt_file, out_file, scope=None):
     # This round's signing secret must exist before the reviewer runs, so a paid review is never thrown away unsigned.
     if eng.review_key(ctx, a.cp, "adv", rnd["round"], st=st) is None:
         sys.exit(f"This round's review-signing secret is missing. Run `ratchet.py reviewers {a.cp}` again, then "
@@ -570,10 +590,15 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
         unavailable(f"exit {r.returncode}, no findings JSON ({tail[0][:160]})",
                     quota=quota_of(r, text), unused=r.returncode != 0 and not text.strip())
     review = eng.clean_review_text(review)  # a cut-off emoji escape in the reply must not break signing or records
-    # Stamp identity ourselves — never trust the model to echo these correctly.
+    # Stamp identity ourselves — never trust the model to echo these correctly. Lane H CP6: a scoped round's
+    # files_reviewed is stamped from ITS OWN scope (since the last round actually reviewed), never the whole
+    # checkpoint's base_tree -- the reviewer was never shown anything outside that scope.
     base = cps.get("base_tree")
-    review["files_reviewed"] = (eng.changed_files(ctx.root, {"kind": "git-tree", "id": base}, {"kind": "git-tree", "id": fp})
-                                if base else review.get("files_reviewed") or ["(whole diff)"])
+    if scope is not None:
+        review["files_reviewed"] = list(scope["changed_files"]) or ["(whole diff)"]
+    else:
+        review["files_reviewed"] = (eng.changed_files(ctx.root, {"kind": "git-tree", "id": base}, {"kind": "git-tree", "id": fp})
+                                    if base else review.get("files_reviewed") or ["(whole diff)"])
     review.update(reviewer=a.reviewer, lens=spec.get("lens"), vendor=spec.get("vendor"), round_nonce=rnd["nonce"],
                   checkpoint=a.cp, fingerprint=fp)
     review["findings"] = [f for f in review.get("findings") or [] if isinstance(f, dict)]

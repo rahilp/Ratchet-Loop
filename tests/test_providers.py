@@ -151,9 +151,10 @@ def severity_and_scope():
     rnd = open_round(d)
     check("round 2 is a fix round naming only the reviewer who raised round 1's finding (lane H CP5)",
           rnd.get("fix_round") is True and ids(rnd) == [rid0], rnd.get("reviewers"))
-    check("round 2 tells reviewers where to look and what blocks",
-          rnd["focus_files"] == ["src/f.js"] and any("changed since the last round" in x for x in rnd["review_rules"]),
-          (rnd.get("focus_files"), rnd.get("review_rules")))
+    check("round 2 is scoped (lane H CP6): the diff is restricted to what changed since round 1, not merely "
+          "prioritized (the old focus_files narrowing no longer applies once it's a fix round)",
+          rnd.get("scope") is not None and rnd["scope"]["changed_files"] == ["src/f.js"]
+          and any("lane H CP6" in x for x in rnd["review_rules"]), (rnd.get("scope"), rnd.get("review_rules")))
     # both findings now come from the one reviewer round 2 names -- the scope rule below (untouched vs. just-
     # changed code) applies the same way whichever reviewer reports a finding, so one review combining them
     # exercises it exactly as the previous two-reviewer version did.
