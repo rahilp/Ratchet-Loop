@@ -621,7 +621,11 @@ def cp6_x01_a_narrowed_round_reserves_only_the_lens_that_still_has_a_blocker():
         need("two codex starts so far", len(scn.starts("codex")) == 2, scn.health())
         r2, rnd2 = _xblock_then_reopen(a, rnd1, "codex-correctness")
     need("round 2 opens", r2.returncode == 0, said(r2)[-300:])
-    check("round 2 is narrowed to the correctness lens", rnd2.get("narrowed") is True and len(ids(rnd2)) == 1, (rnd2.get("narrowed"), ids(rnd2)))
+    # lane H CP5 supersedes narrowing here: after a block and a fixer run, round 2 is a fix round (not "narrowed"),
+    # tied to the one reviewer (codex-correctness) who raised the blocker -- the slot-resolution mechanics below
+    # (which share this test exercises) are unaffected by that label change.
+    check("round 2 is a fix round naming only the correctness reviewer",
+          rnd2.get("fix_round") is True and len(ids(rnd2)) == 1, (rnd2.get("fix_round"), ids(rnd2)))
     check("it keeps codex-correctness, not host-alt-correctness (the dropped standards slot used no share)",
           ids(rnd2) == ["codex-correctness"], (ids(rnd2), row_of(rnd2, first_id(rnd2)).get("reasons")))
     check("codex holds 3 starts: the 2 from round 1 and 1 for the kept slot, none for the dropped one",
