@@ -483,6 +483,7 @@ python3 tests/test_discover_paid.py
 python3 tests/test_docs.py
 python3 tests/test_flaky.py
 python3 tests/test_feedback_fixes.py
+python3 tests/test_fix_round.py
 python3 tests/test_gates.py
 python3 tests/test_guard_python_reads.py
 python3 tests/test_guard_reads.py
