@@ -1137,9 +1137,12 @@ def _small_fix_review_lines(st: dict) -> list[str]:
 # has at least one open finding triaged `fix` and the code differs from that round's fingerprint. This supersedes
 # the older convergence rule for fix rounds specifically: a fix round that blocks again (repeatedly, as many times
 # as it takes) is followed by another fix round, never the full set -- a stuck finding keeps going back to the
-# reviewer who raised it, not to every lens. A step that pins its own `reviewers` list is the one approved
-# exception: it always gets its normal full round, the fix-round mechanism never applies to it (same exemption
-# `_is_small_fix_round` and the docs-only skip already give a pinned list).
+# reviewer who raised it, not to every lens. This also applies when the PREVIOUS round was narrowed by the old rule
+# rather than itself a fix round (e.g. round 1 blocked, no code change yet when round 2 opened narrowed, and the
+# fixer only then changed the code before round 3): once a narrowed round blocks and the fixer actually runs, the
+# next round still ties to its reviewer, same as after a full round. A step that pins its own `reviewers` list is
+# the one approved exception: it always gets its normal full round, the fix-round mechanism never applies to it
+# (same exemption `_is_small_fix_round` and the docs-only skip already give a pinned list).
 #
 # The reviewer is tied to the finding(s) being fixed, never to one a fixer only rebutted:
 #   - One reviewer raised every finding triaged `fix`: that reviewer, in the slot it filled in the blocked round.
@@ -1185,8 +1188,11 @@ def _fix_round_target(ctx: "Ctx", cfg: dict, cp_id: str, cp: dict, rnd: dict | N
                 "findings": list(ff.get("findings") or []), "round": ff.get("round")}
     if not rnd or not rnd.get("recorded") or rnd.get("fingerprint") == fp_id:
         return None
-    if rnd.get("narrowed"):
-        return None  # a narrowed round (the pinned-reviewer fallback above) still converges the old way if it blocks
+    # A narrowed round (the old convergence rule, reached below whenever a fix round didn't apply when IT opened --
+    # a pinned reviewer list, or simply no code change yet since the previous blocked round) is NOT excluded here:
+    # once it blocks and the fixer actually changes the code, the next round still ties to whichever reviewer
+    # raised its open finding, exactly like a full round would. Only the pinned-reviewer check above is a standing
+    # exception; a narrowed round reached only because nothing had changed yet is not.
     open_findings = _adv_open_findings(ctx, cp_id, rnd, cps)
     if not open_findings:
         return None
@@ -1297,6 +1303,39 @@ def _docs_only_skip_lines(st: dict) -> list[str]:
         line = _docs_only_skip_line(cid, c)
         if line:
             lines.append(line)
+    return lines
+
+
+# --------------------------------------------------------------------------- fix-round evidence (lane H CP5)
+# Every round `adv-record` ever records for a checkpoint's adversarial gate -- blocked or approved -- gets its own
+# entry in gates.adversarial.rounds[] (round, findings, reviewers, ...; see cmd_adv_record). A fix round's entry
+# there carries `fix_round: true`, set when `reviewers` opened it that way. Unlike small_fix_review (one note for
+# only the latest APPROVED small-fix round, cleared by the next full approval), a checkpoint can have several
+# recorded fix rounds over its lifetime, including ones that blocked before the finding was eventually fixed --
+# the approved CP5 plan requires every one of them identified, by round number and its actual reviewer, so
+# `_fix_round_lines_for` reads every round in that list tagged `fix_round`, not just the newest.
+
+def _fix_round_lines_for(cid: str, cps: dict) -> list[str]:
+    """One plain line per round of `cid`'s adversarial gate that `reviewers` opened as a fix round, naming the
+    round number, its one reviewer, and whether that round blocked or approved -- in round order, oldest first,
+    exactly as gates.adversarial.rounds[] records them. Used by `status`, `status --json` and the checkpoint's
+    own commit message so they all say the same thing about the same rounds."""
+    rounds = ((cps.get("gates") or {}).get("adversarial") or {}).get("rounds") or []
+    lines = []
+    for r in rounds:
+        if not r.get("fix_round"):
+            continue
+        who = ", ".join(rr["id"] for rr in r.get("reviewers") or []) or "a reviewer"
+        outcome = "approved" if not r.get("findings") else "blocked"
+        lines.append(f"{cid}: round {r.get('round')} was reviewed as a fix round by {who} ({outcome}).")
+    return lines
+
+
+def _fix_round_lines(st: dict) -> list[str]:
+    """Every checkpoint's own `_fix_round_lines_for`, flattened, for `status` and `status --json`."""
+    lines = []
+    for cid, c in (st.get("checkpoints") or {}).items():
+        lines += _fix_round_lines_for(cid, c)
     return lines
 
 
@@ -3697,6 +3736,8 @@ def cmd_status_text(ctx: Ctx):
     for line in _doc_edit_status_lines(st):
         print(line)
     for line in _small_fix_review_lines(st):
+        print(line)
+    for line in _fix_round_lines(st):
         print(line)
     for line in _docs_only_skip_lines(st):
         print(line)
@@ -8881,6 +8922,10 @@ def cmd_adv_record(args):
                                           "raw_findings": raw_count, "substitutions": subs,
                                           "blocking_files": sorted({_norm_path(f.get("file") or f.get("path") or f.get("location"), ctx.root)
                                                                     for f in all_findings} - {""}),
+                                          # Lane H CP5: whether `reviewers` opened this as a one-reviewer fix round
+                                          # (so _fix_round_lines can name every recorded fix round, blocked or
+                                          # approved, by round number and reviewer -- not just the latest one).
+                                          "fix_round": bool(rnd.get("fix_round")),
                                           "reviewers": [{"id": rr["id"], "vendor": rr.get("vendor"),
                                                          "model": rr.get("model")} for rr in rnd.get("resolved") or []]}]
     if not approved:
@@ -10783,6 +10828,8 @@ def cmd_complete(args):
         small_fix_line = _small_fix_review_line(args.cp, cps)
         if small_fix_line:
             msg += "\n" + small_fix_line
+        for fix_round_line in _fix_round_lines_for(args.cp, cps):
+            msg += "\n" + fix_round_line
         docs_only_skip_line = _docs_only_skip_line(args.cp, cps)
         if docs_only_skip_line:
             msg += "\n" + docs_only_skip_line
@@ -12541,11 +12588,13 @@ def cmd_reviewers(args):
         provider_share(cfg)  # a bad provider_share setting stops here, before anything is opened or reserved
         # Narrow after round 1: when the round being replaced was recorded (it blocked) and was itself NOT
         # narrowed, the next round only asks the lens(es) that still had an open blocker/major finding — a lens
-        # that approved isn't re-run. A narrowed round whose fix still left a blocker open brings back the full
-        # set for the round after it (narrow_now stays False), rather than narrowing further. This path is only
-        # ever reached below when the fix-round mechanism (below) doesn't apply -- a pinned reviewer list (its
-        # own approved exception) or an ambiguous fix target -- so it is the only convergence rule those cases
-        # still follow; everywhere else, the fix round below supersedes it, repeating as many times as it blocks.
+        # that approved isn't re-run. This path (narrow_now below) is only ever reached when the fix-round
+        # mechanism (below) doesn't apply to the NEXT round: a pinned reviewer list (its own approved exception),
+        # no code change yet since the round being replaced (no fixer has run, so there's nothing to tie a fix
+        # round to), or an ambiguous fix target. Once the fixer DOES change the code, the fix round below ties the
+        # next round to the blocked round's reviewer instead and repeats for as many rounds as it keeps blocking,
+        # whether or not the round it followed was itself narrowed or full -- a narrowed round whose fix leaves a
+        # blocker open no longer automatically brings back the full set (lane H CP5 supersedes that here too).
         was_narrowed = bool(rnd.get("narrowed") or rnd.get("fix_round")) if rnd else False
         open_lenses = _open_blocking_lenses(ctx, cfg, args.cp, rnd, cps) if rnd and rnd.get("recorded") and not was_narrowed else set()
         narrow_now = False
@@ -12926,6 +12975,7 @@ def status_json(ctx: Ctx) -> dict:
             "viewer_url": viewer_link(ctx)["url"], "viewer_live": viewer_link(ctx)["live"],
             "done": sum(1 for c in cps if c["status"] == "done"), "total": len(cps),
             "small_fix_reviews": _small_fix_review_lines(st),
+            "fix_round_reviews": _fix_round_lines(st),
             "docs_only_review_skips": _docs_only_skip_lines(st),
             "checkpoints": cps, "updated_at": st.get("updated_at")}
 
