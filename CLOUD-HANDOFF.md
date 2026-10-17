@@ -113,3 +113,9 @@ has no PR. No Ratchet gate was run or claimed.
   `# exit=`. It still requires: no stop, no "found when it ended" refusal,
   the run passes on its first counted attempt, and no lock or process is
   left behind (new check).
+- Results at `6542db8`:
+  - `python3 tests/test_stop_on_change.py`: 124 passed, 0 failed, both as
+    root and as a non-root user.
+  - `python3 tests/test_stop_on_change_fixes.py`: 93 passed, 0 failed as a
+    non-root user. As root: 89 passed, 4 failed. All 4 failures are the
+    known CP4-A2 checks, which fail as root on `9e950b9` too.
