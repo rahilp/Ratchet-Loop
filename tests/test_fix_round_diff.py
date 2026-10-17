@@ -36,10 +36,19 @@ signature/origin check, are unchanged.
               the same finding line as the external reviewer's prompt
   - [CP6-D15] a real, signed external review of a fix round: its prompt is scoped (dry-run), and its recorded
               files_reviewed is stamped from the scope, not the whole checkpoint
+  - [CP6-D16] a fake command-kind external provider raises the finding, is the fix round's ONLY reviewer (no
+              host, no tie-break), its scoped prompt carries only the fix diff and that finding, and its real
+              signed review passes adv-record at the scaled minimum, never the full configured one
+  - [CP6-D17] the actual reviewer prompt (not just `scope.changed_files`) shows a new file's content as an
+              addition and a deleted file's content as a removal
+  - [CP6-D18] a fix round's scope survives a same-round reviewer fallback (lane H CP5): the reviewer that
+              actually ends up reviewing gets the same since_tree, changed files and findings
+  - [CP6-D19] a small fix after approval scales its own minimum review time the same way a fix round does
 
 Black-box: every case drives the real ratchet.py CLI in a throwaway git project through tests/test_gates.py's
-helpers, with RATCHET_HOME in a temp folder; CP6-D14/D15 also drive the real external_review.py script against a
-fake command-kind reviewer CLI (tests/test_providers.py's fake_bin/env_with), never a real reviewer CLI.
+helpers, with RATCHET_HOME in a temp folder; CP6-D14/D15/D16/D17/D18 also drive the real external_review.py
+script against a fake command-kind reviewer CLI (tests/test_providers.py's fake_bin/env_with, or a local
+_fake_reply_bin for one that raises a specific finding), never a real reviewer CLI.
 
 Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {"cases": [{"id": "CP6-D01",
 "status": "passed"|"failed", "message": "..."}]}.
@@ -50,6 +59,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import traceback
@@ -551,6 +561,241 @@ def d15_signed_external_review_with_scoped_prompt_and_files_reviewed():
     check("[CP6-D15] the fix round's clean review records and approves", r2.returncode == 0, r2.stdout + r2.stderr)
 
 
+_FAKE_REPLY_TEMPLATE = r"""#!/bin/sh
+# fake agent CLI: answers the connectivity probe, otherwise prints a fixed findings reply (never a real CLI).
+out=""
+args="$*"
+while [ $# -gt 0 ]; do
+  case "$1" in --output-last-message) out="$2"; shift 2;; *) shift;; esac
+done
+input=""
+if [ ! -t 0 ]; then input=$(cat); fi
+case "$input $args" in
+  *"connectivity check"*) reply="RATCHET-PROBE-OK";;
+  *) reply='__REPLY__';;
+esac
+if [ -n "$out" ]; then printf '%s' "$reply" > "$out"; fi
+printf '%s\n' "$reply"
+"""
+
+
+def _fake_reply_bin(name, reply_json):
+    """A fake command-kind reviewer CLI, on its own private PATH, that always answers `reply_json` (never a real
+    CLI) -- the same template tests/test_fix_round.py's own helper uses, kept local here for the same reason it
+    gives: this file depends on neither test_fix_round.py's nor test_signing.py's fixtures."""
+    b = Path(_tmp.mkdtemp(prefix="ratchet-extbin-"))
+    for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+        p = shutil.which(n)
+        if p:
+            (b / n).symlink_to(p)
+    _set_reply(b, name, reply_json)
+    return b
+
+
+def _set_reply(binpath: Path, name: str, reply_json: str):
+    """(Re)writes the fake CLI at `binpath/name` to answer `reply_json` from now on -- used to make the SAME fake
+    provider that raised a fix round's finding answer clean once it's fixed, without swapping its PATH."""
+    script = _FAKE_REPLY_TEMPLATE.replace("__REPLY__", reply_json.replace("\\", "\\\\").replace("'", "'\\''"))
+    (binpath / name).write_text(script)
+    (binpath / name).chmod(0o755)
+
+
+def _ext_dry_run(d, env, rid):
+    """Runs external_review.py --dry-run for `rid` and returns the written prompt's text."""
+    out = Path(_tmp.mkdtemp(prefix="ratchet-prompt-out-")) / "out.json"
+    r = subprocess.run([sys.executable, str(tp.EXT), "--reviewer", rid, "--cp", "CP1", "--out", str(out),
+                        "--dry-run"], cwd=d, capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    m = re.search(r"prompt written: (\S+) ", r.stdout)
+    assert m, r.stdout
+    return Path(m.group(1)).read_text()
+
+
+def d16_external_command_reviewer_is_the_fix_rounds_only_reviewer():
+    """A fake command-kind external provider (never the host) raises the finding in round 1, is the ONE reviewer
+    the fix round ties to (it's the only reviewer this checkpoint ever has, so there's no tie-break to land on),
+    its round-2 prompt is scoped (dry-run: only the fix diff and the one open finding, nothing else in the
+    checkpoint), and its real signed review passes adv-record at the scaled minimum, never the full configured
+    one (proven by pinning each review's age directly, so this never depends on how fast the sandbox happens to
+    run real subprocesses)."""
+    finding = _finding("A1")
+    b = _fake_reply_bin("ext4", json.dumps({"findings": [finding]}))
+    env = tp.env_with(b)
+    d = g.project("d16", extra_cp={"risk": "normal"},
+                  config=["review_depth=" + json.dumps({"normal": ["ext4-correctness"]}),
+                          "min_review_seconds=20", 'provider_share={"max":1000,"minutes":15}'])
+    r = g.rx(d, "providers", "--add", "ext4", "--command", json.dumps([str(b / "ext4")]), "--stdin",
+             "--company", "openai", "--model", "gpt-5", env=env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    g.approve_plan(d)
+    g.to_adversarial(d)
+    rnd1 = tp.open_round(d, env=env)
+    check("[CP6-D16] (fixture sanity) round 1 names exactly one reviewer: the external provider, not the host",
+          [rv["id"] for rv in rnd1["reviewers"]] == ["ext4-correctness"], rnd1["reviewers"])
+    row1 = next(rv for rv in rnd1["reviewers"] if rv["id"] == "ext4-correctness")
+    out1 = Path(row1["output"])
+    p1 = subprocess.run([sys.executable, str(tp.EXT), "--reviewer", "ext4-correctness", "--cp", "CP1",
+                        "--out", str(out1)], cwd=d, capture_output=True, text=True, env=env)
+    assert p1.returncode == 0, p1.stderr + p1.stdout
+    _set_review_age(d, str(out1), rnd1, 25)  # round 1 is unscoped: needs the full configured 20s, deterministically
+    r1 = g.rx(d, "adv-record", "CP1", "--reviews", str(out1), env=env)
+    check("[CP6-D16] round 1 blocks on the external provider's own finding",
+          r1.returncode == 2, r1.stdout + r1.stderr)
+    t = g.rx(d, "triage", "CP1", f'ext4-correctness/{finding["id"]}=fix:"real for the users"', env=env)
+    assert t.returncode == 0, t.stdout + t.stderr
+    _fix(d, 4, "d16")
+    rnd2 = tp.open_round(d, env=env)
+    check("[CP6-D16] round 2 is a fix round tied to the SAME external provider",
+          rnd2.get("fix_round") is True and rnd2["reviewers"][0]["id"] == "ext4-correctness", rnd2)
+    check("[CP6-D16] round 2 is scoped (lane H CP6)", rnd2.get("scope") is not None, rnd2.get("scope"))
+    prompt = _ext_dry_run(d, env, "ext4-correctness")
+    check("[CP6-D16] the scoped prompt carries the open finding's id",
+          f"id={finding['id']}" in prompt, prompt[-0:])
+    check("[CP6-D16] ...and its description", finding["description"] in prompt, prompt[-0:])
+    check("[CP6-D16] ...and the fix diff's own file (src/f.js)", "src/f.js" in prompt, prompt[-0:])
+    check("[CP6-D16] the whole-checkpoint diff is NOT given: the untouched base file (src/a.js) is absent",
+          "src/a.js" not in prompt, prompt[-0:])
+    _set_reply(b, "ext4", json.dumps({"findings": []}))
+    row2 = rnd2["reviewers"][0]
+    out2 = Path(row2["output"])
+    p2 = subprocess.run([sys.executable, str(tp.EXT), "--reviewer", "ext4-correctness", "--cp", "CP1",
+                        "--out", str(out2)], cwd=d, capture_output=True, text=True, env=env)
+    assert p2.returncode == 0, p2.stderr + p2.stdout
+    _set_review_age(d, str(out2), rnd2, 2)  # the SCALED minimum, not the configured 20s, must gate this round
+    r2 = g.rx(d, "adv-record", "CP1", "--reviews", str(out2), env=env)
+    check("[CP6-D16] the signed review passes adv-record at the scaled minimum (2s), well under the configured "
+          "20s", r2.returncode == 0, r2.stdout + r2.stderr)
+
+
+def d17_new_and_deleted_file_content_in_the_real_prompt():
+    """D09/D10 only check `scope.changed_files` (metadata). This drives a real command-kind reviewer's prompt
+    (external_review.py's collect_scoped_diff) for a fix round that both creates and deletes a file alongside
+    the actual fix, and checks the ACTUAL diff text a reviewer is handed: a new file's own content shows as an
+    addition, and a deleted file's own content shows as a removal -- not just that their paths are listed."""
+    finding = _finding("A1")
+    b = _fake_reply_bin("ext5", json.dumps({"findings": [finding]}))
+    env = tp.env_with(b)
+    d = g.project("d17", extra_cp={"risk": "normal"},
+                  config=["review_depth=" + json.dumps({"normal": ["ext5-correctness"]}),
+                          'provider_share={"max":1000,"minutes":15}'])
+    r = g.rx(d, "providers", "--add", "ext5", "--command", json.dumps([str(b / "ext5")]), "--stdin",
+             "--company", "openai", "--model", "gpt-5", env=env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    g.approve_plan(d)
+    g.to_adversarial(d)
+    (d / "src" / "doomed17.js").write_text("export const DOOMED17_MARKER = 1;\n")
+    r = g.rx(d, "behavior", "CP1", env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    rnd1 = tp.open_round(d, env=env)
+    row1 = next(rv for rv in rnd1["reviewers"] if rv["id"] == "ext5-correctness")
+    out1 = Path(row1["output"])
+    p1 = subprocess.run([sys.executable, str(tp.EXT), "--reviewer", "ext5-correctness", "--cp", "CP1",
+                        "--out", str(out1)], cwd=d, capture_output=True, text=True, env=env)
+    assert p1.returncode == 0, p1.stderr + p1.stdout
+    _set_review_age(d, str(out1), rnd1, 25)
+    r1 = g.rx(d, "adv-record", "CP1", "--reviews", str(out1), env=env)
+    assert r1.returncode == 2, r1.stdout + r1.stderr
+    t = g.rx(d, "triage", "CP1", f'ext5-correctness/{finding["id"]}=fix:"real for the users"', env=env)
+    assert t.returncode == 0, t.stdout + t.stderr
+    (d / "src" / "new17.js").write_text("export const NEW17_MARKER = 1;\n")
+    (d / "src" / "doomed17.js").unlink()
+    _fix(d, 4, "d17")
+    rnd2 = tp.open_round(d, env=env)
+    check("[CP6-D17] (fixture sanity) round 2 is a fix round tied to the external provider",
+          rnd2.get("fix_round") is True and rnd2["reviewers"][0]["id"] == "ext5-correctness", rnd2)
+    prompt = _ext_dry_run(d, env, "ext5-correctness")
+    check("[CP6-D17] the new file's own content shows as an addition in the real diff",
+          "+export const NEW17_MARKER" in prompt, prompt[-0:])
+    check("[CP6-D17] the deleted file's own content shows as a removal in the real diff",
+          "-export const DOOMED17_MARKER" in prompt, prompt[-0:])
+
+
+def d18_scope_survives_a_same_round_reviewer_fallback():
+    """When a fix round's tied reviewer goes unavailable mid-round and the same-round refill gives its slot to
+    the normal fallback (lane H CP5 behavior, see test_fix_round.py's CP5-F16), the round's CP6 scope must still
+    describe the SAME since_tree, changed files and findings for whichever reviewer actually ends up reviewing
+    -- never dropped, reset, or left tied to the reviewer that's gone."""
+    finding = _finding("A1")
+    b = _fake_reply_bin("ext6", json.dumps({"findings": [finding]}))
+    env = tp.env_with(b)
+    d = g.project("d18", extra_cp={"risk": "normal"},
+                  config=["review_depth=" + json.dumps({"normal": ["host-standards", "ext6-correctness"]})])
+    r = g.rx(d, "providers", "--add", "ext6", "--command", json.dumps([str(b / "ext6")]), "--stdin",
+             "--company", "openai", "--model", "gpt-5", env=env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    g.approve_plan(d)
+    g.to_adversarial(d)
+    rnd1 = tp.open_round(d, env=env)
+    ext_row = next(rv for rv in rnd1["reviewers"] if rv["id"] == "ext6-correctness")
+    p = subprocess.run([sys.executable, str(tp.EXT), "--reviewer", "ext6-correctness", "--cp", "CP1",
+                        "--out", ext_row["output"]], cwd=d, capture_output=True, text=True, env=env)
+    assert p.returncode == 0, p.stderr + p.stdout
+    host_path = g.write_review(d, rnd1, "host-standards", [])
+    _set_review_age(d, ext_row["output"], rnd1, 25)
+    _set_review_age(d, host_path, rnd1, 25)
+    r = g.rx(d, "adv-record", "CP1", "--reviews", ext_row["output"], host_path, env=env)
+    assert r.returncode == 2, r.stdout + r.stderr
+    t = g.rx(d, "triage", "CP1", f'ext6-correctness/{finding["id"]}=fix:"real for the users"', env=env)
+    assert t.returncode == 0, t.stdout + t.stderr
+    (d / "src/f.js").write_text("export const f = () => 1; // d18 fixed\n")
+    r = g.rx(d, "behavior", "CP1", env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    rnd2 = tp.open_round(d, env=env)
+    check("[CP6-D18] (fixture sanity) round 2 is a fix round tied to ext6-correctness, scoped",
+          rnd2.get("fix_round") is True and rnd2["reviewers"][0]["id"] == "ext6-correctness"
+          and rnd2.get("scope") is not None, rnd2)
+    scope_before = rnd2["scope"]
+    m = g.rx(d, "reviewer-status", "--mark", "ext6-correctness", "--reason", "auth expired mid-round", env=env)
+    assert m.returncode == 0, m.stdout + m.stderr
+    rnd2b = tp.open_round(d, env=env)
+    check("[CP6-D18] the SAME round is refilled with the normal fallback (host-alt-correctness), not replaced",
+          rnd2b["round"] == rnd2["round"] and rnd2b["reviewers"][0]["id"] == "host-alt-correctness"
+          and rnd2b.get("fix_round") is True, rnd2b)
+    check("[CP6-D18] the scope survives the fallback: same since_tree, changed files and findings",
+          rnd2b.get("scope") == scope_before, (rnd2b.get("scope"), scope_before))
+
+
+def d19_small_fix_timing_boundary():
+    """D12 only drives the fix_round path's diff-scaled minimum. This proves the SAME scaling applies to a small
+    fix after a clean approval (lane H CP3/CP6's other scoped-round kind): a 0-second review still fails (never
+    below the 1-second floor), and a 10-second review passes a configured min_review_seconds=20."""
+    cfg_min = 20
+    d = _start("d19a", config=[f"min_review_seconds={cfg_min}"])
+    rnd1 = _open(d)
+    paths = [g.write_review(d, rnd1, rv["id"], []) for rv in rnd1["reviewers"]]
+    for p in paths:
+        _set_review_age(d, p, rnd1, 25)
+    r = g.rx(d, "adv-record", "CP1", "--reviews", *paths)
+    assert r.returncode == 0, r.stdout + r.stderr
+    _append_lines(d / "src/f.js", 3, "d19a")
+    r = g.rx(d, "behavior", "CP1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    rnd2 = _open(d)
+    check("[CP6-D19] (fixture sanity) round 2 is a one-reviewer small-fix round, scoped",
+          rnd2.get("small_fix") is True and rnd2.get("scope") is not None, rnd2)
+    p0 = g.write_review(d, rnd2, rnd2["reviewers"][0]["id"], [])
+    _set_review_age(d, p0, rnd2, 0)
+    r0 = g.rx(d, "adv-record", "CP1", "--reviews", p0)
+    check("[CP6-D19] a small fix reviewed in 0 seconds still fails (never below the 1-second floor)",
+          r0.returncode != 0 and "too fast" in (r0.stdout + r0.stderr), r0.stdout + r0.stderr)
+    d2 = _start("d19b", config=[f"min_review_seconds={cfg_min}"])
+    rnd1b = _open(d2)
+    paths_b = [g.write_review(d2, rnd1b, rv["id"], []) for rv in rnd1b["reviewers"]]
+    for p in paths_b:
+        _set_review_age(d2, p, rnd1b, 25)
+    r = g.rx(d2, "adv-record", "CP1", "--reviews", *paths_b)
+    assert r.returncode == 0, r.stdout + r.stderr
+    _append_lines(d2 / "src/f.js", 3, "d19b")
+    r = g.rx(d2, "behavior", "CP1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    rnd2b = _open(d2)
+    p1 = g.write_review(d2, rnd2b, rnd2b["reviewers"][0]["id"], [])
+    _set_review_age(d2, p1, rnd2b, 10)
+    r1 = g.rx(d2, "adv-record", "CP1", "--reviews", p1)
+    check("[CP6-D19] the same tiny small fix reviewed in 10 seconds passes (min_review_seconds=20, scaled down)",
+          r1.returncode == 0, r1.stdout + r1.stderr)
+
+
 CASES = [("CP6-D01", d01_first_round_never_scoped), ("CP6-D02", d02_fix_round_scoped_to_the_blocked_round),
          ("CP6-D03", d03_rebuttal_reason_attached_to_the_finding),
          ("CP6-D04", d04_small_fix_after_approval_scoped_with_no_open_findings),
@@ -564,7 +809,11 @@ CASES = [("CP6-D01", d01_first_round_never_scoped), ("CP6-D02", d02_fix_round_sc
          ("CP6-D12", d12_timing_boundaries),
          ("CP6-D13", d13_files_reviewed_still_required),
          ("CP6-D14", d14_host_instructions_carry_the_same_scope),
-         ("CP6-D15", d15_signed_external_review_with_scoped_prompt_and_files_reviewed)]
+         ("CP6-D15", d15_signed_external_review_with_scoped_prompt_and_files_reviewed),
+         ("CP6-D16", d16_external_command_reviewer_is_the_fix_rounds_only_reviewer),
+         ("CP6-D17", d17_new_and_deleted_file_content_in_the_real_prompt),
+         ("CP6-D18", d18_scope_survives_a_same_round_reviewer_fallback),
+         ("CP6-D19", d19_small_fix_timing_boundary)]
 
 
 def main():

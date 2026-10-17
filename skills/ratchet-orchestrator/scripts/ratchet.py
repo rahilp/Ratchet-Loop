@@ -9336,7 +9336,10 @@ def review_rules(ctx, cfg, cp, g, rnd, fp_id, cps=None) -> tuple[set | None, lis
     that only wants the pre-CP6 fields (focus, rules) and is not itself a fix_round/small_fix round, since
     `_scope_for_round` needs it to find `base_tree`."""
     scope = _scope_for_round(ctx, cp["id"], rnd, cps or {}, fp_id) if cps is not None else None
-    focus = _changed_since_last_round(ctx, cfg, g, fp_id) if rnd["round"] > 1 and scope is None else None
+    # `focus_files` is kept as compatibility metadata on every round > 1, scoped or not (older callers, and
+    # `status`/the viewer, read it regardless of scope) -- but the "look hardest" RULE TEXT below is given only
+    # on an unscoped round; a scoped round gets the CP6 scope text instead, never both.
+    focus = _changed_since_last_round(ctx, cfg, g, fp_id) if rnd["round"] > 1 else None
     bar = (cfg.get("blocking_severities") or {}).get(cp.get("risk", "normal"), "all")
     rules = []
     if bar != "all":
@@ -9347,7 +9350,7 @@ def review_rules(ctx, cfg, cp, g, rnd, fp_id, cps=None) -> tuple[set | None, lis
         rules.append("These kinds of mistake are already caught by automatic checks that run with the tests: "
                      + ", ".join(kinds) + ". Still report a blocker or major problem of these kinds (it still blocks); "
                      "minor ones of these kinds are noted, not fixed.")
-    if focus is not None:
+    if scope is None and focus is not None:
         rules.append("Round " + str(rnd["round"]) + ": look hardest at the code changed since the last round ("
                      + (", ".join(sorted(focus)[:20]) or "nothing changed") + "). Re-raise any earlier finding that "
                      "still isn't fixed, wherever it is. Beyond that, a new minor problem outside those files is "

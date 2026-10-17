@@ -11,7 +11,9 @@ Covers four independent rules:
   - docs describe both rules (CP6-T12);
   - the prompt hook tells a sub-agent hand-back (wrapped `<agent-message from="...">...</agent-message>`) apart
     from the user's own message, keeping the old on-screen-rendering marker working too (CP6-T13..T15);
-  - a too-large review diff puts files changed since the previous round first and names what was cut (CP6-T16..T18).
+  - a too-large review diff puts files changed since the previous round first and names what was cut (CP6-T16..T18);
+    a lane H CP6 scoped small-fix round, by contrast, excludes an unrelated untouched file outright rather than
+    merely deprioritizing it (CP6-T19).
 
 Reuses tests/test_gates.py's project()/approve_plan()/write_tests()/to_adversarial()/open_round()/R0()/
 write_review()/say()/guard() helpers, tests/test_providers.py's fake_bin()/env_with()/ids() ("other provider" CLI
@@ -506,10 +508,15 @@ def _prompt_dry_run(d, env, rid):
     return Path(m.group(1)).read_text()
 
 
-def truncation_project(name):
+def truncation_project(name, small_edit=False):
     """A low-risk project with one command reviewer (fake 'codex'), a huge filler file written right after the
-    plan is approved (so it is part of round 1's diff already), round 1 approved with no findings, then a small
-    tweak to src/f.js to open round 2 at a new fingerprint. Returns (d, env, rnd1, rnd2)."""
+    plan is approved (so it is part of round 1's diff already), round 1 approved with no findings, then a tweak
+    to src/f.js to open round 2 at a new fingerprint. Returns (d, env, rnd1, rnd2). With `small_edit` False
+    (the default, for T16/T17: a decisive UNSCOPED full round), the tweak is well over `small_edit_lines`
+    (default 20) so round 2 stays a normal full round -- not a lane H CP6 scoped small fix -- and keeps the
+    pre-CP6 whole-checkpoint-diff truncation/prioritization this project exists to test. With `small_edit` True,
+    the tweak is one line, so round 2 IS a CP6 scoped small fix, for the test that checks scoping excludes the
+    filler entirely rather than merely deprioritizing it."""
     b = tp.fake_bin("codex")
     env = tp.env_with(b)
     d = g.project(name, extra_cp={"risk": "low"})
@@ -529,7 +536,11 @@ def truncation_project(name):
     assert rp.returncode == 0, rp.stdout + rp.stderr
     r0 = g.rx(d, "adv-record", "CP1", "--reviews", str(out1), env=env)
     assert r0.returncode == 0, r0.stdout + r0.stderr
-    (Path(d) / "src/f.js").write_text(f"export const f = () => 1; // {ROUND2_MARKER}\n")
+    if small_edit:
+        (Path(d) / "src/f.js").write_text(f"export const f = () => 1; // {ROUND2_MARKER}\n")
+    else:
+        pad = "".join(f"export const pad_{i} = {i}; // filler padding line {i}\n" for i in range(24))
+        (Path(d) / "src/f.js").write_text(pad + f"export const f = () => 1; // {ROUND2_MARKER}\n")
     rnd2 = tp.open_round(d, env)
     return d, env, rnd1, rnd2
 
@@ -539,6 +550,9 @@ def t16_prioritizes_files_changed_since_previous_round():
     d, env, rnd1, rnd2 = truncation_project("cp6-16")
     check("[CP6-T16] setup: round 2 is open at a new fingerprint",
           rnd2["round"] == rnd1["round"] + 1 and rnd2["fingerprint"] != rnd1["fingerprint"], (rnd1, rnd2))
+    check("[CP6-T16] setup: round 2 is a normal full round, not a lane H CP6 scoped small fix -- this project "
+          "tests the pre-CP6 whole-checkpoint truncation/prioritization, which only an unscoped round still uses",
+          rnd2.get("small_fix") is not True and rnd2.get("scope") is None, rnd2)
     prompt = _prompt_dry_run(d, env, tp.ids(rnd2)[0])
     i_round2 = prompt.find(ROUND2_MARKER)
     i_filler = prompt.find(FILLER_MARKER)
@@ -576,6 +590,20 @@ def t18_round1_keeps_plain_order():
           re.search(r"previous round|changed since round", prompt, re.I) is None, prompt[-0:])
 
 
+def t19_scoped_small_fix_excludes_the_filler_entirely():
+    print("CP6-T19: a scoped small-fix round (lane H CP6) omits the unrelated filler file outright, not just "
+          "deprioritized behind it")
+    d, env, rnd1, rnd2 = truncation_project("cp6-19", small_edit=True)
+    check("[CP6-T19] setup: this tiny fix opens round 2 as a CP6 scoped small fix",
+          rnd2.get("small_fix") is True and rnd2.get("scope") is not None, rnd2)
+    prompt = _prompt_dry_run(d, env, tp.ids(rnd2)[0])
+    check("[CP6-T19] the file actually fixed (src/f.js) is in the scoped prompt",
+          ROUND2_MARKER in prompt, prompt[-0:])
+    check("[CP6-T19] the untouched filler file is excluded entirely -- not merely moved after it, truncated, or "
+          "named as cut, since it was never in this round's scope to begin with",
+          FILLER_MARKER not in prompt and "src/aaa-filler.js" not in prompt, prompt[-0:])
+
+
 TESTS = [
     ("CP6-T01", t01_flaky_behavior_passes_without_attempt),
     ("CP6-T02", t02_second_flaky_failure_not_forgiven),
@@ -595,6 +623,7 @@ TESTS = [
     ("CP6-T16", t16_prioritizes_files_changed_since_previous_round),
     ("CP6-T17", t17_names_which_files_were_cut),
     ("CP6-T18", t18_round1_keeps_plain_order),
+    ("CP6-T19", t19_scoped_small_fix_excludes_the_filler_entirely),
     ("CP6-X01", lambda: x01_cutoff_then_genuine_failure_marks_unavailable()),
     ("CP6-X02", lambda: x02_unicode_filename_not_dropped_from_diff()),
     ("CP6-X03", lambda: x03_flaky_log_not_overwritten_and_mark_sticky()),
