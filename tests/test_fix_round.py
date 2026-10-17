@@ -60,11 +60,25 @@ no other-provider CLI configured (providers=[]), so only the host's own reviewer
 which registers one real command-kind provider (tests/test_providers.py's `fake_bin`/`env_with`) to exercise the
 different-company preference.
 
+CP5-T01 through CP5-T29 (below CP5-F16) are the approved plan's own requirement ids for this file. Most are
+proved by one of CP5-F01..F16 above (see this change's own coverage table for exactly which); the ones below
+are new black-box cases added only where an existing CP5-F case gave no direct evidence: an outside-only
+blocker (T03), accept-finding never ties a fix round (T08), a low-risk checkpoint's own reviewer survives the
+mechanism (T09), fix rounds counting toward and still blocked by the step and run-wide round budgets, and an
+approved raise granting exactly one more (T11-T14), a repeat block through fix rounds still checking in (T15),
+a fix round's approval still running `complete`'s tests and regression command (T17), the docs explaining the
+rule (T23), two different-company outside reviewers tie-broken by slot (T25), a reviewer id absent from the
+blocked round never chosen (T27), a high-risk outside blocker re-checked outside the host (T28), and a
+rebutted reviewer excluded from the pick pool even at a lower slot (T29). Each CP5-T case needing a fake
+external provider gets its own fresh RATCHET_HOME (`_fresh_home`), never test_gates.py's single shared one, so
+`provider_share`'s cross-test bookkeeping can never affect which reviewer a fix round picks.
+
 Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {"cases": [{"id": "CP5-F01",
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
 
+import contextlib
 import difflib
 import json
 import os
@@ -84,7 +98,7 @@ import test_providers as tp   # noqa: E402  (fake_bin, env_with, open_round for 
 PASS = FAIL = 0
 CASE_STATUS: dict[str, bool] = {}
 CASE_MESSAGES: dict[str, list] = {}
-ID_RE = re.compile(r"\[(CP5-F\d+)\]")
+ID_RE = re.compile(r"\[(CP5-[FT]\d+)\]")
 
 
 def check(name, cond, detail=""):
@@ -371,6 +385,48 @@ def _fake_reply_bin(name, reply_json):
     (b / name).write_text(script)
     (b / name).chmod(0o755)
     return b
+
+
+def _fake_reply_bin_multi(pairs):
+    """Like `_fake_reply_bin`, but for several differently-named fake reviewer CLIs sharing one PATH, each
+    answering its own fixed reply -- for a case (CP5-T25) where two outside providers both have to run in the
+    same round."""
+    b = Path(_tmp.mkdtemp(prefix="ratchet-fix-fakebin-multi-"))
+    for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+        p = shutil.which(n)
+        if p:
+            (b / n).symlink_to(p)
+    for name, reply_json in pairs:
+        script = _FAKE_REPLY_TEMPLATE.replace("__REPLY__", reply_json.replace("\\", "\\\\").replace("'", "'\\''"))
+        (b / name).write_text(script)
+        (b / name).chmod(0o755)
+    return b
+
+
+@contextlib.contextmanager
+def _fresh_home():
+    """Temporarily points test_gates.py's shared RATCHET_HOME at a brand-new, empty folder for the whole scope
+    of one CP5-T fake-external-provider case (project creation included -- a project's installed hooks bake in
+    whichever RATCHET_HOME was active when `init` ran, so switching it only for LATER calls leaves the hooks
+    pointed at the old one and every later command refused as a folder mismatch). Restores the previous value
+    on exit, so no later case in this file is affected by this one's provider_share bookkeeping (3 starts per
+    provider id per 15 minutes, shared by every lane under one RATCHET_HOME)."""
+    old = g.ENV.get("RATCHET_HOME")
+    home = Path(_tmp.mkdtemp(prefix="ratchet-fixround-freshhome-"))
+    g.ENV["RATCHET_HOME"] = str(home)
+    try:
+        yield home
+    finally:
+        if old is None:
+            g.ENV.pop("RATCHET_HOME", None)
+        else:
+            g.ENV["RATCHET_HOME"] = old
+
+
+def _fresh_env(binpath):
+    """The env for a provider-related call inside a `with _fresh_home():` block: the now-active fresh
+    RATCHET_HOME (read live from g.ENV), plus `binpath` on PATH for the fake reviewer CLI(s)."""
+    return dict(g.ENV, PATH=str(binpath))
 
 
 def f10_prefers_a_different_company_than_the_host_over_a_lower_slot():
@@ -679,6 +735,416 @@ def f16_fix_round_evidence_names_the_replacement_reviewer():
           expect in msg and "ext2-correctness" not in msg, msg)
 
 
+# ------------------------------------------------------------------------------------------------ CP5-T cases:
+# black-box CLI tests under the approved plan's own CP5-T01..T29 ids, for the requirements CP5-F01..F16 above
+# (lane H CP5's engineering test suite, written first) don't already give direct evidence for. See the
+# coverage table in the PR/report that accompanies this change for exactly which existing CP5-F case (or which
+# of these) proves each of CP5-T01..T29; nothing here duplicates an existing CP5-F case's own scenario.
+
+def t03_outside_blocker_fix_round_ties_to_the_same_provider_and_lens_without_the_host():
+    # [CP5-T03] When only the OUTSIDE (non-host) reviewer's own lens blocks -- the host's own review of this
+    # round is clean -- the fix round must tie to that SAME outside provider and lens, never substituting the
+    # host: the host is never asked to review again.
+    with _fresh_home():
+        finding = _finding("A1")
+        b = _fake_reply_bin("ext10", json.dumps({"findings": [finding]}))
+        env = _fresh_env(b)
+        d = g.project("t03", extra_cp={"risk": "normal"},
+                      config=["review_depth=" + json.dumps({"normal": ["host-standards", "ext10-correctness"]})])
+        r = g.rx(d, "providers", "--add", "ext10", "--command", json.dumps([str(b / "ext10")]), "--stdin",
+                 "--company", "openai", "--model", "gpt-5", env=env)
+        assert r.returncode == 0, r.stderr + r.stdout
+        g.approve_plan(d)
+        g.to_adversarial(d)
+        rnd1 = tp.open_round(d, env=env)
+        check("[CP5-T03] (fixture sanity) round 1 names the host (standards) and the outside provider "
+              "(correctness)",
+              sorted(rv["id"] for rv in rnd1["reviewers"]) == ["ext10-correctness", "host-standards"],
+              rnd1["reviewers"])
+        ext_row = next(rv for rv in rnd1["reviewers"] if rv["id"] == "ext10-correctness")
+        p = subprocess.run([sys.executable, str(tp.EXT), "--reviewer", "ext10-correctness", "--cp", "CP1",
+                            "--out", ext_row["output"]], cwd=d, capture_output=True, text=True, env=env)
+        assert p.returncode == 0, p.stderr + p.stdout
+        host_path = g.write_review(d, rnd1, "host-standards", [])  # the host's own review of this round is clean
+        r = g.rx(d, "adv-record", "CP1", "--reviews", ext_row["output"], host_path, env=env)
+        assert r.returncode == 2, r.stdout + r.stderr
+        t = g.rx(d, "triage", "CP1", f'ext10-correctness/{finding["id"]}=fix:"real for the users"', env=env)
+        assert t.returncode == 0, t.stdout + t.stderr
+        (d / "src/f.js").write_text("export const f = () => 1; // t03 fixed\n")
+        r = g.rx(d, "behavior", "CP1", env=env)
+        assert r.returncode == 0, r.stdout + r.stderr
+        rnd2 = tp.open_round(d, env=env)
+        check("[CP5-T03] round 2 is a fix round naming exactly one reviewer",
+              rnd2.get("fix_round") is True and len(rnd2["reviewers"]) == 1, rnd2)
+        check("[CP5-T03] ...and it is the SAME outside provider and lens (ext10-correctness), never "
+              "host-standards", rnd2["reviewers"][0]["id"] == "ext10-correctness", rnd2["reviewers"])
+
+
+def t08_accepting_a_finding_never_creates_a_fix_round():
+    # [CP5-T08] A finding resolved through accept-finding (CP3), not fixed, never ties a fix round to it: the
+    # gate passes directly on acceptance (no round at all), and a LATER code change opens the step's normal
+    # round, never a fix round tied to the accepted finding.
+    d = _start("t08")
+    rnd1 = _open(d)
+    rid = _pick(rnd1, "standards")
+    finding = _finding("M1")
+    paths = [g.write_review(d, rnd1, rv["id"], [finding] if rv["id"] == rid else [])
+             for rv in rnd1["reviewers"]]
+    r = g.rx(d, "adv-record", "CP1", "--reviews", *paths)
+    assert r.returncode == 2, r.stdout + r.stderr
+    key = f"{rid}/{finding['id']}"
+    g.rx(d, "ask", "accept-finding", "CP1", key)
+    g.say(d, "accept: not reachable by a real user of this project")
+    r = g.rx(d, "accept-finding", "CP1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    gate = _state(d)["checkpoints"]["CP1"]["gates"]["adversarial"]
+    check("[CP5-T08] (fixture sanity) the gate passed directly on acceptance, with no new round opened",
+          gate.get("status") == "passed", gate)
+    check("[CP5-T08] no fix round was ever recorded for this acceptance",
+          not any(rr.get("fix_round") for rr in gate.get("rounds") or []), gate.get("rounds"))
+    _fix(d, 5, "t08b")
+    rnd2 = _open(d)
+    _not_fix_round("CP5-T08", rnd2, "a later code change after an accepted finding")
+    check("[CP5-T08] the later round is the step's normal full set, not tied to the accepted finding's reviewer",
+          sorted(rv["id"] for rv in rnd2["reviewers"]) == sorted(rv["id"] for rv in rnd1["reviewers"]),
+          rnd2["reviewers"])
+
+
+def t09_low_risk_settings_do_not_override_fix_round_selection():
+    # [CP5-T09] At low risk, round 1 already names exactly one (both-lens) reviewer via review_depth["low"].
+    # After it blocks and is fixed, the fix round must still tie to that SAME reviewer -- never re-resolved
+    # through some other low-risk default -- proving the low-risk reviewer setting never overrides the
+    # fix-round mechanism's own reviewer-selection rule.
+    d = _start("t09", risk="low")
+    rnd1 = _open(d)
+    check("[CP5-T09] (fixture sanity) a low-risk first round names exactly one (both-lens) reviewer",
+          len(rnd1["reviewers"]) == 1, rnd1["reviewers"])
+    rid = rnd1["reviewers"][0]["id"]
+    keys = _block(d, rnd1, {rid: [_finding("L1")]})
+    _fix(d, 3, "t09")
+    rnd2 = _open(d)
+    _is_fix_round("CP5-T09", d, rnd2, rid, keys,
+                  "low risk: the fix round ties to round 1's own (low-risk) reviewer")
+
+
+def t11_fix_rounds_count_toward_step_and_run_budgets():
+    # [CP5-T11] A fix round costs exactly like any other round: opening one still increments the step's own
+    # attempts and the run-wide adv_rounds_total -- the new mechanism is never exempted from the existing
+    # budgets.
+    d = _start("t11", config=["checkin_round=99"])
+    rnd1 = _open(d)
+    st0 = _state(d)
+    gate0 = st0["checkpoints"]["CP1"]["gates"]["adversarial"]
+    check("[CP5-T11] (fixture sanity) round 1 already counted (attempts=1, run total=1)",
+          gate0.get("attempts") == 1 and st0.get("adv_rounds_total") == 1,
+          (gate0.get("attempts"), st0.get("adv_rounds_total")))
+    rid = _pick(rnd1, "standards")
+    _block(d, rnd1, {rid: [_finding("M1")]})
+    _fix(d, 3, "t11")
+    rnd2 = _open(d)
+    check("[CP5-T11] (fixture sanity) round 2 is a fix round", rnd2.get("fix_round") is True, rnd2)
+    st2 = _state(d)
+    gate2 = st2["checkpoints"]["CP1"]["gates"]["adversarial"]
+    check("[CP5-T11] opening the fix round still increments the step's own attempts (2)",
+          gate2.get("attempts") == 2, gate2.get("attempts"))
+    check("[CP5-T11] ...and the run-wide total too (2)", st2.get("adv_rounds_total") == 2,
+          st2.get("adv_rounds_total"))
+    _block(d, rnd2, {rid: [_finding("M1")]})
+    _fix(d, 4, "t11b")
+    rnd3 = _open(d)
+    check("[CP5-T11] (fixture sanity) round 3 is a fix round too", rnd3.get("fix_round") is True, rnd3)
+    st3 = _state(d)
+    gate3 = st3["checkpoints"]["CP1"]["gates"]["adversarial"]
+    check("[CP5-T11] a second fix round in a row increments both counters again (3, 3)",
+          gate3.get("attempts") == 3 and st3.get("adv_rounds_total") == 3,
+          (gate3.get("attempts"), st3.get("adv_rounds_total")))
+
+
+def t12_the_step_round_limit_still_blocks_through_fix_rounds():
+    # [CP5-T12] Reaching the step's own max_adversarial_rounds purely through repeated fix rounds still blocks
+    # the run, exactly as it would through ordinary rounds.
+    d = _start("t12", config=["max_adversarial_rounds=2", "checkin_round=99"])
+    rnd1 = _open(d)
+    rid = _pick(rnd1, "standards")
+    _block(d, rnd1, {rid: [_finding("M1")]})
+    _fix(d, 3, "t12")
+    rnd2 = _open(d)
+    check("[CP5-T12] (fixture sanity) round 2 is a fix round, attempts now at the step's own cap (2)",
+          rnd2.get("fix_round") is True
+          and _state(d)["checkpoints"]["CP1"]["gates"]["adversarial"].get("attempts") == 2, rnd2)
+    paths = [g.write_review(d, rnd2, rv["id"], [_finding("M1")]) for rv in rnd2["reviewers"]]
+    r = g.rx(d, "adv-record", "CP1", "--reviews", *paths)
+    check("[CP5-T12] blocking again at the cap is still refused as NOT approved",
+          r.returncode == 2, r.stdout + r.stderr)
+    st = _state(d)
+    check("[CP5-T12] the run is now blocked on the step's own round limit, reached purely through fix rounds",
+          st.get("phase") == "blocked" and "human/director decision" in (st.get("blocked_reason") or ""),
+          st.get("blocked_reason"))
+
+
+def t13_the_run_wide_round_limit_still_blocks_through_fix_rounds():
+    # [CP5-T13] Reaching the run-wide max_adversarial_rounds_run purely through repeated fix rounds still
+    # blocks the run, exactly as it would through ordinary rounds.
+    d = _start("t13", config=["max_adversarial_rounds=99", "max_adversarial_rounds_run=2", "checkin_round=99"])
+    rnd1 = _open(d)
+    rid = _pick(rnd1, "standards")
+    _block(d, rnd1, {rid: [_finding("M1")]})
+    _fix(d, 3, "t13")
+    rnd2 = _open(d)
+    check("[CP5-T13] (fixture sanity) round 2 is a fix round, the run-wide total now at its cap (2)",
+          rnd2.get("fix_round") is True and _state(d).get("adv_rounds_total") == 2, rnd2)
+    paths = [g.write_review(d, rnd2, rv["id"], [_finding("M1")]) for rv in rnd2["reviewers"]]
+    r = g.rx(d, "adv-record", "CP1", "--reviews", *paths)
+    assert r.returncode == 2, r.stdout + r.stderr
+    t = g.rx(d, "triage", "CP1", f'{rid}/M1=fix:"real for the users"')
+    assert t.returncode == 0, t.stdout + t.stderr
+    _fix(d, 4, "t13b")
+    r2 = g.rx(d, "reviewers", "CP1", "--json")
+    check("[CP5-T13] no further round opens: the run-wide cap, reached through fix rounds, still blocks",
+          r2.returncode != 0, r2.stdout + r2.stderr)
+    st = _state(d)
+    check("[CP5-T13] the run is blocked specifically on the run-wide cap",
+          st.get("phase") == "blocked" and "Run-wide adversarial round cap" in (st.get("blocked_reason") or ""),
+          st.get("blocked_reason"))
+
+
+def t14_an_approved_raise_grants_exactly_one_further_fix_round():
+    # [CP5-T14] After the step's round limit blocks through fix rounds, an approved raise-limit grants exactly
+    # one further round, and that round is still a one-reviewer fix round, never the full set.
+    d = _start("t14", config=["max_adversarial_rounds=2", "checkin_round=99"])
+    rnd1 = _open(d)
+    rid = _pick(rnd1, "standards")
+    _block(d, rnd1, {rid: [_finding("M1")]})
+    _fix(d, 3, "t14")
+    rnd2 = _open(d)
+    check("[CP5-T14] (fixture sanity) round 2 is a fix round at the step's own cap (2)",
+          rnd2.get("fix_round") is True
+          and _state(d)["checkpoints"]["CP1"]["gates"]["adversarial"].get("attempts") == 2, rnd2)
+    paths = [g.write_review(d, rnd2, rv["id"], [_finding("M1")]) for rv in rnd2["reviewers"]]
+    r = g.rx(d, "adv-record", "CP1", "--reviews", *paths)
+    assert r.returncode == 2, r.stdout + r.stderr
+    check("[CP5-T14] (fixture sanity) the run is now blocked on the step's own round limit",
+          _state(d).get("phase") == "blocked", _state(d).get("blocked_reason"))
+    t = g.rx(d, "triage", "CP1", f'{rid}/M1=fix:"real for the users"')
+    assert t.returncode == 0, t.stdout + t.stderr
+    g.rx(d, "ask", "raise-limit", "CP1")
+    g.say(d, "raise: one more look is worth it here")
+    rr = g.rx(d, "raise-limit", "CP1")
+    check("[CP5-T14] raise-limit succeeds", rr.returncode == 0, rr.stdout + rr.stderr)
+    _fix(d, 4, "t14b")  # the run is unblocked now (raise-limit above), so behavior can run again
+    rnd3 = _open(d)
+    check("[CP5-T14] exactly one further round opens, and it is STILL a one-reviewer fix round, not the full set",
+          rnd3.get("fix_round") is True and len(rnd3["reviewers"]) == 1 and rnd3["reviewers"][0]["id"] == rid,
+          rnd3)
+    paths3 = [g.write_review(d, rnd3, rv["id"], [_finding("M1")]) for rv in rnd3["reviewers"]]
+    r3 = g.rx(d, "adv-record", "CP1", "--reviews", *paths3)
+    check("[CP5-T14] blocking that one extra round again hits the raised cap, refused again",
+          r3.returncode == 2, r3.stdout + r3.stderr)
+    check("[CP5-T14] the raise was truly one-time: the run blocks again, never granting a second extra round",
+          _state(d).get("phase") == "blocked", _state(d).get("blocked_reason"))
+
+
+def t15_a_repeat_block_through_fix_rounds_still_triggers_the_usual_check_in():
+    # [CP5-T15] The usual check-in (reviews dragging) still opens after the configured number of consecutive
+    # blocking rounds, even when those rounds are fix rounds rather than the old narrowed mechanism.
+    d = _start("t15")  # default checkin_round=2, not suppressed here
+    rnd1 = _open(d)
+    rid = _pick(rnd1, "standards")
+    _block(d, rnd1, {rid: [_finding("M1")]})  # round 1: first consecutive blocking round
+    _fix(d, 3, "t15")
+    rnd2 = _open(d)
+    check("[CP5-T15] (fixture sanity) round 2 is a fix round", rnd2.get("fix_round") is True, rnd2)
+    paths = [g.write_review(d, rnd2, rv["id"], [_finding("M1")]) for rv in rnd2["reviewers"]]
+    r = g.rx(d, "adv-record", "CP1", "--reviews", *paths)  # round 2: second consecutive blocking round
+    check("[CP5-T15] the second consecutive blocked fix round opens a check-in",
+          r.returncode == 2 and "check-in opened" in (r.stdout + r.stderr), r.stdout + r.stderr)
+    t = g.rx(d, "triage", "CP1", f'{rid}/M1=fix:"real for the users"')
+    assert t.returncode == 0, t.stdout + t.stderr
+    _fix(d, 4, "t15b")
+    r2 = g.rx(d, "reviewers", "CP1", "--json")
+    check("[CP5-T15] no further round opens while the check-in is still open",
+          r2.returncode != 0 and "check-in is open" in (r2.stdout + r2.stderr), r2.stdout + r2.stderr)
+    r3 = g.rx(d, "check-in", "CP1", "--decision", "simplify", "--why", "keep the fix minimal and move on")
+    check("[CP5-T15] the check-in can be resolved normally", r3.returncode == 0, r3.stdout + r3.stderr)
+    rnd3 = _open(d)
+    check("[CP5-T15] once resolved, the next round opens again -- still a fix round",
+          rnd3.get("fix_round") is True, rnd3)
+
+
+def t17_fix_round_approval_passes_the_gate_and_complete_still_runs_tests_and_the_full_suite():
+    # [CP5-T17] A fix round's clean approval passes the gate (as every other approval does), and `complete`
+    # afterward still runs the configured regression command -- it is never skipped just because the approval
+    # came from a fix round.
+    d = _start("t17", config=["checkin_round=99", "regression_command=node --test tests/cp1.test.js"])
+    rnd1 = _open(d)
+    rid = _pick(rnd1, "standards")
+    _block(d, rnd1, {rid: [_finding("M1")]})
+    _fix(d, 3, "t17")
+    rnd2 = _open(d)
+    check("[CP5-T17] (fixture sanity) round 2 is a fix round", rnd2.get("fix_round") is True, rnd2)
+    path = g.write_review(d, rnd2, rid, [])
+    r = g.rx(d, "adv-record", "CP1", "--reviews", path)
+    check("[CP5-T17] the fix round's clean review passes the gate",
+          r.returncode == 0 and "all 1 reviewer(s)" in r.stdout, r.stdout + r.stderr)
+    gate = _state(d)["checkpoints"]["CP1"]["gates"]["adversarial"]
+    check("[CP5-T17] the adversarial gate is now passed", gate.get("status") == "passed", gate)
+    rc = g.rx(d, "complete", "CP1")
+    check("[CP5-T17] complete succeeds", rc.returncode == 0, rc.stdout + rc.stderr)
+    log = d / ".ratchet/runs/f/evidence/CP1/regression.log"
+    check("[CP5-T17] the full regression suite actually ran at complete (its log was written)",
+          log.exists() and log.stat().st_size > 0, log)
+
+
+def t23_docs_explain_the_fix_round_rule():
+    # [CP5-T23] README, the orchestrator skill and schemas.md all explain the fix-round rule.
+    root = HERE.parent
+    readme = (root / "README.md").read_text()
+    skill = (root / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text()
+    schemas = (root / "skills" / "ratchet-orchestrator" / "references" / "schemas.md").read_text()
+    check("[CP5-T23] README explains the fix-round rule (one reviewer, however many times it blocks)",
+          re.search(r"fix round.{0,80}one reviewer", readme, re.I | re.S) is not None, readme[:0])
+    check("[CP5-T23] the orchestrator skill tells the agent what a fix round is and to launch only that reviewer",
+          re.search(r"fix round", skill, re.I) is not None and "exactly one reviewer" in skill, skill[:0])
+    check("[CP5-T23] schemas.md documents fix_round/fix_for in state.json / --json",
+          "fix_round" in schemas and "fix_for" in schemas, schemas[:0])
+
+
+def t25_two_outside_reviewers_block_the_earlier_one_in_the_round_wins():
+    # [CP5-T25] When the findings being fixed came from TWO outside (non-host) reviewers of different
+    # companies -- neither preferred over the other by the different-company rule, since both already differ
+    # from the host -- the tie breaks by the lowest slot number in the blocked round, the same rule CP5-F07
+    # proves for two host reviewers.
+    with _fresh_home():
+        f_a, f_b = _finding("A1"), _finding("B1")
+        b = _fake_reply_bin_multi([("ext11", json.dumps({"findings": [f_a]})),
+                                   ("ext12", json.dumps({"findings": [f_b]}))])
+        env = _fresh_env(b)
+        d = g.project("t25", extra_cp={"risk": "normal"},
+                      config=["review_depth=" + json.dumps({"normal": ["ext11-standards", "ext12-correctness"]})])
+        r = g.rx(d, "providers", "--add", "ext11", "--command", json.dumps([str(b / "ext11")]), "--stdin",
+                 "--company", "openai", "--model", "gpt-5", env=env)
+        assert r.returncode == 0, r.stderr + r.stdout
+        r = g.rx(d, "providers", "--add", "ext12", "--command", json.dumps([str(b / "ext12")]), "--stdin",
+                 "--company", "google", "--model", "gemini-3", env=env)
+        assert r.returncode == 0, r.stderr + r.stdout
+        g.approve_plan(d)
+        g.to_adversarial(d)
+        rnd1 = tp.open_round(d, env=env)
+        check("[CP5-T25] (fixture sanity) round 1 names ext11 (slot 1) and ext12 (slot 2)",
+              next(rv["slot"] for rv in rnd1["reviewers"] if rv["id"] == "ext11-standards") == 1
+              and next(rv["slot"] for rv in rnd1["reviewers"] if rv["id"] == "ext12-correctness") == 2,
+              rnd1["reviewers"])
+        paths = []
+        for rv in rnd1["reviewers"]:
+            out = Path(rv["output"])
+            p = subprocess.run([sys.executable, str(tp.EXT), "--reviewer", rv["id"], "--cp", "CP1", "--out",
+                               str(out)], cwd=d, capture_output=True, text=True, env=env)
+            assert p.returncode == 0, p.stderr + p.stdout
+            paths.append(str(out))
+        r = g.rx(d, "adv-record", "CP1", "--reviews", *paths, env=env)
+        assert r.returncode == 2, r.stdout + r.stderr
+        keys = sorted([f"ext11-standards/{f_a['id']}", f"ext12-correctness/{f_b['id']}"])
+        for k in keys:
+            t = g.rx(d, "triage", "CP1", f'{k}=fix:"real for the users"', env=env)
+            assert t.returncode == 0, t.stdout + t.stderr
+        (d / "src/f.js").write_text("export const f = () => 1; // t25 fixed\n")
+        r = g.rx(d, "behavior", "CP1", env=env)
+        assert r.returncode == 0, r.stdout + r.stderr
+        rnd2 = tp.open_round(d, env=env)
+        check("[CP5-T25] round 2 is a fix round naming exactly one reviewer",
+              rnd2.get("fix_round") is True and len(rnd2["reviewers"]) == 1, rnd2)
+        check("[CP5-T25] ...and it is ext11-standards (slot 1, the earlier reviewer in the blocked round), not "
+              "ext12-correctness (slot 2)", rnd2["reviewers"][0]["id"] == "ext11-standards", rnd2["reviewers"])
+
+
+def t27_never_choose_a_reviewer_absent_from_the_blocked_round():
+    # [CP5-T27] A finding naming a reviewer id the blocked round itself never listed (corrupted/bad data) is
+    # never a fix-round candidate: the round falls back to the existing rules instead (here: the full set,
+    # since the bogus id can't even be placed in a lens to narrow by), and fix_round_skipped says why.
+    d = _start("t27", config=["checkin_round=99"])
+    rnd1 = _open(d)
+    rid = _pick(rnd1, "standards")
+    _block(d, rnd1, {rid: [_finding("M1")]})
+    of_path = d / f".ratchet/runs/f/evidence/CP1/adversarial/round-{rnd1['round']:02d}/open-findings.json"
+    findings = json.loads(of_path.read_text())
+    assert findings and findings[0]["reviewer"] == rid, findings
+    findings[0]["reviewer"] = "ghost-correctness"  # a reviewer id this round never listed
+    of_path.write_text(json.dumps(findings))
+    t = g.rx(d, "triage", "CP1", 'ghost-correctness/M1=fix:"real for the users"')
+    assert t.returncode == 0, t.stdout + t.stderr
+    _fix(d, 3, "t27")
+    rnd2 = _open(d)
+    check("[CP5-T27] the round never ties to the bogus reviewer id: not a fix round",
+          rnd2.get("fix_round") is False, rnd2)
+    check("[CP5-T27] fix_round_skipped names why (the reviewer isn't in the blocked round's own list)",
+          bool(rnd2.get("fix_round_skipped")) and "ghost-correctness" in rnd2["fix_round_skipped"], rnd2)
+    check("[CP5-T27] the step's own rule applies instead -- here, the full set (the bogus id can't be placed "
+          "in a lens to narrow by, so nothing narrows)",
+          sorted(rv["id"] for rv in rnd2["reviewers"]) == sorted(rv["id"] for rv in rnd1["reviewers"]),
+          rnd2["reviewers"])
+
+
+def t28_a_high_risk_outside_blocker_is_re_checked_outside_the_host():
+    # [CP5-T28] High risk does not change who the fix round ties to: an outside provider's own blocking
+    # finding in a high-risk checkpoint still re-checks that SAME outside provider, never the host, exactly as
+    # at normal risk (CP5-F10).
+    with _fresh_home():
+        finding = _finding("A1")
+        b = _fake_reply_bin("ext13", json.dumps({"findings": [finding]}))
+        env = _fresh_env(b)
+        d = g.project("t28", extra_cp={"risk": "high", "risk_reason": "touches the payment path"},
+                      config=["review_depth=" + json.dumps({"high": ["host-standards", "ext13-correctness"]})])
+        r = g.rx(d, "providers", "--add", "ext13", "--command", json.dumps([str(b / "ext13")]), "--stdin",
+                 "--company", "openai", "--model", "gpt-5", env=env)
+        assert r.returncode == 0, r.stderr + r.stdout
+        g.approve_plan(d)
+        g.to_adversarial(d)
+        rnd1 = tp.open_round(d, env=env)
+        check("[CP5-T28] (fixture sanity) round 1 is the high-risk pair: host-standards and ext13-correctness",
+              sorted(rv["id"] for rv in rnd1["reviewers"]) == ["ext13-correctness", "host-standards"],
+              rnd1["reviewers"])
+        ext_row = next(rv for rv in rnd1["reviewers"] if rv["id"] == "ext13-correctness")
+        p = subprocess.run([sys.executable, str(tp.EXT), "--reviewer", "ext13-correctness", "--cp", "CP1",
+                            "--out", ext_row["output"]], cwd=d, capture_output=True, text=True, env=env)
+        assert p.returncode == 0, p.stderr + p.stdout
+        host_path = g.write_review(d, rnd1, "host-standards", [])
+        r = g.rx(d, "adv-record", "CP1", "--reviews", ext_row["output"], host_path, env=env)
+        assert r.returncode == 2, r.stdout + r.stderr
+        t = g.rx(d, "triage", "CP1", f'ext13-correctness/{finding["id"]}=fix:"real for the users"', env=env)
+        assert t.returncode == 0, t.stdout + t.stderr
+        (d / "src/f.js").write_text("export const f = () => 1; // t28 fixed\n")
+        r = g.rx(d, "behavior", "CP1", env=env)
+        assert r.returncode == 0, r.stdout + r.stderr
+        rnd2 = tp.open_round(d, env=env)
+        check("[CP5-T28] round 2 is a fix round naming exactly one reviewer",
+              rnd2.get("fix_round") is True and len(rnd2["reviewers"]) == 1, rnd2)
+        check("[CP5-T28] ...and it is the outside provider (ext13-correctness), never the host, even at high "
+              "risk", rnd2["reviewers"][0]["id"] == "ext13-correctness", rnd2["reviewers"])
+
+
+def t29_only_a_fix_triaged_reviewer_is_ever_chosen_even_with_a_lower_slot():
+    # [CP5-T29] When the findings being fixed came from two reviewers, only the one triaged `fix` is ever a
+    # candidate -- a reviewer whose finding was triaged `rebut` is excluded from the pool entirely, not merely
+    # deprioritized, even when it has the LOWER slot number (which would otherwise win the tie-break).
+    d = _start("t29")
+    rnd1 = _open(d)
+    standards_id = _pick(rnd1, "standards")  # slot 1, the lower slot
+    correctness_id = _pick(rnd1, "correctness")  # slot 2
+    by = {standards_id: [_finding("M1")], correctness_id: [_finding("C1")]}
+    paths = [g.write_review(d, rnd1, rv["id"], by.get(rv["id"], [])) for rv in rnd1["reviewers"]]
+    r = g.rx(d, "adv-record", "CP1", "--reviews", *paths)
+    assert r.returncode == 2, r.stdout + r.stderr
+    t1 = g.rx(d, "triage", "CP1", f'{standards_id}/M1=rebut:"not reachable by a real user"')
+    assert t1.returncode == 0, t1.stdout + t1.stderr
+    t2 = g.rx(d, "triage", "CP1", f'{correctness_id}/C1=fix:"real for the users"')
+    assert t2.returncode == 0, t2.stdout + t2.stderr
+    _fix(d, 3, "t29")
+    rnd2 = _open(d)
+    _is_fix_round("CP5-T29", d, rnd2, correctness_id, [f"{correctness_id}/C1"],
+                  "the rebutted reviewer (standards, slot 1) is excluded from the pool; the fix-triaged one "
+                  "(correctness, slot 2) is chosen despite its higher slot number")
+
+
 CASES = [("CP5-F01", f01_normal_risk_large_fix), ("CP5-F02", f02_reviewer_tied_to_the_finding),
          ("CP5-F03", f03_high_risk_small_fix), ("CP5-F04", f04_high_risk_large_fix),
          ("CP5-F05", f05_first_round_keeps_full_set), ("CP5-F06", f06_rounds_not_following_a_block),
@@ -691,7 +1157,21 @@ CASES = [("CP5-F01", f01_normal_risk_large_fix), ("CP5-F02", f02_reviewer_tied_t
          ("CP5-F13", f13_narrowed_round_that_blocks_then_gets_a_real_fix_becomes_a_fix_round),
          ("CP5-F14", f14_pinned_reviewer_exception_holds_for_the_narrowed_then_fixed_sequence),
          ("CP5-F15", f15_fix_round_evidence_in_status_and_commit_message),
-         ("CP5-F16", f16_fix_round_evidence_names_the_replacement_reviewer)]
+         ("CP5-F16", f16_fix_round_evidence_names_the_replacement_reviewer),
+         ("CP5-T03", t03_outside_blocker_fix_round_ties_to_the_same_provider_and_lens_without_the_host),
+         ("CP5-T08", t08_accepting_a_finding_never_creates_a_fix_round),
+         ("CP5-T09", t09_low_risk_settings_do_not_override_fix_round_selection),
+         ("CP5-T11", t11_fix_rounds_count_toward_step_and_run_budgets),
+         ("CP5-T12", t12_the_step_round_limit_still_blocks_through_fix_rounds),
+         ("CP5-T13", t13_the_run_wide_round_limit_still_blocks_through_fix_rounds),
+         ("CP5-T14", t14_an_approved_raise_grants_exactly_one_further_fix_round),
+         ("CP5-T15", t15_a_repeat_block_through_fix_rounds_still_triggers_the_usual_check_in),
+         ("CP5-T17", t17_fix_round_approval_passes_the_gate_and_complete_still_runs_tests_and_the_full_suite),
+         ("CP5-T23", t23_docs_explain_the_fix_round_rule),
+         ("CP5-T25", t25_two_outside_reviewers_block_the_earlier_one_in_the_round_wins),
+         ("CP5-T27", t27_never_choose_a_reviewer_absent_from_the_blocked_round),
+         ("CP5-T28", t28_a_high_risk_outside_blocker_is_re_checked_outside_the_host),
+         ("CP5-T29", t29_only_a_fix_triaged_reviewer_is_ever_chosen_even_with_a_lower_slot)]
 
 
 def main():
