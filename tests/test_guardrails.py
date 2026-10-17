@@ -94,12 +94,16 @@ def main():
     r = record(d, "CP1", rnd, {0: DBF("src/f.js")})
     check("round 1: the finding blocks, no repeat yet", r.returncode == 2 and "REPEAT" not in r.stdout, r.stdout)
     put(d, "CP1", {"src/f.js": BAD_F.replace("1;", "1; ")})          # "fixed", but the mistake is still there
-    rnd = open_round(d, "CP1")  # CP5: round 1 blocked on one lens, so round 2 may be narrowed to just that one
+    rnd = open_round(d, "CP1")  # CP5: round 1 blocked on one reviewer's finding and the fixer ran, so round 2 may
+    # be a one-reviewer fix round tied to that reviewer, rather than the step's normal two-reviewer set
     r = record(d, "CP1", rnd, {0: DBF("src/f.js")})
     check("the same unfixed finding raised again is not a repeat", "REPEAT" not in r.stdout, r.stdout)
     put(d, "CP1", {"src/f.js": OK_F, "src/a.js": BAD_A})
     rnd = open_round(d, "CP1")
-    r = record(d, "CP1", rnd, {1: DBF("src/a.js")})
+    # lane H CP5: this round follows two blocks in a row on the same reviewer's finding, so it's now a one-
+    # reviewer fix round (not the old two-reviewer narrowed round) -- report the finding from whichever
+    # reviewer(s) this round actually names, rather than assuming index 1 still exists.
+    r = record(d, "CP1", rnd, {i: DBF("src/a.js") for i in range(len(rnd["reviewers"]))})
     check("the same kind in another place is announced as a repeat", "REPEAT" in r.stdout and "handler-imports-db" in r.stdout,
           r.stdout)
     nx = json.loads(rx(d, "next").stdout)
