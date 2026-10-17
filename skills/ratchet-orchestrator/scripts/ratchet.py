@@ -1131,6 +1131,51 @@ def _small_fix_review_lines(st: dict) -> list[str]:
     return lines
 
 
+# --------------------------------------------------------------------------- fix round: one reviewer (lane H CP5)
+# After a round BLOCKS and the fixer changes the code, the next round is a fix round: exactly one reviewer, the one
+# who raised the finding(s) triaged `fix`, whatever the fix's size or the step's risk. "A fixer ran" means the
+# blocked round has at least one open finding triaged `fix` and the code differs from that round's fingerprint.
+# The reviewer is tied to the finding: the same reviewer id is preferred for the same slot it filled in the blocked
+# round (resolved against the same slot list that round used), and only when it can't run does that slot's own
+# normal fallback order pick a stand-in. When the findings being fixed came from more than one reviewer, or a
+# finding names no reviewer the blocked round listed, there is no single reviewer the existing rules point to:
+# the round falls back to the existing narrowing rules and `reviewers` says why (no tie-break rule is invented).
+# The existing converge rule is kept: the round after a narrowed or fix round that still blocked gets the full set,
+# never another fix round, so a stuck finding still gets every lens looking again.
+
+def _fix_round_target(ctx: "Ctx", cp_id: str, rnd: dict | None, cps: dict, fp_id: str) -> dict | None:
+    """What the next round's single fix-round reviewer is tied to, or None when the next round is not a fix round.
+    Returns {"reviewer", "slot", "low", "findings"} for a fix round, or {"ambiguous": "<plain reason>"} when the
+    findings being fixed don't point at exactly one reviewer of the blocked round."""
+    ff = (rnd or {}).get("fix_for")
+    if rnd and rnd.get("fix_round") and not rnd.get("recorded") and ff and rnd.get("resolved"):
+        # a fix round replaced before it was recorded (the fixer changed the code again): still the same fix
+        return {"reviewer": ff["reviewer"], "slot": rnd["resolved"][0].get("slot"), "low": bool(ff.get("low")),
+                "findings": list(ff.get("findings") or []), "round": ff.get("round")}
+    if not rnd or not rnd.get("recorded") or rnd.get("fingerprint") == fp_id:
+        return None
+    if rnd.get("narrowed") or rnd.get("fix_round"):
+        return None
+    open_findings = _adv_open_findings(ctx, cp_id, rnd, cps)
+    if not open_findings:
+        return None
+    triage = _read_triage(_adv_round_dir(ctx, cp_id, rnd["round"]))
+    fixing = [f for f in open_findings if (triage.get(_finding_key(f)) or {}).get("decision") == "fix"]
+    if not fixing:
+        return None
+    keys = sorted(_finding_key(f) for f in fixing)
+    who = sorted({str(f.get("reviewer") or "") for f in fixing})
+    if len(who) != 1:
+        return {"ambiguous": f"the findings being fixed ({', '.join(keys)}) came from {len(who)} reviewers "
+                             f"({', '.join(w or '(none)' for w in who)}), so no single reviewer is tied to the fix"}
+    slot = next((r.get("slot") for r in rnd.get("resolved") or [] if r.get("id") == who[0]), None)
+    if not who[0] or slot is None:
+        return {"ambiguous": f"the reviewer of the findings being fixed ({who[0] or '(none)'}) is not one round "
+                             f"{rnd['round']} listed"}
+    return {"reviewer": who[0], "slot": slot, "low": bool(rnd.get("small_fix")), "findings": keys,
+            "round": rnd["round"]}
+
+
 # --------------------------------------------------------------------------- docs-only step skips review (CP4)
 # When a checkpoint's own change since its base_tree (never the plan's claim -- the same real diff
 # `classify_changes` reports) is docs only, the step is not high risk, and doc_test_command is configured,
@@ -5522,7 +5567,7 @@ def _dup_key(spec):
             spec.get("lens"))
 
 
-def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None, share=None) -> list[dict]:
+def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None, share=None, prefer=None) -> list[dict]:
     """Turn review slots into concrete reviewer ids for THIS round.
 
     Returns [{"id", "slot", "fallback_for": [ids skipped], "reasons": {...}}]. An any-<lens> slot tries the
@@ -5545,6 +5590,9 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None, s
 
     `only_slots`: slot numbers to resolve; every other slot is skipped (a same-round refill resolves only the slots it
     replaces, so a kept slot's own pick can't use up a provider a replaced slot needs).
+
+    `prefer`: {slot number: reviewer id} -- that reviewer fills its slot whenever it can run (a fix round's reviewer
+    is the one who raised the finding being fixed); when it can't, the slot's own order picks as usual.
 
     `share`: {"data": the shared provider record, "ignore": start ids not to count}. A provider that already has
     provider_share.max review starts inside the last provider_share.minutes (read from that record, any lane, plus the
@@ -5585,6 +5633,9 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None, s
         if only_slots is not None and n not in only_slots:
             continue
         alts = expand_slot(cfg, slot, health)
+        want = (prefer or {}).get(n)
+        if want is not None and want in roster_:
+            alts = [want] + [a for a in alts if a != want]
         unknown = [a for a in alts if a not in roster_]
         if unknown:
             die(f"review_depth/checkpoint names unknown reviewer(s) {unknown}; add them under config 'providers' "
@@ -5621,6 +5672,8 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None, s
         fresh = [c for c in candidates if roster_[c].get("kind") == "command" and roster_[c].get("vendor") not in used_vendors
                  and _reviewer_cost_tier(cfg, roster_[c]) == best]
         pick = fresh[0] if fresh else (candidates[0] if candidates else None)
+        if want is not None and want in candidates:
+            pick = want
         if pick and candidates and pick != candidates[0]:
             skipped.append(candidates[0])
             reasons[candidates[0]] = "provider already reviewing this round; preferring a different one"
@@ -12452,7 +12505,7 @@ def cmd_reviewers(args):
         # narrowed, the next round only asks the lens(es) that still had an open blocker/major finding — a lens
         # that approved isn't re-run. A narrowed round whose fix still left a blocker open brings back the full
         # set for the round after it (narrow_now stays False), rather than narrowing further.
-        was_narrowed = bool(rnd.get("narrowed")) if rnd else False
+        was_narrowed = bool(rnd.get("narrowed") or rnd.get("fix_round")) if rnd else False
         open_lenses = _open_blocking_lenses(ctx, cfg, args.cp, rnd, cps) if rnd and rnd.get("recorded") and not was_narrowed else set()
         narrow_now = False
         # CP3: a small fix made since the checkpoint's last FULL review opens with exactly one reviewer, told
@@ -12466,9 +12519,24 @@ def cmd_reviewers(args):
         small_fix = _is_small_fix_round(ctx, cfg, args.cp, cp, cps, g)
         if small_fix and _small_fix_reviewers(ctx, cfg, cp) is None:
             small_fix = False
+        # Lane H CP5: a round that follows a blocked round and a fixer run is a fix round with exactly one reviewer,
+        # tied to the finding being fixed (_fix_round_target), whatever the fix's size or the step's risk. It takes
+        # precedence over the small-fix and narrowing rules; an ambiguous target keeps those rules and is reported.
+        fix_target = _fix_round_target(ctx, args.cp, rnd, cps, fp)
+        fix_ambiguous = (fix_target or {}).get("ambiguous")
+        if fix_ambiguous:
+            fix_target = None
+        fix_round = fix_target is not None
+        if fix_round:
+            small_fix = False
+            fix_cp = dict(cp, risk="low") if fix_target["low"] else cp
 
         def pick_round(share):
             nonlocal narrow_now
+            if fix_round:
+                narrow_now = False
+                return resolve_reviewers(ctx, cfg, fix_cp, only_slots={fix_target["slot"]}, share=share,
+                                         prefer={fix_target["slot"]: fix_target["reviewer"]})
             if small_fix:
                 low_resolved = _small_fix_reviewers(ctx, cfg, cp, share=share)
                 if low_resolved is not None:
@@ -12540,6 +12608,10 @@ def cmd_reviewers(args):
             prev_round_tree = rnd["fingerprint"] if rnd else None
         rnd = {"round": prev + 1, "nonce": new_nonce, "fingerprint": fp, "opened_at": now(),
                "reviewers": [r["id"] for r in resolved], "narrowed": narrow_now, "small_fix": small_fix,
+               "fix_round": fix_round,
+               "fix_for": ({"round": fix_target["round"], "reviewer": fix_target["reviewer"], "findings": fix_target["findings"],
+                            "low": fix_target["low"]} if fix_round else None),
+               "fix_round_skipped": fix_ambiguous,
                "prev_round_tree": prev_round_tree,
                "substitutions": [{"used": r["id"], "instead_of": r["fallback_for"], "why": r["reasons"]}
                                  for r in resolved if r["fallback_for"]],
@@ -12619,8 +12691,11 @@ def cmd_reviewers(args):
             keep = {r["id"] for i, r in enumerate(rnd["resolved"]) if i not in replace}
             replaced_slots = {rnd["resolved"][i]["slot"] for i in replace}
 
+            # a fix round resolved against the low-risk slot list (its blocked round was a small fix) refills from it
+            refill_cp = dict(cp, risk="low") if (rnd.get("fix_for") or {}).get("low") else cp
+
             def pick_refill(share):
-                return resolve_reviewers(ctx, cfg, cp, exclude=round_cutoff | failed_ids, taken=keep,
+                return resolve_reviewers(ctx, cfg, refill_cp, exclude=round_cutoff | failed_ids, taken=keep,
                                          only_slots=replaced_slots, share=share)
             # A replaced slot whose reviewer never ran gives its start back, and its replacement reserves one, in the same
             # locked step that checks the share (the start about to be given back is not counted against it).
@@ -12712,6 +12787,8 @@ def cmd_reviewers(args):
            "review_rules": rules, "focus_files": sorted(focus) if focus is not None else None,
            "round_nonce": rnd["nonce"], "output_dir": str(out_dir), "narrowed": rnd.get("narrowed", False),
            "small_fix": rnd.get("small_fix", False),
+           "fix_round": rnd.get("fix_round", False), "fix_for": rnd.get("fix_for"),
+           "fix_round_skipped": rnd.get("fix_round_skipped"),
            "fixes_md": str(fixes) if rnd["round"] > 1 else None,
            "run_rounds_used": st.get("adv_rounds_total", 0), "run_rounds_cap": cfg["max_adversarial_rounds_run"],
            "reviewers": rows}
@@ -12723,6 +12800,12 @@ def cmd_reviewers(args):
     if res["small_fix"]:
         print(f"Small fix since approval (at or under {cfg.get('small_edit_lines', 20)} changed code lines): "
               "one reviewer, scoped to the files changed since approval.")
+    if res["fix_round"]:
+        ff = res["fix_for"] or {}
+        print(f"Fix round: one reviewer, {ff.get('reviewer')} from round {ff.get('round')}, re-checks the fix for "
+              f"{', '.join(ff.get('findings') or [])}.")
+    elif res["fix_round_skipped"]:
+        print(f"Not a fix round: {res['fix_round_skipped']}; the usual reviewer rules apply.")
     off_note = _docs_only_quick_path_off_note(ctx, cfg, cp, cps)
     if off_note:
         print(off_note)
