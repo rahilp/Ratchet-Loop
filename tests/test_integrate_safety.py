@@ -357,20 +357,26 @@ def x08_background_warning_is_right_for_integrate():
 
 
 def x09_uncommitted_shared_file_the_merge_changes():
-    """[CP2-X09] An uncommitted learnings.md on main that the lane also changes: rolled back before the suite, bytes kept."""
+    """[CP2-X09] An uncommitted learnings.md on main that the lane also changes is carried across the merge by the
+    lines-of-both-sides rule (CP3): the developer's line survives, uncommitted, next to the lane's."""
     cid = "CP2-X09"
     w = mk(dirty_learnings=True)
-    tim.add_lane(w, "lane-y", {".ratchet/learnings.md": "# Ratchet learnings\n\n- (2026-10-01) main learning one\n"
-                               "- (2026-10-05) a lane note\n"})
-    mine = (w.main / ".ratchet/learnings.md").read_bytes()
-    before = tim.snap(w)
+    lane = tim.add_lane(w, "lane-y", {".ratchet/learnings.md": "# Ratchet learnings\n\n- (2026-10-01) main learning one\n"
+                                      "- (2026-10-05) a lane note\n"})
+    old = g(w.main, "rev-parse", "HEAD")
     r = w.integrate("lane-y")
-    tim.failed_run(r, cid, "the merge changes learnings.md, which is dirty on main", "learnings.md", "again")
-    tim.unchanged(w, before, cid, "main is exactly as it was")
-    check(f"[{cid}] learnings.md holds exactly the developer's bytes", (w.main / ".ratchet/learnings.md").read_bytes() == mine)
-    check(f"[{cid}] the suite never ran", runs2(w) == [], runs2(w))
-    check(f"[{cid}] rolled back, suite not run", last_record(w).get("result") == "rolled-back"
-          and last_record(w).get("suite") == "not-run", last_record(w))
+    tim.merged_ok(w, r, cid, "the merge changes learnings.md, which is dirty on main", old)
+    text = (w.main / ".ratchet/learnings.md").read_text()
+    check(f"[{cid}] learnings.md holds the developer's uncommitted line and the lane's note",
+          "an uncommitted note on main" in text and "a lane note" in text, text)
+    check(f"[{cid}] the developer's line is still uncommitted: the file is modified and unstaged, the tip has the lane's version",
+          " M .ratchet/learnings.md" in tim.porcelain_lines(w.main)
+          and g(w.main, "show", "HEAD:.ratchet/learnings.md") == g(lane, "show", "HEAD:.ratchet/learnings.md"),
+          tim.porcelain_lines(w.main))
+    check(f"[{cid}] the developer's line is in no commit", "an uncommitted note on main" not in g(w.main, "show", "HEAD:.ratchet/learnings.md"))
+    check(f"[{cid}] the suite ran once, on the merged code", len(runs2(w)) == 1, runs2(w))
+    check(f"[{cid}] recorded as merged, suite passed", last_record(w).get("result") == "merged"
+          and last_record(w).get("suite") == "passed", last_record(w))
 
 
 def x10_a_git_timeout_is_a_plain_rollback():
@@ -685,10 +691,12 @@ def x19_records_of_attempts_that_did_not_merge_hold_the_lane_tip():
     need(f"[{cid}] a second integrate is a no-op", r.returncode == 0 and "already merged" in tim.low(r), tim.said(r)[:300])
     rec = last_record(w)
     check(f"[{cid}] the no-op line holds the lane's tip", rec.get("result") == "no-op" and rec.get("commits") == [tip], rec)
+    # CP3: a dirty learnings.md the lane also changes is carried across the merge (no clash); an uncommitted
+    # standards.md the lane also changes is the clash the rules cannot settle, found before the suite
     w = mk(dirty_learnings=True)
-    lane = tim.add_lane(w, "lane-y", {".ratchet/learnings.md": "# Ratchet learnings\n\n- (2026-10-01) main learning one\n"
-                                      "- (2026-10-05) a lane note\n"})
-    tim.failed_run(w.integrate("lane-y"), cid, "a clash with a dirty learnings.md", "learnings.md")
+    lane = tim.add_lane(w, "lane-y", {".ratchet/standards.md": "# Standards\n\n1. the lane's wording\n"})
+    (w.main / ".ratchet/standards.md").write_text("# Standards\n\n1. main's uncommitted wording\n")
+    tim.failed_run(w.integrate("lane-y"), cid, "a clash with a dirty standards.md", "standards.md")
     rec = last_record(w)
     check(f"[{cid}] the clash line holds the lane's tip only", rec.get("commits") == [g(lane, "rev-parse", "HEAD")], rec)
 
@@ -1150,6 +1158,736 @@ def x32_killed_during_the_checks_is_recorded():
     check(f"[{cid}] the journal is gone", not journal.exists())
 
 
+# ---- CP3 (Ratchet's own files merge by Ratchet's rules), adversarial round 1 ---------------------------------------
+import re as _re  # noqa: E402
+import test_integrate_files as tif  # noqa: E402
+
+SHARED = ".ratchet/"
+
+
+def y01_pending_rule_edit_on_main_stays_unapproved():
+    """[CP3-X01] An uncommitted, not-yet-approved rule edit on main is never approved by an integrate that merges
+    config.json: the approval snapshot is taken before the carried files are set back to the tip."""
+    cid = "CP3-X01"
+    w = tif.build(lane=lambda d: tif.set_cfg(d, test_timeout_sec=90))
+    run = tif.approved_run(w.main, w.env, "main-run")
+    tif.set_cfg(w.main, max_ui_rounds=9)   # the developer's pending rule change, uncommitted and unapproved
+    ask = th.rx(w.main, w.env, "ask", "approve-changes")
+    need(f"[{cid}] (setup) before integrate, approve-changes names the pending rule max_ui_rounds",
+         "max_ui_rounds" in tif.raw(ask), tif.said(ask)[-500:])
+    old = g(w.main, "rev-parse", "HEAD")
+    r = w.integrate()
+    tif.merged_ok(w, r, cid, "a lane that changes another config rule", old)
+    c = tif.cfg_at(w.main)
+    check(f"[{cid}] main's config.json holds the lane's test_timeout_sec and the pending max_ui_rounds",
+          c.get("test_timeout_sec") == 90 and c.get("max_ui_rounds") == 9, c)
+    ask = th.rx(w.main, w.env, "ask", "approve-changes")
+    check(f"[{cid}] after integrate, approve-changes still names max_ui_rounds (not 'nothing has changed')",
+          "max_ui_rounds" in tif.raw(ask) and "Nothing has changed since approval" not in tif.raw(ask), tif.said(ask)[-500:])
+    ev = [e for e in tif.jread(run / "state.json").get("history", []) if e.get("event") == "integrated_lane"]
+    acc = (ev[-1].get("accepted") if ev else None) or []
+    check(f"[{cid}] the integrated_lane event accepts the lane's test_timeout_sec only, never the pending rule",
+          ev and any("test_timeout_sec" in x for x in acc) and not any("max_ui_rounds" in x for x in acc), (ev, acc))
+
+
+def _journal_with_carry(w, marker_bytes, rel=SHARED + "learnings.md"):
+    """A journal and carry folder as a kill between the HEAD checkout of a carried file and the write-back leaves
+    them: the file at the tip, the developer's bytes only in the carry folder."""
+    carry = w.main / ".git/ratchet-integrate-carry"
+    carry.mkdir()
+    (carry / "0-learnings.md").write_bytes(marker_bytes)
+    tif.jwrite(w.main / ".git/ratchet-integrate.journal",
+               {"lane": "lane-a", "run": "lane-a-run", "head": g(w.main, "rev-parse", "HEAD"),
+                "lhead": g(w.lanes["lane-a"], "rev-parse", "HEAD"), "target": "main", "sha": None, "suite": "not-run",
+                "started": "2026-10-13T00:00:00+00:00", "carried": {rel: "0-learnings.md"}})
+    th.git(w.main, "checkout", "-q", "HEAD", "--", rel)
+    return carry
+
+
+def y02_recovery_after_a_kill_never_drops_saved_bytes():
+    """[CP3-X02] After a kill while carrying main's uncommitted learnings.md: a file still at the tip gets the
+    developer's bytes back (folder removed, note printed); one edited since keeps its new bytes, and the saved copy
+    stays in a folder of its own, named in the note."""
+    cid = "CP3-X02"
+    note = "- (2026-10-02) an uncommitted note on main"
+    w = tif.build(lane=lambda d: tif.append_line(d, SHARED + "learnings.md", "- (2026-10-02) lane lesson 1"),
+                  dirty=lambda d: tif.append_line(d, SHARED + "learnings.md", note))
+    mine = (w.main / SHARED / "learnings.md").read_bytes()
+    carry = _journal_with_carry(w, mine)
+    need(f"[{cid}] (setup) learnings.md is at the tip, the developer's line only in the carry folder",
+         note not in (w.main / SHARED / "learnings.md").read_text() and tif.porcelain_lines(w.main) == [])
+    old = g(w.main, "rev-parse", "HEAD")
+    r = w.integrate()
+    tif.merged_ok(w, r, cid, "(a) the next integrate, after the kill", old)
+    text = (w.main / SHARED / "learnings.md").read_text()
+    check(f"[{cid}] (a) the note says the developer's bytes were put back into learnings.md",
+          "interrupted" in tif.raw(r).lower() and "put back into" in tif.raw(r).lower() and "learnings.md" in tif.raw(r).lower(),
+          tif.raw(r)[:600])
+    check(f"[{cid}] (a) learnings.md holds the developer's line again (carried across this merge) and the lane's",
+          note in text and "lane lesson 1" in text, text)
+    check(f"[{cid}] (a) still uncommitted", note not in tif.show(w.main, "HEAD", SHARED + "learnings.md")
+          and " M " + SHARED + "learnings.md" in tif.porcelain_lines(w.main), tif.porcelain_lines(w.main))
+    check(f"[{cid}] (a) the carry folder is gone and no renamed copy was made", not carry.exists()
+          and not list((w.main / ".git").glob("ratchet-integrate-carry-*")), list((w.main / ".git").glob("ratchet-integrate-carry*")))
+    recs = w.record_lines()
+    check(f"[{cid}] (a) the interrupted attempt is recorded first, as rolled back", len(recs) == 2
+          and recs[0].get("result") == "rolled-back" and recs[-1].get("result") == "merged", recs)
+
+    w2 = tif.build(lane=lambda d: tif.append_line(d, SHARED + "learnings.md", "- (2026-10-02) lane lesson 1"),
+                   dirty=lambda d: tif.append_line(d, SHARED + "learnings.md", note))
+    mine2 = (w2.main / SHARED / "learnings.md").read_bytes()
+    carry2 = _journal_with_carry(w2, mine2)
+    since = "- (2026-10-03) a line added after the kill"
+    tif.append_line(w2.main, SHARED + "learnings.md", since)   # main's run appended a learning before the next integrate
+    old2 = g(w2.main, "rev-parse", "HEAD")
+    r2 = w2.integrate()
+    tif.merged_ok(w2, r2, cid, "(b) the next integrate, the carried file edited since the kill", old2)
+    text2 = (w2.main / SHARED / "learnings.md").read_text()
+    kept = list((w2.main / ".git").glob("ratchet-integrate-carry-*"))
+    check(f"[{cid}] (b) the file keeps its newer line and the lane's; the lost line is not claimed as put back",
+          since in text2 and "lane lesson 1" in text2 and note not in text2, text2)
+    check(f"[{cid}] (b) the note names the file as changed since and does not say 'put back'",
+          "changed since" in tif.raw(r2).lower() and "put back into" not in tif.raw(r2).lower(), tif.raw(r2)[:800])
+    check(f"[{cid}] (b) the saved bytes stay, in a folder of their own that the new attempt left alone",
+          not carry2.exists() and len(kept) == 1 and (kept[0] / "0-learnings.md").read_bytes() == mine2, kept)
+    check(f"[{cid}] (b) the note names that folder", kept and kept[0].name in tif.raw(r2), tif.said(r2)[:800])
+
+
+def y03_write_back_failure_restores_and_rolls_back():
+    """[CP3-X03] When a carried file cannot be written back after main moved: main goes back to its old tip, the file
+    holds the developer's bytes, the record says rolled-back (in-process, the write refused); when main cannot be
+    moved back either, the attempt says main took the merge and where the saved bytes are, never 'nothing was
+    changed'."""
+    cid = "CP3-X03"
+    eng = engine()
+    note = "- (2026-10-02) an uncommitted note on main"
+    w = tif.build(lane=lambda d: tif.append_line(d, SHARED + "learnings.md", "- (2026-10-02) lane lesson 1"),
+                  dirty=lambda d: tif.append_line(d, SHARED + "learnings.md", note))
+    mine = (w.main / SHARED / "learnings.md").read_bytes()
+    before = tif.snap(w)
+    seen = []
+
+    def finish(result, suite, msg, detail=None, commits=None):
+        seen.append((result, suite, msg, commits))
+        raise SystemExit(1)
+    real_write = eng._write_record
+    refused = []
+
+    def refuse(path, data, pretty=False, raw=False):   # the write-back fails once (a passing lock, say); the restore works
+        if Path(path) == w.main / SHARED / "learnings.md" and not refused:
+            refused.append(path)
+            raise OSError("read-only file system (test)")
+        return real_write(path, data, pretty=pretty, raw=raw)
+    with th.engine_env(w.denv):
+        info = {"lane": "lane-a", "run": None, "commits": []}
+        f = eng._integrate_check(w.main, "lane-a", info, lambda m: finish("refused", "not-run", m))
+        info["prefix"] = "ratchet-integrate-y03-"
+        eng._write_record = refuse
+        try:
+            try:
+                eng._integrate_merge(w.main, f, info, finish)
+            except SystemExit:
+                pass
+        finally:
+            eng._write_record = real_write
+    check(f"[{cid}] (a) rolled back with a plain message naming the file and the saved bytes put back",
+          len(seen) == 1 and seen[0][0] == "rolled-back" and "could not be written back" in seen[0][2]
+          and "moved back" in seen[0][2] and "put back into" in seen[0][2], seen)
+    check(f"[{cid}] (a) main is back at its old tip", g(w.main, "rev-parse", "HEAD") == before["head"])
+    check(f"[{cid}] (a) learnings.md holds exactly the developer's bytes, uncommitted",
+          (w.main / SHARED / "learnings.md").read_bytes() == mine and tif.porcelain_lines(w.main) == [" M " + SHARED + "learnings.md"],
+          tif.porcelain_lines(w.main))
+    check(f"[{cid}] (a) no carry folder is left", not list((w.main / ".git").glob("ratchet-integrate-carry*")))
+    tif.unchanged(w, before, cid, "(a) main is exactly as it was")
+
+    if os.geteuid() == 0:
+        print(f"  - [{cid}] (b) skipped as root (permissions do not apply)")
+        return
+    w2 = tif.build(lane=lambda d: tif.append_line(d, SHARED + "learnings.md", "- (2026-10-02) lane lesson 1"),
+                   dirty=lambda d: tif.append_line(d, SHARED + "learnings.md", note))
+    hook(w2.main / ".git/hooks/post-merge", f"chmod 555 '{w2.main / SHARED}'\n")   # main's folder turns read-only as main moves
+    old2 = g(w2.main, "rev-parse", "HEAD")
+    try:
+        r2 = w2.integrate()
+        j = tif.jread(w2.main / ".git/ratchet-integrate.journal") if (w2.main / ".git/ratchet-integrate.journal").is_file() else {}
+        out = (j.get("outcome") or {}) if isinstance(j, dict) else {}
+        check(f"[{cid}] (b) main holds the merge commit", len(tif.parents(w2.main)) == 2 and tif.parents(w2.main)[0] == old2,
+              tif.parents(w2.main))
+        check(f"[{cid}] (b) the message says main took the merge and could not be moved back, and never 'nothing was changed'",
+              "took the merge" in tif.low(r2) and "could not be moved back" in tif.low(r2) and "nothing was changed" not in tif.low(r2),
+              tif.said(r2)[:800])
+        check(f"[{cid}] (b) the saved bytes are named in a folder of their own", "ratchet-integrate-carry-" in tif.raw(r2)
+              and any(p.name.startswith("ratchet-integrate-carry-") for p in (w2.main / ".git").iterdir()), tif.said(r2)[:800])
+        check(f"[{cid}] (b) the attempt is recorded as merged with the merge commit (journal outcome or record line)",
+              (out.get("result") == "merged" or last_record(w2).get("result") == "merged"), (out, last_record(w2)))
+    finally:
+        os.chmod(str(w2.main / SHARED), 0o755)
+
+
+def y04_standards_changed_in_different_places_stops():
+    """[CP3-X04] standards.md changed on both sides in different places (git would merge them) stops integrate with
+    main unchanged; the dry run reports that stop and the uncommitted-standards clash as 'would refuse'."""
+    cid = "CP3-X04"
+    w = tif.build(main=lambda d: tif.reword(d, SHARED + "standards.md", "1. ", "1. (main's wording) "),
+                  lane=lambda d: tif.append_line(d, SHARED + "standards.md", "6. One assertion per rule"))
+    before = tif.snap(w)
+    d = w.integrate("lane-a", "--dry-run")
+    tif.failed_run(d, cid, "the dry run", "would refuse", "both sides changed", "standards.md")
+    tif.unchanged(w, before, cid, "the dry run changed nothing")
+    r = w.integrate()
+    tif.failed_run(r, cid, "the real run", "both sides changed", "standards.md", "decide which wording")
+    tif.unchanged(w, before, cid, "main is exactly as it was")
+    check(f"[{cid}] the suite never ran", w.runs() == [], w.runs())
+    check(f"[{cid}] recorded as rolled-back, suite not run", w.last().get("result") == "rolled-back"
+          and w.last().get("suite") == "not-run", w.last())
+    w2 = tif.build(lane=lambda d: tif.reword(d, SHARED + "standards.md", "3. Test every rule", "3. Test every rule, the lane's wording"),
+                   dirty=lambda d: tif.reword(d, SHARED + "standards.md", "3. Test every rule", "3. Test every rule, uncommitted on main"))
+    before2 = tif.snap(w2)
+    d2 = w2.integrate("lane-a", "--dry-run")
+    tif.failed_run(d2, cid, "the dry run with an uncommitted standards.md the merge also changes", "would refuse",
+                   "uncommitted", "standards.md")
+    tif.unchanged(w2, before2, cid, "that dry run changed nothing")
+    # main already committed the lane's standards wording (the step the refusal asks for) and has an uncommitted
+    # standards edit of its own: the merge does not change standards.md, so the dry run and the real run agree
+    lane_word = lambda d: tif.reword(d, SHARED + "standards.md", "3. Test every rule", "3. Test every rule, the lane's wording")  # noqa: E731
+    w3 = tif.build(main=lane_word, lane=lane_word,
+                   dirty=lambda d: tif.reword(d, SHARED + "standards.md", "1. ", "1. (uncommitted on main) "))
+    mine3 = (w3.main / SHARED / "standards.md").read_bytes()
+    d3 = w3.integrate("lane-a", "--dry-run")
+    check(f"[{cid}] the dry run says it would merge when main already holds the lane's standards wording",
+          d3.returncode == 0 and "would merge" in tif.low(d3) and "would refuse" not in tif.low(d3), tif.said(d3)[:400])
+    old3 = g(w3.main, "rev-parse", "HEAD")
+    r3 = w3.integrate()
+    tif.merged_ok(w3, r3, cid, "the real run agrees with the dry run", old3)
+    check(f"[{cid}] main's uncommitted standards edit is exactly as it was",
+          (w3.main / SHARED / "standards.md").read_bytes() == mine3 and " M " + SHARED + "standards.md" in tif.porcelain_lines(w3.main),
+          tif.porcelain_lines(w3.main))
+
+
+def y05_fetch_timeout_restores_the_carried_files():
+    """[CP3-X05] A git timeout after the carried files were set back to the tip (the fetch) puts the developer's
+    bytes back: an uncommitted config.json edit comes back exactly, unstaged, main at its old tip."""
+    cid = "CP3-X05"
+    eng = engine()
+    w = tif.build(lane=lambda d: tif.set_cfg(d, test_timeout_sec=90), dirty=lambda d: tif.set_cfg(d, max_ui_rounds=9))
+    mine = (w.main / SHARED / "config.json").read_bytes()
+    need(f"[{cid}] (setup) config.json has an unstaged edit", tif.porcelain_lines(w.main) == [" M " + SHARED + "config.json"],
+         tif.porcelain_lines(w.main))
+    before = tif.snap(w)
+    seen = []
+
+    def finish(result, suite, msg, detail=None, commits=None):
+        seen.append((result, suite, msg))
+        raise SystemExit(1)
+    real = eng.subprocess.run
+
+    def slow(args, *a, **kw):
+        if isinstance(args, list) and "fetch" in args:
+            raise subprocess.TimeoutExpired(args, 120)
+        return real(args, *a, **kw)
+    with th.engine_env(w.denv):
+        info = {"lane": "lane-a", "run": None, "commits": []}
+        f = eng._integrate_check(w.main, "lane-a", info, lambda m: finish("refused", "not-run", m))
+        info["prefix"] = "ratchet-integrate-y05-"
+        eng.subprocess.run = slow
+        try:
+            try:
+                eng._integrate_merge(w.main, f, info, finish)
+            except SystemExit:
+                pass
+        finally:
+            eng.subprocess.run = real
+    check(f"[{cid}] rolled back with the timeout named and the carried file put back",
+          len(seen) == 1 and seen[0][0] == "rolled-back" and "timed out" in seen[0][2] and "put back into" in seen[0][2], seen)
+    check(f"[{cid}] main is at its old tip", g(w.main, "rev-parse", "HEAD") == before["head"])
+    check(f"[{cid}] config.json holds the developer's bytes exactly, unstaged",
+          (w.main / SHARED / "config.json").read_bytes() == mine
+          and tif.porcelain_lines(w.main) == [" M " + SHARED + "config.json"], tif.porcelain_lines(w.main))
+    check(f"[{cid}] no carry folder is left", not list((w.main / ".git").glob("ratchet-integrate-carry*")))
+    tif.unchanged(w, before, cid, "main is exactly as it was")
+
+
+def y06_timeout_after_main_took_the_merge_is_merged():
+    """[CP3-X06] A git timeout right after main took the merge (before the write-back) is recorded as merged, never
+    as rolled back with 'nothing was changed'; the carried file is at the tip, its saved bytes kept and named."""
+    cid = "CP3-X06"
+    eng = engine()
+    note = "- (2026-10-02) an uncommitted note on main"
+    w = tif.build(lane=lambda d: tif.append_line(d, SHARED + "learnings.md", "- (2026-10-02) lane lesson 1"),
+                  dirty=lambda d: tif.append_line(d, SHARED + "learnings.md", note))
+    mine = (w.main / SHARED / "learnings.md").read_bytes()
+    tip = g(w.lanes["lane-a"], "rev-parse", "HEAD")
+    seen = []
+
+    def finish(result, suite, msg, detail=None, commits=None):
+        seen.append((result, suite, msg, commits))
+        raise SystemExit(1)
+    real = eng.subprocess.run
+    hit = {"ff": False, "raised": False}
+
+    def slow(args, *a, **kw):
+        if isinstance(args, list) and hit["ff"] and not hit["raised"] and args[:3] == ["git", "rev-parse", "HEAD"]:
+            hit["raised"] = True
+            raise subprocess.TimeoutExpired(args, 120)
+        r = real(args, *a, **kw)
+        if isinstance(args, list) and "--ff-only" in args:
+            hit["ff"] = True
+        return r
+    with th.engine_env(w.denv):
+        info = {"lane": "lane-a", "run": None, "commits": []}
+        f = eng._integrate_check(w.main, "lane-a", info, lambda m: finish("refused", "not-run", m))
+        info["prefix"] = "ratchet-integrate-y06-"
+        eng.subprocess.run = slow
+        try:
+            try:
+                eng._integrate_merge(w.main, f, info, finish)
+            except SystemExit:
+                pass
+        finally:
+            eng.subprocess.run = real
+    sha = g(w.main, "rev-parse", "HEAD")
+    need(f"[{cid}] (setup) main took the merge before the timeout", len(tif.parents(w.main)) == 2, tif.parents(w.main))
+    check(f"[{cid}] recorded as merged, with the merge commit and the lane's, never 'nothing was changed'",
+          len(seen) == 1 and seen[0][0] == "merged" and "timed out" in seen[0][2] and "took the merge" in seen[0][2]
+          and "nothing was changed" not in seen[0][2].lower() and seen[0][3] == [sha, tip], seen)
+    kept = list((w.main / ".git").glob("ratchet-integrate-carry-*"))
+    check(f"[{cid}] the saved bytes are kept in a folder of their own and named in the message",
+          len(kept) == 1 and (kept[0] / "0-learnings.md").read_bytes() == mine and kept[0].name in seen[0][2], (kept, seen))
+    check(f"[{cid}] learnings.md is at the tip's version (nothing written over it) and the message says not to copy the saved bytes over it",
+          (w.main / SHARED / "learnings.md").read_text() == tif.show(w.main, "HEAD", SHARED + "learnings.md")
+          and "do not copy" in seen[0][2].lower() and f"git show {f['head'][:9]}" in seen[0][2], seen[0][2])
+
+
+def y07_guardrail_checks_matched_by_kind():
+    """[CP3-X07] Guardrail checks merge by kind: a check the lane strengthened (same kind, new command) or removed
+    while main left it alone takes the lane's change, and a check main removed is not listed as a lane setting not
+    taken when the lane never changed it."""
+    cid = "CP3-X07"
+    b_fixed = dict(tif.CHECK_B, command="python3 check_b.py --fixed", title="check B (strengthened)")
+    # (a) base [A, B]; the lane strengthens B and removes A; main leaves config.json alone
+    w = tif.build(base_edit=lambda d: tif.set_cfg(d, checks=[tif.CHECK_A, tif.CHECK_B]),
+                  lane=lambda d: tif.set_cfg(d, checks=[b_fixed]))
+    old = g(w.main, "rev-parse", "HEAD")
+    r = w.integrate()
+    tif.merged_ok(w, r, cid, "(a) the lane strengthened B and removed A, main untouched", old)
+    checks = tif.cfg_at(w.main).get("checks") or []
+    check(f"[{cid}] (a) main has exactly the lane's strengthened B, one check of that kind, A removed",
+          checks == [b_fixed], checks)
+    check(f"[{cid}] (a) nothing is listed as not taken", tif.not_taken(w.last()) == [] and "not taken" not in tif.low(r),
+          (w.last(), tif.said(r)[:300]))
+    # (b) main also added a check of its own: the lane's strengthen and removal still land next to main's
+    w2 = tif.build(base_edit=lambda d: tif.set_cfg(d, checks=[tif.CHECK_A, tif.CHECK_B]),
+                   main=lambda d: tif.set_cfg(d, checks=[tif.CHECK_A, tif.CHECK_B, tif.CHECK_MAIN]),
+                   lane=lambda d: tif.set_cfg(d, checks=[b_fixed]))
+    old2 = g(w2.main, "rev-parse", "HEAD")
+    r2 = w2.integrate()
+    tif.merged_ok(w2, r2, cid, "(b) main added a check, the lane strengthened B and removed A", old2)
+    checks2 = tif.cfg_at(w2.main).get("checks") or []
+    check(f"[{cid}] (b) main has the strengthened B and its own check, A removed, no duplicate kind",
+          checks2 == [b_fixed, tif.CHECK_MAIN], checks2)
+    check(f"[{cid}] (b) nothing is listed as not taken", tif.not_taken(w2.last()) == [], w2.last())
+    # (c) main removed B, the lane left B as it was and added C: B stays removed and is not listed
+    w3 = tif.build(base_edit=lambda d: tif.set_cfg(d, checks=[tif.CHECK_A, tif.CHECK_B]),
+                   main=lambda d: tif.set_cfg(d, checks=[tif.CHECK_A]),
+                   lane=lambda d: tif.set_cfg(d, checks=[tif.CHECK_A, tif.CHECK_B, tif.CHECK_LANE]))
+    old3 = g(w3.main, "rev-parse", "HEAD")
+    r3 = w3.integrate()
+    tif.merged_ok(w3, r3, cid, "(c) main removed B, the lane added C", old3)
+    checks3 = tif.cfg_at(w3.main).get("checks") or []
+    check(f"[{cid}] (c) main has A and the lane's C; B stays removed", checks3 == [tif.CHECK_A, tif.CHECK_LANE], checks3)
+    check(f"[{cid}] (c) B is not listed as a lane setting not taken (the lane never changed it)",
+          tif.not_taken(w3.last()) == [] and "check_b" not in tif.low(r3), (w3.last(), tif.said(r3)[:300]))
+    # (d) main changed A, the lane left A alone and only added C: A is main's and nothing is listed
+    a_main = dict(tif.CHECK_A, title="check A (main wording)")
+    w4 = tif.build(base_edit=lambda d: tif.set_cfg(d, checks=[tif.CHECK_A, tif.CHECK_B]),
+                   main=lambda d: tif.set_cfg(d, checks=[a_main, tif.CHECK_B]),
+                   lane=lambda d: tif.set_cfg(d, checks=[tif.CHECK_A, tif.CHECK_B, tif.CHECK_LANE]))
+    old4 = g(w4.main, "rev-parse", "HEAD")
+    r4 = w4.integrate()
+    tif.merged_ok(w4, r4, cid, "(d) main changed A, the lane only added C", old4)
+    checks4 = tif.cfg_at(w4.main).get("checks") or []
+    check(f"[{cid}] (d) main's A, B and the lane's C", checks4 == [a_main, tif.CHECK_B, tif.CHECK_LANE], checks4)
+    check(f"[{cid}] (d) nothing is listed as not taken (the lane never changed A)",
+          tif.not_taken(w4.last()) == [] and "not taken" not in tif.low(r4), (w4.last(), tif.said(r4)[:300]))
+
+
+def y08_learnings_merge_is_base_aware():
+    """[CP3-X08] learnings.md and the Ratchet .gitignore merge against the base: a line one side deleted stays
+    deleted whether git conflicted or merged cleanly, on the commit and on main's uncommitted copy; a line the lane
+    reworded while main left the file alone is the lane's version."""
+    cid = "CP3-X08"
+    L = SHARED + "learnings.md"
+    lane_line = "- (2026-10-02) lane lesson 1"
+    # (a) main removed the last lesson, the lane appended after it (git conflicts); (b) the Ratchet .gitignore likewise
+    w = tif.build(main=lambda d: (tif.reword(d, L, "- (2026-10-01) base lesson three\n", ""),
+                                  tif.reword(d, SHARED + ".gitignore", "!learnings.md\n", "")),
+                  lane=lambda d: (tif.append_line(d, L, lane_line), tif.append_line(d, SHARED + ".gitignore", "*.log")))
+    old = g(w.main, "rev-parse", "HEAD")
+    r = w.integrate()
+    tif.merged_ok(w, r, cid, "(a) main pruned a lesson, the lane appended one", old)
+    text = (w.main / L).read_text()
+    check(f"[{cid}] (a) the pruned lesson stays out, the other base lessons and the lane's line are there",
+          "base lesson three" not in text and "base lesson one" in text and "base lesson two" in text and lane_line in text, text)
+    gi = tif.lines_of((w.main / SHARED / ".gitignore").read_text())
+    check(f"[{cid}] (b) the .gitignore line main removed stays out, the lane's new line is in",
+          "!learnings.md" not in gi and "*.log" in gi and "!config.json" in gi, gi)
+    check(f"[{cid}] (a, b) git status is clean and there are no conflict markers",
+          tif.porcelain_lines(w.main) == [] and tif.conflict_markers(w.main) == [], tif.porcelain_lines(w.main))
+    # (c) a clean git merge: main removed the first lesson, the lane appended at the end
+    w2 = tif.build(main=lambda d: tif.reword(d, L, "- (2026-10-01) base lesson one\n", ""),
+                   lane=lambda d: tif.append_line(d, L, lane_line))
+    old2 = g(w2.main, "rev-parse", "HEAD")
+    r2 = w2.integrate()
+    tif.merged_ok(w2, r2, cid, "(c) a clean git merge of learnings.md", old2)
+    text2 = (w2.main / L).read_text()
+    check(f"[{cid}] (c) the pruned lesson stays out and the lane's line is in",
+          "base lesson one" not in text2 and lane_line in text2 and "base lesson two" in text2, text2)
+    # (d) the lane reworded a lesson, main left the file alone: the lane's wording, the old line gone
+    w3 = tif.build(lane=lambda d: tif.reword(d, L, "base lesson two", "base lesson two, reworded by the lane"))
+    old3 = g(w3.main, "rev-parse", "HEAD")
+    r3 = w3.integrate()
+    tif.merged_ok(w3, r3, cid, "(d) the lane reworded a lesson", old3)
+    text3 = (w3.main / L).read_text()
+    check(f"[{cid}] (d) main has the lane's wording once and not the old line",
+          text3.count("base lesson two, reworded by the lane") == 1 and "- (2026-10-01) base lesson two\n" not in text3, text3)
+    # (e) main's uncommitted copy pruned a lesson and the lane appended one: the pruning survives the carry
+    w4 = tif.build(lane=lambda d: tif.append_line(d, L, lane_line),
+                   dirty=lambda d: tif.reword(d, L, "- (2026-10-01) base lesson three\n", ""))
+    old4 = g(w4.main, "rev-parse", "HEAD")
+    r4 = w4.integrate()
+    tif.merged_ok(w4, r4, cid, "(e) an uncommitted pruning on main, the lane appended", old4)
+    text4 = (w4.main / L).read_text()
+    check(f"[{cid}] (e) the uncommitted pruning is not undone and the lane's line is there, still uncommitted",
+          "base lesson three" not in text4 and lane_line in text4 and tif.porcelain_lines(w4.main) == [" M " + L],
+          (text4, tif.porcelain_lines(w4.main)))
+
+
+def _merge_in_process(w, eng, patch_run=None, patch_write=None, prefix="ratchet-integrate-y-"):
+    """Run _integrate_merge of lane-a in-process with subprocess.run and/or _write_record patched; returns (seen, f)."""
+    seen = []
+
+    def finish(result, suite, msg, detail=None, commits=None):
+        seen.append((result, suite, msg, commits))
+        raise SystemExit(1)
+    real_run, real_write = eng.subprocess.run, eng._write_record
+    with th.engine_env(w.denv):
+        info = {"lane": "lane-a", "run": None, "commits": []}
+        f = eng._integrate_check(w.main, "lane-a", info, lambda m: finish("refused", "not-run", m))
+        info["prefix"] = prefix
+        if patch_run:
+            eng.subprocess.run = patch_run(real_run)
+        if patch_write:
+            eng._write_record = patch_write(real_write)
+        try:
+            try:
+                eng._integrate_merge(w.main, f, info, finish)
+            except SystemExit:
+                pass
+        finally:
+            eng.subprocess.run, eng._write_record = real_run, real_write
+    return seen, f
+
+
+def y13_staged_version_unlike_the_working_copy_is_saved():
+    """[CP3-X13] A carried config.json whose staged version differs from its working copy (review_depth A staged,
+    B in the working copy): the working copy is B merged by rule, the index is the merge's, the staged version A
+    is saved in a folder of its own that integrate never removes, named in the output and the record; the same
+    when the fast-forward fails."""
+    cid = "CP3-X13"
+    C = SHARED + "config.json"
+
+    def dirty(d):
+        tif.set_cfg(d, review_depth=tif.DEPTH_B)
+        th.git(d, "add", "--", C)
+        tif.set_cfg(d, review_depth=tif.DEPTH_C)
+    w = tif.build(lane=lambda d: tif.set_cfg(d, test_timeout_sec=90), dirty=dirty)
+    staged_a = g(w.main, "show", ":0:" + C)
+    need(f"[{cid}] (setup) config.json is partly staged with review_depth A in the index and B in the working copy",
+         tif.porcelain_lines(w.main) == ["MM " + C] and json.loads(staged_a).get("review_depth") == tif.DEPTH_B,
+         tif.porcelain_lines(w.main))
+    old = g(w.main, "rev-parse", "HEAD")
+    r = w.integrate()
+    tif.merged_ok(w, r, cid, "a staged version unlike the working copy", old)
+    c = tif.cfg_at(w.main)
+    check(f"[{cid}] the working copy is B merged by rule (review_depth B, the lane's test_timeout_sec)",
+          c.get("review_depth") == tif.DEPTH_C and c.get("test_timeout_sec") == 90, c)
+    check(f"[{cid}] the index equals the merge: nothing staged", g(w.main, "diff", "--cached") == ""
+          and tif.porcelain_lines(w.main) == [" M " + C], tif.porcelain_lines(w.main))
+    rec = w.last()
+    at = (rec.get("staged_saved") or {}).get(C)
+    check(f"[{cid}] the record names the saved staged version and lists the file as unstaged",
+          at and rec.get("unstaged") == [C], rec)
+    check(f"[{cid}] the saved file equals the staged version A, in a folder integrate never removes",
+          at and Path(at).is_file() and Path(at).read_text().strip() == staged_a and "ratchet-integrate-staged-" in at, at)
+    check(f"[{cid}] the output names the path and says the file is now unstaged, without claiming no bytes lost",
+          at and at in tif.raw(r) and "had a staged version different from its working copy" in tif.raw(r)
+          and "now unstaged" in tif.raw(r) and "no bytes lost" not in tif.raw(r), tif.raw(r)[:900])
+    # the not-landed path: a fetch timeout puts the working copy back, unstaged; the staged version stays saved
+    eng = engine()
+    w2 = tif.build(lane=lambda d: tif.set_cfg(d, test_timeout_sec=90), dirty=dirty)
+    mine2 = (w2.main / C).read_bytes()
+    staged_a2 = g(w2.main, "show", ":0:" + C)
+
+    def slow(real):
+        def run(args, *a, **kw):
+            if isinstance(args, list) and "fetch" in args:
+                raise subprocess.TimeoutExpired(args, 120)
+            return real(args, *a, **kw)
+        return run
+    seen, f = _merge_in_process(w2, eng, patch_run=slow, prefix="ratchet-integrate-y13-")
+    check(f"[{cid}] (not landed) rolled back, main at its old tip, the working copy back exactly, unstaged",
+          len(seen) == 1 and seen[0][0] == "rolled-back" and g(w2.main, "rev-parse", "HEAD") == f["head"]
+          and (w2.main / C).read_bytes() == mine2 and tif.porcelain_lines(w2.main) == [" M " + C],
+          (seen, tif.porcelain_lines(w2.main)))
+    saved2 = list((w2.main / ".git").glob("ratchet-integrate-staged-*/*"))
+    check(f"[{cid}] (not landed) the staged version is saved and named in the message",
+          len(saved2) == 1 and saved2[0].read_text().strip() == staged_a2 and str(saved2[0]) in seen[0][2]
+          and "had a staged version different from its working copy" in seen[0][2], (saved2, seen[0][2][:600]))
+
+
+def y14_write_back_failure_never_stages_a_reversal():
+    """[CP3-X14] On a write-back failure: (a) the carried paths are set to the merge commit's own versions before
+    main is moved back, so a failed reset leaves nothing staged and no lane change reversed; (b) when main moved on
+    before the rollback, nothing is written at all."""
+    cid = "CP3-X14"
+    eng = engine()
+    L = SHARED + "learnings.md"
+    note = "- (2026-10-02) an uncommitted note on main"
+
+    def mk_w():
+        return tif.build(lane=lambda d: tif.append_line(d, L, "- (2026-10-02) lane lesson 1"),
+                         dirty=lambda d: tif.append_line(d, L, note))
+
+    def refuse_once(real):
+        hit = []
+
+        def write(path, data, pretty=False, raw=False):
+            if Path(path) == Path(main_dir[0]) / L and not hit:
+                hit.append(1)
+                raise OSError("read-only file system (test)")
+            return real(path, data, pretty=pretty, raw=raw)
+        return write
+
+    def reset_fails(real):
+        def run(args, *a, **kw):
+            if isinstance(args, list) and "reset" in args and "--keep" in args:
+                return subprocess.CompletedProcess(args, 1, "", "fatal: reset refused (test)")
+            return real(args, *a, **kw)
+        return run
+    w = mk_w()
+    main_dir = [str(w.main)]
+    seen, f = _merge_in_process(w, eng, patch_run=reset_fails, patch_write=refuse_once, prefix="ratchet-integrate-y14-")
+    sha = g(w.main, "rev-parse", "HEAD")
+    check(f"[{cid}] (a) main stays at the merge, the attempt is merged and the message names the saved folder",
+          len(seen) == 1 and seen[0][0] == "merged" and len(tif.parents(w.main)) == 2 and "could not be moved back" in seen[0][2]
+          and "ratchet-integrate-carry-" in seen[0][2], seen)
+    check(f"[{cid}] (a) nothing is staged and the carried file equals the merge commit's own version (no reversal)",
+          g(w.main, "diff", "--cached") == "" and (w.main / L).read_text() == tif.show(w.main, sha, L)
+          and "lane lesson 1" in (w.main / L).read_text() and tif.porcelain_lines(w.main) == [], tif.porcelain_lines(w.main))
+    kept = list((w.main / ".git").glob("ratchet-integrate-carry-*"))
+    check(f"[{cid}] (a) the saved copy is kept, bytes intact", len(kept) == 1 and note in (kept[0] / "0-learnings.md").read_text(), kept)
+    # (b) main moves on right as the write-back fails: no checkout, no reset, nothing written
+    w2 = mk_w()
+    main_dir = [str(w2.main)]
+
+    def refuse_and_move(real):
+        hit = []
+
+        def write(path, data, pretty=False, raw=False):
+            if Path(path) == w2.main / L and not hit:
+                hit.append(1)
+                th.git(w2.main, "commit", "-q", "--allow-empty", "-m", "main moved on")
+                raise OSError("read-only file system (test)")
+            return real(path, data, pretty=pretty, raw=raw)
+        return write
+    seen2, f2 = _merge_in_process(w2, eng, patch_write=refuse_and_move, prefix="ratchet-integrate-y14b-")
+    head2 = g(w2.main, "rev-parse", "HEAD")
+    merge2 = g(w2.main, "rev-parse", "HEAD~1")
+    check(f"[{cid}] (b) merged, main left where it moved to, the message names the saved folder",
+          len(seen2) == 1 and seen2[0][0] == "merged" and head2 != merge2 and len(tif.parents(w2.main, merge2)) == 2
+          and "ratchet-integrate-carry-" in seen2[0][2] and "moved on" in seen2[0][2], seen2)
+    check(f"[{cid}] (b) no carried file changed after the failed write and nothing is staged",
+          (w2.main / L).read_text() == tif.show(w2.main, merge2, L) and g(w2.main, "diff", "--cached") == ""
+          and tif.porcelain_lines(w2.main) == [], tif.porcelain_lines(w2.main))
+
+
+def y09_staged_edit_to_a_carried_file_comes_back_unstaged():
+    """[CP3-X09] A partly staged config.json on main (index differs from both the tip and the working tree) comes
+    back with every byte of the developer's edits re-applied by rule, unstaged: the index is the merge's (nothing
+    stages a reversal of the lane's change), and the output and the record list the file as now unstaged."""
+    cid = "CP3-X09"
+
+    def dirty(d):
+        tif.set_cfg(d, max_ui_rounds=9)
+        th.git(d, "add", "--", SHARED + "config.json")
+        tif.set_cfg(d, max_ui_rounds=9, commit_per_checkpoint=False)
+    w = tif.build(lane=lambda d: tif.set_cfg(d, test_timeout_sec=90), dirty=dirty)
+    need(f"[{cid}] (setup) config.json is partly staged", tif.porcelain_lines(w.main) == ["MM " + SHARED + "config.json"],
+         tif.porcelain_lines(w.main))
+    old = g(w.main, "rev-parse", "HEAD")
+    r = w.integrate()
+    tif.merged_ok(w, r, cid, "a partly staged config.json on main", old)
+    tif.only_the_merge(w, cid, old)
+    c = tif.cfg_at(w.main)
+    check(f"[{cid}] the working tree holds the lane's change and both of the developer's",
+          c.get("test_timeout_sec") == 90 and c.get("max_ui_rounds") == 9 and c.get("commit_per_checkpoint") is False, c)
+    check(f"[{cid}] nothing is staged: `git diff --cached` is empty, so a plain commit cannot revert the lane's change",
+          g(w.main, "diff", "--cached") == "" and tif.porcelain_lines(w.main) == [" M " + SHARED + "config.json"],
+          (g(w.main, "diff", "--cached")[:300], tif.porcelain_lines(w.main)))
+    check(f"[{cid}] the output says the file had staged changes and is now unstaged",
+          "now unstaged" in tif.low(r) and "config.json" in tif.low(r), tif.said(r)[:600])
+    check(f"[{cid}] the record line lists it under unstaged", w.last().get("unstaged") == [SHARED + "config.json"], w.last())
+    check(f"[{cid}] the committed config.json is the merge's (test_timeout_sec 90, max_ui_rounds 3)",
+          tif.cfg_at(w.main, "HEAD").get("test_timeout_sec") == 90 and tif.cfg_at(w.main, "HEAD").get("max_ui_rounds") == 3)
+    check(f"[{cid}] no carry folder is left", not list((w.main / ".git").glob("ratchet-integrate-carry*")))
+    # a fully staged learnings.md line: the same, and the lane's lesson is in the working tree and the tip
+    note = "- (2026-10-02) a staged note on main"
+    w2 = tif.build(lane=lambda d: tif.append_line(d, SHARED + "learnings.md", "- (2026-10-02) lane lesson 1"),
+                   dirty=lambda d: (tif.append_line(d, SHARED + "learnings.md", note), th.git(d, "add", "--", SHARED + "learnings.md")))
+    need(f"[{cid}] (setup) learnings.md is fully staged", tif.porcelain_lines(w2.main) == ["M  " + SHARED + "learnings.md"],
+         tif.porcelain_lines(w2.main))
+    old2 = g(w2.main, "rev-parse", "HEAD")
+    r2 = w2.integrate()
+    tif.merged_ok(w2, r2, cid, "a fully staged learnings.md on main", old2)
+    text2 = (w2.main / SHARED / "learnings.md").read_text()
+    check(f"[{cid}] the working tree holds the developer's note and the lane's lesson, unstaged, nothing staged",
+          note in text2 and "lane lesson 1" in text2 and g(w2.main, "diff", "--cached") == ""
+          and tif.porcelain_lines(w2.main) == [" M " + SHARED + "learnings.md"], (text2, tif.porcelain_lines(w2.main)))
+    check(f"[{cid}] listed as now unstaged in the output and the record",
+          "now unstaged" in tif.low(r2) and w2.last().get("unstaged") == [SHARED + "learnings.md"], (tif.said(r2)[:400], w2.last()))
+
+
+def y11_staged_removal_of_a_carried_file_is_kept():
+    """[CP3-X11] A staged removal of a Ratchet file on main (git rm --cached, working copy kept) that the lane also
+    changes is never refused: after integrate the working copy holds the re-applied content and the removal is
+    staged again; on a failed fast-forward it comes back exactly as it was."""
+    cid = "CP3-X11"
+    L = SHARED + "learnings.md"
+
+    def dirty(d):
+        th.git(d, "rm", "--cached", "-q", "--", L)
+    w = tif.build(lane=lambda d: tif.append_line(d, L, "- (2026-10-02) lane lesson 1"), dirty=dirty)
+    mine = (w.main / L).read_bytes()
+    need(f"[{cid}] (setup) learnings.md is a staged removal with its working copy present",
+         sorted(tif.porcelain_lines(w.main)) == ["?? " + L, "D  " + L] and (w.main / L).is_file(), tif.porcelain_lines(w.main))
+    old = g(w.main, "rev-parse", "HEAD")
+    r = w.integrate()
+    tif.merged_ok(w, r, cid, "a staged removal on main", old)
+    text = (w.main / L).read_text()
+    check(f"[{cid}] the working copy holds the lane's lesson and the base lessons", "lane lesson 1" in text
+          and all(x in text for x in tif.LEARN_LESSONS), text)
+    check(f"[{cid}] the removal is staged again, the working copy kept",
+          sorted(tif.porcelain_lines(w.main)) == ["?? " + L, "D  " + L] and (w.main / L).is_file(), tif.porcelain_lines(w.main))
+    check(f"[{cid}] the tip holds the lane's lesson", "lane lesson 1" in tif.show(w.main, "HEAD", L))
+    check(f"[{cid}] the record does not list it as unstaged (a removal is not a staged edit)", not w.last().get("unstaged"), w.last())
+    # a fetch timeout: main at its old tip, the staged removal and the working copy exactly as they were
+    eng = engine()
+    w2 = tif.build(lane=lambda d: tif.append_line(d, L, "- (2026-10-02) lane lesson 1"), dirty=dirty)
+    mine2 = (w2.main / L).read_bytes()
+    before2 = tif.snap(w2)
+    seen = []
+
+    def finish(result, suite, msg, detail=None, commits=None):
+        seen.append((result, suite, msg))
+        raise SystemExit(1)
+    real = eng.subprocess.run
+
+    def slow(args, *a, **kw):
+        if isinstance(args, list) and "fetch" in args:
+            raise subprocess.TimeoutExpired(args, 120)
+        return real(args, *a, **kw)
+    with th.engine_env(w2.denv):
+        info = {"lane": "lane-a", "run": None, "commits": []}
+        f = eng._integrate_check(w2.main, "lane-a", info, lambda m: finish("refused", "not-run", m))
+        info["prefix"] = "ratchet-integrate-y11-"
+        eng.subprocess.run = slow
+        try:
+            try:
+                eng._integrate_merge(w2.main, f, info, finish)
+            except SystemExit:
+                pass
+        finally:
+            eng.subprocess.run = real
+    check(f"[{cid}] rolled back, the file put back", len(seen) == 1 and seen[0][0] == "rolled-back" and "put back into" in seen[0][2], seen)
+    check(f"[{cid}] the working copy holds the developer's bytes and the removal is staged again",
+          (w2.main / L).read_bytes() == mine2 and sorted(tif.porcelain_lines(w2.main)) == ["?? " + L, "D  " + L],
+          tif.porcelain_lines(w2.main))
+    tif.unchanged(w2, before2, cid, "main is exactly as it was")
+
+
+def y12_kill_after_the_fast_forward_leaves_mains_files_alone():
+    """[CP3-X12] An integrate killed right after main took the merge, with an uncommitted learnings.md carried: the
+    next integrate writes nothing over main's files (the saved copy predates the merge), sets the copy aside under
+    its own name and says how to re-add only the developer's edits."""
+    cid = "CP3-X12"
+    eng = engine()
+    note = "- (2026-10-02) an uncommitted note on main"
+    w = tif.build(lane=lambda d: tif.append_line(d, SHARED + "learnings.md", "- (2026-10-02) lane lesson 1"),
+                  dirty=lambda d: tif.append_line(d, SHARED + "learnings.md", note))
+    mine = (w.main / SHARED / "learnings.md").read_bytes()
+
+    class Killed(Exception):
+        pass
+
+    def finish(result, suite, msg, detail=None, commits=None):
+        raise SystemExit(1)
+    real = eng.subprocess.run
+
+    def killer(args, *a, **kw):
+        r = real(args, *a, **kw)
+        if isinstance(args, list) and "--ff-only" in args:
+            raise Killed()
+        return r
+    with th.engine_env(w.denv):
+        info = {"lane": "lane-a", "run": None, "commits": []}
+        f = eng._integrate_check(w.main, "lane-a", info, lambda m: finish("refused", "not-run", m))
+        info["prefix"] = "ratchet-integrate-y12-"
+        eng.subprocess.run = killer
+        try:
+            try:
+                eng._integrate_merge(w.main, f, info, finish)
+            except Killed:
+                pass
+        finally:
+            eng.subprocess.run = real
+    sha = g(w.main, "rev-parse", "HEAD")
+    need(f"[{cid}] (setup) main took the merge and the carried file is at the tip, the journal names it",
+         len(tif.parents(w.main)) == 2 and tif.porcelain_lines(w.main) == []
+         and tif.jread(w.main / ".git/ratchet-integrate.journal").get("carried"), tif.porcelain_lines(w.main))
+    r = w.integrate()
+    need(f"[{cid}] the next integrate exits 0 and finds the lane already merged", r.returncode == 0 and "already merged" in tif.low(r),
+         tif.said(r)[:400])
+    kept = list((w.main / ".git").glob("ratchet-integrate-carry-*"))
+    check(f"[{cid}] main's working files are untouched: learnings.md is the tip's, status clean",
+          (w.main / SHARED / "learnings.md").read_text() == tif.show(w.main, "HEAD", SHARED + "learnings.md")
+          and g(w.main, "rev-parse", "HEAD") == sha and tif.porcelain_lines(w.main) == [], tif.porcelain_lines(w.main))
+    check(f"[{cid}] the saved copy is set aside under its own name, bytes intact, and named in the note",
+          len(kept) == 1 and (kept[0] / "0-learnings.md").read_bytes() == mine and kept[0].name in tif.raw(r), (kept, tif.raw(r)[:800]))
+    check(f"[{cid}] the note says not to copy it over the file and how to re-add the developer's edits",
+          "do not copy" in tif.raw(r).lower() and f"git show {f['head'][:9]}" in tif.raw(r) and "put back into" not in tif.raw(r).lower(),
+          tif.raw(r)[:900])
+    recs = w.record_lines()
+    check(f"[{cid}] the interrupted attempt is recorded as merged, then the no-op", len(recs) == 2
+          and recs[0].get("result") == "merged" and recs[1].get("result") == "no-op", recs)
+
+
+def y10_unparsable_config_names_the_right_side():
+    """[CP3-X10] A config.json that is not a JSON object is named by the side it is on: the merge base, main or
+    the lane."""
+    cid = "CP3-X10"
+    eng = engine()
+    good = b'{"a": 1}\n'
+    for tag, b, o, t, want in (("base", b"{bad", good, b'{"a": 2}\n', "merge base"),
+                               ("main", good, b"{bad", b'{"a": 2}\n', "on main"),
+                               ("lane", good, b'{"a": 2}\n', b"{bad", "in the lane")):
+        res, nt, problem = eng._integrate_merge_shared(SHARED + "config.json", b, o, t)
+        check(f"[{cid}] an unparsable config.json on the {tag} side is reported as '{want}'",
+              res is None and problem and want in problem and ("merge base" in problem) == (tag == "base"), problem)
+    _, _, problem = eng._integrate_merge_shared(SHARED + "config.json", b"{bad", good, b'{"a": 2}\n')
+    check(f"[{cid}] for the merge base, the next step is to bring the lane up to a newer base, not to 'fix' main's file",
+          "merge main into the lane" in problem and "Fix that file" not in problem, problem)
+
+
 CASES = [x01_scratch_copy_acts_like_main, x02_main_is_rechecked_right_before_it_moves,
          x03_autostash_setting_cannot_hide_an_edit, x04_dependency_folders_linking_into_main_are_refused,
          x05_every_refusal_is_recorded, x06_untracked_file_main_would_overwrite, x07_record_holds_full_hashes,
@@ -1165,13 +1903,21 @@ CASES = [x01_scratch_copy_acts_like_main, x02_main_is_rechecked_right_before_it_
          x26_dry_run_reports_the_layout_refusals, x27_submodules_are_refused,
          x28_busy_refusal_leaves_the_live_journal_alone, x29_recovery_counts_a_merge_main_has_since_built_on,
          x30_recovery_on_a_main_whose_step_has_moved_on_changes_nothing, x31_a_record_that_cannot_be_written_is_kept_and_recorded_later,
-         x32_killed_during_the_checks_is_recorded]
+         x32_killed_during_the_checks_is_recorded,
+         y01_pending_rule_edit_on_main_stays_unapproved, y02_recovery_after_a_kill_never_drops_saved_bytes,
+         y03_write_back_failure_restores_and_rolls_back, y04_standards_changed_in_different_places_stops,
+         y05_fetch_timeout_restores_the_carried_files, y06_timeout_after_main_took_the_merge_is_merged,
+         y07_guardrail_checks_matched_by_kind, y08_learnings_merge_is_base_aware,
+         y09_staged_edit_to_a_carried_file_comes_back_unstaged, y10_unparsable_config_names_the_right_side,
+         y11_staged_removal_of_a_carried_file_is_kept, y12_kill_after_the_fast_forward_leaves_mains_files_alone,
+         y13_staged_version_unlike_the_working_copy_is_saved, y14_write_back_failure_never_stages_a_reversal]
 
 
 def main():
     only = [a.upper() for a in sys.argv[1:]]
     for fn in CASES:
-        cid = "CP2-" + fn.__name__.split("_")[0].upper()
+        m = _re.search(r"\[(CP\d+-X\d+)\]", fn.__doc__ or "")
+        cid = m.group(1) if m else "CP2-" + fn.__name__.split("_")[0].upper()
         if only and not any(cid.endswith(o) for o in only):
             continue
         print(cid)

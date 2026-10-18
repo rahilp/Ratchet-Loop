@@ -40,14 +40,7 @@
       "host-standards",
       "host-correctness",
       [
-        "codex-correctness",
-        "opencode-kimi-correctness",
-        "opencode-glm-correctness",
         "host-alt-correctness"
-      ],
-      [
-        "opencode-glm-standards",
-        "host-alt-standards"
       ]
     ]
   },

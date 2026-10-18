@@ -1977,6 +1977,14 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round", "converge_after_round",
              "doc_globs", "doc_exclude_globs", "test_globs", "doc_test_command", "small_edit_lines"]
 
+# config.json keys that belong to the checkout they are set in (which reviewers and providers a run uses, the
+# developer's consent to paid ones, and its own review limits): `integrate` never takes a lane's value for them,
+# main's is kept and the lane's is listed as not taken. Every other key, and any unknown one, is project-wide.
+LANE_LOCAL_CONFIG_KEYS = ["review_depth", "reviewers", "providers", "host_provider", "host_models", "role_models",
+                          "ui_reviewers", "approver", "human_review", "max_adversarial_rounds",
+                          "max_adversarial_rounds_run", "unavailable_ttl_hours", "probe_providers", "probe_ttl_minutes",
+                          "probe_timeout_sec", "quota_retest_minutes", "provider_share"]
+
 
 def _file_sha(p: Path) -> str | None:
     try:
@@ -5966,10 +5974,20 @@ def _integrate_lane(main: Path, target: str, fail=None):
 
 def _integrate_line(info: dict, result: str, suite: str, detail: str, commits=None) -> dict:
     """One record line for .ratchet/integrations.jsonl: time, lane, run, commits, suite (passed | failed | not-run),
-    result (merged | rolled-back | refused | no-op) and a plain detail."""
-    return {"time": now(), "lane": info.get("lane"), "run": info.get("run"),
+    result (merged | rolled-back | refused | no-op) and a plain detail; a merged line where the lane changed
+    config.json settings that main kept (by Ratchet's rules) also carries not_taken, the list of those settings (the
+    key is left out when there are none, so the line keeps its seven fields); a merged line where a carried file had
+    staged changes before the merge also carries `unstaged`, the list of those paths (they come back unstaged)."""
+    line = {"time": now(), "lane": info.get("lane"), "run": info.get("run"),
             "commits": list(commits if commits is not None else info.get("commits") or []), "suite": suite,
             "result": result, "detail": detail}
+    if result == "merged" and info.get("not_taken"):
+        line["not_taken"] = list(info["not_taken"])
+    if result == "merged" and info.get("unstaged"):
+        line["unstaged"] = list(info["unstaged"])
+    if info.get("staged_saved"):   # {path: file}: a staged version unlike the working copy, saved before main moved
+        line["staged_saved"] = dict(info["staged_saved"])
+    return line
 
 
 def _integrate_record(main: Path, info: dict = None, result: str = "", suite: str = "", detail: str = "", commits=None,
@@ -6143,9 +6161,12 @@ def cmd_integrate(args):
     """`integrate <lane>` (director only): merges a finished lane into the main checkout. The merge is made and the
     regression_command is run in a scratch clone of main (in the temp folder, borrowing main's objects, at main's tip);
     only when the suite passes on that exact commit and main has not moved is the commit fetched into main and main
-    fast-forwarded to it. Any failure removes the scratch clone and
-    leaves main exactly as it was (it never resets, checks out or cleans main's files, and never commits anything
-    but the merge). Every attempt is appended to .ratchet/integrations.jsonl. Nothing is pushed.
+    fast-forwarded to it. Ratchet's own shared files (MERGE_SHARED) are merged by Ratchet's rules in the scratch copy
+    (_integrate_resolve_shared), and main's uncommitted copies of them are carried across the merge and re-applied by
+    the same rules, still uncommitted (_integrate_carry_plan). Any failure removes the scratch clone and leaves main
+    exactly as it was (it never resets or cleans main's files; the only checkout is of the carried Ratchet files, for
+    the fast-forward, and they get their bytes back on any failure; it never commits anything but the merge). Every
+    attempt is appended to .ratchet/integrations.jsonl. Nothing is pushed.
     `--dry-run` only checks the lane and says what integrate would do; it reads only and writes nothing."""
     require_director_session("integrate")
     main = find_root()
@@ -6231,6 +6252,32 @@ def _integrate_dry_run(main: Path, f: dict):
     base = git(main, "merge-base", head, lhead).stdout.strip()
     differ = [x for x in sorted(MERGE_SHARED)
               if any(git(main, "diff", "--name-only", base, side, "--", x).stdout.strip() for side in (lhead, head))]
+    # the two standards.md stops the real run would make (before any clone): both sides changed it since the lane
+    # branched, or main's uncommitted copy and the lane's change clash
+    std = f"{RATCHET_DIR}/standards.md"
+
+    def blob(rev):
+        r = subprocess.run(["git", "show", f"{rev}:{std}"], cwd=main, capture_output=True, timeout=60)
+        return r.stdout if r.returncode == 0 else None
+
+    b, o, t = blob(base), blob(head), blob(lhead)
+    merged, _nt, problem = _integrate_merge_shared(std, b, o, t)   # the one rule the real run applies
+    if problem or merged is None:
+        die(f"Dry run: integrate would refuse this lane. Both sides changed {std} since the lane branched (the lane "
+            f"'{name}' and main), and integrate does not merge two versions of the standards. Decide which wording to "
+            "keep, change one side to match (commit it on main or in the lane), then run integrate again. Nothing was "
+            "changed.")
+    if std in f["carried"] and merged != o:   # the merge changes it: the uncommitted copy is re-applied by the rule
+        try:
+            mine = (main / std).read_bytes()
+        except OSError:
+            mine = None
+        res, _nt, problem = _integrate_merge_shared(std, o, mine, merged, lane_local=False) if mine is not None else (o, [], None)
+        if problem or res is None:
+            die(f"Dry run: integrate would refuse this lane. Main's uncommitted {std} and the merge both change it "
+                "differently, and integrate does not merge two versions of the standards. Ask the developer to commit "
+                f"or undo the uncommitted {std} on main (or change the lane's version to match), then run integrate "
+                "again. Nothing was changed.")
     suite = f["mctx"].config().get("regression_command")
     lines = [f"Dry run: integrate would merge the lane '{name}' (run '{slug}', finished) into {target}.",
              f"Commits it would bring to {target} ({len(commits)}):", *[f"  {c}" for c in commits],
@@ -6339,24 +6386,58 @@ def _integrate_linked_deps(main: Path) -> list:
     return found[:3]
 
 
-def _integrate_move_base(main: Path, mctx, sha: str, lane: str, run: str):
-    """Called holding main's state lock, right after main was fast-forwarded to the merge commit `sha`. When main's own
-    run is building at step 'tests' (between steps: the only building state integrate allows), its current step's
-    starting tree and commit are moved to the merge, the way `merged` does for a lane, so the step's reviewers and its
-    commit see only the step's own changes and not the lane's. Other phases set a fresh starting tree when their next
-    step begins. Logged as `integrated_lane`. A run state that can't be read is left alone (the merge stands)."""
+def _integrate_rules_snapshot(mctx):
+    """Main's own run's approval snapshot (rules and reference files) as they stand now, taken right before main moves
+    so _integrate_move_base can tell what the integrate itself changed; None when main has no run with an approved
+    plan, or its state can't be read."""
+    mslug = mctx.active_slug()
+    if not (mslug and mctx.state_path(mslug).is_file()):
+        return None
+    mst, why = _read_record(mctx.state_path(mslug))
+    if why or not isinstance(mst.get("approved"), dict):
+        return None
+    try:
+        return approval_snapshot(mctx, mst)
+    except (SystemExit, OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _integrate_move_base(main: Path, mctx, sha: str, lane: str, run: str, before: dict = None):
+    """Called holding main's state lock, right after main was fast-forwarded to the merge commit `sha` (and main's
+    uncommitted Ratchet files were re-applied). When main's own run is building at step 'tests' (between steps: the
+    only building state integrate allows), its current step's starting tree and commit are moved to the merge, the way
+    `merged` does for a lane, so the step's reviewers and its commit see only the step's own changes and not the
+    lane's. Other phases set a fresh starting tree when their next step begins. With `before` (the run's rules and
+    reference files as they were right before main moved, _integrate_rules_snapshot), every config rule and reference
+    file that matched the approved baseline before and that the integrate changed (a shared file merged by Ratchet's
+    rules) becomes the new approved baseline, so main's run never asks approve-changes for it; one that was already
+    changed before stays as it is. Logged as `integrated_lane` (`commit`, `lane`, `run`, `accepted`). A run state that
+    can't be read is left alone (the merge stands)."""
     mslug = mctx.active_slug()
     if not (mslug and mctx.state_path(mslug).is_file()):
         return
     mst, why = _read_record(mctx.state_path(mslug))
-    cur = (mst or {}).get("current") if not why else None
-    if not (cur and mst.get("phase") == "building" and (mst.get("checkpoints") or {}).get(cur, {}).get("step") == "tests"):
+    if why:
         return
-    base = fingerprint(main)["id"]
-    mst["base_tree"] = base
-    mst["checkpoints"][cur]["base_tree"] = base
-    mst["checkpoints"][cur]["base_head"] = sha
-    mctx.log(mst, "integrated_lane", commit=sha, lane=lane, run=run)
+    cur, changed, accepted = mst.get("current"), False, []
+    if cur and mst.get("phase") == "building" and (mst.get("checkpoints") or {}).get(cur, {}).get("step") == "tests":
+        base = fingerprint(main)["id"]
+        mst["base_tree"] = base
+        mst["checkpoints"][cur]["base_tree"] = base
+        mst["checkpoints"][cur]["base_head"] = sha
+        changed = True
+    snap = mst.get("approved")
+    if before and isinstance(snap, dict):
+        now_ = approval_snapshot(mctx, mst)
+        for section, what in (("rules", "config rule '{}'"), ("files", "reference file {}")):
+            for k, h in list((snap.get(section) or {}).items()):
+                if h == (before.get(section) or {}).get(k) and now_.get(section, {}).get(k) != h:
+                    snap[section][k] = now_[section][k]
+                    accepted.append(what.format(k))
+        changed = changed or bool(accepted)
+    if not changed:
+        return
+    mctx.log(mst, "integrated_lane", commit=sha, lane=lane, run=run, accepted=accepted)
     mctx.save_state(mst)
 
 
@@ -6395,11 +6476,15 @@ def _integrate_journal(common: Path) -> Path:
 
 def _integrate_recover(main: Path, common: Path):
     """Called with the integrate lock held, before a new attempt starts: an attempt that ended without its record line
-    (killed mid-run, or its record could not be written) left its journal. Record only, nothing else is changed: the
-    journaled outcome as it is when there is one; else merged with a note when main's history holds that attempt's
-    merge commit (killed after the fast-forward; main's run is not touched, so a step in progress shows the lane's
-    changes in its own diff), else rolled back (killed during the suite or before). The journal is removed only once
-    the record line is written; when it cannot be, the command stops with a plain line and the journal stays."""
+    (killed mid-run, or its record could not be written) left its journal. First, when the journal names carried
+    files (main's uncommitted Ratchet files set back to the tip for the fast-forward), a carried file still at the
+    journaled tip gets the developer's saved bytes back, unstaged, and the carry folder is removed; once main holds
+    the merge (or moved on) nothing is written, the folder is set aside under a name of its own and the note says
+    how to re-add the developer's own edits (_integrate_carry_restore). Then the attempt is recorded: the journaled
+    outcome as it is when there is one; else merged with a note when main's history holds that attempt's merge
+    commit (killed after the fast-forward; main's run is not touched, so a step in progress shows the lane's changes
+    in its own diff), else rolled back (killed during the suite or before). The journal is removed only once the
+    record line is written; when it cannot be, the command stops with a plain line and the journal stays."""
     journal = _integrate_journal(common)
     if not journal.is_file():
         return
@@ -6410,6 +6495,22 @@ def _integrate_recover(main: Path, common: Path):
 
     def git(*a):
         return subprocess.run(["git", *a], cwd=main, capture_output=True, text=True, timeout=60)
+
+    names = j.get("carried") if isinstance(j.get("carried"), dict) else {}
+    if names:
+        # the killed attempt had set main's uncommitted Ratchet files back to the tip to move main: while main is
+        # still at that tip, a file still at it (not edited since) gets the developer's saved bytes back, unstaged;
+        # once main holds the merge the saved copy predates it and is only set aside and named
+        folder = Path(j["carry_folder"]) if isinstance(j.get("carry_folder"), str) and j["carry_folder"] else None
+        jstaged = j.get("staged") if isinstance(j.get("staged"), dict) else {}
+        jsaved = j.get("staged_saved") if isinstance(j.get("staged_saved"), dict) else {}
+        info["staged_saved"] = jsaved
+        back = _integrate_carry_restore(main, common, names, head=head, only_clean=True, staged=jstaged, folder=folder)
+        print(f"RATCHET: note: an earlier integrate of the lane '{lane}' was interrupted while carrying main's "
+              f"uncommitted {', '.join(sorted(names))} across the merge; "
+              + _integrate_carry_said(back, names, head, jstaged, jsaved)
+              + (" A change the merge brought to a restored file is not re-applied." if back[0] else ""),
+              file=sys.stderr, flush=True)
 
     if isinstance(j.get("outcome"), dict):
         line = j["outcome"]
@@ -6432,6 +6533,377 @@ def _integrate_recover(main: Path, common: Path):
         journal.unlink()
     except OSError:
         pass
+
+
+_ABSENT = object()   # a config.json key one side does not have, in the three-way rules below
+
+
+def _integrate_merge_checks(base, ours, theirs):
+    """The guardrail `checks` rule, three-way against the base, matched by `kind` (how _finish_guardrail identifies a
+    check: a strengthen step replaces its kind's check with a new command), by `command` for an entry without one:
+    main's entries in main's order, plus every lane entry main lacks, so no guardrail is lost; an entry the lane
+    changed or removed while main left it as the base takes the lane's change (including the removal); one both sides
+    changed differently keeps main's and is listed; one main removed stays removed, listed only when the lane changed
+    it. Returns (merged list, not_taken)."""
+    def key(c):
+        if isinstance(c, dict) and norm_kind(c.get("kind")):
+            return norm_kind(c.get("kind"))
+        return c.get("command") if isinstance(c, dict) and isinstance(c.get("command"), str) else json.dumps(c, sort_keys=True)
+    bm = {key(c): c for c in base}
+    om = {key(c): c for c in ours}
+    tm = {key(c): c for c in theirs}
+    out, not_taken = [], []
+    for c in ours:
+        k = key(c)
+        if k in tm:
+            if tm[k] == c or not (k in bm and bm[k] == c):
+                out.append(c)                   # same on both sides, or main changed it: main's
+                if tm[k] != c and (k not in bm or tm[k] != bm[k]):   # listed only when the lane changed it too
+                    not_taken.append(f"checks ({k})")
+            else:
+                out.append(tm[k])               # main left it as the base; the lane changed it
+        elif k in bm and bm[k] == c:
+            continue                            # the lane removed it; main left it as the base
+        else:
+            out.append(c)                       # main added or changed it; the lane lacks it
+            if k in bm:
+                not_taken.append(f"checks ({k})")
+    for c in theirs:
+        k = key(c)
+        if k in om:
+            continue
+        if k in bm:                             # main removed it since the base
+            if bm[k] != c:
+                not_taken.append(f"checks ({k})")
+        else:
+            out.append(c)
+    return out, not_taken
+
+
+def _integrate_merge_config(base: dict, ours: dict, theirs: dict, lane_local: bool = True):
+    """The config.json rule, three-way per top-level key against `base`: a key only `theirs` changed takes theirs; a
+    key both changed keeps ours and is listed; a lane-local key (LANE_LOCAL_CONFIG_KEYS, when `lane_local`) always
+    keeps ours and is listed when theirs differs; `checks` merges by _integrate_merge_checks. Keys keep ours' order,
+    theirs' new keys follow. Returns (result, not_taken). With lane_local off (re-applying main's uncommitted copy over
+    the merged result: ours is the uncommitted copy) the uncommitted value wins every clash."""
+    out, not_taken = dict(ours), []
+    for k in dict.fromkeys(list(ours) + list(theirs) + list(base)):
+        ov, tv, bv = ours.get(k, _ABSENT), theirs.get(k, _ABSENT), base.get(k, _ABSENT)
+        if tv == ov or tv == bv:
+            continue                          # no difference, or theirs did not change it: ours stands
+        if lane_local and k in LANE_LOCAL_CONFIG_KEYS:
+            not_taken.append(k)
+        elif ov == bv:                        # only theirs changed it (`checks` too: the lane's list whole)
+            if tv is _ABSENT:
+                out.pop(k, None)
+            else:
+                out[k] = tv
+        elif k == "checks" and isinstance(ov, list) and isinstance(tv, list) and (isinstance(bv, list) or bv is _ABSENT):
+            out[k], nt = _integrate_merge_checks(bv if isinstance(bv, list) else [], ov, tv)
+            not_taken += nt
+        else:                                 # both changed it differently
+            not_taken.append(k)
+    return out, not_taken
+
+
+def _integrate_union_lines(base, ours: bytes, theirs: bytes) -> bytes:
+    """The learnings.md and .ratchet/.gitignore rule, a line merge against the base (None when neither side had the
+    file before): every line of ours, in ours' order, except a base line theirs removed; then each line theirs added
+    (not in the base, not in ours), once, in theirs' order. Every line either side added is kept; a line one side
+    deleted stays deleted."""
+    bl = set(base.decode("utf-8", "surrogateescape").splitlines()) if base else set()
+    tl = theirs.decode("utf-8", "surrogateescape").splitlines()
+    ts = set(tl)
+    o = ours.decode("utf-8", "surrogateescape")
+    kept = [ln for ln in o.splitlines() if ln in ts or ln not in bl]
+    seen = set(kept)
+    add = []
+    for ln in tl:
+        if ln not in seen and ln not in bl:
+            seen.add(ln)
+            add.append(ln)
+    if not add and len(kept) == len(o.splitlines()):
+        return ours
+    return "".join(ln + "\n" for ln in kept + add).encode("utf-8", "surrogateescape")
+
+
+def _integrate_merge_shared(path: str, base, ours, theirs, lane_local: bool = True):
+    """Ratchet's rule for one shared file (a MERGE_SHARED path), given the three versions as bytes (None when that
+    side has no such file). Returns (result bytes, not_taken, problem): `problem` is a plain sentence when the rule
+    cannot decide (standards.md changed on both sides, a config.json that is not a JSON object), with result None.
+    A side that deleted the file counts as unchanged (the other side's version is kept)."""
+    name = path.rsplit("/", 1)[-1]
+    if theirs is None or theirs == ours or theirs == base:
+        return ours if ours is not None else theirs, [], None
+    if name == "config.json":   # always key by key: a lane-local key is kept even when only the lane changed the file
+        sides = {}
+        for tag, raw_ in (("base", base), ("ours", ours), ("theirs", theirs)):
+            data, why = _read_record(Path(path), data=raw_ if raw_ is not None else b"{}")
+            if why:
+                where = {"base": "in the merge base (the commit the lane branched from)", "ours": "on main",
+                         "theirs": "in the lane"}[tag]
+                return None, [], (f"{path} is not a JSON object {where} ({why}), so integrate cannot merge it by its "
+                                  "rules. " + ("Have the lane's agent merge main into the lane (git merge main, then "
+                                               "`ratchet.py merged`), so the lane branches from a newer base, then run "
+                                               "integrate again." if tag == "base" else
+                                               "Fix that file, then run integrate again."))
+            sides[tag] = data
+        res, not_taken = _integrate_merge_config(sides["base"], sides["ours"], sides["theirs"], lane_local)
+        if res == sides["ours"]:
+            return ours, not_taken, None
+        if res == sides["theirs"]:
+            return theirs, not_taken, None
+        return (json.dumps(res, indent=2, ensure_ascii=False) + "\n").encode("utf-8"), not_taken, None
+    if ours is None or ours == base:
+        return theirs, [], None
+    if name in ("learnings.md", ".gitignore"):
+        return _integrate_union_lines(base, ours, theirs), [], None
+    return None, [], None   # standards.md (and any other shared file): both sides changed it differently
+
+
+def _integrate_resolve_shared(tmp: Path, head: str, lhead: str, name: str, git):
+    """Inside the scratch copy, right after `git merge --no-commit` of the lane: Ratchet's shared files are merged by
+    Ratchet's rules, not git's. Every MERGE_SHARED path the lane changed since the merge base is run through its rule,
+    whether git conflicted on it (then from its index stages: :1: base, :2: main, :3: lane) or merged it cleanly (from
+    the base, main and lane versions), and `git add`ed: a lane-local config key never reaches main, a learnings line
+    one side removed stays removed, and standards.md changed on both sides stops integrate even when git would merge
+    the two cleanly. Returns (not_taken, problem): `problem` is a plain sentence to roll back with (main untouched)."""
+    conflicted = set(git(tmp, "diff", "--name-only", "--diff-filter=U").stdout.split())
+    base = git(tmp, "merge-base", head, lhead).stdout.strip()
+    not_taken = []
+
+    def blob(spec):
+        r = subprocess.run(["git", "show", spec], cwd=tmp, capture_output=True, timeout=120)
+        return r.stdout if r.returncode == 0 else None
+
+    for path in sorted(MERGE_SHARED):
+        if path in conflicted:
+            b, o, t = blob(f":1:{path}"), blob(f":2:{path}"), blob(f":3:{path}")
+        elif git(tmp, "diff", "--quiet", base, lhead, "--", path).returncode != 0:
+            b, o, t = blob(f"{base}:{path}"), blob(f"{head}:{path}"), blob(f"{lhead}:{path}")
+        else:
+            continue
+        res, nt, problem = _integrate_merge_shared(path, b, o, t)
+        if problem:
+            return not_taken, problem
+        if res is None:
+            return not_taken, (f"Both sides changed {path} since the lane branched (the lane '{name}' and main), and "
+                               "integrate does not merge two versions of the standards. Decide which wording to keep, "
+                               "change one side to match (commit it on main or in the lane), then run integrate again.")
+        not_taken += nt
+        _write_record(tmp / path, res, raw=True)
+        r = git(tmp, "add", "--", path)
+        if r.returncode != 0:
+            return not_taken, f"git could not stage the merged {path} ({(r.stderr or r.stdout).strip()[:200]})."
+    return not_taken, None
+
+
+def _integrate_carry_plan(main: Path, scratch: Path, head: str, sha: str, carried: list):
+    """What main's uncommitted Ratchet files (`carried`, MERGE_SHARED paths) become once main is at the merge commit
+    `sha` (read from the scratch copy, where it exists before main takes it): each is re-applied by the same per-file
+    rules, three-way with base = main's old HEAD version, ours = the uncommitted copy, theirs = the merged result; the
+    uncommitted value wins a clash and is listed. Returns (saved {path: bytes as they are now}, writes {path: bytes to
+    leave uncommitted}, not_taken, problem)."""
+    saved, writes, not_taken = {}, {}, []
+
+    def blob(rev, path):
+        r = subprocess.run(["git", "show", f"{rev}:{path}"], cwd=scratch, capture_output=True, timeout=120)
+        return r.stdout if r.returncode == 0 else None
+
+    for path in sorted(carried):
+        try:
+            mine = (main / path).read_bytes()
+        except OSError as e:
+            return saved, writes, not_taken, (f"Main's uncommitted {path} could not be read ({e}), so integrate cannot "
+                                              "carry it across the merge. Fix that, then run integrate again.")
+        saved[path] = mine
+        res, nt, problem = _integrate_merge_shared(path, blob(head, path), mine, blob(sha, path), lane_local=False)
+        if problem:
+            return saved, writes, not_taken, problem
+        if res is None:
+            return saved, writes, not_taken, (
+                f"Main's uncommitted {path} and the merge both change it differently, and integrate does not merge two "
+                f"versions of the standards. Ask the developer to commit or undo the uncommitted {path} on main (or "
+                "change the lane's version to match), then run integrate again.")
+        writes[path] = res
+        not_taken += nt
+    return saved, writes, not_taken, None
+
+
+def _integrate_carry_dir(common: Path) -> Path:
+    """Where integrate keeps the bytes of main's uncommitted Ratchet files while main moves (next to the lock and the
+    journal), so a killed attempt can give them back."""
+    return common / "ratchet-integrate-carry"
+
+
+def _integrate_carry_save(common: Path, saved: dict) -> dict:
+    """Writes each uncommitted file's working-tree bytes under the carry folder (the index is not saved: a carried
+    file comes back unstaged, and a staged removal is staged again after the write-back). Returns {path: file name}
+    for the journal."""
+    names = {}
+    for i, (path, data) in enumerate(sorted(saved.items())):
+        fname = f"{i}-{path.rsplit('/', 1)[-1]}"
+        _write_record(_integrate_carry_dir(common) / fname, data, raw=True)
+        names[path] = fname
+    return names
+
+
+def _integrate_carry_staged(main: Path, paths) -> dict:
+    """{path: 'D' | 'M'} for the carried paths whose index differs from HEAD: a staged removal (the working copy is
+    still there) or a staged (or partly staged) edit. Read before the carried files are set back to the tip."""
+    out = {}
+    if not paths:
+        return out
+    r = subprocess.run(["git", "diff", "--cached", "--name-status", "-z", "--no-renames", "--", *sorted(paths)],
+                       cwd=main, capture_output=True, text=True, timeout=60)
+    parts = r.stdout.split("\0")
+    for st, path in zip(parts[::2], parts[1::2]):
+        if path:
+            out[path] = "D" if st.startswith("D") else "M"
+    return out
+
+
+def _integrate_carry_staged_save(main: Path, common: Path, saved: dict):
+    """Before the carried files are set back to the tip: every index blob of a carried path (stages 0, 2 and 3) that
+    differs from both its saved working-tree bytes and the old tip's blob is content only the index holds, so it is
+    written to `<common>/ratchet-integrate-staged-<timestamp>/<i>-<name>`, a folder integrate never removes. Returns
+    ({path: saved file}, folder or None). Raises OSError when it cannot write."""
+    out, folder, i = {}, None, 0
+
+    def blob(spec):
+        r = subprocess.run(["git", "cat-file", "blob", spec], cwd=main, capture_output=True, timeout=60)
+        return r.stdout if r.returncode == 0 else None
+
+    for path, data in sorted(saved.items()):
+        tip = blob(f"HEAD:{path}")
+        ls = subprocess.run(["git", "ls-files", "-s", "-z", "--", path], cwd=main, capture_output=True, text=True,
+                            timeout=60).stdout
+        for ent in ls.split("\0"):
+            fields = ent.split("\t", 1)[0].split()
+            if len(fields) < 3:
+                continue
+            staged = blob(fields[1])
+            if staged is None or staged == data or staged == tip:
+                continue
+            if folder is None:
+                folder = common / f"ratchet-integrate-staged-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+            dst = folder / f"{i}-{path.rsplit('/', 1)[-1]}"
+            _write_record(dst, staged, raw=True)
+            out[path] = str(dst)
+            i += 1
+            break
+    return out, folder
+
+
+def _integrate_carry_set_aside(common: Path, folder: Path = None) -> Path:
+    """Moves the carry folder to `ratchet-integrate-carry-<timestamp>/` next to it, a name the next attempt never
+    overwrites or removes, and returns the folder that holds the saved bytes (the old name when the move fails)."""
+    src = folder or _integrate_carry_dir(common)
+    if src.name != "ratchet-integrate-carry":
+        return src   # already set aside
+    dst = src.with_name(f"ratchet-integrate-carry-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}")
+    try:
+        os.rename(str(src), str(dst))
+    except OSError:
+        return src
+    return dst
+
+
+def _integrate_carry_restore(main: Path, common: Path, names: dict, head: str = None, only_clean: bool = False,
+                             staged: dict = None, folder: Path = None):
+    """Puts the saved bytes back in main's working tree, unstaged (a staged removal in `staged` is staged again with
+    `git rm --cached`), but only while main is still at `head`, the tip the bytes were saved against: once main holds
+    the merge (or moved on), a copy from before the merge must not be written over the file, so nothing is written
+    and the saved copy is kept. With `only_clean` (recovery after a kill), a file that already equals its saved bytes
+    was never reset (its copy is dropped) and one that differs from both the tip and the saved bytes changed since
+    and keeps its current bytes. Returns (restored, could-not-write, left-alone, folder, at_tip): the carry folder is
+    removed when every copy was written back or dropped, else set aside under a name of its own (`folder`)."""
+    done, failed, kept = [], [], []
+    src_dir = folder or _integrate_carry_dir(common)
+    try:
+        cur = subprocess.run(["git", "rev-parse", "HEAD"], cwd=main, capture_output=True, text=True,
+                             timeout=60).stdout.strip()
+    except subprocess.TimeoutExpired:
+        cur = ""
+    at_tip = head is None or cur == head
+    for path, fname in sorted(names.items()):
+        src = src_dir / fname
+        if not src.is_file():
+            continue
+        data = src.read_bytes()
+        if not at_tip:
+            kept.append(path)
+            continue
+        if only_clean:
+            try:
+                now_ = (main / path).read_bytes()
+            except OSError:
+                now_ = None
+            if now_ == data:
+                continue   # never reset, or already restored: nothing to do
+            if subprocess.run(["git", "diff", "--quiet", "HEAD", "--", path], cwd=main, capture_output=True,
+                              timeout=120).returncode != 0:
+                kept.append(path)
+                continue
+        try:
+            _write_record(main / path, data, raw=True)
+        except OSError:
+            failed.append(path)
+            continue
+        if (staged or {}).get(path) == "D":
+            subprocess.run(["git", "rm", "--cached", "-q", "--", path], cwd=main, capture_output=True, timeout=60)
+        done.append(path)
+    if failed or kept:
+        out_folder = _integrate_carry_set_aside(common, src_dir)
+    else:
+        out_folder = None
+        shutil.rmtree(src_dir, ignore_errors=True)
+    return done, failed, kept, out_folder, at_tip
+
+
+def _integrate_unstaged_said(paths, staged_saved: dict = None) -> str:
+    """The sentence for carried files that had staged changes and come back unstaged: one whose staged version
+    differed from its working copy names where that version is saved; "no bytes lost" only when none was saved."""
+    parts = []
+    for p in paths:
+        at = (staged_saved or {}).get(p)
+        if at:
+            parts.append(f"{p} had a staged version different from its working copy; that staged version is saved at "
+                         f"{at}; the file is now unstaged")
+        else:
+            parts.append(f"{p} had staged changes: now unstaged, no bytes lost")
+    return "; ".join(parts)
+
+
+def _integrate_carry_said(back, names: dict = None, head: str = None, staged: dict = None,
+                          staged_saved: dict = None) -> str:
+    """One plain sentence for what _integrate_carry_restore did: which files hold the developer's bytes again (and
+    which of them are now unstaged, with where a staged version unlike the working copy is saved), which could not
+    be written or were left alone, and where the saved bytes are, with the next step when a copy from before the
+    merge must not be copied over the file."""
+    done, failed, kept, folder, at_tip = back
+    names = names or {}
+    parts = []
+    if done:
+        now_un = [p for p in done if (staged or {}).get(p) == "M"]
+        parts.append(f"the developer's bytes were put back into {', '.join(done)}, uncommitted"
+                     + (f" ({_integrate_unstaged_said(now_un, staged_saved)})" if now_un else ""))
+    if failed:
+        parts.append(f"the developer's bytes could not be written back to {', '.join(failed)}")
+    if not at_tip and kept:
+        parts.append(f"main is no longer at {(head or '')[:9]}, the tip the uncommitted {', '.join(kept)} was saved "
+                     f"against, so the saved copy (from before the merge) was not written over the file; it is in "
+                     f"{folder}. Do not copy it over the file: to re-add only the developer's own edits, compare "
+                     f"`git show {(head or '')[:9]}:<path>` with the saved copy "
+                     f"({', '.join(str(folder / names[p]) if p in names else p for p in kept)}) and apply that "
+                     "difference by hand")
+    elif kept:
+        parts.append(f"{', '.join(kept)} changed since and keeps its current bytes; the saved bytes are in {folder}: "
+                     f"compare `git show {(head or 'HEAD')[:9]}:<path>` with the saved copy to see the developer's own "
+                     "edits, and re-add them by hand")
+    if failed and folder:
+        parts.append(f"the saved bytes of {', '.join(failed)} are in {folder} (put them back by hand)")
+    return "; ".join(parts) + "." if parts else "nothing needed restoring."
 
 
 def _integrate_merge(main: Path, f: dict, info: dict, finish):
@@ -6461,8 +6933,9 @@ def _integrate_merge(main: Path, f: dict, info: dict, finish):
 
     state = {"suite": "not-run"}
 
-    def rolled(msg, suite_state, detail=None, commits=None):
-        finish("rolled-back", suite_state, msg + " Nothing was changed.", detail or msg, commits)
+    def rolled(msg, suite_state, detail=None, commits=None, clean=True):
+        # `clean` is False when a carried file could not be put back: then main did change, and the message says how
+        finish("rolled-back", suite_state, msg + (" Nothing was changed." if clean else ""), detail or msg, commits)
 
     def path_of(r):  # a path git printed for main, made absolute
         p = Path(r.stdout.strip())
@@ -6511,11 +6984,22 @@ def _integrate_merge(main: Path, f: dict, info: dict, finish):
         r = git(tmp, *who, *mcfg, "merge", "--no-ff", "--no-commit", lhead)
         if r.returncode != 0:
             files = git(tmp, "diff", "--name-only", "--diff-filter=U").stdout.split()
-            if files:
-                rolled(f"Merging the lane '{name}' into {target} conflicts in: {', '.join(files)}. Have the lane's "
+            project = [x for x in files if x not in MERGE_SHARED]
+            if project:
+                rolled(f"Merging the lane '{name}' into {target} conflicts in: {', '.join(project)}. Have the lane's "
                        "agent merge main into the lane (git merge main, resolve the files, commit, then run "
                        "`ratchet.py merged`), then run integrate again.", "not-run")
-            rolled(f"git could not merge the lane '{name}' ({(r.stderr or r.stdout).strip()[:300]}).", "not-run")
+            if not files:
+                rolled(f"git could not merge the lane '{name}' ({(r.stderr or r.stdout).strip()[:300]}).", "not-run")
+        # Ratchet's own shared files are merged by Ratchet's rules, whether git conflicted on them or not
+        info["not_taken"], problem = _integrate_resolve_shared(tmp, head, lhead, name, git)
+        if problem:
+            rolled(problem, "not-run")
+        left = git(tmp, "diff", "--name-only", "--diff-filter=U").stdout.split()
+        if left:
+            rolled(f"Merging the lane '{name}' into {target} left conflicts in: {', '.join(left)}. Have the lane's "
+                   "agent merge main into the lane (git merge main, resolve the files, commit, then run "
+                   "`ratchet.py merged`), then run integrate again.", "not-run")
         r = git(tmp, *who, *mcfg, "commit", "-q", "-m", f"Merge lane '{name}' (run {slug})", "-m",
                 f"Ratchet-Integrated: {name} {slug}")
         if r.returncode != 0:
@@ -6527,12 +7011,14 @@ def _integrate_merge(main: Path, f: dict, info: dict, finish):
         commits = [sha] + list(f["hashes"])  # recorded only once the merge commit is in main; until then the record
         # keeps the lane's tip, since the scratch merge commit exists nowhere else
         touched = set(git(tmp, "diff", "--name-only", head, sha).stdout.split())
-        clash = sorted(x for x in f["carried"] if x in touched)
-        if clash:
-            rolled(f"The merge changes {', '.join(clash)}, which has uncommitted changes on main that integrate does "
-                   "not merge yet. Ask the developer to commit or stash that file (integrate does not touch it), then "
-                   "run integrate again.", "not-run")
-        loose = sorted(x for x in _integrate_untracked(main) if x in touched)
+        # main's uncommitted Ratchet files are carried across the merge: a re-apply the rules cannot do (the
+        # uncommitted standards.md and the merge both change it) is found here, before the suite and before main
+        # is touched; it is checked again under main's lock right before main moves
+        _s, _w, _nt, problem = _integrate_carry_plan(main, tmp, head, sha, [x for x in f["carried"] if x in touched])
+        if problem:
+            rolled(problem, "not-run")
+        # (a carried Ratchet file with a staged removal shows as untracked too: it is carried, not refused)
+        loose = sorted(x for x in _integrate_untracked(main) if x in touched and x not in f["carried"])
         if loose:
             rolled(f"Main has a file git does not track yet ({', '.join(loose[:5])}) at a path the lane also adds, so "
                    "main cannot take the merge. Ask the developer to move or delete that file (or commit it), then run "
@@ -6557,6 +7043,8 @@ def _integrate_merge(main: Path, f: dict, info: dict, finish):
                    "so what it tested is not the merge commit. Make the regression command leave tracked files as they "
                    "are (commit generated files in the lane, or generate them outside the tracked tree), then run "
                    "integrate again.", "passed", "The suite changed tracked files in the merged copy.")
+
+        carry, saved = [], {}   # main's uncommitted Ratchet files the merge changes, as seen under main's lock
 
         def main_problem():
             """(message, short detail) for what changed in main while the suite ran, or None. Run holding main's state
@@ -6584,13 +7072,8 @@ def _integrate_merge(main: Path, f: dict, info: dict, finish):
                 return (f"The suite passed, but main now has uncommitted changes to project files "
                         f"({', '.join(bad[:5])}). Ask the developer to commit or stash them (integrate does not touch "
                         "them), then run integrate again.", "Main got uncommitted changes while the suite ran.")
-            clash_now = sorted(x for x in carried if x in touched)
-            if clash_now:
-                return (f"The suite passed, but the merge changes {', '.join(clash_now)}, which has uncommitted changes "
-                        "on main that integrate does not merge yet. Ask the developer to commit or stash that file "
-                        "(integrate does not touch it), then run integrate again.",
-                        "A shared Ratchet file on main changed while the suite ran.")
-            loose_now = sorted(x for x in _integrate_untracked(main) if x in touched)
+            carry[:] = sorted(x for x in carried if x in touched)
+            loose_now = sorted(x for x in _integrate_untracked(main) if x in touched and x not in carried)
             if loose_now:
                 return (f"The suite passed, but main now has a file git does not track yet ({', '.join(loose_now[:5])}) "
                         "at a path the lane also adds. Ask the developer to move or delete that file (or commit it), "
@@ -6610,44 +7093,166 @@ def _integrate_merge(main: Path, f: dict, info: dict, finish):
             problem = main_problem()
             if problem:
                 rolled(problem[0], "passed", problem[1])
-            late = ""
-            r = git(main, "fetch", "-q", str(tmp), "refs/heads/ratchet-integrate")  # only brings the commit's objects
-            if r.returncode == 0:
-                try:
-                    # main's hooks (post-merge, say) run inside this call, so it gets the suite's time limit; a hook
-                    # still running after that does not undo a fast-forward that already happened
-                    r = subprocess.run(["git", "-c", "merge.autoStash=false", "merge", "--ff-only",
-                                        "--no-overwrite-ignore", sha], cwd=main, capture_output=True, text=True,
-                                       timeout=max(120, timeout))
-                except subprocess.TimeoutExpired:
-                    if git(main, "rev-parse", "HEAD").stdout.strip() != sha:
-                        raise
-                    r = types.SimpleNamespace(returncode=0, stdout="", stderr="")
-                    late = (f" A git hook on main was still running after {max(120, timeout)}s, so integrate stopped "
-                            "waiting for it; check its result yourself.")
-            landed = r.returncode == 0 and git(main, "rev-parse", "HEAD").stdout.strip() == sha
+            # main's run's rules and reference files as they stand now, uncommitted edits included, so a rule the
+            # developer changed before (not yet approved) is never taken for one the integrate changed
+            before = _integrate_rules_snapshot(f["mctx"])
+            # main's uncommitted Ratchet files the merge changes: their bytes are saved next to the journal, the
+            # paths are set back to main's tip for the fast-forward only, and the saved copy is re-applied by the
+            # per-file rules afterwards, still uncommitted. A re-apply the rules cannot do stops here, main untouched.
+            saved, writes, carry_nt, problem = _integrate_carry_plan(main, tmp, head, sha, carry)
+            if problem:
+                rolled("The suite passed, but " + problem[0].lower() + problem[1:], "passed", problem)
+            names, staged = {}, {}
+            landed = False
+            try:
+                if saved:
+                    staged = _integrate_carry_staged(main, saved)   # staged edits come back unstaged, listed; a
+                    # staged removal is staged again after the write-back; a staged version unlike the working
+                    # copy is kept in a folder of its own (never removed) and named
+                    try:
+                        names = _integrate_carry_save(common, saved)
+                        info["staged_saved"], _sf = _integrate_carry_staged_save(main, common, saved)
+                    except OSError as e:
+                        rolled(f"The suite passed, but integrate could not save a copy of main's uncommitted "
+                               f"{', '.join(saved)} before moving main ({e}). Make {common} writable, then run integrate "
+                               "again.", "passed", "Main's uncommitted Ratchet files could not be saved.")
+                    entry["carried"], entry["staged"], entry["staged_saved"] = names, staged, info["staged_saved"]
+                    _write_record(_integrate_journal(common), entry)
+                    r = git(main, "checkout", "-q", "HEAD", "--", *sorted(saved))
+                    if r.returncode != 0:
+                        rolled(f"The suite passed, but integrate could not set main's uncommitted {', '.join(saved)} "
+                               f"aside for the fast-forward ({(r.stderr or r.stdout).strip()[:200]}). Run integrate "
+                               "again.", "passed", "Main's uncommitted Ratchet files could not be set aside.")
+                late = ""
+                r = git(main, "fetch", "-q", str(tmp), "refs/heads/ratchet-integrate")  # only brings the commit's objects
+                if r.returncode == 0:
+                    try:
+                        # main's hooks (post-merge, say) run inside this call, so it gets the suite's time limit; a hook
+                        # still running after that does not undo a fast-forward that already happened
+                        r = subprocess.run(["git", "-c", "merge.autoStash=false", "merge", "--ff-only",
+                                            "--no-overwrite-ignore", sha], cwd=main, capture_output=True, text=True,
+                                           timeout=max(120, timeout))
+                    except subprocess.TimeoutExpired:
+                        if git(main, "rev-parse", "HEAD").stdout.strip() != sha:
+                            raise
+                        r = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+                        late = (f" A git hook on main was still running after {max(120, timeout)}s, so integrate stopped "
+                                "waiting for it; check its result yourself.")
+                landed = r.returncode == 0 and git(main, "rev-parse", "HEAD").stdout.strip() == sha
+            finally:
+                # whatever stopped the fast-forward (a refusal, a git timeout), the carried files get their bytes
+                # back while main is still at its old tip; once main holds the merge, the saved copy (from before
+                # it) is never written over the file: it is set aside and named, with the next step
+                if names and not landed:
+                    back = _integrate_carry_restore(main, common, names, head=head, staged=staged)
+                    state["carry"] = _integrate_carry_said(back, names, head, staged, info.get("staged_saved"))
+                    state["carry_ok"] = not (back[1] or back[2])
+                    if back[3]:   # the next integrate's recovery finds the set-aside copy by this name
+                        entry["carry_folder"] = str(back[3])
+                        try:
+                            _write_record(_integrate_journal(common), entry)
+                        except OSError:
+                            pass
+                    if sys.exc_info()[0] is SystemExit:   # a refusal already printed its message: add the note
+                        print("RATCHET: note: main's uncommitted Ratchet files: " + state["carry"], file=sys.stderr,
+                              flush=True)
             if landed:
                 info["commits"] = commits
-                _integrate_move_base(main, f["mctx"], sha, name, slug)
+                folder = None
+                if names:
+                    # the saved copy is set aside under its own name before the write-back and named until every
+                    # write succeeded, so a cut-off here (a git timeout) leaves it findable and never overwritten
+                    folder = _integrate_carry_set_aside(common)
+                    entry["carry_folder"] = str(folder)
+                    _write_record(_integrate_journal(common), entry)
+                    state["carry"] = (f"main holds the merge; the developer's uncommitted bytes of "
+                                      f"{', '.join(sorted(names))} (from before it) are saved in {folder}. Do not copy "
+                                      "them over the files: compare `git show "
+                                      f"{head[:9]}:<path>` with the saved copy to see the developer's own edits, and "
+                                      "re-add only those by hand.")
+                failed, err = [], ""
+                for path, data in sorted(writes.items()):   # plain file writes only: no git call in this loop
+                    try:
+                        _write_record(main / path, data, raw=True)   # the working tree only: never staged
+                    except OSError as e:
+                        failed, err = [path], str(e)
+                        break
+                if failed:
+                    # main goes back to its old tip only while it is still at the merge just made: first the carried
+                    # paths are set to the merge commit's own versions (what HEAD holds, so nothing is staged against
+                    # it), then main is moved back; the developer's files get their saved bytes only once main is
+                    # back at that tip. When main already moved on, nothing is written at all.
+                    cur = git(main, "rev-parse", "HEAD").stdout.strip()
+                    undo = types.SimpleNamespace(returncode=1, stdout="", stderr=f"main moved on to {cur[:9]}")
+                    if cur == sha:
+                        undo = git(main, "checkout", "-q", sha, "--", *sorted(saved))
+                        if undo.returncode == 0:
+                            undo = git(main, "reset", "-q", "--keep", head)
+                    back = _integrate_carry_restore(main, common, names, head=head, staged=staged, folder=folder)
+                    said = _integrate_carry_said(back, names, head, staged, info.get("staged_saved"))
+                    if back[4]:   # main is back at its old tip
+                        info["commits"] = [lhead]
+                        rolled(f"Main took the merge, but main's uncommitted {failed[0]} could not be written back "
+                               f"({err}). Main was moved back to {head[:9]} and {said} Make {failed[0]} writable, then "
+                               "run integrate again.", "passed",
+                               f"Main's uncommitted {failed[0]} could not be re-applied after the merge.",
+                               clean=not (back[1] or back[2]))
+                    finish("merged", "passed",
+                           f"Main took the merge (merge commit {sha[:9]}), but main's uncommitted {failed[0]} could not "
+                           f"be written back ({err}), and main could not be moved back "
+                           f"({(undo.stderr or undo.stdout).strip()[:200]}); it stays at the merge with "
+                           f"{', '.join(sorted(saved))} at the merge's version, nothing staged. {said} Make "
+                           f"{failed[0]} writable first. Nothing was pushed.",
+                           f"Main took the merge, but main's uncommitted {failed[0]} could not be re-applied: {err}",
+                           commits)
+                    return
+                for path, how in sorted(staged.items()):
+                    if how == "D" and path in writes:   # the developer's staged removal, staged again
+                        git(main, "rm", "--cached", "-q", "--", path)
+                info["unstaged"] = [p for p in sorted(writes) if staged.get(p) == "M"]
+                if folder:
+                    shutil.rmtree(str(folder), ignore_errors=True)
+                    state.pop("carry", None)
+                info["not_taken"] = list(dict.fromkeys(list(info.get("not_taken") or []) + carry_nt))
+                _integrate_move_base(main, f["mctx"], sha, name, slug, before)
         finally:
             slock.release()
         if not landed:
             why = (r.stderr or r.stdout).strip()
+            carry_note = (" Main's uncommitted Ratchet files: " + state["carry"]) if state.get("carry") else ""
             if "untracked" in why.lower() or "ignored" in why.lower():
                 rolled(f"The suite passed, but main could not take the merge: a file git does not track yet would be "
                        f"overwritten ({why[:300]}). Ask the developer to move or delete that file (or commit it), then "
-                       "run integrate again.", "passed", "Main could not take the merge: " + why[:200])
+                       f"run integrate again.{carry_note}", "passed", "Main could not take the merge: " + why[:200],
+                       clean=state.get("carry_ok", True))
             rolled(f"The suite passed, but main could not take the merge ({why[:300]}). Ask the developer to commit "
-                   "the uncommitted changes in main (or stash them), then run integrate again.", "passed",
-                   "Main could not take the merge: " + why[:200])
+                   f"the uncommitted changes in main (or stash them), then run integrate again.{carry_note}", "passed",
+                   "Main could not take the merge: " + why[:200], clean=state.get("carry_ok", True))
+        nt = info.get("not_taken") or []
         finish("merged", "passed", f"Merged the lane '{name}' (run '{slug}') into {target}: {len(f['commits'])} "
                f"commit(s), merge commit {sha[:9]}. The suite passed on exactly that commit before {target} moved. "
-               f"Nothing was pushed.{late}", None, commits)
+               f"Nothing was pushed.{late}"
+               + (f"\nLane settings in {RATCHET_DIR}/config.json not taken (main's kept, by Ratchet's rules): "
+                  f"{', '.join(nt)}." if nt else "")
+               + (f"\nMain's uncommitted {', '.join(sorted(saved))} carried across the merge, still uncommitted"
+                  + (f" ({_integrate_unstaged_said(info['unstaged'], info.get('staged_saved'))})"
+                     if info.get("unstaged") else "") + "." if saved else ""), None, commits)
     except subprocess.TimeoutExpired as e:
         cmd = " ".join(str(a) for a in (e.cmd if isinstance(e.cmd, (list, tuple)) else [e.cmd]))[:80]
+        carry_note = (" Main's uncommitted Ratchet files: " + state["carry"]) if state.get("carry") else ""
+        try:
+            took = bool(entry.get("sha")) and subprocess.run(["git", "rev-parse", "HEAD"], cwd=main, capture_output=True,
+                                                             text=True, timeout=60).stdout.strip() == entry["sha"]
+        except subprocess.TimeoutExpired:
+            took = False
+        if took:
+            finish("merged", state["suite"], f"A git command timed out ({cmd}) after main took the merge commit "
+                   f"{entry['sha'][:9]}; integrate stopped there. Main's run was not changed: if it is in the middle of "
+                   f"a step, that step's diff also shows the lane's changes. Nothing was pushed.{carry_note}",
+                   "A git command timed out after main took the merge: " + cmd, [entry["sha"]] + list(f["hashes"]))
         finish("rolled-back", state["suite"], f"A git command timed out ({cmd}), so integrate stopped. Check "
                "`git status` and `git log -1` in main to see whether it took the merge, then run integrate again (it "
-               "says 'already merged' if it did).", "A git command timed out: " + cmd, info.get("commits"))
+               f"says 'already merged' if it did).{carry_note}", "A git command timed out: " + cmd, info.get("commits"))
     finally:
         _integrate_drop_scratch(tmp)
 
