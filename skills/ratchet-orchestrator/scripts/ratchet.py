@@ -5579,11 +5579,16 @@ def require_director_session(what: str):
         print(note, file=sys.stderr)
 
 
-def _approval_payload(ctx, st, action) -> str:
+def _approval_payload(ctx, st, action, bind=()) -> str:
+    """What a director token signs: this lane, run, phase and pause (`awaiting_since`, which every `ask` moves, so
+    a token signed before a re-ask is stale), the plan, the action, and `bind`: the details the action must match
+    exactly (raise-limit binds the step and the reason, choice binds the letter), so a token for one step, reason
+    or letter can never be applied to another."""
     parts = [str(ctx.root.resolve()), st["slug"], st["phase"], str(st.get("awaiting_since")),
              str(st.get("plan_hash")), action]
     if action == "hooks-waive":  # single use: the counter moves on every waive/clear, so a spent token is dead
         parts.append(str(st.get("hooks_waive_n", 0)))
+    parts.extend(str(b) for b in bind)
     return "|".join(parts)
 
 
@@ -5740,20 +5745,28 @@ def _iso(ts) -> float:
         return 0.0
 
 
-def _require_approval(ctx, st, action, token=None):
-    """Returns {"by": "human"|"director", "detail": ...} or dies."""
+def _require_approval(ctx, st, action, token=None, bind=()):
+    """Returns {"by": "human"|"director", "detail": ...} or dies. `bind` is what the director token must also
+    match (see _approval_payload): a token signed for another step, reason or letter is refused as not matching."""
     mode = approval_mode(ctx)
     if token:
         if mode == "human":
             die("This lane only accepts human approvals (approver=human). A director must enroll it first.")
         key = _director_key()
-        if not hmac.compare_digest(token, _sign(key, _approval_payload(ctx, st, action))):
-            die("Director token does not match this run's current pause (wrong lane, stale token, "
-                "or the run moved on). Ask the director to sign again.")
+        if not hmac.compare_digest(token, _sign(key, _approval_payload(ctx, st, action, bind))):
+            die("Director token does not match this run's current pause (wrong lane, wrong action, stale token, "
+                "or the run moved on" + (", or it was signed for a different step, reason or letter" if bind else "")
+                + "). Ask the director to sign again.")
         return {"by": "director", "detail": f"director-signed {action}"}
     if mode == "director":
+        sign = f"director-sign {action}"  # the command that actually signs this action, whole
+        if action == "raise-limit":
+            sign += f" {bind[0] if bind else '<CPn>'} --reason \"<why>\""
+        elif action == "choice":
+            opts = (st.get("pending") or {}).get("options") or []
+            sign += " <one of " + ", ".join(opts) + ">" if opts else " <letter>"
         die("This lane is director-enrolled: approvals need a director token "
-            f"(director runs: ratchet.py --root {ctx.root} director-sign {action}). "
+            f"(director runs: ratchet.py --root {ctx.root} {sign}). "
             "Chat messages do not count as approvals here.")
     if human_override(f"approve this pause ({action})", ctx, action):
         return {"by": "human", "detail": "(RATCHET_HUMAN_OVERRIDE, code typed back at the terminal)"}
@@ -7273,15 +7286,69 @@ def cmd_director_sign(args):
             "set-review": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
                            "awaiting_checkpoint_review", "awaiting_final_review"],
             "hooks-waive": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
-                            "awaiting_checkpoint_review", "awaiting_final_review"]}[args.action]
+                            "awaiting_checkpoint_review", "awaiting_final_review"],
+            "raise-limit": ["blocked"],
+            "choice": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
+                       "awaiting_checkpoint_review", "awaiting_final_review", "planning_feedback"]}[args.action]
     if st["phase"] not in want:
+        if args.action == "raise-limit":
+            die(f"Run {st['slug']} is in phase {st['phase']}, not blocked; director-sign raise-limit only applies "
+                "when the step is blocked at its review-round limit (after the lane ran `ask raise-limit CPn`).")
         die(f"Run {st['slug']} is in phase {st['phase']}; {args.action} applies to {want}.")
     action = args.action
+    target = (getattr(args, "target", None) or "").strip()
+    bind = ()
     if action == "guardrail":
         if not args.kind:
             die("director-sign guardrail needs --kind <kind> (from ratchet.py repeats)")
         action = f"guardrail:{norm_kind(args.kind)}"
-    print(_sign(_director_key(), _approval_payload(ctx, st, action)))
+    elif action == "raise-limit":
+        # Signed only for the step the lane asked about, while it is blocked at its review-round limit and its one
+        # raise is unspent: the same checks `ask raise-limit` and `raise-limit` make, so a token is never signed for
+        # a step it could not raise. The step and the reason are bound into the token (_approval_payload), so the
+        # lane applies exactly this raise, with exactly this reason, and nothing else.
+        reason = (getattr(args, "reason", None) or "").strip()
+        if not target or not reason:
+            die("director-sign raise-limit needs the step and the reason: director-sign raise-limit CPn --reason \"...\"")
+        p = st.get("pending") or {}
+        if p.get("action") != "raise-limit" or p.get("mode") != target:
+            die(f"No raise-limit question is waiting for {target}: the lane runs `ask raise-limit {target}` first "
+                "(it is refused there unless the step is blocked at its review-round limit), then the director signs.")
+        g = ((st.get("checkpoints") or {}).get(target) or {}).get("gates", {}).get("adversarial") or {}
+        if g.get("cap_raised_to"):
+            die(f"{target}'s review-round limit was already raised once (to {g['cap_raised_to']} rounds); it is never "
+                "raised a second time. Nothing was signed.")
+        if _adv_block_kind(st, target) not in ("own", "run_wide"):
+            die(f"{target} is not blocked at its review-round limit right now; director-sign raise-limit only applies "
+                "when it is. Nothing was signed.")
+        bind = (target, reason)
+    elif action == "choice":
+        # Signed only for a letter the waiting question offers; the letter is bound into the token.
+        p = st.get("pending") or {}
+        if p.get("action") != "choice":
+            die("No lettered question is waiting: the lane runs `ask choice --options ...` first, then the director "
+                "signs one of its letters with `director-sign choice <letter>`. Nothing was signed.")
+        letter = target.upper()
+        opts = p.get("options") or []
+        if letter not in opts:
+            die(f"director-sign choice needs one of the offered letters ({', '.join(opts)}), got "
+                f"{target or '(none)'}. Nothing was signed.")
+        bind = (letter,)
+        # What the letter does, from the recorded question itself (not the lane's prose), on stderr so stdout
+        # stays the bare token: the director never signs blind.
+        files = (p.get("locked") or {}).get(letter) or []
+        kind = (p.get("guardrail") or {}).get(letter)
+        does = []
+        if files:
+            does.append(f"approves changing the locked file(s) {', '.join(files)} (approve-changes then needs no "
+                        "further signature)")
+        if kind:
+            does.append(f"adds a guardrail step for '{kind}' right after the current step (it may add a tool)")
+        if st["phase"] == "blocked":
+            does.append("is the pick at a blocked run; resuming it still needs director-sign human-approve")
+        print(f"Signing option {letter} of {', '.join(opts)}: it " + ("; ".join(does) if does else
+              "unlocks nothing (it only records the letter)") + ".", file=sys.stderr)
+    print(_sign(_director_key(), _approval_payload(ctx, st, action, bind)))
 
 
 def cmd_approve_plan(args):
@@ -11574,7 +11641,11 @@ def cmd_human_approve(args):
     if st["phase"] not in ("awaiting_checkpoint_review", "awaiting_final_review", "blocked"):
         die(f"Nothing awaiting human approval (phase {st['phase']})")
     allow = st.get("choice_allow") or {}
-    if st["phase"] == "blocked" and allow.get("unblock") and not getattr(args, "director_token", None):
+    if st["phase"] == "blocked" and allow.get("unblock") and not getattr(args, "director_token", None) \
+            and allow.get("by", "human") == "human" and approval_mode(ctx) != "director":
+        # a human's recorded pick at a block is the approval. A director-signed pick never is: resuming a block
+        # (and the run-wide budget reset that comes with it) takes its own director token, so one signed letter
+        # can never do more than record the letter (CP4: the run-wide review budget is never reset by a pick).
         msg = {"by": "human", "prompt": f"picked option {allow['letter']}: {allow.get('reply', '')}"}
     else:
         msg = _require_human(ctx, st, "human-approve", getattr(args, "director_token", None))
@@ -12039,9 +12110,10 @@ def _approval_question(ctx, st, action) -> str:
 
 
 def _ask_choice(ctx, st, args):
-    """A lettered-options question. An option may approve a change to locked files: then picking it is the approval."""
-    if approval_mode(ctx) == "director":
-        die("This lane is director-enrolled: a chat reply can't approve anything here. Put the options to the director.")
+    """A lettered-options question. An option may approve a change to locked files: then picking it is the approval.
+    In a director-enrolled lane the question is recorded the same way, but it waits for the director (who signs a
+    letter with `director-sign choice <L>`), not for a chat reply: it is not shown to the user as a question."""
+    director = approval_mode(ctx) == "director"
     opts = [o.strip().upper() for o in (args.options or "").split(",") if o.strip()]
     if len(opts) < 2 or len(set(opts)) != len(opts) or not all(re.fullmatch(r"[A-Z]", o) for o in opts):
         die("ask choice needs --options with two or more single letters, e.g. --options A,B,C")
@@ -12080,6 +12152,19 @@ def _ask_choice(ctx, st, args):
     ctx.save_state(st)
     if overtook:
         print(_not_asked_text("the same `ratchet.py ask choice ...` command", overtook))
+        return
+    if director:
+        lines = [f"FOR THE DIRECTOR (this lane is director-enrolled, so a chat reply picks nothing): options "
+                 f"{', '.join(opts)} are recorded as waiting. Do not put them to the user as a chat question; say in "
+                 "one line what each option is, with your recommendation, and that the director picks one with "
+                 "`director-sign choice <letter>`."]
+        for letter, paths in locked.items():
+            lines.append(f"  Option {letter} approves changing {', '.join(paths)} (locked since the plan was approved).")
+        for letter, kind in guards.items():
+            lines.append(f"  Option {letter} adds an automatic check for '{kind}' as its own step right after the "
+                         "current one.")
+        lines.append("Apply the director's pick with `ratchet.py choice <letter> --director-token <t>`.")
+        print("\n".join(lines))
         return
     lines = [f"ASK THE USER: give them options {', '.join(opts)} in your own words, with your recommendation, and ask "
              f"them to reply with just the letter."]
@@ -12278,7 +12363,11 @@ def _ask_paid_provider(ctx, st, args):
 
 
 def cmd_choice(args):
-    """Record which lettered option the user picked, from their first reply after `ask choice`."""
+    """Record which lettered option the user picked, from their first reply after `ask choice`. In a
+    director-enrolled lane a chat reply picks nothing (the same rule as every other approval there): the letter
+    comes from `choice <L> --director-token <t>`, where the token was signed for exactly that letter
+    (`director-sign choice <L>`, after the lane's own `ask choice`); it is recorded exactly as a user's pick,
+    including what the option unlocks."""
     ctx = Ctx(find_root())
     st = ctx.state()
     _require_pending(st, "choice")
@@ -12290,32 +12379,49 @@ def cmd_choice(args):
         die("These options were printed while another question was still waiting for the user's first reply, so their "
             "reply could be meant for either. Nothing was recorded. Run `ratchet.py ask choice ...` again on its own "
             "and wait for their pick.")
-    msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the options were put to can pick one
-    if not msgs:
-        die("No reply from the user yet. End your turn and wait for them to pick an option.")
-    entry = msgs[0]  # the first reply answers the question
-    letter = choice_letter(entry.get("prompt", ""), p.get("options") or [])
-    if ctx.config().get("verify_transcripts", True) and not human_override(
-            "record the option the user picked", ctx, "choice (recorded without the transcript check)"):
-        good, why = _transcript_ok(entry, p.get("asked_at"))
-        if not good:
-            die(f"Couldn't confirm that reply came from the user ({why}). Ask them to reply again in this chat.")
-    if not letter:
-        _clear_pending(st)
-        ctx.log(st, "choice_unclear", reply=entry.get("prompt", "")[:200])
-        ctx.save_state(st)
-        die(f"The user's reply isn't a clear pick of one option: \"{entry.get('prompt', '')[:120]}\". Nothing was "
-            "recorded. Answer what they said; if you still need a decision, ask again (`ratchet.py ask choice ...`).")
+    opts = p.get("options") or []
+    token = getattr(args, "director_token", None)
+    given = (getattr(args, "letter", None) or "").strip().upper()
+    if token or approval_mode(ctx) == "director":
+        if token and given not in opts:
+            die(f"choice needs the signed letter with a director token (one of {', '.join(opts)}): "
+                "`ratchet.py choice <letter> --director-token <t>`. Nothing was recorded.")
+        # _require_approval's own director check and token verification (the letter is bound into the token, so a
+        # token for another letter, lane, question or pause is refused): dies here when this lane is
+        # director-enrolled and no (or a bad) director token was given; a chat letter is never enough in that lane.
+        by = _require_approval(ctx, st, "choice", token, bind=(given,))["by"]
+        letter, reply = given, f"director-signed choice {given}"
+    else:
+        msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the options were put to can pick one
+        if not msgs:
+            die("No reply from the user yet. End your turn and wait for them to pick an option.")
+        entry = msgs[0]  # the first reply answers the question
+        letter = choice_letter(entry.get("prompt", ""), opts)
+        if ctx.config().get("verify_transcripts", True) and not human_override(
+                "record the option the user picked", ctx, "choice (recorded without the transcript check)"):
+            good, why = _transcript_ok(entry, p.get("asked_at"))
+            if not good:
+                die(f"Couldn't confirm that reply came from the user ({why}). Ask them to reply again in this chat.")
+        if not letter:
+            _clear_pending(st)
+            ctx.log(st, "choice_unclear", reply=entry.get("prompt", "")[:200])
+            ctx.save_state(st)
+            die(f"The user's reply isn't a clear pick of one option: \"{entry.get('prompt', '')[:120]}\". Nothing was "
+                "recorded. Answer what they said; if you still need a decision, ask again (`ratchet.py ask choice ...`).")
+        if given and given != letter:
+            die(f"The user's reply picked option {letter}, not {given}. Nothing was recorded; run `ratchet.py choice` "
+                "with no letter (or with theirs) to record their pick.")
+        by, reply = "human", entry.get("prompt", "")[:200]
     files = (p.get("locked") or {}).get(letter) or []
     guard = (p.get("guardrail") or {}).get(letter)
     unblock = st["phase"] == "blocked"
     if files or unblock or guard:
         st["choice_allow"] = {"letter": letter, "files": files, "cp": st.get("current"), "at": now(),
-                              "reply": entry.get("prompt", "")[:200], "unblock": unblock, "guardrail": guard}
+                              "reply": reply, "unblock": unblock, "guardrail": guard, "by": by}
     _clear_pending(st)
-    ctx.log(st, "choice_made", letter=letter, approves=files)
+    ctx.log(st, "choice_made", letter=letter, approves=files, by=by)
     ctx.save_state(st)
-    msg = f"The user picked option {letter}."
+    msg = f"The {'director' if by == 'director' else 'user'} picked option {letter}."
     if files:
         msg += (f" That approves changing {', '.join(files)}: make that change (through the sub-agent that owns it), "
                 "then run `ratchet.py approve-changes`. No further question is needed.")
@@ -12324,7 +12430,9 @@ def cmd_choice(args):
                 "--why \"...\" --check-command \"<check> {target}\" --bad-example <fixture path> "
                 "--test-command \"...\" --test-file <path>`.")
     if unblock:
-        msg += " The run is blocked: run `ratchet.py human-approve` to resume it, then act on their choice."
+        msg += (" The run is blocked: run `ratchet.py human-approve`"
+                + (" with a director token (`director-sign human-approve`)" if by == "director" else "")
+                + " to resume it, then act on the choice.")
     ok(msg)
 
 
@@ -12405,7 +12513,8 @@ def cmd_approve_changes(args):
     allow = st.get("choice_allow") or {}
     if allow and allow.get("cp") == st.get("current") and not getattr(args, "director_token", None) \
             and _choice_covers(allow, probs):
-        msg = {"by": "human", "prompt": f"picked option {allow['letter']}: {allow.get('reply', '')}"}
+        # the recorded pick is the approval (a director-signed pick counts as the director's)
+        msg = {"by": allow.get("by", "human"), "prompt": f"picked option {allow['letter']}: {allow.get('reply', '')}"}
         allow["files"] = []
         if not allow.get("unblock") and not allow.get("guardrail"):
             st.pop("choice_allow", None)
@@ -12821,7 +12930,11 @@ def cmd_raise_limit(args):
     and agents, exactly like any other human-review learning. Refuses outright, before recording anything,
     unless `_adv_block_kind(st, cp)` is "own" or "run_wide": the one-time raise only ever applies while the step
     is genuinely blocked on an adversarial round limit, the same precondition `_ask_raise_limit` enforces before
-    asking."""
+    asking. In a director-enrolled lane a chat `raise:` reply never counts (same rule as every other approval
+    there): a director token signed for this step and this reason is required (`director-sign raise-limit CPn
+    --reason "..."`, after the lane's own `ask raise-limit CPn`), with `--reason` repeating the signed reason since
+    there is no chat reply to read one from; every other check (one raise per step, the block kind, the attempt
+    count kept, the run-wide budget never reset) is the same as for a chat raise."""
     ctx = Ctx(find_root())
     st = ctx.state()
     _require_pending(st, "raise-limit", args.cp)
@@ -12850,24 +12963,41 @@ def cmd_raise_limit(args):
         ctx.save_state(st)
         die(f"{cp} is not blocked on an adversarial review-round limit right now; raise-limit only applies then. "
             "Nothing was changed.")
-    msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the question was asked in can answer it
-    if not msgs:
-        die("No reply has been recorded in the owning chat since this question was asked. End your turn and wait "
-            "for the user's reply, exactly `raise: <reason>`; a reply typed in another chat does not count.")
-    entry = msgs[0]  # the first reply answers the question; later messages never do
-    reply = entry.get("prompt", "")
-    reason = _raise_reply_reason(reply)
-    if reason is None:
-        _spend_question(ctx, st, reply)
-        die(f"The user's first reply after the question was not the exact form `raise: <reason>`: \"{reply[:120]}\". "
-            "Nothing was raised, and the question is closed, so a later reply in that form does not count. Run "
-            f"`ratchet.py ask raise-limit {cp}` again if they still want to raise it.")
-    if ctx.config().get("verify_transcripts", True):
-        good, why = _transcript_ok(entry, p.get("asked_at"))
-        if not good:
+    token = getattr(args, "director_token", None)
+    if token or approval_mode(ctx) == "director":
+        reason = (getattr(args, "reason", None) or "").strip()
+        if not token:  # enrolled lane, no token: the missing token is the cause, named first (a chat reply is nothing)
+            _require_approval(ctx, st, "raise-limit", None, bind=(cp,))
+        # With a token, --reason is checked BEFORE the token is verified or anything is cleared (as accept-finding
+        # does): the question stays pending and nothing is saved, so the SAME token with --reason added works.
+        if not reason:
+            die(f"raise-limit needs --reason \"...\" when a director token approves it (the reason the director "
+                f"signed; there is no chat reply to read one from). Nothing was raised, and the question is still "
+                f"waiting: run the same command again with --reason \"...\" added.")
+        # _require_approval's own director check and token verification (the step and the reason are bound into
+        # the token, so a token for another step, reason, lane or pause is refused): dies here when this lane is
+        # director-enrolled and no (or a bad) director token was given; a chat `raise:` reply is never enough there.
+        by = _require_approval(ctx, st, "raise-limit", token, bind=(cp, reason))["by"]
+    else:
+        msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the question was asked in can answer it
+        if not msgs:
+            die("No reply has been recorded in the owning chat since this question was asked. End your turn and wait "
+                "for the user's reply, exactly `raise: <reason>`; a reply typed in another chat does not count.")
+        entry = msgs[0]  # the first reply answers the question; later messages never do
+        reply = entry.get("prompt", "")
+        reason = _raise_reply_reason(reply)
+        if reason is None:
             _spend_question(ctx, st, reply)
-            die(f"Couldn't confirm that reply came from the user ({why}). Nothing was raised. Run `ratchet.py ask "
-                f"raise-limit {cp}` again and ask them to reply in this chat.")
+            die(f"The user's first reply after the question was not the exact form `raise: <reason>`: \"{reply[:120]}\". "
+                "Nothing was raised, and the question is closed, so a later reply in that form does not count. Run "
+                f"`ratchet.py ask raise-limit {cp}` again if they still want to raise it.")
+        if ctx.config().get("verify_transcripts", True):
+            good, why = _transcript_ok(entry, p.get("asked_at"))
+            if not good:
+                _spend_question(ctx, st, reply)
+                die(f"Couldn't confirm that reply came from the user ({why}). Nothing was raised. Run `ratchet.py ask "
+                    f"raise-limit {cp}` again and ask them to reply in this chat.")
+        by = "human"
     cfg = ctx.config()
     prev_attempts = g.get("attempts", 0)  # preserved across _unblock below so the raise grants exactly one more
     # round, not a fresh budget: _unblock() resets failing-gate attempt counters to 0 for every other unblock path,
@@ -12877,13 +13007,13 @@ def cmd_raise_limit(args):
     # grant happen in, instead of compounding on top of each other (see _adv_base_cap/_adv_round_cap).
     g["cap_raised_to"] = cap
     _clear_pending(st)
-    ctx.log(st, "round_limit_raised", cp=cp, cap=cap, reason=reason[:300])
+    ctx.log(st, "round_limit_raised", cp=cp, cap=cap, reason=reason[:300], by=by)
     _append_learning(ctx, f"{cp}'s review-round limit was raised to {cap} rounds: {reason}", source="raise-limit")
     unblocked_to = None
     if _adv_block_kind(st, cp) == "own":  # raise-limit only ever lifts CP's own step cap, so it only ever
         # unblocks CP's own round-limit block, never the run-wide cap (raising one step's cap does not touch
         # the run-wide budget; that needs a plain human-approve, same as any other failing gate).
-        unblocked_to = _unblock(ctx, st, "human", f"raised {cp}'s round limit to {cap}")
+        unblocked_to = _unblock(ctx, st, by, f"raised {cp}'s round limit to {cap}")
         g["attempts"] = prev_attempts
     ctx.save_state(st)
     build_viewer(ctx)
@@ -14260,6 +14390,12 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                    "question.")
                 if p["action"] == "choice":
                     letter = choice_letter(n["prompt"], p.get("options") or [])
+                    if _question_waiter(ctx) == "director":  # read-only: never exits or writes from a hook
+                        return False, (f"[ratchet] Your lettered question ({', '.join(p.get('options') or [])}) is "
+                                       "waiting on the director: this lane is director-enrolled, so a letter typed "
+                                       "in chat picks nothing. Do not run `choice` on it. The director signs a "
+                                       f"letter with `director-sign choice <letter>`; apply it with `{eng} choice "
+                                       "<letter> --director-token <t>`.")
                     return False, (f"[ratchet] This reply answers your lettered question ({', '.join(p.get('options') or [])}). "
                                    + (f"It reads as option {letter}. " if letter else "It is NOT a clear pick of one option. ")
                                    + f"Run `{eng} choice` to record it, then continue. It does NOT approve the plan or a "
@@ -17504,9 +17640,10 @@ def main(argv=None):
     a.add_argument("--reason", help="director mode only: the director's reason (there is no chat reply to read one from)")
     a.set_defaults(fn=cmd_accept_finding)
     a = sp.add_parser("raise-limit", help="raise one checkpoint's review-round limit by one round (after `ask "
-                                          "raise-limit` and the owning chat's own 'raise: <reason>' reply); "
-                                          "offered at most once per step, ever")
-    a.add_argument("cp")
+                                          "raise-limit` and the owning chat's own 'raise: <reason>' reply, or a "
+                                          "director token with --reason); offered at most once per step, ever")
+    a.add_argument("cp"); a.add_argument("--director-token")
+    a.add_argument("--reason", help="director mode only: the reason the director signed (there is no chat reply to read one from)")
     a.set_defaults(fn=cmd_raise_limit)
     a = sp.add_parser("hooks-waive", help="record the user's choice to build without hooks (after `ask hooks-waive`)")
     a.add_argument("--director-token")
@@ -17516,7 +17653,10 @@ def main(argv=None):
     a = sp.add_parser("set-review", help="change how often the user reviews (needs their confirmation)")
     a.add_argument("mode", choices=["end", "each", "none"]); a.add_argument("--director-token")
     a.set_defaults(fn=cmd_set_review)
-    a = sp.add_parser("choice", help="after `ask choice`: record which option the user picked")
+    a = sp.add_parser("choice", help="after `ask choice`: record which option the user picked (or, with a director "
+                                     "token, the letter the director signed)")
+    a.add_argument("letter", nargs="?", help="the letter; required with --director-token (it must match the signed one)")
+    a.add_argument("--director-token")
     a.set_defaults(fn=cmd_choice)
     a = sp.add_parser("ui-respec", help="after `ask ui-respec CPn` and the user's yes: allow one change to a frozen UI check")
     a.add_argument("cp"); a.add_argument("--director-token"); a.set_defaults(fn=cmd_ui_respec)
@@ -17612,8 +17752,10 @@ def main(argv=None):
     a = sp.add_parser("director-sign"); a.add_argument("action", choices=["approve-plan", "human-approve", "feedback",
                                                                           "approve-changes", "cancel", "set-review",
                                                                           "hooks-waive", "ui-respec", "guardrail",
-                                                                          "accept-finding"])
+                                                                          "accept-finding", "raise-limit", "choice"])
+    a.add_argument("target", nargs="?", help="raise-limit: the step (CPn); choice: the letter")
     a.add_argument("--kind", help="guardrail: the kind of finding it covers")
+    a.add_argument("--reason", help="raise-limit: the reason (required; the lane repeats it to raise-limit --reason)")
     a.set_defaults(fn=cmd_director_sign)
     sp.add_parser("fingerprint").set_defaults(fn=cmd_fingerprint)
     a = sp.add_parser("config"); a.add_argument("--set", nargs="*"); a.set_defaults(fn=cmd_config)
