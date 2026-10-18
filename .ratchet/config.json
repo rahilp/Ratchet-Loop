@@ -46,6 +46,9 @@
       [
         "codex-correctness",
         "host-correctness"
+      ],
+      [
+        "host-alt-correctness"
       ]
     ]
   },
@@ -104,7 +107,7 @@
   "host_models": {
     "anthropic": {
       "strong": "inherit",
-      "standard": "fable",
+      "standard": "sonnet",
       "light": "haiku",
       "alternates": [
         "fable",

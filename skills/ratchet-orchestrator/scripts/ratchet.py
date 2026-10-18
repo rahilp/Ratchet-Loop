@@ -2589,8 +2589,12 @@ def _final_review_lines(ctx, st, plan) -> list[str]:
     done_means line marked proven or unproven (`done_means_table`, the same verdicts `status --json` and the
     receipt carry): the tests behind the line with their results, and for an unproven line why (no test linked,
     a linked test failed or has no result, a browser test no UI gate checked, or an open finding that names the
-    line). Completing every checkpoint never proves a line is met, so the verdict comes from the recorded test
-    results and findings, not from the agent's judgment. The objective and its lines are the APPROVED ones
+    line). A line the user accepted (CP5, verdict "accepted") shows who accepted it, what held the line (its
+    real `reasons`, which the acceptance covered) and their reason in place of its tests, never the word unproven;
+    a line held again after an acceptance (`_apply_accepted_lines`: a new reason, or a new open finding naming it)
+    reads unproven with a "held again" reason that names the earlier acceptance. Completing every checkpoint never
+    proves a line is met, so the verdict comes from the recorded test results and findings, not from the agent's
+    judgment. The objective and its lines are the APPROVED ones
     (`_plan_as_approved`), so an edit to checkpoints.json after approval never changes the table. `status`
     prints the findings accepted along the way (`_accepted_findings_lines`) and anything left for later right
     after, and (cmd_status_text) the finish block or the older-run note. A plan with no stated objective, or
@@ -2611,15 +2615,44 @@ def _final_review_lines(ctx, st, plan) -> list[str]:
         out.append(table)
         return out
     n_ok = sum(1 for e in table if e["verdict"] == "proven")
-    out.append(f"Done means ({n_ok} of {len(table)} lines proven" + (
-        "" if n_ok == len(table) else f", {len(table) - n_ok} unproven") +
+    n_acc = sum(1 for e in table if e["verdict"] == "accepted")
+    n_un = len(table) - n_ok - n_acc
+    out.append(f"Done means ({n_ok} of {len(table)} lines proven" + (f", {n_acc} accepted" if n_acc else "") + (
+        f", {n_un} unproven" if n_un else "") +
         "; a line is proven only when every test linked to it passed and no open finding names it):")
     for e in table:
         out.append(f"  {e['number']}. {e['text']}: {e['verdict']}")
+        if e["verdict"] == "accepted":
+            out.append(f"     {_accepted_line_text(e)}")
+            continue
         out += [f"     - {c['id']}: {c['result']}" for c in e["cases"]]
         if e["reasons"]:
             out.append(f"     Why unproven: {'; '.join(e['reasons'])}")
     return out
+
+
+def _accepted_line_text(e: dict, with_ids: bool = True) -> str:
+    """The one line `status` and the receipt print under a done-means line the user accepted (CP5): who accepted
+    it, what held the line (the entry's real `reasons`: a failed or missing test result, an open finding naming
+    it, no test linked; all of them covered by the acceptance, `_apply_accepted_lines`) and their reason, on one
+    line (a multi-line reason is collapsed), in place of its tests. Never a fixed cause: a line held by an open
+    finding alone must not read as if its tests failed. The receipt (cmd_receipt) passes `with_ids=False`: there
+    an accepted line is shown apart from the proven lines, without its test ids, so each test reason reads "a
+    linked test failed" / "a linked test has no result" instead of naming the case (`receipt --json` keeps the
+    full `reasons`); an open finding is named either way."""
+    a = e.get("accepted") or {}
+    who = "the director" if a.get("accepted_by") == "director" else "the user"
+    reasons = [str(r) for r in e.get("reasons") or []]
+    if not with_ids:
+        for c in e.get("cases") or []:
+            cid = str(c.get("id") or "")
+            # by slice on a space boundary, never `replace`: with ids CP1-T1 and CP1-T10 on one line, a prefix
+            # replace would leave "a linked test0 failed"
+            reasons = ["a linked test" + r[len(cid):] if cid and (r == cid or r.startswith(cid + " ")) else r
+                       for r in reasons]
+    held = "; ".join(reasons) or "not judged"
+    return (f"Accepted by {who}. What held it: {held}. Their reason: "
+            f"{' '.join(str(a.get('reason') or '').split())}")
 
 
 def _objective_fill_ins(obj: dict) -> list[str]:
@@ -3227,11 +3260,13 @@ QUESTION_WORDS = {"approve-plan": "the plan", "human-approve": "an approval", "a
                   "cancel": "cancelling the run", "set-review": "how often to review", "claim": "continuing the run in this chat",
                   "hooks-waive": "building without the hooks", "ui-respec": "a change to the UI check",
                   "choice": "a choice between options", "accept-finding": "accepting a review finding as a known limit",
-                  "raise-limit": "raising the review limit by one round"}
+                  "raise-limit": "raising the review limit by one round",
+                  "accept-line": "accepting an unproven done-means line"}
 
 
 GATING_QUESTIONS = ("approve-plan", "human-approve", "choice")  # while the run is at a pause or blocked
-ALWAYS_GATING_QUESTIONS = ("accept-finding", "raise-limit")  # a step whose review round blocked waits on them
+ALWAYS_GATING_QUESTIONS = ("accept-finding", "raise-limit", "accept-line")  # a blocked review round, or the held
+                                                                               # finish (CP5), waits on them
 GATING_PHASES = ("awaiting_plan_approval", "awaiting_checkpoint_review", "awaiting_final_review", "blocked",
                  "paused")
 CARRY_ON_QUESTIONS = ("cancel", "set-review", "claim", "hooks-waive", "ui-respec", "choice")
@@ -3272,7 +3307,8 @@ def waiting_question(ctx: Ctx, st):
     question the user has replied to is answered, so it is dropped even before the agent runs the command that
     clears `pending`; in a director lane a chat reply answers nothing, so the question shows until `pending`
     clears. `stops_run` says whether the run really waits for it: only the approval pauses, a blocked run's
-    questions and the accept-a-finding / raise-the-limit questions of a blocked review round do (True); the others
+    questions, the accept-a-finding / raise-the-limit questions of a blocked review round and the accept-a-line
+    question of a held finish (CP5, `about` names its lines) do (True); the others
     (a review-frequency or cancel question, a building-phase choice...) leave a building run building (False);
     approve-changes and the like, and the carry-on kinds outside the building phase, are left unsaid (None)."""
     p = st.get("pending")
@@ -3287,7 +3323,10 @@ def waiting_question(ctx: Ctx, st):
     waiting_on = _question_waiter(ctx, p["action"] == "claim")
     if waiting_on == "user" and _question_answered(ctx, st, p):
         return None
-    about = p.get("mode") if p["action"] in ("accept-finding", "raise-limit", "ui-respec") else None
+    _m, _t = _pq(p)
+    about = (_t or _m) if p["action"] in ("accept-finding", "raise-limit", "ui-respec") else None
+    if p["action"] == "accept-line":
+        about = _lines_word([int(x) for x in str(_t or "").split(",") if x.strip().isdigit()]) or None
     stops = None
     if p["action"] in ALWAYS_GATING_QUESTIONS or (p["action"] in GATING_QUESTIONS and st.get("phase") in GATING_PHASES):
         stops = True
@@ -4205,7 +4244,7 @@ def _consume_paid_ok(ctx, st, pv) -> str:
         ctx.log(st, "paid_provider_unclear", tool=tool, model=model)
         ctx.save_state(st)
         die(f"This question was printed while another one (shall I "
-            f"{_question_what(p['overtook'], p.get('overtook_mode'))}?) was still waiting for the user's first "
+            f"{_question_what(p['overtook'], p.get('overtook_mode'), p.get('overtook_target'))}?) was still waiting for the user's first "
             "reply, so their reply could be meant for either. Nothing was added. Run `ratchet.py ask "
             f"paid-provider {tool} {model}` again on its own.")
     msgs = _replies(ctx, st, p.get("asked_at"), p)
@@ -5965,14 +6004,39 @@ def _require_approval(ctx, st, action, token=None):
 ASKED_APPROVALS = ("approve-plan", "human-approve", "cancel", "set-review", "approve-changes", "claim", "ui-respec")
 
 
-def _ask_cmd(action, mode=None, eng="ratchet.py") -> str:
+def _pq(p):
+    """(mode, target) of a pending question. `mode` is the argument the follow-up command takes; `target` is what
+    the question is about (accept-line: the line numbers, sorted and comma-joined). A pending written before
+    `target` existed kept accept-line's line numbers in `mode`: read them as the target."""
+    if "target" not in p and p.get("action") == "accept-line":
+        return None, p.get("mode") or None
+    return p.get("mode") or None, p.get("target") or None
+
+
+def _ask_cmd(action, mode=None, eng="ratchet.py", target=None) -> str:
+    """The `ask` command that prints this question again: it takes the target when there is one, else the mode."""
     if action == "paid-provider" and mode and ":" in mode:
         tool, model = mode.split(":", 1)  # `mode` is stored as "tool:model"; the real command takes two args
         return f"`{eng} ask paid-provider {tool} {model}`"
-    return f"`{eng} ask {action}{' ' + mode if mode else ''}`"
+    arg = target or mode
+    return f"`{eng} ask {action}{' ' + str(arg) if arg else ''}`"
 
 
-def _question_what(action, mode=None) -> str:
+def _ask_now(ctx, st, action) -> str:
+    """The `ask` command that prints `action`'s question now, for a hint where no question of it is waiting.
+    `ask accept-line` needs line numbers, so a bare one would die: name the lines unproven right now."""
+    if action == "accept-line":
+        try:
+            nums = [e["number"] for e in (done_means_table(ctx, ctx.plan() or {"checkpoints": []}, st) or [])
+                    if e.get("verdict") == "unproven"]
+        except Exception:
+            nums = []
+        if nums:
+            return _ask_cmd(action, target=",".join(str(i) for i in nums))
+    return _ask_cmd(action)
+
+
+def _question_what(action, mode=None, target=None) -> str:
     """The question `ask <action>` put to the user, in the words it used ("shall I <this>?")."""
     if action == "set-review":
         return f"change how often they review to: {REVIEW_MODE_WORDS.get(mode, mode)}"
@@ -5980,6 +6044,11 @@ def _question_what(action, mode=None) -> str:
         tool, model = mode.split(":", 1)
         return (f"use {tool}'s {model} (costs money per use, or whose cost is unknown, treated the same way) "
                 "for reviews instead of only flat-rate ones")
+    if action == "accept-line" and target:
+        nums = [int(t) for t in str(target).split(",") if t.strip().isdigit()]
+        if nums:
+            return (f"accept done-means {_lines_word(nums)} as unproven, with your own reason, so "
+                    f"{'they' if len(nums) != 1 else 'it'} no longer {'hold' if len(nums) != 1 else 'holds'} the finish")
     return ASKABLE.get(action, action)
 
 
@@ -6014,16 +6083,17 @@ def _asked_reply(ctx, st, action, p):
     want = p.get("action")
     if want != action:
         if want:
-            what = _question_what(want, p.get("mode"))
+            wm, wt = _pq(p)
+            what = _question_what(want, wm, wt)
             die(f"A different question is waiting for the user's answer: shall I {what}? Their reply answers THAT "
-                f"question, not this one. If they said yes to it, run `ratchet.py {_pending_followup(want, p.get('mode'))}"
+                f"question, not this one. If they said yes to it, run `ratchet.py {_pending_followup(want, wm)}"
                 "`. If they said no or moved on, run `ratchet.py ask withdraw`. Then print this question "
-                f"with {_ask_cmd(action)}, show it to them word for word, and wait for their reply.")
+                f"with {_ask_now(ctx, st, action)}, show it to them word for word, and wait for their reply.")
         die(f"Ratchet has not asked the user this question yet, so no reply counts as their answer. Run "
-            f"{_ask_cmd(action)}, show them the question it prints word for word, and end your turn. Only their first "
+            f"{_ask_now(ctx, st, action)}, show them the question it prints word for word, and end your turn. Only their first "
             "reply after the question counts; a yes from before it does not.")
     asked = p.get("asked_at")
-    again = _ask_cmd(action, p.get("mode"))
+    again = _ask_cmd(action, _pq(p)[0], target=_pq(p)[1])
     if p.get("phase") and p["phase"] != st.get("phase"):
         _spend_question(ctx, st)
         die(f"That question was asked while the run was {PHASE_PLAIN.get(p['phase'], p['phase'])}; it is now "
@@ -6031,7 +6101,7 @@ def _asked_reply(ctx, st, action, p):
             f"you still need their yes, print the question again ({again}).")
     if p.get("overtook"):
         _spend_question(ctx, st)
-        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'))}"
+        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'), p.get('overtook_target'))}"
             "?) was still waiting for the user's first reply, so their reply could be meant for either. Nothing was "
             f"approved and the question is closed. Print it again on its own ({again}), with no other question or "
             "offer in that message, and wait for their reply.")
@@ -6115,6 +6185,7 @@ def cmd_director_sign(args):
             "ui-respec": ["building", "blocked"],
             "guardrail": ["building", "blocked"],
             "accept-finding": ["building", "blocked"],
+            "accept-line": ["awaiting_final_review", "awaiting_checkpoint_review"],  # the finish pause (CP5)
             "cancel": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
                        "awaiting_checkpoint_review", "awaiting_final_review", "planning_feedback"],
             "set-review": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
@@ -8361,7 +8432,8 @@ def _approved_after_dm(st) -> bool:
     `done_means_rules` marker `approve-plan` writes (DM_RULES_VERSION). False for a run with no approval yet or
     one approved before this change (the snapshot has no marker; nothing infers the era from today's links).
     The marker's one reader that judges it; `_dm_findings_block` (CP3), `_finish_blockers` / `_finish_legacy_note`
-    (CP4) and cmd_plan_extend's append-only check on the approved lines share it. Its other reader,
+    (CP4), `_ask_accept_line` (CP5: an older run gets a plain note, never an accept question) and cmd_plan_extend's
+    append-only check on the approved lines share it. Its other reader,
     `_approval_snapshot_keeping_dm`, only copies it forward."""
     return bool((st.get("approved") or {}).get("done_means_rules"))
 
@@ -9988,8 +10060,10 @@ def _done_means_proof(ctx, plan, cps_map: dict | None = None, older_plan_note: b
     final review's table in `status` and `status --json`'s "done_means_table", and the receipt): "proven" when
     the line has at least one linked case, every linked case passed (per case, or by exit code only, or checked
     by a passed UI gate) and no open finding names the line; otherwise "unproven", with one plain string in
-    `reasons` for each cause: "no test linked", a linked case that failed / has no result / is a browser case no
-    UI gate checked, and each open finding that names the line in its "done_means" field. When "any_proves" is
+    `reasons` for each cause (`done_means_table` and cmd_receipt then turn an unproven line the user accepted
+    into "accepted" through `_apply_accepted_lines`, CP5; this function never reads state's `accepted_lines`):
+    "no test linked", a linked case that failed / has no result / is a browser case no UI gate checked, and each
+    open finding that names the line in its "done_means" field. When "any_proves" is
     False and `older_plan_note` is True (the default) every line's `verdict` is None and `reasons` is [] (an older
     plan is not "unproven", it was never linked), so no consumer reads a verdict that was never computed. With
     `older_plan_note=False` (a plan approved under the done-means rules, `_approved_after_dm`: `done_means_table`
@@ -10066,10 +10140,79 @@ def _plan_for_briefs(plan, st) -> dict:
     return _plan_as_approved(plan, st)
 
 
+def _lines_word(nums) -> str:
+    """'line 2' or 'lines 2, 3': the plain words for a list of 1-based done-means line numbers."""
+    nums = list(nums)
+    return "line" + ("s " if len(nums) != 1 else " ") + ", ".join(str(x) for x in nums)
+
+
+def _accepted_lines(st) -> dict:
+    """CP5: the done-means lines the user (or the director, in an enrolled lane) accepted as unproven with
+    `accept-line`, by 1-based line number: {n: {"number", "text", "reason", "accepted_by", "accepted_at",
+    "covered"}} ("covered": the line's `reasons` at the moment it was accepted, what the acceptance covered), read
+    from state.json's `accepted_lines` (a dict keyed by the line number as a string, written by cmd_accept_line
+    only). {} when none, or when the key has some other shape. Read by `_apply_accepted_lines` and
+    `_ask_accept_line` (a line that reads "accepted" cannot be asked about again; one held again can)."""
+    acc = st.get("accepted_lines")
+    out = {}
+    if not isinstance(acc, dict):
+        return out
+    for k, v in acc.items():
+        try:
+            n = int(k)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(v, dict):
+            out[n] = v
+    return out
+
+
+HELD_AGAIN_PREFIX = "held again: "
+
+
+def _apply_accepted_lines(st, lines: list) -> list:
+    """CP5: marks the accepted lines in a `_done_means_proof` lines list, in place, and returns it. An entry whose
+    verdict is "unproven" and whose number the user accepted (`_accepted_lines`) gets verdict "accepted" and an
+    "accepted" record {"reason", "accepted_by", "accepted_at", "covered"} ONLY while every one of its current
+    `reasons` is in the record's "covered" list (the reasons at accept time): its `reasons` stay (what the
+    acceptance covered, printed by `_accepted_line_text`). A line that is unproven for a reason the acceptance did
+    not cover (a linked test that failed since, a NEW open finding naming the line, a link removed) is HELD AGAIN:
+    it keeps verdict "unproven", gets an "accepted_earlier" record and one more plain reason string starting with
+    HELD_AGAIN_PREFIX that names the earlier acceptance, what it covered and what is new, so status, status --json,
+    the receipt, `_finish_blockers` and every refusal built on them show it, and `ask accept-line` may be run for
+    it again. A record without "covered" (none is written any more) covers whatever holds the line. A line that is
+    proven stays "proven" even when it was accepted earlier (the tests prove it now), and a line never accepted is
+    untouched, so acceptance is per line and never a blanket flag. The one place the verdict "accepted" is made:
+    `done_means_table` (status, status --json, `_finish_blockers`, which then no longer holds the finish on that
+    line) and cmd_receipt both call it."""
+    acc = _accepted_lines(st)
+    for e in lines:
+        rec = acc.get(e.get("number"))
+        if not rec or e.get("verdict") != "unproven":
+            continue
+        record = {k: rec.get(k) for k in ("reason", "accepted_by", "accepted_at", "covered")}
+        covered = rec.get("covered")
+        reasons = e.get("reasons") or []
+        new = [r for r in reasons if r not in covered] if isinstance(covered, list) else []
+        if not new:
+            e["verdict"] = "accepted"
+            e["accepted"] = record
+            continue
+        who = "the director" if rec.get("accepted_by") == "director" else "the user"
+        e["accepted_earlier"] = record
+        why = " ".join(str(rec.get("reason") or "").split())
+        e["reasons"] = list(reasons) + [
+            f"{HELD_AGAIN_PREFIX}{who} accepted this line on {rec.get('accepted_at') or '?'} (reason: {why}) when "
+            f"it was held by: {'; '.join(covered) or 'nothing'}; that acceptance does not cover what holds it now: "
+            f"{'; '.join(new)}"]
+    return lines
+
+
 def done_means_table(ctx, plan, st):
     """The final review's done-means table, one source for plain `status`, `status --json`'s "done_means_table",
     the receipt and the finish check (`_finish_blockers`): the list of per-line entries from _done_means_proof
-    ("number", "text", "verdict", "cases", "reasons"), or one plain note string instead of a list when there is
+    ("number", "text", "verdict", "cases", "reasons"; verdict "accepted" with an "accepted" record for an unproven
+    line the user accepted, `_apply_accepted_lines`, CP5), or one plain note string instead of a list when there is
     nothing to tabulate (no objective at all: NO_OBJECTIVE_NOTE; an objective with no done-means lines:
     DM_NO_LINES_NOTE; no test linked to any line on an OLDER plan: DM_NO_TESTS_NOTE). The lines are the
     APPROVED ones (`_plan_as_approved`), never a later edit of checkpoints.json. A plan approved under the
@@ -10081,7 +10224,7 @@ def done_means_table(ctx, plan, st):
     dm = _done_means_proof(ctx, plan, st.get("checkpoints") or {}, older_plan_note=not marked)
     if dm is None:
         return _dm_none_note(plan)
-    return dm["lines"] if dm["any_proves"] or marked else DM_NO_TESTS_NOTE
+    return _apply_accepted_lines(st, dm["lines"]) if dm["any_proves"] or marked else DM_NO_TESTS_NOTE
 
 
 def _finish_pending(st) -> bool:
@@ -10101,7 +10244,9 @@ def _finish_pending(st) -> bool:
 def _unproven_finish_lines(ctx, st) -> list:
     """The final review table's entries whose verdict is "unproven" (a linked test failed or has no result, a
     browser case no UI gate checked, no test linked, or an open finding names the line), read from the approved
-    lines (`done_means_table`). [] when the table is a plain note instead (no objective, no done-means lines, or
+    lines (`done_means_table`); a line the user accepted reads "accepted" there (CP5), so it is not in this list,
+    while a line held again after its acceptance (a reason the acceptance did not cover) is. [] when the table is
+    a plain note instead (no objective, no done-means lines, or
     an OLDER plan whose tests link to no line; a plan under the done-means rules whose links were all removed
     gets every line as unproven instead, never a note) or every line is proven. Shared by `_finish_blockers` and
     `_finish_legacy_note`, so the block and the older-run note judge the same lines."""
@@ -10115,7 +10260,10 @@ def _finish_blockers(ctx, st) -> list:
     """CP4: the done-means lines that hold the finish, one table entry each ("number", "text", "cases",
     "reasons"), or [] when the run may be marked done. Non-empty only for a plan approved under the done-means
     rules (`_approved_after_dm`) with at least one unproven line; a run approved before this change
-    (no marker) never blocks here and gets `_finish_legacy_note` instead. One verdict, read at the moment it
+    (no marker) never blocks here and gets `_finish_legacy_note` instead. A line the user accepted with
+    `accept-line` (CP5, verdict "accepted") no longer holds the finish; every other unproven line still does,
+    including an accepted line held again by a reason the acceptance did not cover (`_apply_accepted_lines`: its
+    entry carries the "held again" reason). One verdict, read at the moment it
     matters and never cached: cmd_human_approve (a chat yes and a director token alike, before any counter, gate
     or round changes, and only where the approval would finish the run: `_finish_pending`; its one state change
     is dropping a pending human-approve question, so a yes given before the line went unproven never finishes
@@ -10196,10 +10344,27 @@ def _finish_block_lines(ctx, st, blockers: list) -> list[str]:
     UI gate checked sits in a step that is already done, whose tests are not re-run, so no new step can clear it
     (every test linked to a line must pass) and the agent is told to say so plainly instead of being sent down
     that path. Never an instruction to put the approval question to the user: that question is not asked while a
-    line is unproven."""
+    line is unproven. CP5: also the one way the user themselves can release a line (`ask accept-line <n>`, their
+    own `accept: <reason>` reply, or a director token in an enrolled lane) and, while that question is waiting
+    (`waiting_question`), one line saying so, so `next` and `status` name what the run waits for; once the reply
+    has landed (the question no longer waits, `pending` still accept-line), one line pointing at `accept-line` to
+    record it, never back at `ask accept-line`."""
     n = len(blockers)
     out = [f"The run cannot be marked done yet: {n} done-means line{'s are' if n != 1 else ' is'} unproven, so the "
            "finish is held and the approval question is not asked."]
+    q = waiting_question(ctx, st)
+    p = st.get("pending") if isinstance(st.get("pending"), dict) else {}
+    if q and q.get("kind") == "accept-line":
+        out.append(f"A question to accept {q.get('about') or 'a line'} as unproven is waiting for the user's reply "
+                   "(exactly `accept: <reason>`, their first reply after it); when it arrives, run `ratchet.py "
+                   "accept-line`.")
+    elif p.get("action") == "accept-line" and not p.get("overtook"):
+        # the reply landed (so the question no longer "waits") but accept-line has not read it yet: keep pointing
+        # at the command that records it, never back at `ask accept-line` (a re-ask would ask the user again)
+        about = _lines_word([i for i in (p.get("ids") or []) if isinstance(i, int)]) or "a line"
+        out.append(f"The user has replied to your question to accept {about} as unproven: run `ratchet.py "
+                   "accept-line` now to record it (it accepts only a first reply in the exact form "
+                   "`accept: <reason>`; any other first reply closes the question). Do not ask it again first.")
     cps = st.get("checkpoints") or {}
     dm_n = len(_approved_done_means(st)) or max((int(e.get("number") or 0) for e in blockers), default=0)
     unlinked, stuck = [], []
@@ -10214,12 +10379,10 @@ def _finish_block_lines(ctx, st, blockers: list) -> list[str]:
                                f"`ratchet.py mark-fixed {cid} {key}=\"<how it was fixed>\"`.")
         if "no test linked" in reasons:
             unlinked.append(e["number"])
-        if any(not r.startswith("open finding ") and r != "no test linked" for r in reasons):
+        if any(not r.startswith(("open finding ", HELD_AGAIN_PREFIX)) and r != "no test linked" for r in reasons):
             stuck.append(e["number"])
 
-    def _lines(nums):
-        return "line" + ("s " if len(nums) != 1 else " ") + ", ".join(str(x) for x in nums)
-
+    _lines = _lines_word
     out.append("Ways forward: tell the user plainly which lines are unproven and why. An open finding is closed with "
                "mark-fixed as above. If the user asks for changes, `ratchet.py feedback` is still open. A line is "
                "proven only when every test linked to it passed and no open finding names it.")
@@ -10230,6 +10393,10 @@ def _finish_block_lines(ctx, st, blockers: list) -> list[str]:
         out.append(f"  {_lines(stuck)}: a linked test failed, has no result or is a browser test no UI gate checked, "
                    "in a step that is already done. A done step's tests are not re-run and every test linked to a "
                    "line must pass, so a new step cannot clear this: do not offer one for it. Say so plainly.")
+    out.append("  If the user decides a line may stay unproven, run `ratchet.py ask accept-line <n>[,<n>]` and show the "
+               "question it prints; only their own first reply `accept: <reason>` (in a director-enrolled lane, a "
+               "director token with --reason) accepts it, and an accepted line no longer holds the finish. You "
+               "cannot accept a line yourself.")
     return out
 
 
@@ -10241,7 +10408,10 @@ def cmd_receipt(args):
     findings left for later or fixed later in the run (CP1's own `left_for_later`/`_fixed_later` rule, so this
     always agrees with `ratchet.py deferred` and `status`). Also the done-means proof (`_done_means_proof`): every
     objective line with the tests linked to it and their results, a proven / unproven verdict and a "Why
-    unproven:" line per unproven line, the same verdicts `status` shows. A plan whose tests link to no line
+    unproven:" line per unproven line, the same verdicts `status` shows; a line the user accepted
+    (`_apply_accepted_lines`, CP5) reads "accepted" with who accepted it, what held it and their reason in place
+    of its tests (`_accepted_line_text`), and one held again after its acceptance reads unproven with the "held
+    again" reason. A plan whose tests link to no line
     (an older plan) gets one plain note instead of verdicts (`--json` then carries `verdict: null` on each
     line); a plan with no objective, or an objective with no done-means lines, gets its own plain note."""
     ctx = Ctx(find_root())
@@ -10264,6 +10434,8 @@ def cmd_receipt(args):
     judged = _approved_after_dm(st)
     dm = _done_means_proof(ctx, _plan_as_approved(plan, st), cps_map, older_plan_note=not judged)
     judged = judged or bool(dm and dm["any_proves"])
+    if dm is not None and judged:
+        _apply_accepted_lines(st, dm["lines"])
     if getattr(args, "json", False):
         data = {"run": {"elapsed_seconds": run_seconds, "finished": run_status == "finished"},
                 "steps": [{k: s[k] for k in ("id", "title", "commit", "finished", "elapsed_seconds", "reviewers")}
@@ -10293,6 +10465,9 @@ def cmd_receipt(args):
         print("Done-means proof (which tests prove each objective line):")
         for i, line in enumerate(dm["lines"], 1):
             print(f"{i}. {line['text']}" + (f" - {line['verdict']}" if judged else ""))
+            if judged and line["verdict"] == "accepted":
+                print(f"   {_accepted_line_text(line, with_ids=False)}")
+                continue
             if not line["cases"]:
                 print("   - no test linked")
             else:
@@ -11161,12 +11336,14 @@ ASKABLE = {"approve-plan": "start building the plan as it is",
                              "of running another review round",
            "raise-limit": "raise this step's review-round limit by one round, with your own reason, so the "
                           "reviewers can keep going (offered at most once per step, ever)",
+           "accept-line": "accept the done-means line(s) named above as unproven, with your own reason, so they no "
+                          "longer hold the finish",
            "paid-provider": "use a provider that costs money per use (or whose cost is unknown, treated the "
                             "same way) for reviews, named above, instead of only flat-rate ones"}
 # the command that carries out a "yes" to each question
 PENDING_COMMAND = {"approve-plan": "approve-plan", "human-approve": "human-approve", "approve-changes": "approve-changes", "cancel": "cancel", "set-review": "set-review",
                    "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec", "choice": "choice",
-                   "accept-finding": "accept-finding", "raise-limit": "raise-limit"}
+                   "accept-finding": "accept-finding", "raise-limit": "raise-limit", "accept-line": "accept-line"}
 REVIEW_MODE_WORDS = {"end": "only at the end", "each": "after every step", "none": "never (fully autonomous)"}
 
 
@@ -11174,7 +11351,9 @@ def _pending_followup(action, mode=None) -> str:
     """The real command that carries out a developer's yes to a waiting question, for the re-ask/overtaken
     hints that build it from PENDING_COMMAND and the question's mode. paid-provider's mode is "tool:model"
     (joined only for display/comparison); its real follow-up needs them as separate --preset/--model flags
-    and an id for the new provider, not PENDING_COMMAND's plain command-plus-mode form."""
+    and an id for the new provider, not PENDING_COMMAND's plain command-plus-mode form. The follow-up takes only
+    the question's `mode` (the argument its command takes), never its `target` (what it is about, e.g. accept-line's
+    line numbers, which `accept-line` reads from `pending`), so accept-line's is the bare command."""
     if action == "paid-provider" and mode and ":" in mode:
         tool, model = mode.split(":", 1)
         return f"providers --add <id> --preset {tool} --model {model}"
@@ -11211,11 +11390,14 @@ def cmd_ask(args):
     if args.action == "paid-provider" and not (args.mode and getattr(args, "ids", None)):
         die("ask paid-provider needs the tool and model, e.g. `ratchet.py ask paid-provider opencode "
             "openrouter/z-ai/glm-5`")
-    if args.action not in ("set-review", "ui-respec", "accept-finding", "raise-limit", "paid-provider") and args.mode:
+    if args.action not in ("set-review", "ui-respec", "accept-finding", "raise-limit", "paid-provider",
+                           "accept-line") and args.mode:
         die(f"ask {args.action} takes no extra value")
     _bind_owner(ctx, st, args.action, asker)
     if args.action == "raise-limit":
         return _ask_raise_limit(ctx, st, args)
+    if args.action == "accept-line":
+        return _ask_accept_line(ctx, st, args)
     if args.action == "choice":
         return _ask_choice(ctx, st, args)
     if args.action == "accept-finding":
@@ -11301,7 +11483,7 @@ def _bind_owner(ctx, st, action, asker):
         ctx.log(st, "owner_recorded", session=asker, via="ask")
 
 
-def _overtake(ctx, st, action, mode, asker=None) -> dict:
+def _overtake(ctx, st, action, mode, asker=None, target=None) -> dict:
     """A new question while a DIFFERENT one still waits for the user's first reply: the user may see both, and one
     reply can't answer two questions. Plan and step approvals are refused until the waiting one is answered or
     withdrawn. Any other question is recorded but marked as overtaking, so no reply approves it; the agent asks it
@@ -11310,16 +11492,17 @@ def _overtake(ctx, st, action, mode, asker=None) -> dict:
     oa = old.get("action")
     if not oa:
         return {}  # nothing waiting
+    om, ot = _pq(old)
     first = _replies(ctx, st, old.get("asked_at"), old)[:1]
     answered = bool(first)
     new_sess = _asking_session(ctx, st, action, asker)
     if not answered and old.get("session") and new_sess != old.get("session"):
         # the waiting question belongs to another chat: a question asked here (even the same one) must not drop it
-        die(f"A question is waiting for the user's first reply in another chat (shall I {_question_what(oa, old.get('mode'))}?), "
+        die(f"A question is waiting for the user's first reply in another chat (shall I {_question_what(oa, om, ot)}?), "
             "so nothing was asked here. Try again after it is answered there. If the user tells you that chat is "
             "gone, run `ratchet.py ask withdraw` first (that drops its question; it is logged, and that chat has to "
             "ask it again).")
-    if oa == action and (old.get("mode") or None) == (mode or None):
+    if oa == action and om == (mode or None) and ot == (target or None):
         return {}  # the same question printed again in its own chat
     if oa == "hooks-waive" and (not answered or hooks_waive_intent(first[0].get("prompt", "")) == "approve"):
         # `hooks-waive` reads its answer from this question: replacing it before the reply, or after the user agreed,
@@ -11335,17 +11518,17 @@ def _overtake(ctx, st, action, mode, asker=None) -> dict:
             "on its own.")
     if not answered and action in ("approve-plan", "human-approve"):
         die(f"A different question is still waiting for the user's first reply: shall I "
-            f"{_question_what(oa, old.get('mode'))}? One reply can't answer two questions. Get that one answered "
-            f"(if they say yes, run `ratchet.py {_pending_followup(oa, old.get('mode'))}`"
+            f"{_question_what(oa, om, ot)}? One reply can't answer two questions. Get that one answered "
+            f"(if they say yes, run `ratchet.py {_pending_followup(oa, om)}`"
             ") or run `ratchet.py ask withdraw` if you no longer need it, then ask this question on its own.")
-    ctx.log(st, "question_overtaken", action=oa, mode=old.get("mode"), by=action, answered=answered)
+    ctx.log(st, "question_overtaken", action=oa, mode=om, target=ot, by=action, answered=answered)
     if answered:
         return {}  # the old question already had its one reply; this one starts clean
-    return {"overtook": oa, "overtook_mode": old.get("mode")}
+    return {"overtook": oa, "overtook_mode": om, "overtook_target": ot}
 
 
 def _not_asked_text(again, overtook) -> str:
-    return (f"NOT ASKED: a different question (shall I {_question_what(overtook['overtook'], overtook.get('overtook_mode'))}"
+    return (f"NOT ASKED: a different question (shall I {_question_what(overtook['overtook'], overtook.get('overtook_mode'), overtook.get('overtook_target'))}"
             "?) was still waiting for the user's first reply. It is now withdrawn, and this question is recorded as "
             "overtaking it, so no reply approves it: if the user saw both, their reply could be meant for either. Do "
             f"not show it. Run {again} again to ask it on its own, then show the user only that "
@@ -11443,7 +11626,7 @@ ACCEPT_FINDING_RE = re.compile(r"^accept:\s*(.+)$", re.I | re.S)
 
 def _accept_reply_reason(text: str) -> str | None:
     """The reason in a reply of the exact form `accept: <reason>`, or None when the reply is not that form (or
-    gives no reason)."""
+    gives no reason). Read by cmd_accept_finding and cmd_accept_line (CP5): the one reply form that accepts."""
     m = ACCEPT_FINDING_RE.match((text or "").strip())
     if not m:
         return None
@@ -11603,6 +11786,112 @@ def _ask_accept_finding(ctx, st, args):
     print(ASK_ALONE)
 
 
+def _ask_accept_line(ctx, st, args):
+    """`ask accept-line <n>[,<n>...]` (CP5; `args.mode` carries the 1-based numbers of the approved done-means
+    lines, as the final review's table numbers them): the one way a line that holds the finish can be released
+    without proving it. Only at the finish pause (`_finish_pending`) of a plan approved under the done-means rules
+    (`_approved_after_dm`; an older run gets a plain note and nothing is asked, since nothing holds its finish),
+    and only for lines the table (`done_means_table`) reads as "unproven" right now: a line that is proven, not a
+    real line (0, past the last line, not a number, an empty entry), or already accepted is refused naming it,
+    and a mixed list is refused whole, so no line slips past the check; a line accepted earlier but held again
+    (`_apply_accepted_lines`: unproven for a reason that acceptance did not cover) reads unproven and can be
+    asked about again, the question naming the earlier acceptance. Repeated numbers count once. Records the
+    question (`pending`: action accept-line, `target` the line numbers sorted and comma-joined ("2,3" whether typed
+    as 2,3 or 3,2; what the question is about, `mode` stays null, so `_overtake` treats a question about other lines as a different
+    question, a re-print in another order as the same one, and NOT ASKED names the lines; two space-separated
+    values are refused rather than one being dropped),
+    `ids` the numbers parsed, `covered` the reasons the question showed per line (what a reply accepts; a
+    reason that appears later is not accepted unseen, cmd_accept_line), `phase`) through the same `_overtake` /
+    `_asking_session` rules as every other `ask`, and prints it with the only reply that counts: the user's own
+    FIRST reply, exactly `accept: <reason>`; the listed yes words are never offered. `accept-line` reads the
+    reply."""
+    phase = st.get("phase")
+    if not _finish_pending(st):
+        die("A done-means line can be accepted only at the final review, when an unproven line holds the finish; the "
+            f"run is {PHASE_PLAIN.get(phase, phase)} (not at the final review). Nothing was asked.")
+    if not _approved_after_dm(st):
+        ok("This run's plan was approved before unproven done-means lines held the finish, so no line needs "
+           "accepting: its unproven lines are shown but do not stop the run from being marked done. Nothing was "
+           "asked; ask for the final approval as usual (`ratchet.py ask human-approve`).")
+        return
+    table = done_means_table(ctx, ctx.plan() or {"checkpoints": []}, st)
+    if not isinstance(table, list):
+        die(f"There is no done-means table to accept a line from ({table}). Nothing was asked.")
+    n = len(table)
+    unproven = [e["number"] for e in table if e.get("verdict") == "unproven"]
+    none_left = ("Nothing is unproven: every done-means line is proven or already accepted, so the finish is not held "
+                 "and there is nothing to accept.")
+    spec = (args.mode or "").strip()
+    if getattr(args, "ids", None):
+        die(f"ask accept-line takes the line numbers as one comma-separated value, e.g. `ratchet.py ask accept-line "
+            f"{spec},{args.ids}`, not `{spec} {args.ids}` (the second value would be dropped). Nothing was asked.")
+    if not spec and not unproven:
+        die(f"{none_left} Nothing was asked.")
+    if not spec:
+        die("ask accept-line needs the line numbers to accept, e.g. `ratchet.py ask accept-line 2` or `ratchet.py ask "
+            f"accept-line 2,3` (the numbers the final review's table shows; unproven now: {_lines_word(unproven)}). "
+            "Nothing was asked.")
+    nums, bad = [], []
+    for tok in spec.split(","):
+        t = tok.strip()
+        try:
+            v = int(t)
+        except ValueError:
+            bad.append(t)
+            continue
+        if not 1 <= v <= n:
+            bad.append(t)
+            continue
+        if v not in nums:
+            nums.append(v)
+    if bad:
+        shown = ", ".join(f'"{b}"' if b else "an empty entry" for b in bad)
+        die(f"{shown} is not a done-means line of this plan: the real line numbers are 1 to {n} (unproven now: "
+            f"{_lines_word(unproven)}). Nothing was asked.")
+    by_num = {e["number"]: e for e in table}
+    acc = _accepted_lines(st)
+    probs = []
+    for v in nums:
+        verdict = by_num[v].get("verdict")
+        if verdict == "accepted":
+            rec = by_num[v].get("accepted") or acc.get(v) or {}
+            probs.append(f"line {v} is already accepted (by {rec.get('accepted_by', '?')}: "
+                         f"{' '.join(str(rec.get('reason') or '').split())[:120]})")
+        elif verdict == "proven":
+            probs.append(f"line {v} is already proven")
+        elif verdict != "unproven":
+            probs.append(f"line {v} is {verdict or 'not judged'}")
+    if probs:
+        die(f"{'; '.join(probs)}. " + (none_left if not unproven else "Only a line that is unproven right now can be "
+            f"accepted (unproven now: {_lines_word(unproven)}).") + " Nothing was asked.")
+    nums.sort()  # "3,2" and "2,3" are the same question, so a re-print in another order is not an overtake
+    spec_txt = ",".join(str(i) for i in nums)
+    # the lines are the question's target (what it is about), not a mode (the argument `accept-line` takes: none), so
+    # `_overtake` tells a question about other lines from this one printed again, and NOT ASKED names its lines
+    overtook = _overtake(ctx, st, "accept-line", None, target=spec_txt)
+    asked = now()
+    shown = {str(v): [r for r in (by_num[v].get("reasons") or []) if not str(r).startswith(HELD_AGAIN_PREFIX)]
+             for v in nums}
+    st["pending"] = {"action": "accept-line", "mode": None, "target": spec_txt, "ids": nums, "covered": shown, "asked_at": asked,
+                     "phase": phase, "prev_awaiting": st.get("awaiting_since"),
+                     "session": _asking_session(ctx, st, "accept-line"), **overtook}
+    st["awaiting_since"] = asked
+    ctx.log(st, "question_asked", action="accept-line", ids=nums)
+    ctx.save_state(st)
+    if overtook:
+        print(_not_asked_text(f"`ratchet.py ask accept-line {spec_txt}`", overtook))
+        return
+    named = "; ".join(f"line {v}: \"{by_num[v]['text']}\" ({'; '.join(by_num[v].get('reasons') or []) or 'unproven'})"
+                      for v in nums)
+    them, hold = ("them", "hold") if len(nums) != 1 else ("it", "holds")
+    print(f"ASK THE USER: The finish is held because {'these done-means lines are' if len(nums) != 1 else 'this done-means line is'} "
+          f"unproven: {named}. Shall I accept {_lines_word(nums)} as unproven, with your own reason, so {'they' if len(nums) != 1 else 'it'} "
+          f"no longer {hold} the finish? To accept, your reply must be exactly: accept: <your reason>. Only your first "
+          f"reply counts, and only that exact form (starting with \"accept: \") accepts {them}; any other reply accepts "
+          "nothing.")
+    print(ASK_ALONE)
+
+
 def _ask_paid_provider(ctx, st, args):
     """`ask paid-provider <tool> <model>`: the developer's OK to spend money on this one model, through
     `providers --add`, the next time it is run for this exact tool and model. This spends real money (a
@@ -11687,10 +11976,10 @@ def _choice_covers(allow: dict, probs: list[str]) -> bool:
                                for pr in probs)
 
 
-def _require_pending(st, action, mode=None):
+def _require_pending(st, action, mode=None, ctx=None):
     p = st.get("pending") or {}
     if p.get("action") != action or (mode and p.get("mode") != mode):
-        die(f"First run {_ask_cmd(action, mode)}, show the user the question it prints, "
+        die(f"First run {_ask_now(ctx, st, action) if ctx else _ask_cmd(action, mode)}, show the user the question it prints, "
             "and wait for their reply. Replies from before the question don't count.")
 
 
@@ -11959,7 +12248,7 @@ def cmd_accept_finding(args):
         _clear_pending(st)
         ctx.log(st, "accept_finding_unclear", cp=cp, ids=ids)
         ctx.save_state(st)
-        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'))}"
+        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'), p.get('overtook_target'))}"
             "?) was still waiting for the user's first reply, so their reply could be meant for either. Nothing was "
             f"accepted. Run `ratchet.py ask accept-finding {cp} {','.join(ids)}` again on its own.")
     token = getattr(args, "director_token", None)
@@ -12187,7 +12476,7 @@ def cmd_raise_limit(args):
         _clear_pending(st)
         ctx.log(st, "raise_limit_unclear", cp=cp)
         ctx.save_state(st)
-        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'))}"
+        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'), p.get('overtook_target'))}"
             "?) was still waiting for the user's first reply, so their reply could be meant for either. Nothing was "
             f"raised. Run `ratchet.py ask raise-limit {cp}` again on its own.")
     g = cps["gates"]["adversarial"]
@@ -12245,6 +12534,149 @@ def cmd_raise_limit(args):
     else:
         msg += f" `ratchet.py reviewers {cp}` can open another round for this step once it is blocked there again."
     ok(msg)
+
+
+def cmd_accept_line(args):
+    """CP5: record the unproven done-means lines the user accepted, with their reason: only their FIRST reply
+    after `ask accept-line`, from the owning chat, in the exact form `accept: <reason>`, accepts them (the same
+    consent machinery as cmd_accept_finding: _require_pending, _replies, _accept_reply_reason, _spend_question, the
+    transcript check); a reply from another chat, from before the question, or a host-generated turn never counts,
+    and a first reply in any other form closes the question. `--reason` on its own never stands in for the reply.
+    In a director-enrolled lane a chat reply never counts: a director token signed for this action after the ask
+    (`director-sign accept-line`, bound to `awaiting_since`, which `ask` moves) is required, with --reason carrying
+    the director's own reason, checked before the token so a forgotten flag costs no second signature. The lines
+    are re-judged at accept time (`done_means_table`): a line that is not unproven any more clears the question
+    and accepts nothing, and so does a line whose reasons differ from the ones the question showed (`pending`'s
+    `covered`, recorded by `_ask_accept_line`): the reply accepts exactly what the user saw, never a reason that
+    appeared between the question and the reply, so the agent asks again with the current reasons. Then, in this
+    order: one `.ratchet/learnings.md` line per line (keyed by a marker unique
+    to this run, line and what held the line, so a retry after a crash never duplicates it while a re-accept of a
+    line held again for a new reason gets its own line; the reason collapsed to one line there, kept verbatim in
+    state), the `accepted_lines` record in state ({"<n>": {"number", "text", "reason", "accepted_by",
+    "accepted_at", "covered"}}, "covered" being the line's reasons right now, what this acceptance covers; a
+    re-accept replaces the line's record), `pending` cleared, and the state commit last, so a crash before it
+    leaves the accept not made and a plain retry finishes once. Never finishes the run, never touches a review
+    counter, a gate or a stored choice: the accepted line simply reads "accepted" in the table and no longer holds
+    the finish (`_finish_blockers`) until a reason the acceptance did not cover appears (`_apply_accepted_lines`);
+    the agent still asks for the final approval afterwards. The closing line reads the whole finish verdict
+    (`_finish_blockers` and `_finish_integrity_lines`, as `_finish_held` does): it never says the finish is free
+    while a checkpoint or test plan edited after approval still holds it."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    _require_pending(st, "accept-line", ctx=ctx)
+    p = st["pending"]
+    ids = [i for i in (p.get("ids") or []) if isinstance(i, int) and not isinstance(i, bool)]
+    again = _ask_cmd("accept-line", target=",".join(str(i) for i in ids))
+    them = "them" if len(ids) != 1 else "it"
+    if p.get("overtook"):
+        _clear_pending(st)
+        ctx.log(st, "accept_line_unclear", ids=ids)
+        ctx.save_state(st)
+        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'), p.get('overtook_target'))}"
+            "?) was still waiting for the user's first reply, so their reply could be meant for either. Nothing was "
+            f"accepted. Run {again} again on its own.")
+    token = getattr(args, "director_token", None)
+    reason_flag = (getattr(args, "reason", None) or "").strip()
+    if token or approval_mode(ctx) == "director":
+        if token and not reason_flag:
+            # checked BEFORE the token is verified or anything is cleared, as cmd_accept_finding does: the same
+            # command with --reason added then simply works
+            die("accept-line needs --reason \"...\" when a director token accepts the line (there is no chat reply to "
+                "read a reason from). Nothing was accepted, and the question is still waiting: run the same command "
+                "again with --reason \"...\" added.")
+        # _require_approval's own checks: a token in a human lane, no (or a bad) token in a director lane
+        appr = _require_approval(ctx, st, "accept-line", token)
+        by, reason = appr["by"], reason_flag
+    else:
+        if reason_flag:
+            die("--reason is only for a director token in a director-enrolled lane. Here the reason must come from the "
+                "user's own reply in the owning chat, exactly `accept: <reason>`, as their first reply after the "
+                "question; nothing else stands in for that reply. Nothing was accepted; the question is still waiting.")
+        msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the question was asked in can answer it
+        if not msgs:
+            die("No reply has been recorded in the owning chat since this question was asked (a reply typed in another "
+                "chat, or before the question, does not count). End your turn and wait for the user's reply, exactly "
+                "`accept: <reason>`.")
+        entry = msgs[0]  # the first reply answers the question; later messages never do
+        reply = entry.get("prompt", "")
+        reason = _accept_reply_reason(reply)
+        if reason is None:
+            _spend_question(ctx, st, reply)
+            die(f"The user's first reply after the question was not the exact form `accept: <reason>`: \"{reply[:120]}\". "
+                "Nothing was accepted, and the question is closed, so a later reply in that form does not count. Run "
+                f"{again} again if they still want to accept {them}.")
+        if ctx.config().get("verify_transcripts", True):
+            good, why = _transcript_ok(entry, p.get("asked_at"))
+            if not good:
+                _spend_question(ctx, st, reply)
+                die(f"Couldn't confirm that reply came from the user ({why}). Nothing was accepted. Run {again} again "
+                    "and ask them to reply in this chat.")
+        by = "human"
+    if not _finish_pending(st):
+        _clear_pending(st)
+        ctx.save_state(st)
+        die(f"The run is no longer at the final review ({PHASE_PLAIN.get(st.get('phase'), st.get('phase'))}), so this "
+            "question no longer applies. Nothing was accepted.")
+    table = done_means_table(ctx, ctx.plan() or {"checkpoints": []}, st)
+    by_num = {e["number"]: e for e in table} if isinstance(table, list) else {}
+    stale = [i for i in ids if (by_num.get(i) or {}).get("verdict") != "unproven"]
+    if stale or not ids:
+        _clear_pending(st)
+        ctx.save_state(st)
+        what = "; ".join(f"line {i} is not unproven any more (it is "
+                         f"{(by_num.get(i) or {}).get('verdict') or 'not in the table'})" for i in stale) or "no line is named"
+        die(f"{what}, so this question no longer applies and nothing was accepted. If another line still holds the "
+            "finish, run `ratchet.py ask accept-line <n>` again for it.")
+    covered = {i: [r for r in (by_num[i].get("reasons") or []) if not str(r).startswith(HELD_AGAIN_PREFIX)]
+               for i in ids}
+    shown = p.get("covered") if isinstance(p.get("covered"), dict) else {}
+    moved = [i for i in ids if isinstance(shown.get(str(i)), list) and sorted(shown[str(i)]) != sorted(covered[i])]
+    if moved:
+        # the user accepts exactly what the question showed; what holds a line changed since, so the reply covers
+        # something they never saw (or less than they were shown): ask again with the current reasons
+        _clear_pending(st)
+        ctx.log(st, "accept_line_unclear", ids=ids, moved=moved)
+        ctx.save_state(st)
+        what = "; ".join(f"line {i} is held by: {'; '.join(covered[i]) or 'nothing'} (the question showed: "
+                         f"{'; '.join(shown[str(i)]) or 'nothing'})" for i in moved)
+        die(f"What holds {_lines_word(moved)} changed after the question was shown: {what}. The user's reply covers "
+            f"only what they were shown, so nothing was accepted and the question is closed. Run {again} again to "
+            "ask with what holds it now.")
+    at = now()
+    reason_line = " ".join(reason.split())
+    # (a) learnings first, keyed by a marker unique to this run and line: a retry after a crash never duplicates it
+    learnings = _learnings_text(ctx)
+    for i in ids:
+        e = by_num[i]
+        marker = (f"Accepted done-means line {i} of run {st['slug']} (\"{e['text']}\"; "
+                  f"{'; '.join(e.get('reasons') or []) or 'unproven'}) as unproven.")
+        if marker in learnings:
+            continue
+        _append_learning(ctx, f"{marker} Reason: {reason_line}", f"{by}, accept-line")
+        learnings += marker
+    # (b) the per-line record, then (c) the one state commit
+    acc = st.get("accepted_lines")
+    if not isinstance(acc, dict):
+        acc = {}
+    for i in ids:
+        acc[str(i)] = {"number": i, "text": by_num[i]["text"], "reason": reason, "accepted_by": by, "accepted_at": at,
+                       "covered": covered[i]}
+    st["accepted_lines"] = acc
+    ctx.log(st, "line_accepted", lines=ids, reason=reason[:200], by=by)
+    _clear_pending(st)
+    ctx.save_state(st)
+    build_viewer(ctx)
+    left = _finish_blockers(ctx, st)
+    changed = [] if left else _finish_integrity_lines(ctx, st)
+    if left:
+        tail = f"Still unproven and holding the finish: {_lines_word(e['number'] for e in left)}."
+    elif changed:
+        tail = ("No done-means line holds the finish now, but it is still held: a checkpoint or test plan changed "
+                "after the user approved the plan. Run `ratchet.py status` for what changed and settle it (undo it, "
+                "or `ratchet.py ask approve-changes`) before asking for the final approval.")
+    else:
+        tail = "The finish is no longer held: ask for the final approval (`ratchet.py ask human-approve`)."
+    ok(f"Accepted {_lines_word(ids)} as unproven, by {by}: {reason_line}. {tail}")
 
 
 def cmd_next(args):
@@ -13605,9 +14037,10 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                f"`{eng} resume --claim` only if their first reply after it is one of the listed yes "
                                "replies. Otherwise leave the run alone and do what they asked.")
             if p.get("action") and p["action"] != "hooks-waive":
-                cmd = _pending_followup(p["action"], p.get("mode"))
-                what = _question_what(p["action"], p.get("mode"))
-                again = _ask_cmd(p["action"], p.get("mode"), eng=eng)
+                p_mode, p_target = _pq(p)
+                cmd = _pending_followup(p["action"], p_mode)
+                what = _question_what(p["action"], p_mode, p_target)
+                again = _ask_cmd(p["action"], p_mode, eng=eng, target=p_target)
                 asked_in = _question_session(st, p)
                 if asked_in and here and here != asked_in:
                     return False, (f"[ratchet] A Ratchet question (shall I {what}?) is waiting for a reply in another "
@@ -13643,6 +14076,17 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                    f"Only after that exact reply run `{eng} {cmd}` (pick an id for the new provider); "
                                    f"otherwise run `{eng} ask withdraw` and do what they asked. This reply does NOT "
                                    "approve the plan, a checkpoint or anything else.")
+                if p["action"] == "accept-line":
+                    # CP5: this question's own exact reply form, `accept: <reason>` (never a listed yes: the user
+                    # gives their own reason), and `accept-line` takes no argument: it reads the lines from pending
+                    reason = _accept_reply_reason(n["prompt"])
+                    verdict = ("It is in the exact form `accept: <reason>`, the one reply that accepts" if reason
+                               else "It is NOT in the exact form `accept: <reason>`, so it accepts nothing")
+                    return False, (f"[ratchet] This reply answers your waiting question: shall I {what}? {verdict}. "
+                                   f"Run `{eng} {cmd}` now to record it: it accepts the line only after that exact "
+                                   "form, and a first reply in any other form closes the question (ask again with "
+                                   f"{again} if the user still wants it). Do NOT run `ask withdraw` for a reply in "
+                                   "that form. This reply does NOT approve the finish or anything else.")
                 verdict = ("It is one of the listed yes replies" if is_listed_yes(n["prompt"])
                            else "It is NOT one of the listed yes replies, so it approves nothing")
                 if p["action"] == "human-approve" and _finish_held(ctx, st):
@@ -16125,7 +16569,7 @@ STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "re
                      "ui-record", "adv-record", "complete", "human-approve", "feedback", "plan-extend", "pause",
                      "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
                      "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait", "accept-finding",
-                     "raise-limit", "check-in", "triage", "merged")
+                     "raise-limit", "check-in", "triage", "merged", "accept-line")
 LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers", "providers", "merged")  # tests, checks, a regression
                                                                                           # suite, provider probes (--add included)
 # The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
@@ -16847,10 +17291,11 @@ def main(argv=None):
     a.add_argument("--claim", action="store_true"); a.set_defaults(fn=cmd_resume)
     a = sp.add_parser("ask", help="record and print the question you're about to ask the user (needed before approve-plan, "
                                   "human-approve, cancel, set-review, approve-changes, hooks-waive, resume --claim, "
-                                  "ui-respec, accept-finding, paid-provider)")
+                                  "ui-respec, accept-finding, paid-provider, accept-line)")
     a.add_argument("action", choices=list(ASKABLE) + ["withdraw"])
     a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec/accept-finding: the checkpoint "
-                                           "id; paid-provider: the tool (preset)")
+                                           "id; paid-provider: the tool (preset); accept-line: the done-means line "
+                                           "numbers, comma-separated (e.g. 2 or 2,3)")
     a.add_argument("ids", nargs="?", help="accept-finding: the finding ids to accept, comma-separated (e.g. F1,F2); "
                                           "paid-provider: the exact model name")
     a.add_argument("--options", help="choice: the option letters, e.g. A,B,C")
@@ -16865,6 +17310,12 @@ def main(argv=None):
     a.add_argument("cp"); a.add_argument("--director-token")
     a.add_argument("--reason", help="director mode only: the director's reason (there is no chat reply to read one from)")
     a.set_defaults(fn=cmd_accept_finding)
+    a = sp.add_parser("accept-line", help="record the unproven done-means lines the user accepted (after `ask "
+                                          "accept-line <n,..>` and their 'accept: <reason>' reply, or a director "
+                                          "token with --reason)")
+    a.add_argument("--director-token")
+    a.add_argument("--reason", help="director mode only: the director's reason (there is no chat reply to read one from)")
+    a.set_defaults(fn=cmd_accept_line)
     a = sp.add_parser("raise-limit", help="raise one checkpoint's review-round limit by one round (after `ask "
                                           "raise-limit` and the owning chat's own 'raise: <reason>' reply); "
                                           "offered at most once per step, ever")
@@ -16970,7 +17421,7 @@ def main(argv=None):
     a = sp.add_parser("director-sign"); a.add_argument("action", choices=["approve-plan", "human-approve", "feedback",
                                                                           "approve-changes", "cancel", "set-review",
                                                                           "hooks-waive", "ui-respec", "guardrail",
-                                                                          "accept-finding"])
+                                                                          "accept-finding", "accept-line"])
     a.add_argument("--kind", help="guardrail: the kind of finding it covers")
     a.set_defaults(fn=cmd_director_sign)
     sp.add_parser("fingerprint").set_defaults(fn=cmd_fingerprint)
