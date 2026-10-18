@@ -621,7 +621,10 @@ def cp6_x01_a_narrowed_round_reserves_only_the_lens_that_still_has_a_blocker():
         need("two codex starts so far", len(scn.starts("codex")) == 2, scn.health())
         r2, rnd2 = _xblock_then_reopen(a, rnd1, "codex-correctness")
     need("round 2 opens", r2.returncode == 0, said(r2)[-300:])
-    check("round 2 is narrowed to the correctness lens", rnd2.get("narrowed") is True and len(ids(rnd2)) == 1, (rnd2.get("narrowed"), ids(rnd2)))
+    kind2 = str(rnd2.get("kind") or "")
+    check("round 2 is a one-reviewer fix round after a block",
+          rnd2.get("small_fix") is True and kind2 == "after a block" and len(ids(rnd2)) == 1,
+          (rnd2.get("small_fix"), kind2 or "no kind field", ids(rnd2)))
     check("it keeps codex-correctness, not host-alt-correctness (the dropped standards slot used no share)",
           ids(rnd2) == ["codex-correctness"], (ids(rnd2), row_of(rnd2, first_id(rnd2)).get("reasons")))
     check("codex holds 3 starts: the 2 from round 1 and 1 for the kept slot, none for the dropped one",

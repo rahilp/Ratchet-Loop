@@ -94,12 +94,16 @@ def main():
     r = record(d, "CP1", rnd, {0: DBF("src/f.js")})
     check("round 1: the finding blocks, no repeat yet", r.returncode == 2 and "REPEAT" not in r.stdout, r.stdout)
     put(d, "CP1", {"src/f.js": BAD_F.replace("1;", "1; ")})          # "fixed", but the mistake is still there
-    rnd = open_round(d, "CP1")  # CP5: round 1 blocked on one lens, so round 2 may be narrowed to just that one
+    rnd = open_round(d, "CP1")  # CP5: round 1 blocked and the fix was made, so this is a one-reviewer fix round
     r = record(d, "CP1", rnd, {0: DBF("src/f.js")})
     check("the same unfixed finding raised again is not a repeat", "REPEAT" not in r.stdout, r.stdout)
     put(d, "CP1", {"src/f.js": OK_F, "src/a.js": BAD_A})
     rnd = open_round(d, "CP1")
-    r = record(d, "CP1", rnd, {1: DBF("src/a.js")})
+    # CP5: this round follows a block and a fix too, so the finding goes to the one reviewer it names (slot 0),
+    # not to a second reviewer that no longer exists.
+    check("after the block and the fix, the round names exactly one reviewer", len(rnd["reviewers"]) == 1,
+          rnd["reviewers"])
+    r = record(d, "CP1", rnd, {0: DBF("src/a.js")})
     check("the same kind in another place is announced as a repeat", "REPEAT" in r.stdout and "handler-imports-db" in r.stdout,
           r.stdout)
     nx = json.loads(rx(d, "next").stdout)

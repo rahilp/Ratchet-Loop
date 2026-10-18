@@ -262,12 +262,13 @@ Each role also gets its own model. Planning, coding, fixing and reviewing use a 
 
 Round 1 of a step always asks every reviewer. After that, review gets cheaper on purpose:
 
-- **Fewer reviewers after round 1.** Once a round blocks, the next one only asks back the reviewer(s) whose kind of review still has an open serious finding; one that approved isn't re-run. If the fix doesn't actually settle it, the round after that brings back the full set again, rather than narrowing down forever.
+- **Fewer reviewers after round 1.** When a round blocks and the findings are rebutted rather than fixed, the next one only asks back the reviewer(s) whose kind of review still has an open serious finding; one that approved isn't re-run. (When the fixer has actually run, the fix round below takes over from this narrowing.)
 - **No double-counting.** If two review slots would end up at the same reviewer (same company, same model, same kind of review), it only runs once, and you're told the real number that reviewed, not the number of slots configured.
 - **A replaced round that nobody reviewed yet is free.** If the code changes again before any reviewer wrote a review, re-opening the round doesn't use up any of your review budget. Once a review has been written, though, that round counts, whether or not it was ever recorded.
 - **On a big diff, what changed since the last reviewed round comes first.** When a step's diff is too large to hand a reviewer whole, the files changed since the last round a reviewer actually saw come first; anything still left out after that is named by file, not just a character count, so a reviewer always sees what's new since it last looked, and knows by name what it didn't see.
 - **Small issues stop blocking after a couple of rounds.** Serious findings always block, every round. A minor one — a nit, a style note — blocks for the first couple of rounds (`converge_after_round` in config, default 2; so round 3 on), after which it's simply recorded for the final review instead of starting another round over it.
 - **A small fix after approval gets one reviewer, covering both lenses.** Once a step's adversarial gate has approved, a code fix at or under `small_edit_lines` (default 20 changed lines, measured since the last full multi-reviewer approval so several small fixes in a row still add up to a full round) opens its next round with a single reviewer who checks both standards and correctness, instead of the step's whole reviewer set — unless the step is high risk, which always keeps the full round. The commit message and `status` say when a round was reviewed this way, and by whom.
+- **After a block, the fix round gets one reviewer.** Once a round blocked and the fixer has run, the next round is a fix round: it opens with exactly one reviewer, whatever the fix's size and whatever the step's risk. That one reviewer is the one whose blocking finding was fixed, with the same provider and the same lens (kind of review), so a Codex correctness finding is re-checked by Codex correctness; when several reviewers blocked, one from a company other than the host's is preferred, and then the lowest slot number. Any finding that actually blocked that round counts, whatever its severity, so a round that blocked on minor findings alone (at normal or high risk, where every severity blocks) starts a fix round too. If that reviewer is unavailable (benched, out of quota, or already at its share of review starts), its slot's own stand-in for the same lens takes the round, and no provider that had not reviewed the step is ever brought in. A fix round counts toward the step's and the run's review limits like any other round, and when it blocks again it goes to the usual check-in before another round can open. `status` and the commit message name each fix round and the one reviewer that re-checked it.
 
 ### One flaky failure doesn't cost you anything
 
@@ -482,6 +483,8 @@ python3 tests/test_discover_paid.py
 python3 tests/test_docs.py
 python3 tests/test_flaky.py
 python3 tests/test_feedback_fixes.py
+python3 tests/test_fix_round.py
+python3 tests/test_fix_round_fixes.py
 python3 tests/test_gates.py
 python3 tests/test_guard_python_reads.py
 python3 tests/test_guard_reads.py

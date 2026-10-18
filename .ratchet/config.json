@@ -30,15 +30,23 @@
     ],
     "normal": [
       [
+        "codex-standards",
         "host-alt-standards"
       ],
       [
+        "codex-correctness",
         "host-alt-correctness"
       ]
     ],
     "high": [
-      "host-standards",
-      "host-correctness",
+      [
+        "codex-standards",
+        "host-standards"
+      ],
+      [
+        "codex-correctness",
+        "host-correctness"
+      ],
       [
         "host-alt-correctness"
       ]
@@ -99,7 +107,7 @@
   "host_models": {
     "anthropic": {
       "strong": "inherit",
-      "standard": "fable",
+      "standard": "sonnet",
       "light": "haiku",
       "alternates": [
         "fable",
