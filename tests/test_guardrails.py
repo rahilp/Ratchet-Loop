@@ -45,7 +45,7 @@ def record(d, cp, rnd, findings_by_reviewer=None):
     paths = []
     for i, rv in enumerate(rnd["reviewers"]):
         f = (findings_by_reviewer or {}).get(i)
-        paths.append(g.write_review(d, rnd, rv["id"], findings=f, files_reviewed=["src/f.js", "src/g.js", "guard/check.mjs", "tests/guard.test.js", "tests/cp2.test.js"]))
+        paths.append(g.write_review(d, rnd, rv["id"], findings=f, files_reviewed=["src/f.js", "src/g.js", "guard/check.mjs", "tests/guard.test.js", "tests/cp2.test.js", "src/a.js"]))
     return rx(d, "adv-record", cp, "--reviews", *paths)
 
 
