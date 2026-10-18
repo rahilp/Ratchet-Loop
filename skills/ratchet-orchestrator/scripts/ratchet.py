@@ -187,6 +187,7 @@ DEFAULT_CONFIG = {
     "app": {"start_command": None, "url": None, "healthcheck": None},
     "test_timeout_sec": 900,
     "load_stretch_max": 4,          # a busy machine stretches test_timeout_sec by load average / CPUs, up to this many times
+    "suite_watch_seconds": 30,      # while a step's tests run, look this often for an edit to the code under them; a positive number
     "max_stop_blocks": 40,         # safety valve for the Stop hook (reset whenever a gate makes progress)
     "fingerprint_include": [],      # gitignored files that still matter to behaviour (e.g. ".env.test"); added to fingerprints
     "ui_single_reviewer_ok": False, # allow a UI review with only one of visual/behaviour (human-set, locked at approval)
@@ -379,6 +380,34 @@ def _is_git(root: Path) -> bool:
 JUNK_PATHSPECS = [":(exclude,glob)**/__pycache__/**", ":(exclude,glob)**/*.pyc", ":(exclude,glob)**/.DS_Store"]
 
 
+class _LookFailed(Exception):
+    """A look at the code could not be taken: git could not read the tree (a file the running command created and
+    removed between git's walk and its open, or one it cannot read) or could not list the files. The code watch
+    skips such a look and notes it; outside the watch the same failure dies."""
+
+
+def _git_tree_id(root: Path, env: dict, strict: bool = True, extra: list | None = None) -> str:
+    """The tree id of the working tree (tracked + untracked, respecting .gitignore, minus .ratchet and junk, plus
+    `extra`: the config's fingerprint_include, gitignored files that tests still depend on, read by the caller),
+    built in the index `env` names (GIT_INDEX_FILE), which must already be seeded. With `strict` a git failure
+    dies; otherwise it raises _LookFailed with the same message."""
+    def fail(msg):
+        if strict:
+            die(msg)
+        raise _LookFailed(msg)
+    r = subprocess.run(["git", "add", "-A", "--", ".", f":(exclude){RATCHET_DIR}", *JUNK_PATHSPECS],
+                       cwd=root, env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(f"git add for fingerprint failed: {r.stderr.strip()}")
+    if extra:  # gitignored files that tests still depend on
+        subprocess.run(["git", "add", "-f", "--", *extra], cwd=root, env=env, capture_output=True, text=True)
+    t = subprocess.run(["git", "write-tree"], cwd=root, env=env,
+                       capture_output=True, text=True)
+    if t.returncode != 0:
+        fail(f"git write-tree failed: {t.stderr.strip()}")
+    return t.stdout.strip()
+
+
 def fingerprint(root: Path) -> dict:
     """Hash of the working tree (tracked + untracked, respecting .gitignore, minus .ratchet)."""
     if _is_git(root):
@@ -387,18 +416,8 @@ def fingerprint(root: Path) -> dict:
             # seed from HEAD if it exists so the add is fast
             subprocess.run(["git", "read-tree", "HEAD"], cwd=root, env=env,
                            capture_output=True)
-            r = subprocess.run(["git", "add", "-A", "--", ".", f":(exclude){RATCHET_DIR}", *JUNK_PATHSPECS],
-                               cwd=root, env=env, capture_output=True, text=True)
-            if r.returncode != 0:
-                die(f"git add for fingerprint failed: {r.stderr.strip()}")
             extra = (read_json(root / RATCHET_DIR / "config.json", {}) or {}).get("fingerprint_include") or []
-            if extra:  # gitignored files that tests still depend on
-                subprocess.run(["git", "add", "-f", "--", *extra], cwd=root, env=env, capture_output=True, text=True)
-            t = subprocess.run(["git", "write-tree"], cwd=root, env=env,
-                               capture_output=True, text=True)
-            if t.returncode != 0:
-                die(f"git write-tree failed: {t.stderr.strip()}")
-            return {"kind": "git-tree", "id": t.stdout.strip()}
+            return {"kind": "git-tree", "id": _git_tree_id(root, env, extra=extra)}
     # non-git fallback: manifest of file hashes
     manifest = {}
     for dp, dns, fns in os.walk(root):
@@ -987,12 +1006,13 @@ def _failing_files(out: str, files: list[str]) -> list[str]:
     return hit
 
 
-def _run_related_tests(ctx: "Ctx", cfg: dict, cp: dict, cps: dict, fp: dict) -> None:
+def _run_related_tests(ctx: "Ctx", cfg: dict, cp: dict, cps: dict, fp: dict, watch: "_Watch | None" = None) -> None:
     """The related pass at `complete`, right before the full suite: says which files were picked and why, runs
     related_test_command on them (evidence/CPn/related-tests.log) and dies, naming the failing file(s), when it
     fails, without saving state (same as the full suite's failure branch); the full suite is then never started
     and no gate, attempt count or flaky allowance changes. With related_test_command unset it only says the pass
-    is off; a value without {files} is refused before anything runs."""
+    is off; a value without {files} is refused before anything runs. `watch` is `complete`'s code watch: an edit
+    during the related run stops it the same way (code changed, nothing saved, run `complete` again)."""
     cp_id = cp["id"]
     if not cfg.get("related_test_command"):
         print("Related tests: off (related_test_command is not configured); running the full suite directly.")
@@ -1017,7 +1037,7 @@ def _run_related_tests(ctx: "Ctx", cfg: dict, cp: dict, cps: dict, fp: dict) -> 
         print(f"  - {f}: {reason}")
     files = [f for f, _ in picked]
     cmd = cfg["related_test_command"].replace("{files}", " ".join(shlex.quote(f) for f in files))
-    code, out, _ = _run_cmd(ctx, cmd, ctx.evidence(cp_id) / "related-tests.log", cfg["test_timeout_sec"])
+    code, out, _ = _run_cmd(ctx, cmd, ctx.evidence(cp_id) / "related-tests.log", cfg["test_timeout_sec"], watch=watch)
     if code != 0:
         # Like the full suite's failure branch below in `complete`: print the tail and die without saving state,
         # so nothing from this failed call (a doc quick-path record above it) is persisted.
@@ -2296,7 +2316,7 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "verify_transcripts", "min_review_seconds", "commit_per_checkpoint", "blocking_severities",
              "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round", "converge_after_round",
              "doc_globs", "doc_exclude_globs", "test_globs", "doc_test_command", "related_test_command",
-             "related_tests_max", "related_always", "small_edit_lines", "load_stretch_max"]
+             "related_tests_max", "related_always", "small_edit_lines", "load_stretch_max", "suite_watch_seconds"]
 
 
 def _file_sha(p: Path) -> str | None:
@@ -6455,6 +6475,175 @@ def _load_stretch_max(cfg) -> float:
     return v if 1.0 <= v < float("inf") else float(DEFAULT_CONFIG["load_stretch_max"])
 
 
+def _suite_watch_seconds(cfg) -> float | None:
+    """How often a running command's code is compared with the tree it started on (suite_watch_seconds): a number
+    above 0, or None when the configured value is not one (then the default applies)."""
+    v = cfg.get("suite_watch_seconds")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or not (0 < v < float("inf")):
+        return None
+    return float(v)
+
+
+def _watch_every(cfg) -> float:
+    """The interval a _Watch uses: the configured suite_watch_seconds, or the default when it is not a usable one."""
+    v = _suite_watch_seconds(cfg)
+    return float(DEFAULT_CONFIG["suite_watch_seconds"]) if v is None else v
+
+
+class _Watch:
+    """The code-under-the-run watch for one command: the tree (`fp`) it started on, how often to look (`every`
+    seconds), and the command the agent should run again if the code changes. `changed()` is the one check: a
+    fingerprint, and only when its id differs, the list of files the run started with that were edited or deleted
+    meanwhile, plus the new project source files that appeared (_new_source: a source extension outside every
+    build, cache, report, snapshot and scratch folder). Ratchet's own folder and the agent's chat transcript never
+    count, and neither does any other file that only appeared: suites write snapshots and reports of their own,
+    and those are left to the command's own 'changed files' check. A periodic
+    look (`final=False`) builds its tree in one private index kept across looks, so git rehashes only the files
+    whose stat changed since the last look, and a look git cannot take (a file the command created and removed
+    under git's walk, one it cannot read, a failed diff-tree) is skipped and noted in `skipped`, never fatal with
+    the command still running; the last look (`final=True`, the command has ended) is the full fingerprint() and
+    a git failure there dies as it does everywhere else. `found_at_end` says whether the change was found by that
+    last look (the command ended on its own) rather than by a periodic one (the command was stopped)."""
+
+    def __init__(self, ctx, fp: dict, every: float, again: str, extra: list | None = None):
+        self.ctx, self.fp, self.every, self.again = ctx, fp, every, again
+        self.extra = list(extra or [])   # the config's fingerprint_include, so a look's tree is fingerprint()'s
+        self.skipped: list = []      # one reason per look that could not be taken (noted in the command's log)
+        self.found_at_end = False
+        self.added: list = []        # the changed files that are new source (not in the tree the run started on)
+        self._index = None           # the private index for periodic looks (git projects only), seeded on first use
+
+    def _look_fp(self) -> dict:
+        """A periodic look's fingerprint: the same tree id fingerprint() gives, from the kept index."""
+        root = self.ctx.root
+        if not _is_git(root):
+            return fingerprint(root)
+        if self._index is None:
+            self._index = tempfile.TemporaryDirectory()
+            env = dict(os.environ, GIT_INDEX_FILE=str(Path(self._index.name) / "index"))
+            subprocess.run(["git", "read-tree", "HEAD"], cwd=root, env=env, capture_output=True)
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(self._index.name) / "index"))
+        return {"kind": "git-tree", "id": _git_tree_id(root, env, strict=False, extra=self.extra)}
+
+    def changed(self, final: bool = False) -> list:
+        try:
+            now_fp = fingerprint(self.ctx.root) if final else self._look_fp()
+            if now_fp["id"] == self.fp["id"]:
+                return []
+            added = []
+            files = _edited_or_deleted(self.ctx.root, self.fp, now_fp, added)
+            self.added = added
+        except _LookFailed as e:
+            if final:  # the tree differs, so this is a change; what changed could not be listed: say so, never pass
+                return [f"(the files could not be listed: {e})"]
+            self.skipped.append(str(e))
+            return []
+        chat = _chat_transcript_paths(self.ctx, None)
+        return [f for f in files if f != RATCHET_DIR and not f.startswith(RATCHET_DIR + "/") and f not in chat]
+
+
+# A new file counts as a code change under a running suite when git would commit it and it is neither generated
+# output nor a doc: no folder on its path that holds generated output (FINGERPRINT_EXCLUDES, _WATCH_GENERATED_DIRS,
+# .NET's bin/<configuration>/, any dot folder), not a generated name, not a doc. There is no source-extension
+# allow-list: a template, a stylesheet, a config file or a module in a folder called reports/ is project code.
+_WATCH_GENERATED_DIRS = {
+    "__snapshots__", "__generated__", "generated", "htmlcov", "lib-cov", "test-results", "test-reports", "junit",
+    "logs", "log", "tmp", "temp", "scratch", "artifacts", "obj", "vendor", "bower_components", "jspm_packages",
+}
+# `bin` holds source in many projects (Rust's src/bin/, a package's bin/ scripts): it is build output only as .NET's
+# bin/<configuration>/
+_WATCH_BUILD_CONFIGS = {"debug", "release"}
+_WATCH_GENERATED_NAMES = ("*.min.*", "*.map", "*.bundle.*", "*.pyc", "*.pyo", ".#*", "*~", "*.log", "*.lcov",
+                          "coverage*", ".coverage*", "junit*.xml", "*results*.xml", "*.orig", "*.rej", "*.swp",
+                          "*.tmp", "*.bak")
+_WATCH_DOC_NAMES = (*DEFAULT_CONFIG["doc_globs"], "*.txt")  # a doc that appears is not a code change
+
+
+def _new_source(path: str) -> bool:
+    """Whether a file that appeared under a running suite is a new project source file (a change that stops the
+    run) rather than generated build, cache, report, snapshot or scratch output, or a doc (never a change). Any
+    file git would commit counts unless one of those fixed exclusions names it; there is no extension allow-list."""
+    parts = path.split("/")
+    name = parts[-1]
+    if any(d in FINGERPRINT_EXCLUDES or d in _WATCH_GENERATED_DIRS or d.startswith(".") for d in parts[:-1]):
+        return False
+    if any(d == "bin" and nxt.lower() in _WATCH_BUILD_CONFIGS for d, nxt in zip(parts[:-2], parts[1:-1])):
+        return False
+    if any(fnmatch.fnmatch(name, g) for g in _WATCH_GENERATED_NAMES):
+        return False
+    return not any(fnmatch.fnmatch(name, g) for g in _WATCH_DOC_NAMES)
+
+
+def _edited_or_deleted(root: Path, fp_a: dict, fp_b: dict, added: list | None = None) -> list:
+    """The files in fp_a's tree that fp_b's tree changed or lacks, plus the files fp_b added that are new project
+    source (_new_source; any other added file is left out), named relative to `root` (diff-tree's `--relative`:
+    a project below the repository's top gets project-relative names, the way `.ratchet/` and the chat
+    transcript paths are named). The new source files are also put in `added` when it is given. For two git
+    trees a failed diff-tree raises _LookFailed: the trees are known to differ, so the answer is never 'nothing'; only two manifests are compared as manifests, and a manifest that is
+    missing or damaged raises _LookFailed the same way (read through _read_record)."""
+    if fp_a["kind"] == fp_b["kind"] == "git-tree":
+        r = subprocess.run(["git", "diff-tree", "-r", "-z", "--no-renames", "--name-status",
+                            "--relative", fp_a["id"], fp_b["id"]], cwd=root, capture_output=True)
+        if r.returncode != 0:
+            raise _LookFailed(f"git diff-tree failed: {r.stderr.decode('utf-8', 'replace').strip()}")
+        parts = r.stdout.decode("utf-8", "surrogateescape").split("\0")
+        pairs = [(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2) if parts[i]]
+        if added is not None:
+            added.extend(f for st, f in pairs if st == "A" and _new_source(f))
+        return [f for st, f in pairs if st != "A" or _new_source(f)]
+    mdir = root / RATCHET_DIR / "manifests"
+    sides = []
+    for fp in (fp_a, fp_b):  # a manifest that is missing or damaged cannot say 'nothing changed': a failed look
+        data, why = _read_record(mdir / f"{fp['id']}.json", missing=None)
+        if data is None:
+            raise _LookFailed(f"fingerprint manifest {fp['id']} cannot be read ({why or 'missing'})")
+        sides.append(data)
+    a, b = sides
+    new = [k for k in b if k not in a and _new_source(k)]
+    if added is not None:
+        added.extend(new)
+    return sorted([k for k in a if b.get(k) != a[k]] + new)
+
+
+def _signal_group(proc, sig) -> None:
+    """Send `sig` to a command's whole process group (the command alone where there are no groups). Never raises."""
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, sig)
+        else:
+            proc.send_signal(sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _group_alive(proc) -> bool:
+    """Whether any process of the command's group is still there (the leader is reaped first, so an exited shell
+    leader no longer counts; its children do until they are gone)."""
+    if proc.poll() is None:
+        return True
+    if not hasattr(os, "killpg"):
+        return False
+    try:
+        os.killpg(proc.pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+
+
+def _stop_group(proc, grace: float = 2.0) -> None:
+    """Stop a command and everything it started, politely first: SIGTERM to its process group (a runner that
+    manages helpers of its own, like tests/run_all.py, gets to stop them), then, once the whole group is gone or
+    `grace` seconds have passed (the group, not only its leader: under `sh -c` the shell leader dies at once while
+    the runner is still cleaning up), SIGKILL to whatever ignored it (_kill_group). Never raises."""
+    _signal_group(proc, signal.SIGTERM)
+    end = time.monotonic() + grace
+    while time.monotonic() < end and _group_alive(proc):
+        time.sleep(0.05)
+    _kill_group(proc)
+
+
 def _secs(x: float) -> str:
     """A number of seconds for a log line: whole when it is whole (`2s`), else one decimal (`2.5s`)."""
     return str(int(x)) if float(x) == int(x) else f"{x:.1f}"
@@ -6462,13 +6651,7 @@ def _secs(x: float) -> str:
 
 def _kill_group(proc) -> None:
     """Stop a command and everything it started (its own process group), then reap it. Never raises."""
-    try:
-        if hasattr(os, "killpg"):
-            os.killpg(proc.pid, signal.SIGKILL)
-        else:
-            proc.kill()
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+    _signal_group(proc, signal.SIGKILL)
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
@@ -6512,18 +6695,27 @@ def _restore_handlers(saved: list) -> None:
             pass
 
 
-def _wait_stretched(proc, timeout: float, max_stretch: float):
+def _wait_stretched(proc, timeout: float, max_stretch: float, watch: "_Watch | None" = None):
     """Wait for a command, polling. The deadline is `timeout` times the highest stretch factor read while the
     command runs (re-read every RUN_POLL_SECONDS, so a load spike while the command runs still extends it; a load
     drop never shortens a limit already granted), never earlier than `timeout` and never later than `timeout` times
-    `max_stretch`. Stops the whole process group when the deadline passes. Returns (timed_out, limit, note): the
-    limit in force when the command ended, and a line saying the limit was stretched (the highest reading taken
-    during the run, or a fresh one when the command ended within one poll of passing `timeout`), or "" when the
-    command ran within the configured limit."""
+    `max_stretch`. Stops the whole process group when the deadline passes. With a `watch`, every `watch.every`
+    seconds the code is compared with the tree the command started on, and once more when the command ends
+    (whatever way it ended), so a quick command that finishes before the next look still never counts; a change
+    stops the command and everything it started (_stop_group; on the last look too, so a helper the ended
+    command left in its group never outlives the run), and `watch.found_at_end` says which look found it.
+    A periodic look git cannot take is skipped (noted on the watch), never fatal; the last look is the full
+    fingerprint and may die, which the caller (_run_cmd) turns into a kill of the group first. Returns
+    (timed_out, limit, note, changed): the
+    limit in force when the command ended, a line saying the limit was stretched (the highest reading taken during
+    the run, or a fresh one when the command ended within one poll of passing `timeout`), or "" when the command
+    ran within the configured limit, and the files the watch found edited or deleted ([] when none, or no watch)."""
     t0 = time.monotonic()
     peak = None  # the reading that set the highest limit so far: the limit in force never shrinks
     timed_out = False
     limit = float(timeout)
+    next_look = t0 + watch.every if watch else None
+    changed = []
     while True:
         factor, load, cpus = _stretch_factor(max_stretch)
         if timeout * factor > limit:
@@ -6534,11 +6726,23 @@ def _wait_stretched(proc, timeout: float, max_stretch: float):
             timed_out = True
             _kill_group(proc)
             break
+        if watch and time.monotonic() >= next_look:
+            changed = watch.changed()
+            if changed:
+                watch.found_at_end = False
+                _stop_group(proc)
+                break
+            next_look = time.monotonic() + watch.every
         try:
             proc.wait(timeout=min(RUN_POLL_SECONDS, limit - elapsed))
             break
         except subprocess.TimeoutExpired:
             continue
+    if watch and not changed:
+        changed = watch.changed(final=True)  # the last look: the tree the command ended on
+        watch.found_at_end = bool(changed)
+        if changed:  # the leader has ended, but a helper it left in its group belongs to a run that no longer counts
+            _stop_group(proc)
     ran_past = timed_out or time.monotonic() - t0 >= timeout
     if ran_past and not timed_out:
         fresh = _stretch_factor(max_stretch)  # ended within one poll of passing the configured limit
@@ -6546,14 +6750,14 @@ def _wait_stretched(proc, timeout: float, max_stretch: float):
             limit = timeout * fresh[0]
             peak = fresh
     if peak is None or not ran_past:
-        return timed_out, (limit if timed_out else float(timeout)), ""
+        return timed_out, (limit if timed_out else float(timeout)), "", changed
     factor, load, cpus = peak
     note = (f"time limit stretched {factor:.1f}x ({_secs(timeout)}s to {_secs(limit)}s) at load {load:.1f} "
             f"on {cpus} CPUs")
-    return timed_out, limit, note
+    return timed_out, limit, note, changed
 
 
-def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None):
+def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None, watch: "_Watch | None" = None):
     """Run a test or check command in its own process group and wait for it with _wait_stretched: on a busy machine
     its time limit is `timeout` (test_timeout_sec) times the load average over the CPU count, re-read while it runs
     (the highest reading wins: a load drop never shortens the limit), never below `timeout` and at most
@@ -6562,8 +6766,18 @@ def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None):
     so, with the factor, both limits, the load and the CPU count. A SIGTERM, SIGINT or SIGHUP to ratchet.py while
     the command runs stops the command's process group first (_forward_stop). With `report`, the
     command gets that path in RATCHET_TEST_REPORT, and any file already there is deleted first, so a report left by
-    an earlier run can never count for this one. Output goes through temp files, so a command that prints a lot
-    never stalls on a full pipe."""
+    an earlier run can never count for this one. With a `watch` (a _Watch: the tree the step's work started on and
+    suite_watch_seconds), an edit to the code while the command runs stops it with everything it started, writes
+    the log as `stopped: code changed` and dies through the normal path (the state lock is released, nothing is
+    saved: no attempt, no gate status, no flaky allowance changes), telling the agent to run `watch.again`. Each
+    such stop is recorded in `stopped-runs.json` next to the log, keyed by the command, and cleared when the same
+    command next ends unstopped: when the previous call of this command was stopped on the same files, the message
+    adds that the command itself may be the writer, with the restore guidance. A change found only by the last look
+    (the command ended on its own, so the writer cannot be told: the command itself, or an edit while it ran) is
+    not a stop but a refusal naming both causes (log header `# code changed under the run, found when it ended`),
+    with the right guidance per file (tracked: restore it; untracked: delete or ignore it), equally uncounted.
+    Anything that escapes the wait (a git failure on the last look, a signal) kills the command's group first.
+    Output goes through temp files, so a command that prints a lot never stalls on a full pipe."""
     env = dict(os.environ, CI="1", FORCE_COLOR="0")
     env.pop("RATCHET_TEST_REPORT", None)
     if report is not None:
@@ -6575,30 +6789,118 @@ def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None):
             die(f"Could not delete the old test report at {report.relative_to(ctx.root)} ({e}); remove it and re-run.")
         env["RATCHET_TEST_REPORT"] = str(report)
     max_stretch = _load_stretch_max(ctx.config())
+    if watch:  # one watch serves every command of a call: the per-command parts start clean
+        watch.skipped = []
+        watch.found_at_end = False
     t0 = _dt.datetime.now()
     with tempfile.TemporaryFile() as so, tempfile.TemporaryFile() as se:
         proc = subprocess.Popen(command, shell=True, cwd=ctx.root, stdout=so, stderr=se, env=env,
                                 start_new_session=True)
         saved = _forward_stop(proc)
         try:
-            timed_out, limit, note = _wait_stretched(proc, float(timeout), max_stretch)
+            timed_out, limit, note, changed = _wait_stretched(proc, float(timeout), max_stretch, watch)
+        except BaseException:
+            _kill_group(proc)  # whatever escapes the wait, the command never outlives ratchet.py
+            raise
         finally:
             _restore_handlers(saved)
         so.seek(0)
         se.seek(0)
         stdout = so.read().decode("utf-8", errors="replace")
         stderr = se.read().decode("utf-8", errors="replace")
+    skipped = ""
+    if watch and watch.skipped:
+        skipped = (f"# {len(watch.skipped)} look(s) at the code could not be taken and were skipped "
+                   f"(last reason: {watch.skipped[-1]})\n")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    dur = (_dt.datetime.now() - t0).total_seconds()
+    if changed:
+        names = ", ".join(changed[:5]) + (f" and {len(changed) - 5} more" if len(changed) > 5 else "")
+        guidance = _restore_guidance(ctx.root, changed, watch.fp.get("id") if watch.fp.get("kind") == "git-tree" else None,
+                                     added=watch.added)
+        if watch.found_at_end:
+            # the command ended on its own and the tree it ended on is not the one it started on: the writer cannot
+            # be told (the command itself, or an edit while it ran), so name both and refuse; never a stop, never
+            # a pass, never a counted failure
+            log_path.write_text(f"$ {command}\n# exit={proc.returncode} duration={dur:.1f}s at {now()}\n"
+                                f"# code changed under the run, found when it ended ({names})\n{skipped}\n"
+                                f"{stdout}{stderr}")
+            die(f"The code changed while this command ran, found only when it ended ({names}): either the "
+                "command itself wrote these files (a regenerated snapshot, a tracked report, a formatter), or they "
+                "were edited while it ran. Either way its result cannot count, and nothing was recorded: no "
+                f"attempt, no gate status and no flaky re-run allowance changed. {guidance} Put the files right "
+                f"first (a file left changed is a code change at the next command), then run `ratchet.py "
+                f"{watch.again}` again. Log: {log_path.relative_to(ctx.root)}", 2)
+        record = log_path.parent / "stopped-runs.json"
+        stops = read_json(record, {}, record="Ratchet treats it as holding no earlier stop") or {}
+        prev = stops.get(command) if isinstance(stops, dict) else None
+        same = bool(prev) and sorted(prev.get("files") or []) == sorted(changed)
+        stops = stops if isinstance(stops, dict) else {}
+        stops[command] = {"files": changed, "again": watch.again, "at": now()}
+        write_json(record, stops)
+        hint = ""
+        if same:
+            hint = (" This is the second run in a row stopped on the same file(s): if you did not edit them, the "
+                    "command itself rewrites them, and a test or check command must not change the files it started "
+                    f"with. {guidance}")
+        log_path.write_text(f"$ {command}\n# stopped: code changed under the run ({names}) duration={dur:.1f}s "
+                            f"at {now()}\n{skipped}\n{stdout}{stderr}")
+        die(f"Stopped: the code changed while this command was running ({names}), so its result cannot "
+            "count. Nothing was recorded: no attempt, no gate status and no flaky re-run allowance changed. "
+            f"Run `ratchet.py {watch.again}` again when the edit is finished.{hint} "
+            f"Log: {log_path.relative_to(ctx.root)}", 2)
+    if watch:
+        record = log_path.parent / "stopped-runs.json"
+        stops = read_json(record, {}, record="Ratchet treats it as holding no earlier stop") or {}
+        if isinstance(stops, dict) and command in stops:  # this command ended unstopped: its stop record is spent
+            del stops[command]
+            write_json(record, stops)
     if timed_out:
         code, out = 124, f"TIMEOUT after {_secs(limit)}s\n{stdout}{stderr}"
     else:
         code, out = proc.returncode, stdout + "\n" + stderr
-    dur = (_dt.datetime.now() - t0).total_seconds()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     header = f"$ {command}\n# exit={code} duration={dur:.1f}s at {now()}\n"
     if note:
         header += f"# {note}\n"
-    log_path.write_text(f"{header}\n{out}")
+    log_path.write_text(f"{header}{skipped}\n{out}")
     return code, out, dur
+
+
+def _restore_guidance(root: Path, files: list, tree: str | None, added: list | None = None) -> str:
+    """What to do about files a watched command's tree lost, changed or gained, never at the cost of the agent's
+    own work. A new source file (`added`: not in the tree the run started on) is kept if the agent added it, and
+    removed or ignored if the command wrote it (_added_guidance). Every other named file was in the tree the run started on (`tree`, the git tree id `fingerprint()` wrote: the step's
+    uncommitted work included, files untracked at HEAD included, never HEAD or the index), so the advice is the
+    same for all of them: an edit the agent made is kept (run again); a file the command wrote is put back from
+    that tree, and the command is fixed or the file taken out of the fingerprint (.gitignore, `git rm --cached`
+    first when git tracks it). Nothing is ever told to be deleted. The `(the files could not be listed: ...)`
+    marker gets no per-file advice."""
+    new = [f for f in files if f in (added or [])]
+    named = [f for f in files if not f.startswith("(") and f not in new]
+    if new:
+        tail = _added_guidance(new)
+        return f"{_restore_guidance(root, named, tree)} {tail}" if named else tail
+    if not named:
+        return "Find out what wrote them, and restore the files before running again."
+    if not _is_git(root):
+        return ("Restore the files before running again; if the command wrote them, fix it so a test or check "
+                "command never changes the files it started with.")
+    q = " ".join(shlex.quote(f) for f in named)
+    back = (f"git checkout {tree} -- {q}; that tree is the code the run started on, your uncommitted work and "
+            "files untracked at HEAD included, not HEAD" if tree else "from the code the run started on, not from HEAD")
+    return (f"{', '.join(named)} differ from when the run began. If you edited them, keep your edit and run again. "
+            f"If the command wrote them, put them back as they were when the run began ({back}), then stop the "
+            f"command writing into the tree, or take them out of the fingerprint: add them to .gitignore (and "
+            f"git rm --cached {q} first if git tracks them). Never delete a file the run started with.")
+
+
+def _added_guidance(files: list) -> str:
+    """What to do about new source files that appeared while a watched command ran: they were not there when it
+    began, so an edit is kept and a file the command wrote is taken out again (removed, or ignored)."""
+    q = " ".join(shlex.quote(f) for f in files)
+    return (f"{', '.join(files)} did not exist when the run began. If you added them, keep them and run again. If "
+            f"the command wrote them, remove them (rm {q}) or add them to .gitignore, and stop the command writing "
+            "source files into the project.")
 
 
 def _report_path(ctx, cp):
@@ -7350,6 +7652,24 @@ def cmd_implemented(args):
     ok(f"{args.cp}: implementation recorded. Next: {cps['step']} gate.")
 
 
+def _record_behavior_failure(ctx, st, g: dict, cfg, cp_id: str, code: int, log: Path, check: dict | None = None):
+    """The one record of a failed behavior attempt (the tests, their re-run, or an automatic check `check`): the
+    gate's status and `last`, the attempt limit (`blocked` so a human decides), the `behavior_failed` history
+    event, the saved state and the viewer. The caller prints the tail and dies with its own message."""
+    g["status"] = "failed"
+    g["last"] = {"exit": code, "log": str(log.relative_to(ctx.root)), "at": now()}
+    if check:
+        g["last"]["check"] = check.get("kind")
+    if g["attempts"] >= cfg["max_behavior_attempts"]:
+        _set_blocked(st, f"{cp_id}: behavior gate failed {g['attempts']} times — needs a human decision.")
+    if check:
+        ctx.log(st, "behavior_failed", cp=cp_id, attempt=g["attempts"], check=check.get("kind"))
+    else:
+        ctx.log(st, "behavior_failed", cp=cp_id, attempt=g["attempts"])
+    ctx.save_state(st)
+    build_viewer(ctx)
+
+
 def cmd_behavior(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -7371,10 +7691,14 @@ def cmd_behavior(args):
         die(f"Behavior gate FAILED: planned cases were removed from tests: {', '.join(missing)}. "
             "Tests may not be deleted or weakened to pass the gate.")
     rpath = _report_path(ctx, cp)
+    # the code under the run: an edit to it while the tests, the re-run or a check runs stops that command and
+    # ends here with nothing saved (see _run_cmd); the same watch covers every command of this call
+    watch = _Watch(ctx, fingerprint(ctx.root), _watch_every(cfg), f"behavior {args.cp}",
+                   extra=cfg.get("fingerprint_include") or [])
 
     def run_once(suffix):
         log_ = ctx.evidence(args.cp) / f"behavior-{g['runs']:02d}{suffix}.log"
-        code_, out_, dur_ = _run_cmd(ctx, cp["tests"]["command"], log_, cfg["test_timeout_sec"], rpath)
+        code_, out_, dur_ = _run_cmd(ctx, cp["tests"]["command"], log_, cfg["test_timeout_sec"], rpath, watch)
         bad_ = []
         if rpath:
             cases, why = _read_test_report(ctx, rpath)
@@ -7384,9 +7708,9 @@ def cmd_behavior(args):
     code, out, dur, bad, log = run_once("")
     flaky = False
     if (code != 0 or bad) and not g.get("flaky_used"):
-        # One immediate automatic re-run, once per step: a failure that passes on it is flaky, not a real attempt.
-        # The allowance is spent the moment this retry is attempted, win or lose, so a second failing call never
-        # gets a free retry of its own just because this one's retry also failed.
+        # One immediate automatic re-run, once per step: a failure that passes on it is flaky, not a real
+        # attempt. The allowance is spent the moment this retry is attempted, win or lose, so a second failing
+        # call never gets a free retry of its own just because this one's retry also failed.
         g["flaky_used"] = True
         code2, out2, dur2, bad2, log2 = run_once("b")
         if code2 == 0 and not bad2:
@@ -7402,7 +7726,7 @@ def cmd_behavior(args):
             if not isinstance(chk, dict) or not chk.get("command"):
                 continue
             clog = ctx.evidence(args.cp) / f"check-{re.sub(r'[^a-z0-9]+', '-', str(chk.get('kind', 'x')))}-{g['runs']:02d}.log"
-            ccode, cout, _ = _run_cmd(ctx, chk["command"], clog, cfg["test_timeout_sec"])
+            ccode, cout, _ = _run_cmd(ctx, chk["command"], clog, cfg["test_timeout_sec"], watch=watch)
             if ccode != 0:
                 code, out, log, failed_check = ccode, cout, clog, chk
                 break
@@ -7413,25 +7737,13 @@ def cmd_behavior(args):
         die(f"Behavior gate FAILED for {args.cp}: an automatic check changed files in the project. Checks must only read "
             "the code; restore the files (git) and fix the check's command.", 2)
     if code != 0 and failed_check:
-        g["status"] = "failed"
-        g["last"] = {"exit": code, "log": str(log.relative_to(ctx.root)), "at": now(), "check": failed_check.get("kind")}
-        if g["attempts"] >= cfg["max_behavior_attempts"]:
-            _set_blocked(st, f"{args.cp}: behavior gate failed {g['attempts']} times — needs a human decision.")
-        ctx.log(st, "behavior_failed", cp=args.cp, attempt=g["attempts"], check=failed_check.get("kind"))
-        ctx.save_state(st)
-        build_viewer(ctx)
+        _record_behavior_failure(ctx, st, g, cfg, args.cp, code, log, check=failed_check)
         print(_tail(out))
         die(f"Behavior gate FAILED for {args.cp}: the automatic check '{failed_check.get('kind')}' "
             f"({failed_check.get('command')}) failed. Log: {log.relative_to(ctx.root)}. Give it to ratchet-implementer; "
             "the check stays as it is.", 2)
     if code != 0 or bad:
-        g["status"] = "failed"
-        g["last"] = {"exit": code, "log": str(log.relative_to(ctx.root)), "at": now()}
-        if g["attempts"] >= cfg["max_behavior_attempts"]:
-            _set_blocked(st, f"{args.cp}: behavior gate failed {g['attempts']} times — needs a human decision.")
-        ctx.log(st, "behavior_failed", cp=args.cp, attempt=g["attempts"])
-        ctx.save_state(st)
-        build_viewer(ctx)
+        _record_behavior_failure(ctx, st, g, cfg, args.cp, code, log)
         print(_tail(out))
         die(f"Behavior gate FAILED for {args.cp} (exit {code}" + ("; " + "; ".join(bad) if bad else "") +
             f"). Log: {log.relative_to(ctx.root)}. "
@@ -10324,17 +10636,21 @@ def cmd_complete(args):
     if cfg.get("regression_command") and not skip_full:
         # The related pass runs only here, when the full suite is about to run: a break in the step's own,
         # changed or naming test files stops the step in seconds, before the suite; it never replaces the suite.
-        _run_related_tests(ctx, cfg, cp, cps, fp)
+        # the code under the run: an edit to it while the related pass, the suite or its re-run runs stops that
+        # command and ends here with nothing saved (see _run_cmd); the gates above were checked against `fp`
+        watch = _Watch(ctx, fp, _watch_every(cfg), f"complete {args.cp}", extra=cfg.get("fingerprint_include") or [])
+        _run_related_tests(ctx, cfg, cp, cps, fp, watch)
         code, out, _ = _run_cmd(ctx, cfg["regression_command"], ctx.evidence(args.cp) / "regression.log",
-                                cfg["test_timeout_sec"])
+                                cfg["test_timeout_sec"], watch=watch)
         if code != 0 and not st.get("regression_flaky_used"):
             # The run's own one-time allowance (not per-step): a regression failure that passes on one
-            # immediate automatic re-run is flaky, never spending this; a second one anywhere is never forgiven.
-            # Spent the moment this retry is attempted, win or lose, so a later failed complete call never gets
-            # its own free retry just because this one's retry also failed.
+            # immediate automatic re-run is flaky, never spending this; a second one anywhere is never
+            # forgiven. Spent the moment this retry is attempted, win or lose, so a later failed complete call
+            # never gets its own free retry just because this one's retry also failed.
             st["regression_flaky_used"] = True
             code2, out2, _ = _run_cmd(ctx, cfg["regression_command"],
-                                      ctx.evidence(args.cp) / "regression-retry.log", cfg["test_timeout_sec"])
+                                      ctx.evidence(args.cp) / "regression-retry.log", cfg["test_timeout_sec"],
+                                      watch=watch)
             if code2 == 0:
                 code, out = code2, out2
                 cps["regression_flaky"] = True
@@ -12544,6 +12860,8 @@ def cmd_config(args):
                 quota_retest_minutes({k: val})
             if k == "related_test_command" and val and "{files}" not in str(val):
                 die(_NO_FILES_PLACEHOLDER_MSG, 2)
+            if k == "suite_watch_seconds" and _suite_watch_seconds({k: val}) is None:
+                die(f"suite_watch_seconds must be a number of seconds above 0 (got {v!r}); the value was not changed.", 2)
             cur = user
             parts = k.split(".")
             for p in parts[:-1]:
