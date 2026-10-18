@@ -2151,6 +2151,23 @@ def proves_problems(ctx, plan) -> list[str]:
     errs = []
     for cp in plan.get("checkpoints") or []:
         for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
+            if case.get("layer") == "shortcuts":  # names a shortcut table that exists (tests/shortcuts/<table>.json)
+                t = case.get("table")
+                if not isinstance(t, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", t):
+                    errs.append(f"{case.get('id', '?')}: a shortcuts case must name its table in \"table\" "
+                                f"(tests/shortcuts/<table>.json)")
+                elif not (ctx.root / SHORTCUT_DIR / f"{t}.json").is_file():
+                    errs.append(f"{case.get('id', '?')}: shortcut table {t!r} does not exist "
+                                f"({SHORTCUT_DIR}/{t}.json)")
+                else:
+                    try:
+                        tdef, twhy = _sc_parse((ctx.root / SHORTCUT_DIR / f"{t}.json").read_text(errors="replace"))
+                    except OSError as e:
+                        tdef, twhy = None, f"unreadable: {e}"
+                    gone = _sc_watch_missing(ctx, None, tdef["watches"]) if tdef else []
+                    if twhy or gone:
+                        errs.append(f"{case.get('id', '?')}: shortcut table {t!r} cannot be used: "
+                                    + (twhy or f"it watches {', '.join(gone)}, which does not exist"))
             proves = case.get("proves")
             if proves is None:
                 continue
@@ -3363,6 +3380,11 @@ def cmd_status_text(ctx: Ctx):
         if flaky_steps:
             print(f"Flaky (a test run failed once, then passed on an immediate automatic re-run): "
                   f"{', '.join(flaky_steps)}.")
+        print("")
+    sc_lines = _sc_block_lines(_sc_saved(ctx))  # CP6: the shortcut tables that ran (none: nothing is printed)
+    if sc_lines:  # part of the final review at the finish pause; otherwise shown as it stands (stale if the code moved)
+        for line in sc_lines:
+            print(line)
         print("")
     cps = plan.get("checkpoints", [])
     total = len(cps)
@@ -6230,6 +6252,9 @@ def cmd_approve_plan(args):
     first["started_at"] = now()
     first["base_tree"] = fingerprint(ctx.root)["id"]
     first["base_head"] = _head_sha(ctx.root)  # the commit `merged` counts the lane's own commits from
+    # where the run started, written once and never rewritten (`merged` moves the step's base_tree/base_head, not
+    # this): the shortcut tables compare the current code with it (`_sc_old_version`)
+    st.setdefault("run_start", {"tree": first["base_tree"], "head": first["base_head"]})
     st["awaiting_since"] = None
     ctx.log(st, "plan_approved", by=msg["by"], note=msg.get("prompt", "")[:200])
     ctx.save_state(st)
@@ -6254,7 +6279,7 @@ def _expect_step(cps, allowed, cp_id):
 
 def _planned_cases(ctx, cp_id):
     tp = test_plan(ctx, cp_id) or {}
-    return [c for c in tp.get("cases", []) if c.get("layer", "code") != "browser"]
+    return [c for c in tp.get("cases", []) if c.get("layer", "code") not in ("browser", "shortcuts")]
 
 
 def _coverage(ctx, cp):
@@ -9043,6 +9068,506 @@ def _check_cmd(gr: dict, target: str) -> str:
     return gr["check_command"].replace("{target}", shlex.quote(target))
 
 
+# --------------------------------------------------------------------------- shortcut tables
+# A guard-like part of the code (one the table names in "watches") has a fixed table of shortcut commands in
+# tests/shortcuts/<name>.json: {"name", "watches": [files], "runner": "<command>", "rows": [{"id", "command",
+# "expect": "refused"|"allowed"}]}. `ratchet.py shortcuts` runs each table whose watched files this run changed,
+# once per row against the code the run started from and once against the current code, and says which rows got
+# worse, stayed open, got fixed or errored. It only shows the result: nothing here ever blocks a finish.
+
+SHORTCUT_DIR = "tests/shortcuts"
+SHORTCUT_TIMEOUT_SEC = 60
+SC_ZERO = {"worse": 0, "still_open": 0, "fixed": 0, "held": 0, "errored": 0, "unknown": 0}
+SC_HEADINGS = (("worse", "got worse"), ("still_open", "still open"), ("fixed", "fixed"), ("errored", "errored"),
+               ("unknown", "unknown"))
+
+
+_SC_PATH_RE = re.compile(r"[A-Za-z0-9_.@+-]+(/[A-Za-z0-9_.@+-]+)*")
+
+
+def _sc_canonical(p: str) -> bool:
+    """A plain project-relative path: no leading ./ or /, no .. or . segment, no empty segment, no glob, no
+    backslash, no space (one trailing / is allowed for a folder by the caller)."""
+    return bool(_SC_PATH_RE.fullmatch(p)) and not any(seg in (".", "..") for seg in p.split("/"))
+
+
+def _sc_runner_argv(runner: str):
+    """(argument list, None) for an allowed runner, else (None, why). Exactly one shape is allowed:
+    `python3 <path to a file under tests/shortcuts/>`. It is run as an argument list, never through a shell."""
+    parts = runner.split(" ")
+    path = parts[-1]
+    if len(parts) == 1 and path.startswith(SHORTCUT_DIR + "/"):
+        return None, (f"its runner {runner!r} is not allowed: write `python3 {path}` (the copy the rows run in has "
+                      "no exec bit, so a bare file cannot run)")
+    if len(parts) != 2 or parts[0] != "python3":
+        return None, (f"its runner {runner!r} is not allowed: use `python3 {SHORTCUT_DIR}/<file>` (no other "
+                      "interpreter, no arguments, no shell)")
+    if not path.startswith(SHORTCUT_DIR + "/") or not _sc_canonical(path):
+        return None, (f"its runner {runner!r} is not allowed: the file must be a plain relative path under "
+                      f"{SHORTCUT_DIR}/ (no .., absolute path, glob or shell syntax)")
+    return [parts[0], "./" + path], None
+
+
+def _sc_watch_why(w: str):
+    """None for a canonical watch entry, else why it is refused. Entries are never normalised."""
+    if not _sc_canonical(w[:-1] if w.endswith("/") else w):
+        return (f"its watch {w!r} is not a canonical project path (no leading ./ or /, no .., no glob, no "
+                "backslash, no empty part)")
+    return None
+
+
+def _sc_watch_missing(ctx, tree, watches):
+    """The watches that exist in neither the starting tree nor the current folder."""
+    out = []
+    for w in watches:
+        p = w.rstrip("/")
+        if (ctx.root / p).exists():
+            continue
+        if tree and subprocess.run(["git", "cat-file", "-e", f"{tree}:{p}"], cwd=ctx.root,
+                                   capture_output=True).returncode == 0:
+            continue
+        out.append(w)
+    return out
+
+
+def _sc_parse(text: str):
+    """(table definition, None) for a readable table file, else (None, why it is unreadable)."""
+    raw = text if isinstance(text, bytes) else text.encode("utf-8", "replace")
+    d, bad = _read_record(Path("shortcut-table.json"), kind=None, data=raw)  # a people-written file, parsed from text
+    if bad:
+        return None, f"unreadable: not valid JSON ({bad.split(': ', 1)[-1][:80]})"
+    if not isinstance(d, dict):
+        return None, "unreadable: the file is not a JSON object"
+    rows, watches, runner = d.get("rows"), d.get("watches"), d.get("runner")
+    if not isinstance(runner, str) or not runner.strip():
+        return None, "unreadable: it has no \"runner\" command"
+    _argv, why = _sc_runner_argv(runner)
+    if why:
+        return None, f"unreadable: {why}"
+    if not isinstance(watches, list) or not watches or not all(isinstance(w, str) and w for w in watches):
+        return None, "unreadable: \"watches\" must list at least one file"
+    for w in watches:
+        why = _sc_watch_why(w)
+        if why:
+            return None, f"unreadable: {why}"
+    if not isinstance(rows, list) or not rows or not all(
+            isinstance(r, dict) and isinstance(r.get("id"), str) and isinstance(r.get("command"), str) for r in rows):
+        return None, "unreadable: \"rows\" must be a list of {id, command, expect}"
+    for r in rows:
+        if r.get("expect") not in ("allowed", "refused") or not isinstance(r.get("expect"), str):
+            return None, (f"unreadable: row {r['id']!r} has expect {json.dumps(r.get('expect'))[:40]}; "
+                          "expect must be the string \"allowed\" or \"refused\"")
+    return {"watches": watches, "runner": runner, "rows": rows}, None
+
+
+def _sc_start_tree(st):
+    """The tree this run recorded at its start (run_start.tree, else its first step's starting tree), or None. It
+    is where the starting copy of every table (rows, expectations, runner) is read, whatever the comparison
+    version turns out to be."""
+    rs = st.get("run_start") if isinstance(st.get("run_start"), dict) else {}
+    first = next(iter((st.get("checkpoints") or {}).values()), None) or {}
+    return rs.get("tree") or first.get("base_tree") or None
+
+
+def _sc_merge_tree(ctx, a, b):
+    """(exit code, tree id or "", set of conflicted paths) of `git merge-tree --write-tree a b`. A conflicted merge
+    still writes a tree (the conflicted files hold markers), so only its conflicted paths are unusable."""
+    r = subprocess.run(["git", "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", a, b],
+                       cwd=ctx.root, capture_output=True)
+    parts = r.stdout.decode("utf-8", "surrogateescape").split("\0") if r.returncode in (0, 1) else []
+    tree = parts[0].strip() if parts else ""
+    paths = set(x for x in parts[1:] if x) if r.returncode == 1 else set()
+    return r.returncode, tree, paths
+
+
+def _sc_old_version(ctx, st):
+    """(tree id of the code this run started from, None, paths that conflicted laying main on the start, paths that
+    conflicted redoing the lane/main merge), or (None, a plain note, set(), set()) when it
+    cannot be worked out. run_start.tree (written once at plan approval; `merged` never rewrites it) while main was
+    never merged in. After a merge, main's side laid onto the run's starting commit (`git merge-tree --write-tree
+    <run_start.head> M^2` for the latest merged_main commit M), so main's own changes are not counted as this run's.
+    A conflict there, or in redoing the lane/main merge itself (a hand-made resolution mixes the run's lines with
+    main's), does not make the whole version unknown: the tree is still built and the conflicted paths are returned
+    (the two causes apart, so a note names the merge that conflicted),
+    so only a table that watches one of them is unknown. A run approved before run_start existed falls back to its
+    first step's starting tree, unless main was merged in."""
+    merges = [e for e in (st.get("history") or []) if e.get("event") == "merged_main" and e.get("commit")]
+    rs = st.get("run_start") if isinstance(st.get("run_start"), dict) else {}
+    if not merges:
+        tree = _sc_start_tree(st)
+        if not tree:
+            return None, "The starting version cannot be worked out: this run recorded no starting tree.", set(), set()
+        return tree, None, set(), set()
+    if not rs.get("head"):
+        return None, ("The starting version cannot be worked out: this run began before starting versions were "
+                      "recorded and main was merged into it."), set(), set()
+    m = merges[-1]["commit"]
+    side = m + "^2"
+    if subprocess.run(["git", "rev-parse", "-q", "--verify", side], cwd=ctx.root, capture_output=True).returncode != 0:
+        side = m  # a fast-forward: the commit is main's tip itself
+    code, tree, conflicts = _sc_merge_tree(ctx, rs["head"], side)
+    conflicts2 = set()
+    if side != m:  # the same merge as git made it: a hand-made resolution shows up as a conflict here
+        code2, _t2, conflicts2 = _sc_merge_tree(ctx, m + "^1", side)
+        if code2 not in (0, 1):
+            return None, "The starting version cannot be worked out: git could not redo the merge of main.", set(), set()
+    if code not in (0, 1) or not tree:
+        return None, "The starting version cannot be worked out: git could not build main's side onto the start.", set(), set()
+    return tree, None, conflicts, conflicts2
+
+
+def _sc_old_files(ctx, tree: str) -> dict:
+    """{table name: file text} for every tests/shortcuts/*.json in the starting tree."""
+    r = subprocess.run(["git", "ls-tree", "-r", "--name-only", "-z", tree, "--", SHORTCUT_DIR], cwd=ctx.root,
+                       capture_output=True)
+    out = {}
+    for path in r.stdout.decode("utf-8", "surrogateescape").split("\0") if r.returncode == 0 else []:
+        rest = path[len(SHORTCUT_DIR) + 1:] if path.startswith(SHORTCUT_DIR + "/") else ""
+        if rest.endswith(".json") and "/" not in rest:
+            s = subprocess.run(["git", "show", f"{tree}:{path}"], cwd=ctx.root, capture_output=True)
+            if s.returncode == 0:
+                out[rest[:-5]] = s.stdout.decode("utf-8", "replace")
+    return out
+
+
+def _sc_run_row(runner: str, cwd: Path, root: Path, command: str):
+    """(ALLOWED | REFUSED | error, note): run in `cwd` (the version's own folder, the same as `root`); the runner's whole trimmed output must be exactly ALLOWED or REFUSED and
+    its exit code 0; anything else (a crash, a timeout, a runner that cannot start) is an error, never refused."""
+    argv, why = _sc_runner_argv(runner)
+    if why:
+        return "error", why
+    try:
+        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, errors="replace",
+                           timeout=SHORTCUT_TIMEOUT_SEC,
+                           env=dict(os.environ, RATCHET_SHORTCUT_ROOT=str(root), RATCHET_SHORTCUT_COMMAND=command))
+    except subprocess.TimeoutExpired:
+        return "error", f"the runner timed out after {SHORTCUT_TIMEOUT_SEC}s"
+    except (OSError, ValueError) as e:  # ValueError: a NUL byte in the runner or the row's command
+        return "error", f"the runner could not be started ({e})"
+    out = (r.stdout or "").strip()
+    if r.returncode == 0 and out in ("ALLOWED", "REFUSED"):
+        return out, None
+    if r.returncode == 0:
+        return "error", f"the runner printed {out[:60]!r}, not exactly ALLOWED or REFUSED"
+    lines = [x for x in ((r.stderr or "") + "\n" + (r.stdout or "")).splitlines() if x.strip()]
+    err = (r.stderr or "").strip().splitlines()
+    return "error", f"the runner exited {r.returncode}: {(err[-1] if err else (lines[-1] if lines else 'no output'))[:160]}"
+
+
+def _sc_verdict(expect, old, new):
+    want = {"refused": "REFUSED", "allowed": "ALLOWED"}.get(expect)
+    if want is None or old == "error" or new == "error":
+        return "errored"
+    if old == "unknown":
+        return "unknown"
+    if old == want:
+        return "held" if new == want else "worse"
+    return "fixed" if new == want else "still_open"
+
+
+def _sc_table(ctx, name, old_def, cur_def, cur_why, old_root, new_root, old_note):
+    """One table's result: its rows run on the starting code and the current code. The rows, expectations and
+    runner of a table that existed at the start always come from its starting copy (a row cannot be dropped or
+    flipped by editing or deleting the file); rows added since run too and are marked new_row."""
+    notes = []
+    if old_note:
+        notes.append(old_note)
+    base = old_def or cur_def
+    rows = [dict(r, new_row=False) for r in (old_def["rows"] if old_def else [])]
+    if old_def:
+        cur_rows = {r["id"]: r for r in (cur_def["rows"] if cur_def else [])}
+        if cur_def is None and cur_why is None:
+            notes.append(f"The table file for {name} was deleted since the run started; its starting copy was used.")
+        elif cur_def is None:
+            notes.append(f"The current {name} table file is unreadable ({cur_why}); its starting copy was used.")
+        else:
+            gone = [r["id"] for r in rows if r["id"] not in cur_rows]
+            changed = [r["id"] for r in rows if r["id"] in cur_rows and (
+                cur_rows[r["id"]].get("command") != r["command"] or cur_rows[r["id"]].get("expect") != r.get("expect"))]
+            if gone:
+                notes.append(f"Row(s) {', '.join(gone)} no longer in the {name} table file (removed since the run "
+                             "started); they still run from the starting copy.")
+            if changed:
+                notes.append(f"Row(s) {', '.join(changed)} changed since the run started; the starting version "
+                             "of each was used.")
+            have = {r["id"] for r in rows}
+            rows += [dict(r, new_row=True) for r in cur_def["rows"] if r["id"] not in have]
+    elif cur_def:
+        rows = [dict(r, new_row=old_root is not None) for r in cur_def["rows"]]
+    out_rows, counts = [], dict(SC_ZERO)
+    for r in rows:
+        expect = r.get("expect")
+        if old_root is None:
+            old, onote = "unknown", None
+        else:
+            old, onote = _sc_run_row(base["runner"], old_root, old_root, r["command"])
+        new, nnote = _sc_run_row(base["runner"], new_root, new_root, r["command"])
+        verdict = _sc_verdict(expect, old, new)
+        if old_def is None and old == "error" and new != "error" and expect in ("refused", "allowed"):
+            # a table added during the run has no old side (its runner may not exist there): the row is new and is
+            # judged on the current code only
+            old, onote = "none", None
+            verdict = "held" if new == {"refused": "REFUSED", "allowed": "ALLOWED"}[expect] else "still_open"
+        row = {"id": r["id"], "command": r["command"], "expect": expect, "old": old, "new": new,
+               "verdict": verdict, "new_row": bool(r.get("new_row"))}
+        why = "; ".join(x for x in (onote, nnote) if x)
+        if verdict == "errored" and not why:
+            why = f"expect must be \"refused\" or \"allowed\", not {expect!r}"
+        if why:
+            row["note"] = why
+        counts[verdict] += 1
+        out_rows.append(row)
+    return {"name": name, "ran": True, "stale": False, "note": notes[0] if notes else None, "notes": notes,
+            "counts": counts, "rows": out_rows, "watches": base["watches"]}
+
+
+def _sc_not_run(name, note, failed=False):
+    """A table that did not run. `failed`: it should have (unreadable file, code could not be rebuilt), so the
+    result is saved and shown; otherwise it was skipped on purpose (its watched files did not change)."""
+    return {"name": name, "ran": False, "failed": failed, "stale": False, "note": note, "notes": [note],
+            "counts": dict(SC_ZERO), "rows": [], "watches": []}
+
+
+def _sc_lay_runner(src: Path, dst: Path):
+    """Lays the starting copy of tests/shortcuts (runner scripts and helpers) over the current copy, so a runner the
+    builder edited or deleted still runs as it was at the start; the code under test is untouched."""
+    sdir = src / SHORTCUT_DIR
+    if sdir.is_dir():
+        shutil.copytree(sdir, dst / SHORTCUT_DIR, dirs_exist_ok=True, symlinks=False, ignore_dangling_symlinks=True)
+
+
+def _sc_hits(paths, watches) -> bool:
+    return any(c == w.rstrip("/") or c.startswith(w.rstrip("/") + "/") for c in paths for w in watches)
+
+
+def _sc_compute(ctx, st, only=None) -> dict:
+    """Runs every shortcut table whose watched files this run changed (all of them when the starting code cannot
+    be worked out); returns {"tables": [...]}. Changes nothing in the project: both versions are throwaway copies."""
+    if not _is_git(ctx.root):
+        return {"tables": [], "notes": ["Shortcut tables need a git project, so none were run."]}
+    old_tree, old_note, conflicts, conflicts_redo = _sc_old_version(ctx, st)
+    # the starting rows and expectations always come from the run's starting tree, never from the comparison
+    # version (main's own edits to a table must not drop or flip a row); only the code compared comes from old_tree
+    start_tree = _sc_start_tree(st) or old_tree
+    old_files = _sc_old_files(ctx, start_tree) if start_tree else {}
+    cmp_files = _sc_old_files(ctx, old_tree) if old_tree and old_tree != start_tree else {}
+    cur_dir = ctx.root / SHORTCUT_DIR
+    cur_files = {p.stem: p for p in sorted(cur_dir.glob("*.json")) if p.is_file()} if cur_dir.is_dir() else {}
+    names = sorted(set(old_files) | set(cur_files))
+    if only:
+        names = [n for n in names if n == only]
+    if not names:
+        return {"tables": []}
+    fp = fingerprint(ctx.root)
+    changed = changed_files(ctx.root, {"kind": "git-tree", "id": old_tree}, fp) if old_tree else None
+    old_root = new_root = start_root = None
+    laid = False
+    tables = []
+    try:
+        for name in names:
+            old_def = old_why = cur_def = cur_why = None
+            if name in old_files:
+                old_def, old_why = _sc_parse(old_files[name])
+            if name in cur_files:
+                try:
+                    cur_def, cur_why = _sc_parse(cur_files[name].read_text(errors="replace"))
+                except OSError as e:
+                    cur_why = f"unreadable: {e}"
+            if old_def and name in cmp_files:  # rows main added are extra rows; they never replace a starting row
+                main_def, _w = _sc_parse(cmp_files[name])
+                if main_def:
+                    have = {r["id"] for r in old_def["rows"]}
+                    old_def = dict(old_def, rows=old_def["rows"] + [r for r in main_def["rows"] if r["id"] not in have])
+            base = old_def or cur_def
+            if base is None:
+                tables.append(_sc_not_run(name, f"Not run: the {name} table file is {old_why or cur_why}.", True))
+                continue
+            gone = _sc_watch_missing(ctx, start_tree, base["watches"])
+            if gone:
+                tables.append(_sc_not_run(name, f"Not run: the {name} table watches {', '.join(gone)}, which exists "
+                                                "neither in the starting code nor in the current code.", True))
+                continue
+            if changed is not None and not _sc_hits(changed, base["watches"]):
+                tables.append(_sc_not_run(name, f"{name} was not run: the files it watches "
+                                                f"({', '.join(base['watches'])}) did not change in this run."))
+                continue
+            if new_root is None:
+                new_root = _materialize(ctx, fp["id"], [])
+                old_root = _materialize(ctx, old_tree, []) if old_tree else None
+                if new_root is None or (old_tree and old_root is None):
+                    tables.append(_sc_not_run(name, "Not run: Ratchet could not rebuild the code to run it on.", True))
+                    for d in (old_root, new_root):
+                        if d is not None:
+                            shutil.rmtree(d, ignore_errors=True)
+                    new_root = old_root = None
+                    continue
+            if old_def and not laid:  # a table that existed at the start keeps its starting runner files
+                src = old_root if old_tree == start_tree else None
+                if src is None and start_tree:
+                    src = start_root = _materialize(ctx, start_tree, [])
+                if src is not None:
+                    _sc_lay_runner(src, new_root)
+                    if old_root is not None and src is not old_root:
+                        _sc_lay_runner(src, old_root)
+                laid = True
+            t_old, t_note = old_root, old_note
+            for cset, cwhy in ((conflicts, "laying main's side onto the code this run started from hit a conflict there"),
+                               (conflicts_redo, "main's merge into this lane had a conflict resolved by hand in a "
+                                                "file this table watches")):
+                if t_old is not None and _sc_hits(cset, base["watches"]):  # only this table's watched files conflict
+                    t_old = None
+                    t_note = f"The starting version of the files this table watches cannot be worked out: {cwhy}."
+            res = _sc_table(ctx, name, old_def, cur_def, cur_why, t_old, new_root, t_note)
+            res["fingerprint"] = fp["id"]
+            tables.append(res)
+    finally:
+        for d in (old_root, new_root, start_root):
+            if d is not None:
+                shutil.rmtree(d, ignore_errors=True)
+    return {"tables": tables}
+
+
+def _has_shortcut_case(ctx, plan) -> bool:
+    """True when some test-plan case has layer "shortcuts": status --json then carries `done_means_table` at any
+    phase, so the agent can see mid-run whether a line linked to a shortcut table is proven."""
+    return any(c.get("layer") == "shortcuts" for cp in (plan or {}).get("checkpoints") or []
+               if isinstance(cp, dict) and cp.get("id")
+               for c in (test_plan(ctx, cp["id"]) or {}).get("cases") or [])
+
+
+def _sc_dir(ctx) -> Path:
+    return ctx.run_dir() / "evidence" / "shortcuts"
+
+
+def _sc_save(ctx, result: dict):
+    """Saves each table that ran, and each that failed to run (unreadable file, code that could not be rebuilt:
+    shown as a failure, its linked line stays unproven), as evidence/shortcuts/<name>.json with the code
+    fingerprint it ran on. A table skipped because its watched files did not change writes nothing and never deletes
+    an earlier saved result (a valid result is not thrown away)."""
+    d = _sc_dir(ctx)
+    for t in result["tables"]:
+        p = d / f"{t['name']}.json"
+        if not t.get("ran") and not t.get("failed"):
+            continue
+        d.mkdir(parents=True, exist_ok=True)
+        _write_record(p, dict(t, saved_at=now()), pretty=True)
+
+
+def _sc_saved(ctx) -> dict:
+    """The saved table results (no running), each with `stale`: true when the code changed since it ran."""
+    d = _sc_dir(ctx)
+    files = sorted(d.glob("*.json")) if d.is_dir() else []
+    tables = []
+    for p in files:
+        t, bad = _read_record(p, kind=dict)
+        if bad:
+            continue
+        if isinstance(t, dict) and isinstance(t.get("rows"), list) and (t.get("ran") or t.get("failed")):
+            tables.append(t)
+    if tables:
+        now_id = fingerprint(ctx.root)["id"]
+        for t in tables:
+            t["stale"] = t.get("fingerprint") != now_id
+    return {"tables": tables}
+
+
+def _sc_counts_line(t: dict) -> str:
+    if t.get("failed"):
+        return f"Shortcut table {t['name']}: could not run. {t.get('note') or ''}".rstrip()
+    c = t.get("counts") or {}
+    return (f"Shortcut table {t['name']}: {c.get('worse', 0)} worse, {c.get('still_open', 0)} still open, "
+            f"{c.get('fixed', 0)} fixed, {c.get('held', 0)} held, {c.get('errored', 0)} errored"
+            + (f", {c['unknown']} unknown (the starting version could not be run)" if c.get("unknown") else ""))
+
+
+def _sc_table_lines(t: dict) -> list[str]:
+    """One table's block, shared by `shortcuts`, `status` (the final review), and the receipt: its counts, its
+    notes, then a heading per verdict that has rows (got worse, still open, fixed, errored, unknown) with each
+    row's command. Held rows are only counted."""
+    out = [_sc_counts_line(t)]
+    if t.get("stale"):
+        out.append("  This saved result is out of date: the code changed after it ran. Run `ratchet.py "
+                   "shortcuts` again.")
+    if not t.get("failed"):  # a failed table's one note is already in its first line
+        out += [f"  Note: {n}" for n in t.get("notes") or []]
+    for verdict, heading in SC_HEADINGS:
+        rows = [r for r in t.get("rows") or [] if r.get("verdict") == verdict]
+        if not rows:
+            continue
+        out.append(f"  {heading} ({len(rows)}):")
+        for r in rows:
+            tail = f" [{r['note']}]" if r.get("note") else ""
+            new = " (added since the run started)" if r.get("new_row") else ""
+            out.append(f"    {r['id']}: {r['command']}   expected {r.get('expect')}; at the start {r.get('old')}, "
+                       f"now {r.get('new')}{new}{tail}")
+    return out
+
+
+def _sc_block_lines(saved: dict) -> list[str]:
+    out = []
+    for t in saved.get("tables") or []:
+        out += _sc_table_lines(t)
+    return out
+
+
+def cmd_shortcuts(args):
+    """`ratchet.py shortcuts [<name>] [--json]`: runs the shortcut tables whose watched files this run changed,
+    against the code the run started from and the current code, and saves each result under the run's
+    evidence/shortcuts. Shows rows that got worse, stayed open, got fixed or errored; changes no project file."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    result = _sc_compute(ctx, st, getattr(args, "name", None))
+    _sc_save(ctx, result)
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return
+    if not result["tables"]:
+        print("There are no shortcut tables in this project (tests/shortcuts/*.json)."
+              if not result.get("notes") else result["notes"][0])
+        return
+    for t in result["tables"]:
+        if not t.get("ran"):
+            print(t["note"])
+            continue
+        for line in _sc_table_lines(t):
+            print(line)
+        print("")
+
+
+def _sc_case_status(ctx, case: dict) -> str:
+    """A 'shortcuts'-layer case's own state for the done-means table: "passed" only when a saved result for its
+    table, made on the current code, has every row right on the current code (the starting side never matters);
+    otherwise the table's wrong rows by id, or that the saved result is out of date, or DM_NO_RESULT."""
+    name = case.get("table")
+    p = _sc_dir(ctx) / f"{name}.json" if isinstance(name, str) and name else None
+    if p is None or not p.is_file():
+        return DM_NO_RESULT
+    saved = _sc_saved(ctx)
+    t = next((x for x in saved["tables"] if x.get("name") == name), None)
+    if t is None:
+        return DM_NO_RESULT
+    if t.get("failed"):
+        return f"shortcut table {name}: could not run ({t.get('note')})"
+    if t.get("stale"):
+        return f"shortcut table {name}: the saved result is out of date (the code changed since it ran)"
+    want = {"refused": "REFUSED", "allowed": "ALLOWED"}
+    wrong = [r["id"] for r in t["rows"] if r.get("verdict") == "errored" or r.get("new") != want.get(r.get("expect"))]
+    if wrong:
+        return f"shortcut table {name}: rows wrong on the current code: {', '.join(wrong)}"
+    return "passed"
+
+
+def _sc_run_at_finish(ctx, st) -> list[str]:
+    """Called when the last step completes: runs and saves the tables; the lines to print. Never blocks a finish:
+    a failure here is a plain note."""
+    try:
+        result = _sc_compute(ctx, st)
+        _sc_save(ctx, result)
+    except Exception as e:  # shows a note, never refuses the finish
+        return [f"The shortcut tables could not be run ({str(e)[:160]}); run `ratchet.py shortcuts` to see why."]
+    return [_sc_counts_line(t) for t in result["tables"] if t.get("ran") or t.get("failed")]
+
+
 def _finish_guardrail(ctx, st, cp):
     """A guardrail step passed every gate: its check becomes permanent (config `checks`) and is noted in learnings."""
     gr = cp.get("guardrail") or {}
@@ -9131,6 +9656,8 @@ def spec_coverage(ctx, plan, items) -> dict:
             unmapped[ref] = u["reason"].strip()
     by_case, by_step, ui_steps, unknown = {}, {}, {}, set()
     for cp in plan.get("checkpoints") or []:
+        if not isinstance(cp, dict) or not cp.get("id"):
+            continue  # a malformed step is refused by plan validation; this table just skips it
         for ref in _as_list(cp.get("spec_refs") or []):
             by_step.setdefault(ref, []).append(cp["id"])
             if (cp.get("gates") or {}).get("ui"):
@@ -9530,7 +10057,7 @@ def living_spec_text(ctx, st) -> str:
                 out.append(f"- **GIVEN** {c['given']}")
             out.append(f"- **WHEN** {c.get('when') or 'this behaviour is exercised'}")
             out.append(f"- **THEN** {c.get('then') or c.get('title') or 'it works as described'}")
-            how = "checked by the UI review" if c.get("layer") == "browser" else f"test {c['id']}" + (f" in {files}" if files else "")
+            how = "checked by the UI review" if c.get("layer") == "browser" else f"shortcut table {c.get('table')}" if c.get("layer") == "shortcuts" else f"test {c['id']}" + (f" in {files}" if files else "")
             out += [f"<!-- proven by {how}" + (f", commit {commit}" if commit else "") + " -->", ""]
     return "\n".join(out).rstrip() + "\n"
 
@@ -10003,6 +10530,8 @@ def _dm_case_status(ctx, cp_id: str, case: dict, behavior_status: str | None = N
     skipped instance among several still shows as failed."""
     if case.get("layer") == "browser":
         return "checked by the UI gate" if ui_status == "passed" else DM_NO_UI_GATE
+    if case.get("layer") == "shortcuts":  # never run by `behavior`: its saved shortcut-table result decides
+        return _sc_case_status(ctx, case)
     case_id = case.get("id") or ""
     pat = _case_id_re(case_id) if case_id else None
     for name in ("test-report.json", "test-report.xml"):
@@ -10040,6 +10569,8 @@ def _dm_case_reason(c: dict) -> str | None:
     st, cid = c.get("status") or "", c.get("id")
     if st in ("passed", "checked by the UI gate") or st.startswith("step tests passed"):
         return None
+    if st.startswith("shortcut table"):
+        return f"{cid}: {st}"
     if st == DM_NO_UI_GATE:
         return f"{cid} is a browser test and no UI gate checked it"
     if st.startswith("step tests failed"):
@@ -10440,7 +10971,8 @@ def cmd_receipt(args):
         data = {"run": {"elapsed_seconds": run_seconds, "finished": run_status == "finished"},
                 "steps": [{k: s[k] for k in ("id", "title", "commit", "finished", "elapsed_seconds", "reviewers")}
                          for s in steps],
-                "accepted": accepted, "left_for_later": left, "fixed_later": fixed, "done_means": dm}
+                "accepted": accepted, "left_for_later": left, "fixed_later": fixed, "done_means": dm,
+                "shortcut_tables": _sc_saved(ctx)["tables"]}
         print(json.dumps(data, indent=2))
         return
     print(f"# Proof receipt: {plan.get('feature') or st.get('feature') or st.get('slug')}")
@@ -10478,6 +11010,11 @@ def cmd_receipt(args):
         if not judged:
             print("Note: this plan's tests were never linked to done_means lines (an older test plan, "
                   "approved before the \"proves\" field existed).")
+    sc_lines = _sc_block_lines(_sc_saved(ctx))
+    if sc_lines:
+        print("")
+        for line in sc_lines:
+            print(line)
     acc_lines = _accepted_findings_lines(st)
     if acc_lines:
         print("")
@@ -10689,6 +11226,8 @@ def cmd_complete(args):
     remaining = [c for c in order if st["checkpoints"][c]["status"] != "done"]
     mode = st.get("human_review", "end")
     finish_lines: list[str] = []  # CP4: the held-finish lines or the older-run note, printed after the ok line
+    if not remaining:  # CP6: the last step is done: run the shortcut tables (shown, never blocking)
+        finish_lines += _sc_run_at_finish(ctx, st)
     if mode == "each":
         st["phase"] = "awaiting_checkpoint_review"
         st["awaiting_since"] = now()
@@ -13106,7 +13645,9 @@ def status_json(ctx: Ctx) -> dict:
             "hooks": hs, "hook_errors": hook_errors_view(ctx.root, hs.get("host", "unknown")),
             "viewer_url": viewer_link(ctx)["url"], "viewer_live": viewer_link(ctx)["live"],
             "done": sum(1 for c in cps if c["status"] == "done"), "total": len(cps),
-            "done_means_table": done_means_table(ctx, plan, st) if _finish_pending(st) else None,
+            "done_means_table": (done_means_table(ctx, plan, st)
+                                 if _finish_pending(st) or _has_shortcut_case(ctx, plan) else None),
+            "shortcuts": _sc_saved(ctx),
             "finish_blockers": ([{k: e.get(k) for k in ("number", "text", "reasons")} for e in _finish_blockers(ctx, st)]
                                 if _finish_pending(st) else None),
             "small_fix_reviews": _small_fix_review_lines(st),
@@ -16569,8 +17110,8 @@ STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "re
                      "ui-record", "adv-record", "complete", "human-approve", "feedback", "plan-extend", "pause",
                      "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
                      "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait", "accept-finding",
-                     "raise-limit", "check-in", "triage", "merged", "accept-line")
-LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers", "providers", "merged")  # tests, checks, a regression
+                     "raise-limit", "check-in", "triage", "merged", "accept-line", "shortcuts")
+LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers", "providers", "merged", "shortcuts")  # tests, checks, a regression
                                                                                           # suite, provider probes (--add included)
 # The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
 OVERRIDE_CMDS = ("approve-plan", "human-approve", "approve-changes", "cancel", "set-review", "resume", "hooks-waive",
@@ -17383,6 +17924,10 @@ def main(argv=None):
     a = sp.add_parser("mark-fixed", help="record that a deferred finding was really fixed and reviewed again")
     a.add_argument("cp"); a.add_argument("decision", metavar='ref="how it was fixed"')
     a.set_defaults(fn=cmd_mark_fixed)
+    a = sp.add_parser("shortcuts", help="run the shortcut tables (tests/shortcuts/*.json) whose watched files this run "
+                      "changed against the code the run started from and the current code")
+    a.add_argument("name", nargs="?", help="only this table"); a.add_argument("--json", action="store_true")
+    a.set_defaults(fn=cmd_shortcuts)
     a = sp.add_parser("receipt", help="one proof receipt to paste into the pull request: steps, time, reviewers, "
                                       "accepted/left-for-later/fixed-later findings")
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_receipt)

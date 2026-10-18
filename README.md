@@ -432,6 +432,7 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py deferred` | review findings noted for later instead of blocking (minor ones, and any blocker/major/unknown-severity one with no `user_impact`), plus, in their own section first, any findings you accepted yourself, with your reason and who accepted them, and a 'fixed later in the run' section for ones `mark-fixed` closed |
 | `ratchet.py mark-fixed CPn <ref>="<how>"` | record that a finding left for later was really fixed: refused unless its file changed since the round that raised it AND a later round was recorded on that changed code |
 | `ratchet.py receipt [--json]` | one proof receipt to paste into the pull request at the final review: each step's title, commit and elapsed time, the run's own elapsed time (no cost or tokens), who reviewed each step (host-company fallbacks marked, with why when recorded), findings accepted, left for later or fixed later in the run, and every objective done-means line marked proven or unproven next to the test case(s) that prove it (or "no test linked") |
+| `ratchet.py shortcuts [<name>] [--json]` | for a guard-like change: runs each shortcut table in `tests/shortcuts/` whose watched files this run changed against the code the run started from and the current code, and shows which rows got worse, stayed open, got fixed or errored (a crash or odd output is an error, never a refusal; rows the run started with cannot be dropped or flipped). It runs by itself when the last step completes, the final review, `status` and the receipt show the result, and it never blocks the finish. A test case with layer `shortcuts` links a table to done-means lines. Details in `schemas.md` section 14 |
 | `ratchet.py ask accept-finding CPn F1,F2`, `accept-finding CPn` | ask the user to accept named open (blocking) findings of a blocked round, with their own reason (`accept: <reason>`); record it once they reply |
 | `ratchet.py ask accept-line <n>[,<n>]`, `accept-line [--director-token <t> --reason "<r>"]` | at the final review, ask the user to accept named unproven done-means lines (by the table's numbers) with their own reason (`accept: <reason>`); record it once they reply (a director token with `--reason` in an enrolled lane); accepted lines show as accepted in the final-review table and the receipt and no longer hold the finish |
 | `ratchet.py ask raise-limit CPn`, `raise-limit CPn` | ask the user to raise a blocked step's own review-round limit by one round, with their own reason (`raise: <reason>`); offered at most once per step, ever, whatever `config.json`'s `max_adversarial_rounds` is later edited to |
@@ -532,6 +533,8 @@ python3 tests/test_results.py
 python3 tests/test_review_objective.py
 python3 tests/test_run_all_dedupe.py
 python3 tests/test_runner.py
+python3 tests/test_shortcuts.py
+python3 tests/test_shortcuts_extra.py
 python3 tests/test_signing.py
 python3 tests/test_specs.py
 python3 tests/test_split_check.py
