@@ -160,6 +160,7 @@ DEFAULT_CONFIG = {
     "spec_archive": True,
     "spec_keep": None,              # no spec tool: keep a running spec (openspec/specs/<run>/spec.md)? None = not asked yet           # archive an OpenSpec change (merge its deltas into the specs) when the run is approved
     "regression_command": None,     # full suite run before a checkpoint can complete
+    "lane_start_command": None,     # `lanes-start` prints this argument list ({worktree}, {brief}, {name}) per lane; never runs it
     # The quick path (`ratchet.py changes CPn`): a file matching doc_globs and not doc_exclude_globs (plus the
     # configured design_md and standards files) counts as a doc, not code. A test file matching test_globs "names"
     # a doc when its text contains the doc's repo-relative path or file name. doc_test_command (with a {files}
@@ -5991,11 +5992,12 @@ def cmd_director_key(args):
     ok(f"Director key {'rotated' if args.rotate else 'created'}: {p}  (re-enroll lanes after a rotation)")
 
 
-def cmd_director_enroll(args):
-    require_director_session("director-enroll")
-    ctx = Ctx(find_root())
+def _enroll_lane(root: Path):
+    """Enrolls the lane folder `root` with the director: its signature into RATCHET_HOME/enrolled.json (under that
+    file's lock; never over a file that can't be read) and .ratchet/director.json in the lane. Dies with the reason
+    when it cannot (nothing is then written)."""
     ep = _enrolled_path()
-    lane = str(ctx.root.resolve())
+    lane = str(root.resolve())
     bad, signed = [], []
 
     def damaged(why):  # it holds other lanes' enrollment: never replace it with this lane's alone
@@ -6014,9 +6016,217 @@ def cmd_director_enroll(args):
             f"over it, and nothing was changed. Tell the user; to repair it: {_enrolled_repair(ep)}.")
     if done == "busy":
         _die_record_busy(ep, "nothing was changed")
-    ctx.ratchet.mkdir(exist_ok=True)
-    _write_record(ctx.ratchet / "director.json", {"enrolled_at": now(), "sig": signed[0]}, pretty=True)
+    (root / RATCHET_DIR).mkdir(exist_ok=True)
+    _write_record(root / RATCHET_DIR / "director.json", {"enrolled_at": now(), "sig": signed[0]}, pretty=True)
+
+
+def cmd_director_enroll(args):
+    require_director_session("director-enroll")
+    ctx = Ctx(find_root())
+    _enroll_lane(ctx.root)
     ok(f"Lane {ctx.root} enrolled: approvals now require a director token.")
+
+
+_LANE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_LANE_PLACEHOLDERS = ("{worktree}", "{brief}", "{name}")
+
+
+def _lanes_start_template(cfg: dict):
+    """The developer's lane_start_command (a non-empty list of strings using only {worktree}, {brief} and {name}), or
+    None when none is set. Dies, before anything is created, when it is not usable."""
+    t = cfg.get("lane_start_command")
+    if t is None:
+        return None
+    what = ("lane_start_command in .ratchet/config.json must be a list of words (an argument list such as "
+            "[\"mycli\", \"--cwd\", \"{worktree}\"]) using only the placeholders {worktree}, {brief} and {name}. "
+            "Fix or remove it, then run lanes-start again. Nothing was changed.")
+    if not isinstance(t, list) or not t or not all(isinstance(x, str) and x for x in t):
+        die(what)
+    for x in t:
+        if any(m not in _LANE_PLACEHOLDERS for m in re.findall(r"\{[^{}]*\}", x)):
+            die(what)
+    return t
+
+
+def cmd_lanes_start(args):
+    """`lanes-start --request "<text>" --lane NAME=FEATURE [--lane ...] [--name N] [--json]` (director only): from one
+    request, makes for each lane a branch named NAME (from the main checkout's HEAD), a plain git worktree next to the
+    main checkout, the lane's enrollment with the director (no run: the lane's agent runs init itself), and a brief
+    file; records the request in .ratchet/requests/<name>.json and prints each lane's start command (the developer's
+    lane_start_command template filled in, which Ratchet only prints, or plain words). main's uncommitted Ratchet
+    settings (MERGE_SHARED) are copied into each worktree as uncommitted changes; main itself gains no commit and no
+    byte changes. Every refusal comes before anything is created; a failure part-way removes what was made."""
+    require_director_session("lanes-start")
+    main = find_root()
+    if not _is_git(main):
+        die("lanes-start needs a git project: each lane is a branch and a git worktree. Nothing was changed.")
+    top = _git_top_problem(main, "lanes-start", "Start the lanes by hand (git worktree add, then director-enroll in each).")
+    if top:
+        die(top)
+    # one lanes-start or integrate at a time per repository: integrate's lock, so two calls for the same lane name
+    # can never both pass the preflight and the loser's rollback can never remove the winner's lane
+    cd = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=main, capture_output=True, text=True, timeout=60)
+    common = Path(cd.stdout.strip() or ".git")
+    common = common if common.is_absolute() else main / common
+    lk = _IntegrateLock(main, common, "lanes-start")
+    why = lk.acquire()
+    try:
+        if why:
+            die((f"Ratchet is busy running {lk.holder}; try lanes-start again when it finishes. Nothing was changed.")
+                if why.startswith("Ratchet is busy") else why)
+        _lanes_start_run(args, main)
+    finally:
+        lk.release()
+
+
+def _lanes_start_run(args, main: Path):
+    """The body of cmd_lanes_start, run while it holds the repository's integrate lock."""
+    request = (args.request or "").strip()
+    if not request:
+        die("lanes-start needs the request text (--request \"...\"). Nothing was changed.")
+    if not args.lane:
+        die("lanes-start needs at least one lane (--lane NAME=FEATURE). Nothing was changed.")
+
+    def git(d, *a):
+        return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True, timeout=120)
+
+    lanes = []
+    for spec in args.lane:
+        n, _eq, feat = spec.partition("=")
+        n, feat = n.strip(), feat.strip()
+        if not _LANE_NAME_RE.match(n) or ".." in n or git(main, "check-ref-format", "--branch", n).returncode != 0:
+            die(f"'{n}' is not a usable lane name (it becomes a branch and a folder name: letters, digits, . _ -). "
+                "Pick another name. Nothing was changed.")
+        if not feat:
+            die(f"Lane '{n}' has no feature text. Give each lane NAME=FEATURE. Nothing was changed.")
+        lanes.append({"name": n, "feature": feat})
+    names = [x["name"] for x in lanes]
+    if len(set(names)) != len(names):
+        die("Each lane name must be distinct: a name is used twice. Pick another name for one. Nothing was changed.")
+    name = args.name if args.name is not None else slugify(request)
+    if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name):
+        die(f"The request name '{name}' must be lowercase letters, digits and hyphens. Pick another --name. "
+            "Nothing was changed.")
+    rdir = main / RATCHET_DIR / "requests"
+    if (rdir / f"{name}.json").exists() or (rdir / name).exists():
+        die(f"A request named '{name}' is already recorded. Give this one another --name. Nothing was changed.")
+    template = _lanes_start_template(Ctx(main).config())
+    _director_key()
+    ep = _enrolled_path()
+    _d, why = _read_record(ep)
+    if why:
+        die(f"Ratchet's record of enrolled lanes ({ep}) can't be read ({why}); it is not valid or unreadable, so "
+            f"Ratchet won't write over it. Tell the user; to repair it: {_enrolled_repair(ep)}. Nothing was changed.")
+    base = main.resolve()
+    for x in lanes:
+        if git(main, "rev-parse", "--verify", "-q", f"refs/heads/{x['name']}").returncode == 0:
+            die(f"A branch named '{x['name']}' already exists. Pick another lane name (a different name), then "
+                "run lanes-start again. Nothing was changed.")
+        x["branch"] = x["name"]
+        x["worktree"] = str(base.parent / f"{base.name}-{x['name']}")
+        if os.path.lexists(x["worktree"]):
+            die(f"The folder {x['worktree']} already exists, so lane '{x['name']}' cannot get a worktree there. "
+                "Move it away or pick another lane name. Nothing was changed.")
+    if git(main, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+        die("The main checkout has a merge in progress. Finish or abort it before starting lanes. Nothing was changed.")
+    carried, bad = [], []
+    for path in _integrate_dirty(main, False):
+        (carried if path in MERGE_SHARED else bad).append(path)
+    if bad:
+        die(f"The main checkout has uncommitted changes to project files ({', '.join(bad[:5])}). Ask the developer "
+            "to commit or stash them (lanes-start does not touch them), then run lanes-start again. Nothing was "
+            "changed.")
+    copies = {}
+    for path in carried:
+        f = main / path
+        copies[path] = f.read_bytes() if f.is_file() else None
+
+    made = {"worktrees": [], "enrolled": [], "briefs": rdir / name}
+    try:
+        for x in lanes:
+            made["worktrees"].append(x)   # neither existed above: whatever is there after git runs, this attempt made
+            r = git(main, "worktree", "add", "-q", "-b", x["branch"], x["worktree"], "HEAD")
+            if r.returncode != 0:   # git can fail after making both (a post-checkout hook that exits non-zero)
+                die(f"git could not create the worktree for lane '{x['name']}' (a git hook of this project may have "
+                    f"failed): {(r.stderr or r.stdout).strip()[:200]}. Everything this attempt made was removed.")
+            for path, data in copies.items():
+                t = Path(x["worktree"]) / path
+                if data is None:
+                    t.unlink()
+                else:
+                    _write_record(t, data, raw=True)
+            k = str(Path(x["worktree"]).resolve())
+            if k not in (_read_record(ep)[0] or {}):   # a pre-existing entry is never dropped by the rollback
+                made["enrolled"].append(k)             # tracked before the step that writes it
+            _enroll_lane(Path(x["worktree"]))
+            brief = made["briefs"] / f"{x['name']}.md"
+            _write_record(brief, (
+                f"# Lane {x['name']}\n\nThe developer's request: {request}\n\nYour part of it, lane '{x['name']}': "
+                f"{x['feature']}\n\nYou work only in {x['worktree']} (branch {x['branch']}). Run Ratchet's init "
+                "yourself there to plan this feature, and ask for the developer's approvals through your own "
+                "director as usual. When the lane is finished, the director merges it with integrate.\n"), raw=True)
+            x["brief"] = str(brief)
+        _write_record(rdir / f"{name}.json", {"request": request, "name": name, "created_at": now(),
+                                              "lanes": [{k: x[k] for k in ("name", "feature", "branch", "worktree", "brief")}
+                                                        for x in lanes]}, pretty=True)
+    except BaseException:
+        def attempt(fn, *a, **kw):   # one failed cleanup action never skips the rest
+            try:
+                return fn(*a, **kw)
+            except Exception:
+                return None
+
+        for x in made["worktrees"]:
+            attempt(git, main, "worktree", "remove", "--force", x["worktree"])
+            attempt(shutil.rmtree, x["worktree"], ignore_errors=True)
+            attempt(git, main, "worktree", "prune")
+            attempt(git, main, "branch", "-D", x["branch"])
+        attempt(shutil.rmtree, made["briefs"], ignore_errors=True)
+        attempt(os.unlink, rdir / f"{name}.json") if (rdir / f"{name}.json").exists() else None
+
+        def drop(outside):
+            for k in made["enrolled"]:
+                outside.pop(k, None)
+            return outside
+        if made["enrolled"]:
+            res = attempt(update_record, ep, drop, damaged=lambda why: KEEP, pretty=True)
+            if res not in ("written", "kept"):
+                print(f"ratchet: {ep} still lists these removed lanes: {', '.join(made['enrolled'])}. Remove those "
+                      "entries from it (or run director-enroll only for lanes that exist).", file=sys.stderr)
+        raise
+    out = []
+    for x in lanes:
+        if template:
+            fill = {"{worktree}": x["worktree"], "{brief}": x["brief"], "{name}": x["name"]}
+            parts = []
+            for w in template:
+                for k, v in fill.items():
+                    w = w.replace(k, v)
+                parts.append(w)
+            start = shlex.join(parts)
+        else:
+            start = f"Open your agent CLI in {x['worktree']} and give it the brief {x['brief']}"
+        out.append(dict({k: x[k] for k in ("name", "branch", "worktree", "brief")}, start=start))
+    if args.json:
+        print(json.dumps({"request": name, "lanes": out}, indent=2))
+        return
+    ok(f"Request '{name}' recorded: {len(out)} lane(s) ready. Lanes are enrolled with no run; each lane's agent runs "
+       "init itself.")
+    for x in out:
+        print(f"Lane {x['name']}: branch {x['branch']}, worktree {x['worktree']}, brief {x['brief']}")
+        if template:
+            print(f"Start command for {x['name']} (Ratchet only prints it; run it yourself):")
+        print(x["start"])
+
+
+def _git_top_problem(main: Path, command: str, by_hand: str):
+    """The plain refusal (or None) for a Ratchet project that sits below the top of its git repository: `command`
+    (integrate, lanes-start) assumes the project is the repository top. `by_hand` says what to do instead."""
+    where = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=main, capture_output=True, text=True, timeout=60)
+    if where.stdout.strip():
+        return (f"{command} supports a Ratchet project at the top of its git repository only, and this project sits "
+                f"at '{where.stdout.strip()}' inside its repository. {by_hand} Nothing was changed.")
+    return None
 
 
 def _integrate_lane(main: Path, target: str, fail=None):
@@ -6158,12 +6368,10 @@ def _integrate_check(main: Path, target: str, info: dict, fail):
     facts: lane folder, name, run slug, main's tip, the lane's tip, the branch main is on, the commits the lane would
     bring (as "<hash> <subject>" lines), the uncommitted Ratchet files on main, and main's context."""
     info["lane"] = target
-    where = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=main, capture_output=True, text=True, timeout=60)
-    if where.stdout.strip():
-        # known limit: the scratch clone, the suite and the file checks all assume the project is the repository top
-        fail(f"integrate supports a Ratchet project at the top of its git repository only, and this project sits at "
-             f"'{where.stdout.strip()}' inside its repository. Merge this lane by hand (git merge in the main checkout, "
-             "then run the suite there). Nothing was changed.")
+    # known limit: the scratch clone, the suite and the file checks all assume the project is the repository top
+    top = _git_top_problem(main, "integrate", "Merge this lane by hand (git merge in the main checkout, then run the suite there).")
+    if top:
+        fail(top)
     wt = subprocess.run(["git", "config", "--get", "core.worktree"], cwd=main, capture_output=True, text=True, timeout=60)
     if wt.stdout.strip():
         # known limit: the scratch clone takes main's local config, and a core.worktree there would point its git
@@ -7760,7 +7968,9 @@ def cmd_approve_plan(args):
     ctx = Ctx(find_root())
     st = ctx.state()
     if st["phase"] != "awaiting_plan_approval":
-        die(f"Nothing to approve (phase {st['phase']})")
+        die(f"Nothing to approve (phase {st['phase']})"
+            + (". This lane is enrolled with the director, so its plan is approved only with a director token, "
+               "never by a chat reply." if approval_mode(ctx) == "director" else ""))
     plan = ctx.plan()
     if _plan_hash(plan, ctx) != st["plan_hash"]:
         die("checkpoints.json changed since it was shown to the human. Run plan-submit again and re-review.")
@@ -15087,7 +15297,7 @@ def _expand(cmd: str) -> str:
             continue
         cmd = re.sub(r"\$\{" + name + r"\}|\$" + name + r"(?![A-Za-z0-9_])", lambda _m: val, cmd)
     return cmd
-DIRECTOR_CALL_RE = re.compile(r"""ratchet\.py["']?\s+(?:--root\s+\S+\s+)?(?:director-(?:sign|key|enroll|policy)|integrate)\b""")
+DIRECTOR_CALL_RE = re.compile(r"""ratchet\.py["']?\s+(?:--root\s+\S+\s+)?(?:director-(?:sign|key|enroll|policy)|integrate|lanes-start)\b""")
 # Variables a builder session may read but never set. Each is matched however it is set: VAR=, export/declare/
 # typeset/local/readonly/setenv/fish `set -x`, a dict or kwargs entry (python3 -c os.environ / env=...), putenv-style
 # calls, or indirectly (the name stored in another variable, or built from pieces, then used by eval, env -S,
@@ -18214,6 +18424,12 @@ def main(argv=None):
     a.set_defaults(fn=cmd_lanes)
     a = sp.add_parser("director-key"); a.add_argument("--rotate", action="store_true"); a.set_defaults(fn=cmd_director_key)
     sp.add_parser("director-enroll").set_defaults(fn=cmd_director_enroll)
+    a = sp.add_parser("lanes-start", help="director only: start several lanes (branch, worktree, enrollment, brief) from one request")
+    a.add_argument("--request", required=True, help="the developer's request, in words")
+    a.add_argument("--lane", action="append", metavar="NAME=FEATURE", help="a lane: its name and its part of the request (repeat)")
+    a.add_argument("--name", help="the request's name (default: a slug of the request text)")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(fn=cmd_lanes_start)
     a = sp.add_parser("integrate", help="director only: merge a finished lane into main (suite first), or check it with --dry-run")
     a.add_argument("lane", help="the lane's folder (a git worktree) or its branch name")
     a.add_argument("--dry-run", action="store_true", help="say what integrate would do; change nothing")
