@@ -18,6 +18,8 @@ Judge every finding against the plan's objective given to you at the top of this
 ## Find the code under review
 `git diff $(git log --grep='^ratchet(' -1 --format=%H 2>/dev/null || git merge-base HEAD origin/HEAD 2>/dev/null || echo HEAD)` plus `git status --porcelain` for untracked files. Read every changed file **in full**, not just the hunks, and read the callers or callees you need to judge it. Review the tests too: weak tests are findings.
 
+<!-- scoped-round -->**Except when your spawn instructions or review rules name a scope (a fix round or a small fix after approval).** In a fix round you are shown only the fixer's diff and the findings it was meant to fix. Then `git diff <the named since-tree>` instead — only the files your instructions list as changed, never the whole checkpoint — and read each of those files in full, same as above. A fix round's review rules also give you the full detail of every finding still open in the round you're fixing (id, reviewer, severity, location, description, suggested fix, any rebuttal reason): re-check each one against this diff, re-raising any that isn't actually fixed. When a fix round's diff is too large for one prompt, the prompt names every file it left out, and `adv-record` refuses any review that carries `omitted_files`, whatever its findings, the risk or the round. A small fix's review rules say there are no open findings to re-check; judge only the diff. Either way, a problem you notice outside this scoped diff is out of scope for this round — don't raise it.
+
 ## Read the standard
 `.ratchet/standards.md`, then the other files in `.ratchet/config.json → standards`, `DESIGN.md` §8 (for UI code), and `.ratchet/learnings.md`. These are the law. Cite them.
 
@@ -33,6 +35,8 @@ Each finding needs **either** a cited rule (`standards.md §3`, `learnings 2026-
 Reviewing a **guardrail step** (its checkpoint has a `guardrail`): the check is the code under review. Hunt for real variants of the mistake it would miss and legitimate code it would wrongly flag. A check that matches text (a grep or a regex over source) where an import-graph rule, a syntax-aware lint rule or a type rule could do the job is a **major** finding.
 
 From round 2 on: re-check that previous fixes actually hold, and withdraw a finding only if `fixes.md` proves it wrong with evidence. Otherwise re-raise it. Look hardest at the code changed since the last round (the review rules list the files). Earlier findings that still aren't fixed count wherever they are: re-raise them. Beyond those, raise only blocker or major problems you missed before, and any finding that names a done-means line (`done_means`), wherever it is and whatever its severity, since that always blocks (unless the review rules say this plan predates that rule); a new minor one that names no line, outside the listed files, is noted for later, not fixed.
+
+<!-- scoped-round -->On a scoped round (a fix round or a small fix after approval) there is no "beyond those": judge only the scoped diff, re-raising any of its listed findings that isn't fixed and reporting a genuinely new blocker or major problem you find in it. Nothing outside that diff is yours to look at this round.
 
 ## Approve
 Only when you genuinely can't find anything: `"findings": []`. Don't approve to be nice, and don't invent findings to look busy.
