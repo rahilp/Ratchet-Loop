@@ -6610,8 +6610,10 @@ class _Watch:
     """The code-under-the-run watch for one command: the tree (`fp`) it started on, how often to look (`every`
     seconds), and the command the agent should run again if the code changes. `changed()` is the one check: a
     fingerprint, and only when its id differs, the list of files the run started with that were edited or deleted
-    meanwhile, plus the new project source files that appeared (_new_source: a source extension outside every
-    build, cache, report, snapshot and scratch folder). Ratchet's own folder and the agent's chat transcript never
+    meanwhile, plus the new project source files that appeared (_new_source: any added file git would commit counts
+    as new source unless a fixed generated list (build, cache, test-report, snapshot and scratch folders and file
+    names) or the doc list names it; there is no extension allow-list, and a plain `report` or `reports` folder is
+    not treated as generated). Ratchet's own folder and the agent's chat transcript never
     count, and neither does any other file that only appeared: suites write snapshots and reports of their own,
     and those are left to the command's own 'changed files' check. A periodic
     look (`final=False`) builds its tree in one private index kept across looks, so git rehashes only the files
@@ -6816,8 +6818,9 @@ def _wait_stretched(proc, timeout: float, max_stretch: float, watch: "_Watch | N
     command runs (re-read every RUN_POLL_SECONDS, so a load spike while the command runs still extends it; a load
     drop never shortens a limit already granted), never earlier than `timeout` and never later than `timeout` times
     `max_stretch`. Stops the whole process group when the deadline passes. With a `watch`, every `watch.every`
-    seconds the code is compared with the tree the command started on, and once more when the command ends
-    (whatever way it ended), so a quick command that finishes before the next look still never counts; a change
+    seconds the code is compared with the tree the command started on, and once more when the command ends on its
+    own, so a quick command that finishes before the next look still never counts (a command killed by the time
+    limit gets no last look: it is a timeout even when the tree also changed); a change
     stops the command and everything it started (_stop_group; on the last look too, so a helper the ended
     command left in its group never outlives the run), and `watch.found_at_end` says which look found it.
     A periodic look git cannot take is skipped (noted on the watch), never fatal; the last look is the full
@@ -6854,7 +6857,7 @@ def _wait_stretched(proc, timeout: float, max_stretch: float, watch: "_Watch | N
             break
         except subprocess.TimeoutExpired:
             continue
-    if watch and not changed:
+    if watch and not changed and not timed_out:  # a kill by the time limit wins: a timeout, counted as one
         changed = watch.changed(final=True)  # the last look: the tree the command ended on
         watch.found_at_end = bool(changed)
         if changed:  # the leader has ended, but a helper it left in its group belongs to a run that no longer counts
@@ -6891,7 +6894,11 @@ def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None, watch:
     adds that the command itself may be the writer, with the restore guidance. A change found only by the last look
     (the command ended on its own, so the writer cannot be told: the command itself, or an edit while it ran) is
     not a stop but a refusal naming both causes (log header `# code changed under the run, found when it ended`),
-    with the right guidance per file (tracked: restore it; untracked: delete or ignore it), equally uncounted.
+    with the restore guidance (_restore_guidance: every named file is restored from the run's starting tree, a
+    file the run started with is never deleted, and a new source file is kept if the agent added it), equally
+    uncounted. A command killed by its time limit is reported as a timeout even when the tree also changed: the
+    time-limit kill wins over the last look, so it gets the `TIMEOUT after <limit>s` log and is counted exactly
+    like any other timeout.
     Anything that escapes the wait (a git failure on the last look, a signal) kills the command's group first.
     Output goes through temp files, so a command that prints a lot never stalls on a full pipe."""
     env = dict(os.environ, CI="1", FORCE_COLOR="0")

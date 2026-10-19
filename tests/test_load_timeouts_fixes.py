@@ -9,6 +9,9 @@ engine's environment and never in this process's.
   - [CP2-X01] a load drop after the command passed test_timeout_sec does not take back the time already granted
               (the mirror of CP2-T06): the command still passes and the log carries the stretch note
   - [CP2-X02] a SIGTERM to ratchet.py while a step's command runs kills the command's whole process group too
+  - [CP2-X03] a SIGINT or SIGHUP to ratchet.py while its command runs kills the command's whole process group
+  - [CP2-X04] a SIGHUP that ratchet.py already ignores (nohup) is still ignored: the command runs on and passes
+  - [CP2-X05] load_stretch_max is a plan rule: changing it after approval stops the gates
 """
 from __future__ import annotations
 

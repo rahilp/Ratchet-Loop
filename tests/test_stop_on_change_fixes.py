@@ -34,6 +34,9 @@ machine (RATCHET_FAKE_LOADAVG=0).
               quick suite that itself writes a new source file is refused when it ends, with remove-or-ignore
               guidance for that file, uncounted; a `bin` folder holds source (Rust's src/bin/main.rs is a change)
               unless it is .NET's bin/Debug or bin/Release output
+  - [CP4-A7]  any added file git would commit is new source: an HTML template and a module in a `reports/`
+              folder added while the suite runs stop it, naming the file and counting nothing; build output such
+              as build/out.js and dist/app.min.js that appears during the run does not
 
 Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set.
 """
