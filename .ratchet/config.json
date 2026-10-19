@@ -98,8 +98,8 @@
   "spec_keep": true,
   "max_adversarial_rounds": 6,
   "role_models": {
-    "ratchet-implementer": "standard",
-    "ratchet-fixer": "standard"
+    "ratchet-implementer": "strong",
+    "ratchet-fixer": "strong"
   },
   "min_review_seconds": 20,
   "host_models": {

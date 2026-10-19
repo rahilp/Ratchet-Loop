@@ -30,6 +30,7 @@ import datetime as _dt
 import fnmatch
 import hashlib
 import hmac
+import io
 import secrets
 import json
 import os
@@ -163,6 +164,7 @@ DEFAULT_CONFIG = {
     "spec_archive": True,
     "spec_keep": None,              # no spec tool: keep a running spec (openspec/specs/<run>/spec.md)? None = not asked yet           # archive an OpenSpec change (merge its deltas into the specs) when the run is approved
     "regression_command": None,     # full suite run before a checkpoint can complete
+    "lane_start_command": None,     # `lanes-start` prints this argument list ({worktree}, {brief}, {name}) per lane; never runs it
     # The quick path (`ratchet.py changes CPn`): a file matching doc_globs and not doc_exclude_globs (plus the
     # configured design_md and standards files) counts as a doc, not code. A test file matching test_globs "names"
     # a doc when its text contains the doc's repo-relative path or file name. doc_test_command (with a {files}
@@ -2451,6 +2453,14 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "doc_globs", "doc_exclude_globs", "test_globs", "doc_test_command", "related_test_command",
              "related_tests_max", "related_always", "small_edit_lines", "load_stretch_max", "suite_watch_seconds"]
 
+# config.json keys that belong to the checkout they are set in (which reviewers and providers a run uses, the
+# developer's consent to paid ones, and its own review limits): `integrate` never takes a lane's value for them,
+# main's is kept and the lane's is listed as not taken. Every other key, and any unknown one, is project-wide.
+LANE_LOCAL_CONFIG_KEYS = ["review_depth", "reviewers", "providers", "host_provider", "host_models", "role_models",
+                          "ui_reviewers", "approver", "human_review", "max_adversarial_rounds",
+                          "max_adversarial_rounds_run", "unavailable_ttl_hours", "probe_providers", "probe_ttl_minutes",
+                          "probe_timeout_sec", "quota_retest_minutes", "provider_share"]
+
 
 def _file_sha(p: Path) -> str | None:
     try:
@@ -2498,7 +2508,11 @@ def approval_snapshot(ctx, st) -> dict:
             "custom_providers": _custom_providers_sha(cfg),
             "spec": _spec_snapshot(ctx),
             "host": detect_host(cfg),
-            "human_review": st.get("human_review")}
+            "human_review": st.get("human_review"),
+            # the planned test files as they stood at the red run (checkpoints.CPn.red_tests), as approved: a
+            # record of the baseline approve-changes moved to (weakened_tests judges against red_tests itself)
+            "red_tests": {cid: c.get("red_tests") for cid, c in (st.get("checkpoints") or {}).items()
+                          if c.get("red_tests")}}
 
 
 def integrity_problems(ctx, st) -> list[str]:
@@ -2544,6 +2558,11 @@ def integrity_problems(ctx, st) -> list[str]:
 def verify_integrity(ctx, st):
     probs = integrity_problems(ctx, st)
     if probs:
+        if approval_mode(ctx) == "director":  # an enrolled lane: the director approves, nobody is asked in chat
+            die("These changed after the user approved the plan: " + _problems_for_director(probs) + ". This lane is "
+                "director-enrolled, so either undo the change, or have the director approve it in one step with "
+                f"`{_director_apply_cmd(ctx, 'approve-changes')}` (or sign it for a token this lane applies with "
+                "`ratchet.py approve-changes --director-token <t>`). End your turn saying what you are waiting for.")
         die("These changed after the user approved the plan: " + "; ".join(probs) + ". "
             "Either undo the change, or show the user exactly what changed and — only after they confirm — "
             "run `ratchet.py approve-changes`.")
@@ -3375,7 +3394,8 @@ def next_action(ctx: Ctx, st=None, compute_accept_note: bool = True) -> dict:
         extra = (f" (test plans still missing for {', '.join(missing)} — spawn ratchet-test-planner, then run "
                  "ratchet.py plan-submit again)") if missing else ""
         asked = (st.get("pending") or {}).get("action") == "approve-plan"
-        how = ("The approval question is printed: wait for the user's reply. Run ratchet.py approve-plan only if "
+        how = _director_next(ctx, st) or (
+              "The approval question is printed: wait for the user's reply. Run ratchet.py approve-plan only if "
                "their first reply after it is one of the listed yes replies; otherwise answer them or make their "
                "change, then print the question again (ratchet.py ask approve-plan)." if asked else
                "Waiting for the user to approve the plan. " + _after_next(PLAN_ASK_NEXT))
@@ -3388,7 +3408,8 @@ def next_action(ctx: Ctx, st=None, compute_accept_note: bool = True) -> dict:
         if changed:  # CP4: a checkpoint or test plan changed after approval; approve-changes first, no approval question
             return {"phase": phase, "action": "\n".join(changed), "stop_ok": True}
         asked = (st.get("pending") or {}).get("action") == "human-approve"
-        how = ("The review question is printed: wait for the user's reply. Run ratchet.py human-approve only if "
+        how = _director_next(ctx, st) or (
+              "The review question is printed: wait for the user's reply. Run ratchet.py human-approve only if "
                "their first reply after it is one of the listed yes replies; if they ask for changes, run "
                "ratchet.py feedback." if asked else "Waiting for the human to review. " + REVIEW_ASK_NEXT)
         return {"phase": phase, "action": how, "stop_ok": True}
@@ -3399,6 +3420,9 @@ def next_action(ctx: Ctx, st=None, compute_accept_note: bool = True) -> dict:
     if phase in ("blocked", "paused", "done", "cancelled"):
         na = {"phase": phase, "action": st.get("blocked_reason") or phase, "stop_ok": True}
         if phase == "blocked":
+            director = _director_next(ctx, st)
+            if director:  # an enrolled lane: the next action is the director's, named here, never a chat question
+                na["action"] = f"{na['action']}. {director}"
             na["options"] = blocked_options(st)
             na["reason_plain"] = plain_reason(st.get("blocked_reason"))
             note = _blocked_accept_note(ctx, st) if compute_accept_note else None
@@ -3442,6 +3466,40 @@ def next_action(ctx: Ctx, st=None, compute_accept_note: bool = True) -> dict:
         na["action"] = (f"First offer the user a guardrail for the repeated finding '{reps[0]['kind']}' (ratchet.py ask "
                         f"choice --guardrail ...; see the orchestrator skill). Then: " + na["action"])
     return na
+
+
+def _director_next(ctx: Ctx, st) -> str | None:
+    """In a director-enrolled lane, what the lane waits for at a pause (plan approval, a review, a block), naming
+    the director's command: the one-step `director-sign <action> ... --apply` for a routine approval, or the token
+    the lane applies with `--director-token`. None in a lane the developer approves, or in any other phase. Used by
+    `next`, `status` and `status --json` so an enrolled lane's agent is never told to ask the user."""
+    if approval_mode(ctx) != "director":
+        return None
+    phase = st.get("phase")
+    eng = f"ratchet.py --root {ctx.root}"
+    tail = (" A chat reply approves nothing here, so put no question in chat; end your turn saying what you are "
+            "waiting for.")
+    if phase == "awaiting_plan_approval":
+        return (f"Waiting for the director to approve the plan: the director runs `{eng} director-sign approve-plan` "
+                "and the token is applied with `ratchet.py approve-plan --director-token <t>`." + tail)
+    if phase in ("awaiting_checkpoint_review", "awaiting_final_review"):
+        return (f"Waiting for the director to review: the director runs `{eng} director-sign human-approve` (applied "
+                "with `ratchet.py human-approve --director-token <t>`), or `director-sign feedback` for changes "
+                "(applied with `ratchet.py feedback --director-token <t>`)." + tail)
+    if phase == "blocked":
+        cur = st.get("current")
+        cps = ((st.get("checkpoints") or {}).get(cur) or {}) if cur else {}
+        g = (cps.get("gates") or {}).get("adversarial") or {}
+        ways = []
+        if cur and _adv_block_kind(st, cur) in ("own", "run_wide"):
+            ways.append(f"accept the open findings with `{_director_apply_cmd(ctx, 'accept-finding', cur)}`")
+            if not g.get("cap_raised_to"):
+                ways.append(f"raise this step's review limit once with `{_director_apply_cmd(ctx, 'raise-limit', cur)}`")
+        ways.append(f"resume the run with `{eng} director-sign human-approve` (applied with `ratchet.py human-approve "
+                    "--director-token <t>`), after a lettered option if one is wanted (`ratchet.py ask choice "
+                    f"--options ...` here, then `{_director_apply_cmd(ctx, 'choice')}`)")
+        return "Waiting for the director, who can " + "; or ".join(ways) + "." + tail
+    return None
 
 
 # --------------------------------------------------------------------------- plain language
@@ -3560,9 +3618,16 @@ def _blocked_accept_note(ctx, st) -> str | None:
     rnd = cps.get("adv_round")
     if not rnd or not _adv_open_findings(ctx, cur, rnd, cps):
         return None
+    director = approval_mode(ctx) == "director"
     if _cached_code_changed_since_round(ctx, st, rnd):
+        if director:
+            return ("The last fix changed the code, so these findings need a fresh look: the director raises the "
+                    f"limit for one more round with `{_director_apply_cmd(ctx, 'raise-limit', cur)}`.")
         return ("The last fix changed the code, so these findings need a fresh look; raise the limit (A) for one "
                 "more round.")
+    if director:
+        return (f"The director can accept the open findings with `{_director_apply_cmd(ctx, 'accept-finding', cur)}`; "
+                "a chat reply accepts nothing here.")
     return ("You can also accept open findings yourself: the agent asks with `ask accept-finding`, and only "
             "your reply `accept: <reason>` closes them.")
 
@@ -3861,6 +3926,9 @@ def cmd_status_text(ctx: Ctx):
     print(f"Run: {st['slug']}  -  {st['feature']}")
     print(f"Phase: {PHASE_PLAIN.get(st.get('phase'), st.get('phase'))}")
     print(plain_now(ctx, st, plan))
+    director = _director_next(ctx, st)
+    if director:
+        print(director)
     q = waiting_question(ctx, st)
     if q:
         print(question_line(q))
@@ -5131,13 +5199,14 @@ def _note_fresh(note) -> bool:
 
 
 def _note_engine_call(root: Path, cmd: str, session: str | None, tool_input: dict | None = None):
-    """Guard hook: for every `ratchet.py init` / `ask` / `wait` / `complete` call `cmd` really runs, note which chat
-    is about to run it here, with its exact arguments. A `complete` note also carries the host's run_in_background
-    and timeout for the call (`bg`, `timeout`), which `complete` reads to warn about a foreground run. Best effort;
+    """Guard hook: for every `ratchet.py init` / `ask` / `wait` / `complete` / `integrate` call `cmd` really runs, note
+    which chat is about to run it here, with its exact arguments. A `complete` or `integrate` note also carries the
+    host's run_in_background and timeout for the call (`bg`, `timeout`), which that command reads to warn about a
+    foreground run. Best effort;
     never blocks the call."""
     if not session:
         return
-    calls = [a for a in _engine_invocations(cmd) if _engine_subcommand(a) in ("init", "ask", "wait", "complete")]
+    calls = [a for a in _engine_invocations(cmd) if _engine_subcommand(a) in ("init", "ask", "wait", "complete", "integrate")]
     if not calls:
         return
     try:
@@ -5148,7 +5217,7 @@ def _note_engine_call(root: Path, cmd: str, session: str | None, tool_input: dic
                 key = f"{root.resolve()}|{_engine_subcommand(argv)}"
                 kept = [x for x in (notes.get(key) if isinstance(notes.get(key), list) else []) if _note_fresh(x)]
                 note = {"session": session, "argv": argv, "at": now()}
-                if _engine_subcommand(argv) == "complete":
+                if _engine_subcommand(argv) in ("complete", "integrate"):
                     ti = tool_input if isinstance(tool_input, dict) else {}
                     note["bg"] = ti.get("run_in_background") is True
                     note["timeout"] = ti.get("timeout") if isinstance(ti.get("timeout"), (int, float)) else None
@@ -6264,11 +6333,16 @@ def require_director_session(what: str):
         print(note, file=sys.stderr)
 
 
-def _approval_payload(ctx, st, action) -> str:
+def _approval_payload(ctx, st, action, bind=()) -> str:
+    """What a director token signs: this lane, run, phase and pause (`awaiting_since`, which every `ask` moves, so
+    a token signed before a re-ask is stale), the plan, the action, and `bind`: the details the action must match
+    exactly (raise-limit binds the step and the reason, choice binds the letter), so a token for one step, reason
+    or letter can never be applied to another."""
     parts = [str(ctx.root.resolve()), st["slug"], st["phase"], str(st.get("awaiting_since")),
              str(st.get("plan_hash")), action]
     if action == "hooks-waive":  # single use: the counter moves on every waive/clear, so a spent token is dead
         parts.append(str(st.get("hooks_waive_n", 0)))
+    parts.extend(str(b) for b in bind)
     return "|".join(parts)
 
 
@@ -6425,21 +6499,31 @@ def _iso(ts) -> float:
         return 0.0
 
 
-def _require_approval(ctx, st, action, token=None):
-    """Returns {"by": "human"|"director", "detail": ...} or dies."""
+def _require_approval(ctx, st, action, token=None, bind=()):
+    """Returns {"by": "human"|"director", "detail": ...} or dies. `bind` is what the director token must also
+    match (see _approval_payload): a token signed for another step, reason or letter is refused as not matching."""
     mode = approval_mode(ctx)
     if token:
         if mode == "human":
             die("This lane only accepts human approvals (approver=human). A director must enroll it first.")
         key = _director_key()
-        if not hmac.compare_digest(token, _sign(key, _approval_payload(ctx, st, action))):
-            die("Director token does not match this run's current pause (wrong lane, stale token, "
-                "or the run moved on). Ask the director to sign again.")
+        if not hmac.compare_digest(token, _sign(key, _approval_payload(ctx, st, action, bind))):
+            die("Director token does not match this run's current pause (wrong lane, wrong action, stale token, "
+                "or the run moved on" + (", or it was signed for a different step, reason or letter" if bind else "")
+                + "). Ask the director to sign again.")
         return {"by": "director", "detail": f"director-signed {action}"}
     if mode == "director":
+        sign = f"director-sign {action}"  # the command that actually signs this action, whole
+        if action == "raise-limit":
+            sign += f" {bind[0] if bind else '<CPn>'} --reason \"<why>\""
+        elif action == "choice":
+            opts = (st.get("pending") or {}).get("options") or []
+            sign += " <one of " + ", ".join(opts) + ">" if opts else " <letter>"
         die("This lane is director-enrolled: approvals need a director token "
-            f"(director runs: ratchet.py --root {ctx.root} director-sign {action}). "
-            "Chat messages do not count as approvals here.")
+            f"(director runs: ratchet.py --root {ctx.root} {sign}"
+            + (f", or signs and applies it in one step with `{_director_apply_cmd(ctx, action, bind[0] if action != 'choice' and bind else None)}`"
+               if action in DIRECTOR_APPLY_ACTIONS else "")
+            + "). Chat messages do not count as approvals here.")
     if human_override(f"approve this pause ({action})", ctx, action):
         return {"by": "human", "detail": "(RATCHET_HUMAN_OVERRIDE, code typed back at the terminal)"}
     p = st.get("pending") or {}
@@ -6633,11 +6717,12 @@ def cmd_director_key(args):
     ok(f"Director key {'rotated' if args.rotate else 'created'}: {p}  (re-enroll lanes after a rotation)")
 
 
-def cmd_director_enroll(args):
-    require_director_session("director-enroll")
-    ctx = Ctx(find_root())
+def _enroll_lane(root: Path):
+    """Enrolls the lane folder `root` with the director: its signature into RATCHET_HOME/enrolled.json (under that
+    file's lock; never over a file that can't be read) and .ratchet/director.json in the lane. Dies with the reason
+    when it cannot (nothing is then written)."""
     ep = _enrolled_path()
-    lane = str(ctx.root.resolve())
+    lane = str(root.resolve())
     bad, signed = [], []
 
     def damaged(why):  # it holds other lanes' enrollment: never replace it with this lane's alone
@@ -6656,19 +6741,1813 @@ def cmd_director_enroll(args):
             f"over it, and nothing was changed. Tell the user; to repair it: {_enrolled_repair(ep)}.")
     if done == "busy":
         _die_record_busy(ep, "nothing was changed")
-    ctx.ratchet.mkdir(exist_ok=True)
-    _write_record(ctx.ratchet / "director.json", {"enrolled_at": now(), "sig": signed[0]}, pretty=True)
+    (root / RATCHET_DIR).mkdir(exist_ok=True)
+    _write_record(root / RATCHET_DIR / "director.json", {"enrolled_at": now(), "sig": signed[0]}, pretty=True)
+
+
+def cmd_director_enroll(args):
+    require_director_session("director-enroll")
+    ctx = Ctx(find_root())
+    _enroll_lane(ctx.root)
     ok(f"Lane {ctx.root} enrolled: approvals now require a director token.")
 
 
+_LANE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_LANE_PLACEHOLDERS = ("{worktree}", "{brief}", "{name}")
+
+
+def _lanes_start_template(cfg: dict):
+    """The developer's lane_start_command (a non-empty list of strings using only {worktree}, {brief} and {name}), or
+    None when none is set. Dies, before anything is created, when it is not usable."""
+    t = cfg.get("lane_start_command")
+    if t is None:
+        return None
+    what = ("lane_start_command in .ratchet/config.json must be a list of words (an argument list such as "
+            "[\"mycli\", \"--cwd\", \"{worktree}\"]) using only the placeholders {worktree}, {brief} and {name}. "
+            "Fix or remove it, then run lanes-start again. Nothing was changed.")
+    if not isinstance(t, list) or not t or not all(isinstance(x, str) and x for x in t):
+        die(what)
+    for x in t:
+        if any(m not in _LANE_PLACEHOLDERS for m in re.findall(r"\{[^{}]*\}", x)):
+            die(what)
+    return t
+
+
+def cmd_lanes_start(args):
+    """`lanes-start --request "<text>" --lane NAME=FEATURE [--lane ...] [--name N] [--json]` (director only): from one
+    request, makes for each lane a branch named NAME (from the main checkout's HEAD), a plain git worktree next to the
+    main checkout, the lane's enrollment with the director (no run: the lane's agent runs init itself), and a brief
+    file; records the request in .ratchet/requests/<name>.json and prints each lane's start command (the developer's
+    lane_start_command template filled in, which Ratchet only prints, or plain words). main's uncommitted Ratchet
+    settings (MERGE_SHARED) are copied into each worktree as uncommitted changes; main itself gains no commit and no
+    byte changes. Every refusal comes before anything is created; a failure part-way removes what was made."""
+    require_director_session("lanes-start")
+    main = find_root()
+    if not _is_git(main):
+        die("lanes-start needs a git project: each lane is a branch and a git worktree. Nothing was changed.")
+    top = _git_top_problem(main, "lanes-start", "Start the lanes by hand (git worktree add, then director-enroll in each).")
+    if top:
+        die(top)
+    # one lanes-start or integrate at a time per repository: integrate's lock, so two calls for the same lane name
+    # can never both pass the preflight and the loser's rollback can never remove the winner's lane
+    cd = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=main, capture_output=True, text=True, timeout=60)
+    common = Path(cd.stdout.strip() or ".git")
+    common = common if common.is_absolute() else main / common
+    lk = _IntegrateLock(main, common, "lanes-start")
+    why = lk.acquire()
+    try:
+        if why:
+            die((f"Ratchet is busy running {lk.holder}; try lanes-start again when it finishes. Nothing was changed.")
+                if why.startswith("Ratchet is busy") else why)
+        _lanes_start_run(args, main)
+    finally:
+        lk.release()
+
+
+def _lanes_start_run(args, main: Path):
+    """The body of cmd_lanes_start, run while it holds the repository's integrate lock."""
+    request = (args.request or "").strip()
+    if not request:
+        die("lanes-start needs the request text (--request \"...\"). Nothing was changed.")
+    if not args.lane:
+        die("lanes-start needs at least one lane (--lane NAME=FEATURE). Nothing was changed.")
+
+    def git(d, *a):
+        return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True, timeout=120)
+
+    lanes = []
+    for spec in args.lane:
+        n, _eq, feat = spec.partition("=")
+        n, feat = n.strip(), feat.strip()
+        if not _LANE_NAME_RE.match(n) or ".." in n or git(main, "check-ref-format", "--branch", n).returncode != 0:
+            die(f"'{n}' is not a usable lane name (it becomes a branch and a folder name: letters, digits, . _ -). "
+                "Pick another name. Nothing was changed.")
+        if not feat:
+            die(f"Lane '{n}' has no feature text. Give each lane NAME=FEATURE. Nothing was changed.")
+        lanes.append({"name": n, "feature": feat})
+    names = [x["name"] for x in lanes]
+    if len(set(names)) != len(names):
+        die("Each lane name must be distinct: a name is used twice. Pick another name for one. Nothing was changed.")
+    name = args.name if args.name is not None else slugify(request)
+    if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name):
+        die(f"The request name '{name}' must be lowercase letters, digits and hyphens. Pick another --name. "
+            "Nothing was changed.")
+    rdir = main / RATCHET_DIR / "requests"
+    if (rdir / f"{name}.json").exists() or (rdir / name).exists():
+        die(f"A request named '{name}' is already recorded. Give this one another --name. Nothing was changed.")
+    template = _lanes_start_template(Ctx(main).config())
+    _director_key()
+    ep = _enrolled_path()
+    _d, why = _read_record(ep)
+    if why:
+        die(f"Ratchet's record of enrolled lanes ({ep}) can't be read ({why}); it is not valid or unreadable, so "
+            f"Ratchet won't write over it. Tell the user; to repair it: {_enrolled_repair(ep)}. Nothing was changed.")
+    base = main.resolve()
+    for x in lanes:
+        if git(main, "rev-parse", "--verify", "-q", f"refs/heads/{x['name']}").returncode == 0:
+            die(f"A branch named '{x['name']}' already exists. Pick another lane name (a different name), then "
+                "run lanes-start again. Nothing was changed.")
+        x["branch"] = x["name"]
+        x["worktree"] = str(base.parent / f"{base.name}-{x['name']}")
+        if os.path.lexists(x["worktree"]):
+            die(f"The folder {x['worktree']} already exists, so lane '{x['name']}' cannot get a worktree there. "
+                "Move it away or pick another lane name. Nothing was changed.")
+    if git(main, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+        die("The main checkout has a merge in progress. Finish or abort it before starting lanes. Nothing was changed.")
+    carried, bad = [], []
+    for path in _integrate_dirty(main, False):
+        (carried if path in MERGE_SHARED else bad).append(path)
+    if bad:
+        die(f"The main checkout has uncommitted changes to project files ({', '.join(bad[:5])}). Ask the developer "
+            "to commit or stash them (lanes-start does not touch them), then run lanes-start again. Nothing was "
+            "changed.")
+    copies = {}
+    for path in carried:
+        f = main / path
+        copies[path] = f.read_bytes() if f.is_file() else None
+
+    made = {"worktrees": [], "enrolled": [], "briefs": rdir / name}
+    try:
+        for x in lanes:
+            made["worktrees"].append(x)   # neither existed above: whatever is there after git runs, this attempt made
+            r = git(main, "worktree", "add", "-q", "-b", x["branch"], x["worktree"], "HEAD")
+            if r.returncode != 0:   # git can fail after making both (a post-checkout hook that exits non-zero)
+                die(f"git could not create the worktree for lane '{x['name']}' (a git hook of this project may have "
+                    f"failed): {(r.stderr or r.stdout).strip()[:200]}. Everything this attempt made was removed.")
+            for path, data in copies.items():
+                t = Path(x["worktree"]) / path
+                if data is None:
+                    t.unlink()
+                else:
+                    _write_record(t, data, raw=True)
+            k = str(Path(x["worktree"]).resolve())
+            if k not in (_read_record(ep)[0] or {}):   # a pre-existing entry is never dropped by the rollback
+                made["enrolled"].append(k)             # tracked before the step that writes it
+            _enroll_lane(Path(x["worktree"]))
+            brief = made["briefs"] / f"{x['name']}.md"
+            _write_record(brief, (
+                f"# Lane {x['name']}\n\nThe developer's request: {request}\n\nYour part of it, lane '{x['name']}': "
+                f"{x['feature']}\n\nYou work only in {x['worktree']} (branch {x['branch']}). Run Ratchet's init "
+                "yourself there to plan this feature, and ask for the developer's approvals through your own "
+                "director as usual. When the lane is finished, the director merges it with integrate.\n"), raw=True)
+            x["brief"] = str(brief)
+        _write_record(rdir / f"{name}.json", {"request": request, "name": name, "created_at": now(),
+                                              "lanes": [{k: x[k] for k in ("name", "feature", "branch", "worktree", "brief")}
+                                                        for x in lanes]}, pretty=True)
+    except BaseException:
+        def attempt(fn, *a, **kw):   # one failed cleanup action never skips the rest
+            try:
+                return fn(*a, **kw)
+            except Exception:
+                return None
+
+        for x in made["worktrees"]:
+            attempt(git, main, "worktree", "remove", "--force", x["worktree"])
+            attempt(shutil.rmtree, x["worktree"], ignore_errors=True)
+            attempt(git, main, "worktree", "prune")
+            attempt(git, main, "branch", "-D", x["branch"])
+        attempt(shutil.rmtree, made["briefs"], ignore_errors=True)
+        attempt(os.unlink, rdir / f"{name}.json") if (rdir / f"{name}.json").exists() else None
+
+        def drop(outside):
+            for k in made["enrolled"]:
+                outside.pop(k, None)
+            return outside
+        if made["enrolled"]:
+            res = attempt(update_record, ep, drop, damaged=lambda why: KEEP, pretty=True)
+            if res not in ("written", "kept"):
+                print(f"ratchet: {ep} still lists these removed lanes: {', '.join(made['enrolled'])}. Remove those "
+                      "entries from it (or run director-enroll only for lanes that exist).", file=sys.stderr)
+        raise
+    out = []
+    for x in lanes:
+        if template:
+            fill = {"{worktree}": x["worktree"], "{brief}": x["brief"], "{name}": x["name"]}
+            parts = []
+            for w in template:
+                for k, v in fill.items():
+                    w = w.replace(k, v)
+                parts.append(w)
+            start = shlex.join(parts)
+        else:
+            start = f"Open your agent CLI in {x['worktree']} and give it the brief {x['brief']}"
+        out.append(dict({k: x[k] for k in ("name", "branch", "worktree", "brief")}, start=start))
+    if args.json:
+        print(json.dumps({"request": name, "lanes": out}, indent=2))
+        return
+    ok(f"Request '{name}' recorded: {len(out)} lane(s) ready. Lanes are enrolled with no run; each lane's agent runs "
+       "init itself.")
+    for x in out:
+        print(f"Lane {x['name']}: branch {x['branch']}, worktree {x['worktree']}, brief {x['brief']}")
+        if template:
+            print(f"Start command for {x['name']} (Ratchet only prints it; run it yourself):")
+        print(x["start"])
+
+
+def _git_top_problem(main: Path, command: str, by_hand: str):
+    """The plain refusal (or None) for a Ratchet project that sits below the top of its git repository: `command`
+    (integrate, lanes-start) assumes the project is the repository top. `by_hand` says what to do instead."""
+    where = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=main, capture_output=True, text=True, timeout=60)
+    if where.stdout.strip():
+        return (f"{command} supports a Ratchet project at the top of its git repository only, and this project sits "
+                f"at '{where.stdout.strip()}' inside its repository. {by_hand} Nothing was changed.")
+    return None
+
+
+def _integrate_lane(main: Path, target: str, fail=None):
+    """(lane folder, branch or None) for a lane named by folder or by branch, from git's list of this project's
+    worktrees. Ends with a plain line (through `fail`, which the real merge uses to record the refusal; die when none
+    is given) when the name is neither."""
+    fail = fail or die
+    r = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=main, capture_output=True, text=True, timeout=60)
+    trees, cur = [], None
+    for ln in r.stdout.splitlines():
+        if ln.startswith("worktree "):
+            cur = {"path": os.path.realpath(ln[9:]), "branch": None}
+            trees.append(cur)
+        elif ln.startswith("branch ") and cur:
+            cur["branch"] = ln[7:][len("refs/heads/"):] if ln[7:].startswith("refs/heads/") else ln[7:]
+    p = Path(target).expanduser()
+    if p.is_dir():
+        hit = next((t for t in trees if t["path"] == os.path.realpath(p)), None)
+        if hit:
+            return Path(hit["path"]), hit["branch"]
+        fail(f"{target} is not a git worktree of this project, so it is not a lane. Give the lane's folder (a git "
+            "worktree of this project) or its branch name. Nothing was changed.")
+    hit = next((t for t in trees if t["branch"] == target), None)
+    if hit:
+        return Path(hit["path"]), hit["branch"]
+    fail(f"No lane found for '{target}': no worktree has that branch checked out, and it is not a folder. Give the "
+        "lane's folder or its branch name (the lane's branch must be checked out in a worktree). Nothing was changed.")
+
+
+def _integrate_line(info: dict, result: str, suite: str, detail: str, commits=None) -> dict:
+    """One record line for .ratchet/integrations.jsonl: time, lane, run, commits, suite (passed | failed | not-run),
+    result (merged | rolled-back | refused | no-op) and a plain detail; a merged line where the lane changed
+    config.json settings that main kept (by Ratchet's rules) also carries not_taken, the list of those settings (the
+    key is left out when there are none, so the line keeps its seven fields); a merged line where a carried file had
+    staged changes before the merge also carries `unstaged`, the list of those paths (they come back unstaged)."""
+    line = {"time": now(), "lane": info.get("lane"), "run": info.get("run"),
+            "commits": list(commits if commits is not None else info.get("commits") or []), "suite": suite,
+            "result": result, "detail": detail}
+    if result == "merged" and info.get("not_taken"):
+        line["not_taken"] = list(info["not_taken"])
+    if result == "merged" and info.get("unstaged"):
+        line["unstaged"] = list(info["unstaged"])
+    if info.get("staged_saved"):   # {path: file}: a staged version unlike the working copy, saved before main moved
+        line["staged_saved"] = dict(info["staged_saved"])
+    return line
+
+
+def _integrate_record(main: Path, info: dict = None, result: str = "", suite: str = "", detail: str = "", commits=None,
+                      line: dict = None) -> bool:
+    """Append one line (built from the arguments, or `line` as it is) to .ratchet/integrations.jsonl in the main
+    checkout (run state, git-ignored). Never rewrites what is there. Returns whether the line was written; a record
+    that cannot be written is said on stderr and never changes the outcome (the caller keeps the journal so the next
+    integrate records it)."""
+    try:
+        (main / RATCHET_DIR).mkdir(exist_ok=True)
+    except OSError:
+        pass
+    line = line if line is not None else _integrate_line(info or {}, result, suite, detail, commits)
+    if not _append_jsonl(main / RATCHET_DIR / "integrations.jsonl", line):
+        print("ratchet: could not write the integration record (.ratchet/integrations.jsonl); the outcome stands",
+              file=sys.stderr)
+        return False
+    return True
+
+
+def _integrate_drop_scratch(tmp):
+    """Remove an integrate scratch copy: the links to the project's installed dependencies as links (never followed),
+    then the folder. It is a clone of its own, not a registered worktree, so main's git has nothing to prune."""
+    tmp = Path(tmp)
+    for dep in DEP_DIRS:
+        try:
+            if (tmp / dep).is_symlink():
+                (tmp / dep).unlink()
+        except OSError:
+            pass
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _integrate_clear_leftovers(prefix: str):
+    """Called with the integrate lock held: a scratch copy left in the temp folder by an integrate of this repository
+    that was killed (named with this repository's prefix) is removed. No other repository's copy has this prefix."""
+    tmpdir = Path(tempfile.gettempdir())
+    try:
+        old = [p for p in tmpdir.iterdir() if p.name.startswith(prefix) and p.is_dir() and not p.is_symlink()]
+    except OSError:
+        return
+    for p in old:
+        _integrate_drop_scratch(p)
+
+
+def _integrate_dirty(d, exclude):
+    """Paths with uncommitted changes to tracked files in the checkout `d` (untracked files are not listed), relative
+    to the project folder; `exclude`: leave out Ratchet's own folder."""
+    def git(*a):
+        return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True, timeout=60)
+    top = Path(git("rev-parse", "--show-toplevel").stdout.strip() or d)
+    prefix = git("rev-parse", "--show-prefix").stdout.strip()
+    r = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames",
+                        "--untracked-files=no", "--", prefix or ".", *([f":(exclude){prefix}{RATCHET_DIR}"] if exclude else [])],
+                       cwd=top, capture_output=True, text=True, timeout=60)
+    return [x[3:][len(prefix):] if prefix and x[3:].startswith(prefix) else x[3:] for x in r.stdout.split("\0") if x]
+
+
+def _integrate_untracked(d):
+    """Files in the checkout `d` that git does not track, ignored ones included (paths from the repository top): a
+    merge may not overwrite any of them."""
+    out = []
+    for extra in ((), ("--ignored",)):
+        r = subprocess.run(["git", "--no-optional-locks", "ls-files", "--others", "--exclude-standard", "--full-name",
+                            "-z", *extra], cwd=d, capture_output=True, text=True, timeout=60)
+        out += [x for x in r.stdout.split("\0") if x and x not in out]
+    return out
+
+
+def _integrate_run_problem(main: Path, mctx):
+    """Why the main checkout's own run stops a merge right now (a plain sentence ending in what to do), or None. The
+    same rule as lane F's merge guard: only a run that is building mid-step (or blocked), or paused from building or
+    blocked, stops it; done, cancelled, not-yet-approved plan phases and a run paused from a waiting phase do not."""
+    mslug = mctx.active_slug()
+    if mslug and mctx.state_path(mslug).is_file():
+        mst, why = _read_record(mctx.state_path(mslug))
+        if why:
+            return (f"The main checkout's run state ({mctx.state_path(mslug)}) can't be read ({why}), so integrate "
+                    "can't tell if its run is between steps. Check it with status first.")
+        if mst.get("phase") in ("building", "blocked") and not _between_steps(mst, main):
+            return (f"The main checkout's own run '{mslug}' is in phase '{mst.get('phase')}', in the middle of a step. "
+                    "Wait for the step to finish (or for the run to be unblocked), then run integrate again.")
+        if mst.get("phase") == "paused" and mst.get("paused_from") in ("building", "blocked"):
+            # like `merged`: a run paused from building keeps its step's starting tree, which a merge now would
+            # leave behind the lane's work
+            return (f"The main checkout's own run '{mslug}' is paused from phase '{mst.get('paused_from')}', in the "
+                    "middle of a step. Resume it (resume) until it is between steps, then run integrate again.")
+    return None
+
+
+def _integrate_check(main: Path, target: str, info: dict, fail):
+    """Everything integrate checks before it changes anything, for the dry run and the real merge alike. `fail(msg)`
+    ends the command with a plain message (the real merge records it as refused first). Reads only. Returns the
+    facts: lane folder, name, run slug, main's tip, the lane's tip, the branch main is on, the commits the lane would
+    bring (as "<hash> <subject>" lines), the uncommitted Ratchet files on main, and main's context."""
+    info["lane"] = target
+    # known limit: the scratch clone, the suite and the file checks all assume the project is the repository top
+    top = _git_top_problem(main, "integrate", "Merge this lane by hand (git merge in the main checkout, then run the suite there).")
+    if top:
+        fail(top)
+    wt = subprocess.run(["git", "config", "--get", "core.worktree"], cwd=main, capture_output=True, text=True, timeout=60)
+    if wt.stdout.strip():
+        # known limit: the scratch clone takes main's local config, and a core.worktree there would point its git
+        # commands at main's own files
+        fail(f"integrate does not support a main checkout whose git config sets core.worktree ({wt.stdout.strip()}): "
+             "the scratch copy would work on main's files. Merge this lane by hand (git merge in the main checkout, "
+             "then run the suite there). Nothing was changed.")
+    if subprocess.run(["git", "cat-file", "-e", "HEAD:.gitmodules"], cwd=main, capture_output=True, text=True,
+                      timeout=60).returncode == 0:
+        # known limit: the scratch copy would have empty submodule folders, and the suite would blame the lane
+        fail("integrate cannot test a project with git submodules yet (main's tree has a .gitmodules file): the "
+             "scratch copy's submodule folders would be empty. Merge this lane by hand (git merge in the main checkout, "
+             "then run the suite there). Nothing was changed.")
+    lane, branch = _integrate_lane(main, target, fail)
+    if lane == main.resolve():
+        fail("That folder is the main checkout itself, not a lane. Give the lane's folder or its branch name. "
+             "Nothing was changed.")
+    lctx, mctx = Ctx(lane), Ctx(main)
+    name = branch or str(lane)
+    info["lane"] = name
+    slug = lctx.active_slug()
+    if not slug or not lctx.state_path(slug).is_file():
+        fail(f"The lane '{name}' has no active run, so there is nothing finished to integrate. Give the folder or "
+             "branch of a lane whose agent ran its work through Ratchet. Nothing was changed.")
+    info["run"] = slug
+    lst, why = _read_record(lctx.state_path(slug))
+    if why:
+        fail(f"The lane's run state ({lctx.state_path(slug)}) can't be read ({why}), so integrate can't tell if the "
+             "run is finished. Have the lane's agent check it with status. Nothing was changed.")
+    phase = lst.get("phase")
+    if phase != "done":
+        fail(f"The lane's run '{slug}' is not finished (it is in phase '{phase}'). Have the lane's agent finish it, "
+             "then run integrate again. Nothing was changed.")
+
+    def git(d, *a):
+        return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True, timeout=60)
+
+    dirty = _integrate_dirty
+
+    if git(lane, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+        fail(f"A merge is in progress in the lane '{name}'. Have the lane's agent finish or abort it there first, "
+             "then run integrate again. Nothing was changed.")
+    bad = dirty(lane, True)
+    if bad:
+        fail(f"The lane '{name}' has uncommitted changes ({', '.join(bad[:5])}). Have the lane's agent commit or "
+             "discard them, then run integrate again. Nothing was changed.")
+    if git(main, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+        fail("The main checkout has a merge in progress. Finish or abort it before integrating. Nothing was changed.")
+    carried = []
+    for path in dirty(main, False):
+        (carried if path in MERGE_SHARED else bad).append(path)
+    if bad:
+        fail(f"The main checkout has uncommitted changes to project files ({', '.join(bad[:5])}). Ask the developer "
+             "to commit or stash them (integrate does not touch them), then run integrate again. Nothing was changed.")
+    problem = _integrate_run_problem(main, mctx)
+    if problem:
+        fail(problem + " Nothing was changed.")
+    head = git(main, "rev-parse", "HEAD").stdout.strip()
+    lhead = git(lane, "rev-parse", "HEAD").stdout.strip()
+    tip = git(main, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "HEAD"
+    commits = git(main, "log", "--format=%h %s", f"{head}..{lhead}").stdout.splitlines()
+    hashes = git(main, "log", "--format=%H", f"{head}..{lhead}").stdout.split()
+    info["commits"] = [lhead]
+    return {"lane": lane, "name": name, "slug": slug, "head": head, "lhead": lhead, "target": tip, "commits": commits,
+            "hashes": hashes, "carried": carried, "mctx": mctx}
+
+
+def cmd_integrate(args):
+    """`integrate <lane>` (director only): merges a finished lane into the main checkout. The merge is made and the
+    regression_command is run in a scratch clone of main (in the temp folder, borrowing main's objects, at main's tip);
+    only when the suite passes on that exact commit and main has not moved is the commit fetched into main and main
+    fast-forwarded to it. Ratchet's own shared files (MERGE_SHARED) are merged by Ratchet's rules in the scratch copy
+    (_integrate_resolve_shared), and main's uncommitted copies of them are carried across the merge and re-applied by
+    the same rules, still uncommitted (_integrate_carry_plan). Any failure removes the scratch clone and leaves main
+    exactly as it was (it never resets or cleans main's files; the only checkout is of the carried Ratchet files, for
+    the fast-forward, and they get their bytes back on any failure; it never commits anything but the merge). Every
+    attempt is appended to .ratchet/integrations.jsonl. Nothing is pushed.
+    `--dry-run` only checks the lane and says what integrate would do; it reads only and writes nothing."""
+    require_director_session("integrate")
+    main = find_root()
+    if not _is_git(main):
+        die("integrate needs a git project: it merges a lane's branch. Nothing was changed.")
+    if args.dry_run:
+        try:
+            _integrate_dry_run(main, _integrate_check(main, args.lane, {}, die))
+        except subprocess.TimeoutExpired as e:
+            die("A git command timed out while integrate checked the lane "
+                f"({' '.join(str(a) for a in e.cmd)[:80]}). Nothing was changed. Run integrate again.")
+        return
+    info = {"lane": args.lane, "run": None, "commits": []}
+
+    held = {"lock": False}  # only the integrate that holds the lock (and so wrote the journal) may remove the journal
+
+    def finish(result, suite, msg, detail=None, commits=None):
+        line = _integrate_line(info, result, suite, detail or msg, commits)
+        if held["lock"]:  # the outcome goes into the journal first, so a record that cannot be written now is not lost
+            try:
+                j, why = _read_record(_integrate_journal(common))
+                j = j if not why and isinstance(j, dict) else {}
+                j["outcome"] = line
+                _write_record(_integrate_journal(common), j)
+            except Exception:
+                pass
+        wrote = _integrate_record(main, line=line)
+        if held["lock"]:
+            if wrote:
+                try:
+                    _integrate_journal(common).unlink()  # the attempt is on record: nothing left to recover
+                except OSError:
+                    pass
+            else:
+                print("ratchet: the attempt's outcome is kept in the integrate journal; the next integrate records it "
+                      "once the record can be written", file=sys.stderr)
+        if result in ("merged", "no-op"):
+            ok(msg)
+            return
+        die(msg)
+
+    cd = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=main, capture_output=True, text=True, timeout=60)
+    common = Path(cd.stdout.strip() or ".git")
+    common = common if common.is_absolute() else main / common
+    lk = _IntegrateLock(main, common, f"integrate {args.lane}")
+    why = lk.acquire()
+    try:
+        if why:
+            busy = (f"Another integrate is already running (Ratchet is busy running {lk.holder}). Try again when it "
+                    "finishes. Nothing was changed.")
+            finish("refused", "not-run", busy if why.startswith("Ratchet is busy") else why)
+        held["lock"] = True
+        info["prefix"] = "ratchet-integrate-" + hashlib.sha1(os.path.realpath(common).encode()).hexdigest()[:10] + "-"
+        _integrate_recover(main, common)
+        # this attempt's journal from here on (after recover, so an old one is never overwritten): a kill during the
+        # checks is recorded by the next integrate too
+        _write_record(_integrate_journal(common), {"lane": args.lane, "run": None, "head": None, "lhead": None,
+                                                   "target": None, "sha": None, "suite": "not-run", "started": now()})
+        _integrate_clear_leftovers(info["prefix"])
+        try:
+            f = _integrate_check(main, args.lane, info, lambda m: finish("refused", "not-run", m))
+        except subprocess.TimeoutExpired as e:
+            finish("refused", "not-run", "A git command timed out while integrate checked the lane "
+                   f"({' '.join(str(a) for a in e.cmd)[:80]}). Nothing was changed. Run integrate again.")
+        _integrate_merge(main, f, info, finish)
+    finally:
+        lk.release()
+
+
+def _integrate_dry_run(main: Path, f: dict):
+    name, slug, head, lhead, target, commits = f["name"], f["slug"], f["head"], f["lhead"], f["target"], f["commits"]
+
+    def git(d, *a):
+        return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True, timeout=60)
+
+    if not commits:
+        ok(f"Dry run: the lane '{name}' (run '{slug}') has nothing new to bring to {target}, so there is nothing to "
+           "merge. Nothing was changed.")
+        return
+    layout = _integrate_layout_problem(main, head, lhead)
+    if layout:
+        die("Dry run: integrate would refuse this lane. " + layout)
+    base = git(main, "merge-base", head, lhead).stdout.strip()
+    differ = [x for x in sorted(MERGE_SHARED)
+              if any(git(main, "diff", "--name-only", base, side, "--", x).stdout.strip() for side in (lhead, head))]
+    # the two standards.md stops the real run would make (before any clone): both sides changed it since the lane
+    # branched, or main's uncommitted copy and the lane's change clash
+    std = f"{RATCHET_DIR}/standards.md"
+
+    def blob(rev):
+        r = subprocess.run(["git", "show", f"{rev}:{std}"], cwd=main, capture_output=True, timeout=60)
+        return r.stdout if r.returncode == 0 else None
+
+    b, o, t = blob(base), blob(head), blob(lhead)
+    merged, _nt, problem = _integrate_merge_shared(std, b, o, t)   # the one rule the real run applies
+    if problem or merged is None:
+        die(f"Dry run: integrate would refuse this lane. Both sides changed {std} since the lane branched (the lane "
+            f"'{name}' and main), and integrate does not merge two versions of the standards. Decide which wording to "
+            "keep, change one side to match (commit it on main or in the lane), then run integrate again. Nothing was "
+            "changed.")
+    if std in f["carried"] and merged != o:   # the merge changes it: the uncommitted copy is re-applied by the rule
+        try:
+            mine = (main / std).read_bytes()
+        except OSError:
+            mine = None
+        res, _nt, problem = _integrate_merge_shared(std, o, mine, merged, lane_local=False) if mine is not None else (o, [], None)
+        if problem or res is None:
+            die(f"Dry run: integrate would refuse this lane. Main's uncommitted {std} and the merge both change it "
+                "differently, and integrate does not merge two versions of the standards. Ask the developer to commit "
+                f"or undo the uncommitted {std} on main (or change the lane's version to match), then run integrate "
+                "again. Nothing was changed.")
+    suite = f["mctx"].config().get("regression_command")
+    lines = [f"Dry run: integrate would merge the lane '{name}' (run '{slug}', finished) into {target}.",
+             f"Commits it would bring to {target} ({len(commits)}):", *[f"  {c}" for c in commits],
+             "Ratchet's own files that differ since the lane branched (merged by Ratchet's rules): "
+             + (", ".join(differ) if differ else "none differ."),
+             "Uncommitted Ratchet files on main it would carry across (never committed): "
+             + (", ".join(sorted(f["carried"])) if f["carried"] else "none."),
+             "Suite it would run on the merged code before main moves: "
+             + (suite if suite else "none (no regression_command is set)."),
+             "This was a dry run: nothing was changed, no merge was made and nothing was pushed."]
+    ok("\n".join(lines))
+
+
+def _integrate_linked_deps(main: Path) -> list:
+    """Installed-dependency folders (DEP_DIRS) of the main checkout whose contents point back into the main checkout
+    itself, outside that dependency folder: workspace links in node_modules or vendor, and a Python editable install
+    (a .pth, .egg-link or __editable__ file, or an editable direct_url.json, naming main's path). The scratch copy
+    borrows those folders by link, so the suite would load main's code from before the merge through them. Returns
+    short "where -> what" strings (at most three); [] when none."""
+    from urllib.parse import unquote, urlparse
+    roots = sorted({os.path.realpath(main), os.path.abspath(main)})
+    found = []
+
+    def inside(path, dep_real):
+        path = os.path.normpath(path)
+        return any(path == r or path.startswith(r + os.sep) for r in roots) and not (
+            path == dep_real or path.startswith(dep_real + os.sep))
+
+    def links(dep, dep_real, d, level):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            return
+        for n in names:
+            p = os.path.join(d, n)
+            if os.path.islink(p):
+                t = os.path.realpath(p)
+                if inside(t, dep_real):
+                    found.append(f"{os.path.relpath(p, main)} -> {os.path.relpath(t, main)}")
+            elif level == 1 and os.path.isdir(p) and (dep != "node_modules" or n.startswith("@") or n == ".bin"):
+                links(dep, dep_real, p, 2)
+
+    pat = re.compile("(?:" + "|".join(re.escape(r) for r in roots) + r")(?![\w.\-])[^\s'\"\\]*")
+
+    def text_of(p):
+        try:
+            if os.path.getsize(p) > 1000000:
+                return ""
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def python_installs(dep_real, dep_dir):
+        sites = []
+        for lib in ("lib", "lib64", "Lib"):
+            base = os.path.join(dep_dir, lib)
+            try:
+                sites += [os.path.join(base, n, "site-packages") for n in sorted(os.listdir(base)) if n.startswith("python")]
+            except OSError:
+                pass
+            sites.append(os.path.join(base, "site-packages"))
+        for site in sites:
+            try:
+                names = sorted(os.listdir(site))
+            except OSError:
+                continue
+            for n in names:
+                p = os.path.join(site, n)
+                if n.endswith((".pth", ".egg-link")) or n.startswith("__editable__"):
+                    hit = next((m.group(0) for m in pat.finditer(text_of(p)) if inside(m.group(0), dep_real)), None)
+                    if hit:
+                        found.append(f"{os.path.relpath(p, main)} -> {os.path.relpath(hit, main)}")
+                elif n.endswith(".dist-info"):
+                    try:
+                        # direct_url.json is the installer's own file, not a Ratchet record: unreadable or
+                        # invalid means not an editable install, never an exit
+                        du, _why = _read_record(Path(p) / "direct_url.json", kind=dict, missing={})
+                        url = (du or {}).get("url") or ""
+                        loc = unquote(urlparse(url).path)
+                        if (du.get("dir_info") or {}).get("editable") and url.startswith("file:") and inside(loc, dep_real):
+                            found.append(f"{os.path.relpath(p, main)} -> {os.path.relpath(loc, main)}")
+                    except (ValueError, AttributeError):
+                        pass
+
+    for dep in DEP_DIRS:
+        dep_dir = os.path.join(main, dep)
+        if not os.path.isdir(dep_dir):
+            continue
+        dep_real = os.path.realpath(dep_dir)
+        links(dep, dep_real, dep_dir, 1)
+        if dep in (".venv", "venv"):
+            python_installs(dep_real, dep_dir)
+        if dep == "vendor":
+            # Composer's autoloader maps the project's own classes through __DIR__ . '/../..', which resolves the
+            # linked folder back into this checkout
+            try:
+                auto = sorted(n for n in os.listdir(os.path.join(dep_dir, "composer"))
+                              if n.startswith("autoload_") and n.endswith(".php"))
+            except OSError:
+                auto = []
+            for rel in ["vendor/autoload.php"] + ["vendor/composer/" + n for n in auto]:
+                if os.path.isfile(os.path.join(main, rel)):
+                    found.append(f"{rel} -> this checkout's classes (Composer's autoloader)")
+                    break
+    return found[:3]
+
+
+def _integrate_rules_snapshot(mctx):
+    """Main's own run's approval snapshot (rules and reference files) as they stand now, taken right before main moves
+    so _integrate_move_base can tell what the integrate itself changed; None when main has no run with an approved
+    plan, or its state can't be read."""
+    mslug = mctx.active_slug()
+    if not (mslug and mctx.state_path(mslug).is_file()):
+        return None
+    mst, why = _read_record(mctx.state_path(mslug))
+    if why or not isinstance(mst.get("approved"), dict):
+        return None
+    try:
+        return approval_snapshot(mctx, mst)
+    except (SystemExit, OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _integrate_move_base(main: Path, mctx, sha: str, lane: str, run: str, before: dict = None):
+    """Called holding main's state lock, right after main was fast-forwarded to the merge commit `sha` (and main's
+    uncommitted Ratchet files were re-applied). When main's own run is building at step 'tests' (between steps: the
+    only building state integrate allows), its current step's starting tree and commit are moved to the merge, the way
+    `merged` does for a lane, so the step's reviewers and its commit see only the step's own changes and not the
+    lane's. Other phases set a fresh starting tree when their next step begins. With `before` (the run's rules and
+    reference files as they were right before main moved, _integrate_rules_snapshot), every config rule and reference
+    file that matched the approved baseline before and that the integrate changed (a shared file merged by Ratchet's
+    rules) becomes the new approved baseline, so main's run never asks approve-changes for it; one that was already
+    changed before stays as it is. Logged as `integrated_lane` (`commit`, `lane`, `run`, `accepted`). A run state that
+    can't be read is left alone (the merge stands)."""
+    mslug = mctx.active_slug()
+    if not (mslug and mctx.state_path(mslug).is_file()):
+        return
+    mst, why = _read_record(mctx.state_path(mslug))
+    if why:
+        return
+    cur, changed, accepted = mst.get("current"), False, []
+    if cur and mst.get("phase") == "building" and (mst.get("checkpoints") or {}).get(cur, {}).get("step") == "tests":
+        base = fingerprint(main)["id"]
+        mst["base_tree"] = base
+        mst["checkpoints"][cur]["base_tree"] = base
+        mst["checkpoints"][cur]["base_head"] = sha
+        changed = True
+    snap = mst.get("approved")
+    if before and isinstance(snap, dict):
+        now_ = approval_snapshot(mctx, mst)
+        for section, what in (("rules", "config rule '{}'"), ("files", "reference file {}")):
+            for k, h in list((snap.get(section) or {}).items()):
+                if h == (before.get(section) or {}).get(k) and now_.get(section, {}).get(k) != h:
+                    snap[section][k] = now_[section][k]
+                    accepted.append(what.format(k))
+        changed = changed or bool(accepted)
+    if not changed:
+        return
+    mctx.log(mst, "integrated_lane", commit=sha, lane=lane, run=run, accepted=accepted)
+    mctx.save_state(mst)
+
+
+def _integrate_layout_problem(main: Path, head: str, lhead: str):
+    """The known layout limits the real merge refuses before any clone, as one plain line (or None), so the dry run
+    can report them too: the lane changes a dependency manifest or lockfile (the suite would run with main's installed
+    dependencies, linked in, which cannot match the lane's), or main's installed dependencies link back into main."""
+    manifests = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock",
+                 "bun.lockb", "pyproject.toml", "setup.py", "setup.cfg", "Pipfile", "Pipfile.lock", "uv.lock",
+                 "poetry.lock", "Gemfile", "Gemfile.lock", "composer.json", "composer.lock", "Cargo.toml", "Cargo.lock",
+                 "go.mod", "go.sum"}
+    base = subprocess.run(["git", "merge-base", head, lhead], cwd=main, capture_output=True, text=True, timeout=60)
+    changed = subprocess.run(["git", "diff", "--name-only", base.stdout.strip() or head, lhead], cwd=main,
+                             capture_output=True, text=True, timeout=60).stdout.split()
+    deps = [p for p in changed if os.path.basename(p) in manifests
+            or (os.path.basename(p).startswith("requirements") and p.endswith(".txt"))]
+    if deps:
+        return (f"The lane changes the project's dependencies ({', '.join(deps[:5])}). integrate runs the suite with "
+                "main's installed dependencies, which do not match the lane's, and cannot install the lane's yet. Merge "
+                "this lane by hand (git merge in the main checkout, install, then run the suite there). Nothing was "
+                "changed.")
+    linked = _integrate_linked_deps(main)
+    if linked:
+        return ("integrate cannot test this project layout yet: its installed dependencies link back into the main "
+                f"checkout ({'; '.join(linked)}; workspace links or an editable install), so a suite run on the merged "
+                "copy would load main's code from before the merge. Merge this lane by hand (git merge in the main "
+                "checkout, then run the suite there). Nothing was changed.")
+    return None
+
+
+def _integrate_journal(common: Path) -> Path:
+    """The journal of the integrate attempt under way (next to the integrate lock): what the next integrate needs to
+    record the attempt if this one is killed before it records itself."""
+    return common / "ratchet-integrate.journal"
+
+
+def _integrate_recover(main: Path, common: Path):
+    """Called with the integrate lock held, before a new attempt starts: an attempt that ended without its record line
+    (killed mid-run, or its record could not be written) left its journal. First, when the journal names carried
+    files (main's uncommitted Ratchet files set back to the tip for the fast-forward), a carried file still at the
+    journaled tip gets the developer's saved bytes back, unstaged, and the carry folder is removed; once main holds
+    the merge (or moved on) nothing is written, the folder is set aside under a name of its own and the note says
+    how to re-add the developer's own edits (_integrate_carry_restore). Then the attempt is recorded: the journaled
+    outcome as it is when there is one; else merged with a note when main's history holds that attempt's merge
+    commit (killed after the fast-forward; main's run is not touched, so a step in progress shows the lane's changes
+    in its own diff), else rolled back (killed during the suite or before). The journal is removed only once the
+    record line is written; when it cannot be, the command stops with a plain line and the journal stays."""
+    journal = _integrate_journal(common)
+    if not journal.is_file():
+        return
+    j, why = _read_record(journal)
+    j = j if not why and isinstance(j, dict) else {}
+    lane, run, sha, head, lhead = j.get("lane"), j.get("run"), j.get("sha"), j.get("head"), j.get("lhead")
+    info = {"lane": lane, "run": run}
+
+    def git(*a):
+        return subprocess.run(["git", *a], cwd=main, capture_output=True, text=True, timeout=60)
+
+    names = j.get("carried") if isinstance(j.get("carried"), dict) else {}
+    if names:
+        # the killed attempt had set main's uncommitted Ratchet files back to the tip to move main: while main is
+        # still at that tip, a file still at it (not edited since) gets the developer's saved bytes back, unstaged;
+        # once main holds the merge the saved copy predates it and is only set aside and named
+        folder = Path(j["carry_folder"]) if isinstance(j.get("carry_folder"), str) and j["carry_folder"] else None
+        jstaged = j.get("staged") if isinstance(j.get("staged"), dict) else {}
+        jsaved = j.get("staged_saved") if isinstance(j.get("staged_saved"), dict) else {}
+        info["staged_saved"] = jsaved
+        back = _integrate_carry_restore(main, common, names, head=head, only_clean=True, staged=jstaged, folder=folder)
+        print(f"RATCHET: note: an earlier integrate of the lane '{lane}' was interrupted while carrying main's "
+              f"uncommitted {', '.join(sorted(names))} across the merge; "
+              + _integrate_carry_said(back, names, head, jstaged, jsaved)
+              + (" A change the merge brought to a restored file is not re-applied." if back[0] else ""),
+              file=sys.stderr, flush=True)
+
+    if isinstance(j.get("outcome"), dict):
+        line = j["outcome"]
+    elif sha and git("merge-base", "--is-ancestor", sha, "HEAD").returncode == 0:  # main took it (and may have moved on)
+        lane_commits = git("rev-list", f"{head}..{lhead}").stdout.split() if head and lhead else []
+        note = (f"An earlier integrate of the lane '{lane}' (run '{run}') was interrupted after {j.get('target') or 'main'} "
+                f"took its merge commit {sha[:9]}; it is recorded now. Main's run was not changed: if it is in the "
+                "middle of a step, that step's diff also shows the lane's changes.")
+        line = _integrate_line(info, "merged", j.get("suite") or "passed", note, [sha] + lane_commits)
+        print(f"RATCHET: note: {note}", file=sys.stderr, flush=True)
+    else:
+        line = _integrate_line(info, "rolled-back", j.get("suite") or "not-run",
+                               f"An earlier integrate of the lane '{lane}' (run '{run}') was interrupted (killed) before "
+                               "it finished; main did not take the merge.", [lhead] if lhead else [])
+    if not _integrate_record(main, line=line):
+        die(f"The record of an earlier interrupted integrate (of the lane '{lane}') could not be written to "
+            f"{RATCHET_DIR}/integrations.jsonl in the main checkout. Fix that (the file and its folder must be "
+            "writable), then run integrate again: it records that attempt first. Nothing was changed.")
+    try:
+        journal.unlink()
+    except OSError:
+        pass
+
+
+_ABSENT = object()   # a config.json key one side does not have, in the three-way rules below
+
+
+def _integrate_merge_checks(base, ours, theirs):
+    """The guardrail `checks` rule, three-way against the base, matched by `kind` (how _finish_guardrail identifies a
+    check: a strengthen step replaces its kind's check with a new command), by `command` for an entry without one:
+    main's entries in main's order, plus every lane entry main lacks, so no guardrail is lost; an entry the lane
+    changed or removed while main left it as the base takes the lane's change (including the removal); one both sides
+    changed differently keeps main's and is listed; one main removed stays removed, listed only when the lane changed
+    it. Returns (merged list, not_taken)."""
+    def key(c):
+        if isinstance(c, dict) and norm_kind(c.get("kind")):
+            return norm_kind(c.get("kind"))
+        return c.get("command") if isinstance(c, dict) and isinstance(c.get("command"), str) else json.dumps(c, sort_keys=True)
+    bm = {key(c): c for c in base}
+    om = {key(c): c for c in ours}
+    tm = {key(c): c for c in theirs}
+    out, not_taken = [], []
+    for c in ours:
+        k = key(c)
+        if k in tm:
+            if tm[k] == c or not (k in bm and bm[k] == c):
+                out.append(c)                   # same on both sides, or main changed it: main's
+                if tm[k] != c and (k not in bm or tm[k] != bm[k]):   # listed only when the lane changed it too
+                    not_taken.append(f"checks ({k})")
+            else:
+                out.append(tm[k])               # main left it as the base; the lane changed it
+        elif k in bm and bm[k] == c:
+            continue                            # the lane removed it; main left it as the base
+        else:
+            out.append(c)                       # main added or changed it; the lane lacks it
+            if k in bm:
+                not_taken.append(f"checks ({k})")
+    for c in theirs:
+        k = key(c)
+        if k in om:
+            continue
+        if k in bm:                             # main removed it since the base
+            if bm[k] != c:
+                not_taken.append(f"checks ({k})")
+        else:
+            out.append(c)
+    return out, not_taken
+
+
+def _integrate_merge_config(base: dict, ours: dict, theirs: dict, lane_local: bool = True):
+    """The config.json rule, three-way per top-level key against `base`: a key only `theirs` changed takes theirs; a
+    key both changed keeps ours and is listed; a lane-local key (LANE_LOCAL_CONFIG_KEYS, when `lane_local`) always
+    keeps ours and is listed when theirs differs; `checks` merges by _integrate_merge_checks. Keys keep ours' order,
+    theirs' new keys follow. Returns (result, not_taken). With lane_local off (re-applying main's uncommitted copy over
+    the merged result: ours is the uncommitted copy) the uncommitted value wins every clash."""
+    out, not_taken = dict(ours), []
+    for k in dict.fromkeys(list(ours) + list(theirs) + list(base)):
+        ov, tv, bv = ours.get(k, _ABSENT), theirs.get(k, _ABSENT), base.get(k, _ABSENT)
+        if tv == ov or tv == bv:
+            continue                          # no difference, or theirs did not change it: ours stands
+        if lane_local and k in LANE_LOCAL_CONFIG_KEYS:
+            not_taken.append(k)
+        elif ov == bv:                        # only theirs changed it (`checks` too: the lane's list whole)
+            if tv is _ABSENT:
+                out.pop(k, None)
+            else:
+                out[k] = tv
+        elif k == "checks" and isinstance(ov, list) and isinstance(tv, list) and (isinstance(bv, list) or bv is _ABSENT):
+            out[k], nt = _integrate_merge_checks(bv if isinstance(bv, list) else [], ov, tv)
+            not_taken += nt
+        else:                                 # both changed it differently
+            not_taken.append(k)
+    return out, not_taken
+
+
+def _integrate_union_lines(base, ours: bytes, theirs: bytes) -> bytes:
+    """The learnings.md and .ratchet/.gitignore rule, a line merge against the base (None when neither side had the
+    file before): every line of ours, in ours' order, except a base line theirs removed; then each line theirs added
+    (not in the base, not in ours), once, in theirs' order. Every line either side added is kept; a line one side
+    deleted stays deleted."""
+    bl = set(base.decode("utf-8", "surrogateescape").splitlines()) if base else set()
+    tl = theirs.decode("utf-8", "surrogateescape").splitlines()
+    ts = set(tl)
+    o = ours.decode("utf-8", "surrogateescape")
+    kept = [ln for ln in o.splitlines() if ln in ts or ln not in bl]
+    seen = set(kept)
+    add = []
+    for ln in tl:
+        if ln not in seen and ln not in bl:
+            seen.add(ln)
+            add.append(ln)
+    if not add and len(kept) == len(o.splitlines()):
+        return ours
+    return "".join(ln + "\n" for ln in kept + add).encode("utf-8", "surrogateescape")
+
+
+def _integrate_merge_shared(path: str, base, ours, theirs, lane_local: bool = True):
+    """Ratchet's rule for one shared file (a MERGE_SHARED path), given the three versions as bytes (None when that
+    side has no such file). Returns (result bytes, not_taken, problem): `problem` is a plain sentence when the rule
+    cannot decide (standards.md changed on both sides, a config.json that is not a JSON object), with result None.
+    A side that deleted the file counts as unchanged (the other side's version is kept)."""
+    name = path.rsplit("/", 1)[-1]
+    if theirs is None or theirs == ours or theirs == base:
+        return ours if ours is not None else theirs, [], None
+    if name == "config.json":   # always key by key: a lane-local key is kept even when only the lane changed the file
+        sides = {}
+        for tag, raw_ in (("base", base), ("ours", ours), ("theirs", theirs)):
+            data, why = _read_record(Path(path), data=raw_ if raw_ is not None else b"{}")
+            if why:
+                where = {"base": "in the merge base (the commit the lane branched from)", "ours": "on main",
+                         "theirs": "in the lane"}[tag]
+                return None, [], (f"{path} is not a JSON object {where} ({why}), so integrate cannot merge it by its "
+                                  "rules. " + ("Have the lane's agent merge main into the lane (git merge main, then "
+                                               "`ratchet.py merged`), so the lane branches from a newer base, then run "
+                                               "integrate again." if tag == "base" else
+                                               "Fix that file, then run integrate again."))
+            sides[tag] = data
+        res, not_taken = _integrate_merge_config(sides["base"], sides["ours"], sides["theirs"], lane_local)
+        if res == sides["ours"]:
+            return ours, not_taken, None
+        if res == sides["theirs"]:
+            return theirs, not_taken, None
+        return (json.dumps(res, indent=2, ensure_ascii=False) + "\n").encode("utf-8"), not_taken, None
+    if ours is None or ours == base:
+        return theirs, [], None
+    if name in ("learnings.md", ".gitignore"):
+        return _integrate_union_lines(base, ours, theirs), [], None
+    return None, [], None   # standards.md (and any other shared file): both sides changed it differently
+
+
+def _integrate_resolve_shared(tmp: Path, head: str, lhead: str, name: str, git):
+    """Inside the scratch copy, right after `git merge --no-commit` of the lane: Ratchet's shared files are merged by
+    Ratchet's rules, not git's. Every MERGE_SHARED path the lane changed since the merge base is run through its rule,
+    whether git conflicted on it (then from its index stages: :1: base, :2: main, :3: lane) or merged it cleanly (from
+    the base, main and lane versions), and `git add`ed: a lane-local config key never reaches main, a learnings line
+    one side removed stays removed, and standards.md changed on both sides stops integrate even when git would merge
+    the two cleanly. Returns (not_taken, problem): `problem` is a plain sentence to roll back with (main untouched)."""
+    conflicted = set(git(tmp, "diff", "--name-only", "--diff-filter=U").stdout.split())
+    base = git(tmp, "merge-base", head, lhead).stdout.strip()
+    not_taken = []
+
+    def blob(spec):
+        r = subprocess.run(["git", "show", spec], cwd=tmp, capture_output=True, timeout=120)
+        return r.stdout if r.returncode == 0 else None
+
+    for path in sorted(MERGE_SHARED):
+        if path in conflicted:
+            b, o, t = blob(f":1:{path}"), blob(f":2:{path}"), blob(f":3:{path}")
+        elif git(tmp, "diff", "--quiet", base, lhead, "--", path).returncode != 0:
+            b, o, t = blob(f"{base}:{path}"), blob(f"{head}:{path}"), blob(f"{lhead}:{path}")
+        else:
+            continue
+        res, nt, problem = _integrate_merge_shared(path, b, o, t)
+        if problem:
+            return not_taken, problem
+        if res is None:
+            return not_taken, (f"Both sides changed {path} since the lane branched (the lane '{name}' and main), and "
+                               "integrate does not merge two versions of the standards. Decide which wording to keep, "
+                               "change one side to match (commit it on main or in the lane), then run integrate again.")
+        not_taken += nt
+        _write_record(tmp / path, res, raw=True)
+        r = git(tmp, "add", "--", path)
+        if r.returncode != 0:
+            return not_taken, f"git could not stage the merged {path} ({(r.stderr or r.stdout).strip()[:200]})."
+    return not_taken, None
+
+
+def _integrate_carry_plan(main: Path, scratch: Path, head: str, sha: str, carried: list):
+    """What main's uncommitted Ratchet files (`carried`, MERGE_SHARED paths) become once main is at the merge commit
+    `sha` (read from the scratch copy, where it exists before main takes it): each is re-applied by the same per-file
+    rules, three-way with base = main's old HEAD version, ours = the uncommitted copy, theirs = the merged result; the
+    uncommitted value wins a clash and is listed. Returns (saved {path: bytes as they are now}, writes {path: bytes to
+    leave uncommitted}, not_taken, problem)."""
+    saved, writes, not_taken = {}, {}, []
+
+    def blob(rev, path):
+        r = subprocess.run(["git", "show", f"{rev}:{path}"], cwd=scratch, capture_output=True, timeout=120)
+        return r.stdout if r.returncode == 0 else None
+
+    for path in sorted(carried):
+        try:
+            mine = (main / path).read_bytes()
+        except OSError as e:
+            return saved, writes, not_taken, (f"Main's uncommitted {path} could not be read ({e}), so integrate cannot "
+                                              "carry it across the merge. Fix that, then run integrate again.")
+        saved[path] = mine
+        res, nt, problem = _integrate_merge_shared(path, blob(head, path), mine, blob(sha, path), lane_local=False)
+        if problem:
+            return saved, writes, not_taken, problem
+        if res is None:
+            return saved, writes, not_taken, (
+                f"Main's uncommitted {path} and the merge both change it differently, and integrate does not merge two "
+                f"versions of the standards. Ask the developer to commit or undo the uncommitted {path} on main (or "
+                "change the lane's version to match), then run integrate again.")
+        writes[path] = res
+        not_taken += nt
+    return saved, writes, not_taken, None
+
+
+def _integrate_carry_dir(common: Path) -> Path:
+    """Where integrate keeps the bytes of main's uncommitted Ratchet files while main moves (next to the lock and the
+    journal), so a killed attempt can give them back."""
+    return common / "ratchet-integrate-carry"
+
+
+def _integrate_carry_save(common: Path, saved: dict) -> dict:
+    """Writes each uncommitted file's working-tree bytes under the carry folder (the index is not saved: a carried
+    file comes back unstaged, and a staged removal is staged again after the write-back). Returns {path: file name}
+    for the journal."""
+    names = {}
+    for i, (path, data) in enumerate(sorted(saved.items())):
+        fname = f"{i}-{path.rsplit('/', 1)[-1]}"
+        _write_record(_integrate_carry_dir(common) / fname, data, raw=True)
+        names[path] = fname
+    return names
+
+
+def _integrate_carry_staged(main: Path, paths) -> dict:
+    """{path: 'D' | 'M'} for the carried paths whose index differs from HEAD: a staged removal (the working copy is
+    still there) or a staged (or partly staged) edit. Read before the carried files are set back to the tip."""
+    out = {}
+    if not paths:
+        return out
+    r = subprocess.run(["git", "diff", "--cached", "--name-status", "-z", "--no-renames", "--", *sorted(paths)],
+                       cwd=main, capture_output=True, text=True, timeout=60)
+    parts = r.stdout.split("\0")
+    for st, path in zip(parts[::2], parts[1::2]):
+        if path:
+            out[path] = "D" if st.startswith("D") else "M"
+    return out
+
+
+def _integrate_carry_staged_save(main: Path, common: Path, saved: dict):
+    """Before the carried files are set back to the tip: every index blob of a carried path (stages 0, 2 and 3) that
+    differs from both its saved working-tree bytes and the old tip's blob is content only the index holds, so it is
+    written to `<common>/ratchet-integrate-staged-<timestamp>/<i>-<name>`, a folder integrate never removes. Returns
+    ({path: saved file}, folder or None). Raises OSError when it cannot write."""
+    out, folder, i = {}, None, 0
+
+    def blob(spec):
+        r = subprocess.run(["git", "cat-file", "blob", spec], cwd=main, capture_output=True, timeout=60)
+        return r.stdout if r.returncode == 0 else None
+
+    for path, data in sorted(saved.items()):
+        tip = blob(f"HEAD:{path}")
+        ls = subprocess.run(["git", "ls-files", "-s", "-z", "--", path], cwd=main, capture_output=True, text=True,
+                            timeout=60).stdout
+        for ent in ls.split("\0"):
+            fields = ent.split("\t", 1)[0].split()
+            if len(fields) < 3:
+                continue
+            staged = blob(fields[1])
+            if staged is None or staged == data or staged == tip:
+                continue
+            if folder is None:
+                folder = common / f"ratchet-integrate-staged-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+            dst = folder / f"{i}-{path.rsplit('/', 1)[-1]}"
+            _write_record(dst, staged, raw=True)
+            out[path] = str(dst)
+            i += 1
+            break
+    return out, folder
+
+
+def _integrate_carry_set_aside(common: Path, folder: Path = None) -> Path:
+    """Moves the carry folder to `ratchet-integrate-carry-<timestamp>/` next to it, a name the next attempt never
+    overwrites or removes, and returns the folder that holds the saved bytes (the old name when the move fails)."""
+    src = folder or _integrate_carry_dir(common)
+    if src.name != "ratchet-integrate-carry":
+        return src   # already set aside
+    dst = src.with_name(f"ratchet-integrate-carry-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}")
+    try:
+        os.rename(str(src), str(dst))
+    except OSError:
+        return src
+    return dst
+
+
+def _integrate_carry_restore(main: Path, common: Path, names: dict, head: str = None, only_clean: bool = False,
+                             staged: dict = None, folder: Path = None):
+    """Puts the saved bytes back in main's working tree, unstaged (a staged removal in `staged` is staged again with
+    `git rm --cached`), but only while main is still at `head`, the tip the bytes were saved against: once main holds
+    the merge (or moved on), a copy from before the merge must not be written over the file, so nothing is written
+    and the saved copy is kept. With `only_clean` (recovery after a kill), a file that already equals its saved bytes
+    was never reset (its copy is dropped) and one that differs from both the tip and the saved bytes changed since
+    and keeps its current bytes. Returns (restored, could-not-write, left-alone, folder, at_tip): the carry folder is
+    removed when every copy was written back or dropped, else set aside under a name of its own (`folder`)."""
+    done, failed, kept = [], [], []
+    src_dir = folder or _integrate_carry_dir(common)
+    try:
+        cur = subprocess.run(["git", "rev-parse", "HEAD"], cwd=main, capture_output=True, text=True,
+                             timeout=60).stdout.strip()
+    except subprocess.TimeoutExpired:
+        cur = ""
+    at_tip = head is None or cur == head
+    for path, fname in sorted(names.items()):
+        src = src_dir / fname
+        if not src.is_file():
+            continue
+        data = src.read_bytes()
+        if not at_tip:
+            kept.append(path)
+            continue
+        if only_clean:
+            try:
+                now_ = (main / path).read_bytes()
+            except OSError:
+                now_ = None
+            if now_ == data:
+                continue   # never reset, or already restored: nothing to do
+            if subprocess.run(["git", "diff", "--quiet", "HEAD", "--", path], cwd=main, capture_output=True,
+                              timeout=120).returncode != 0:
+                kept.append(path)
+                continue
+        try:
+            _write_record(main / path, data, raw=True)
+        except OSError:
+            failed.append(path)
+            continue
+        if (staged or {}).get(path) == "D":
+            subprocess.run(["git", "rm", "--cached", "-q", "--", path], cwd=main, capture_output=True, timeout=60)
+        done.append(path)
+    if failed or kept:
+        out_folder = _integrate_carry_set_aside(common, src_dir)
+    else:
+        out_folder = None
+        shutil.rmtree(src_dir, ignore_errors=True)
+    return done, failed, kept, out_folder, at_tip
+
+
+def _integrate_unstaged_said(paths, staged_saved: dict = None) -> str:
+    """The sentence for carried files that had staged changes and come back unstaged: one whose staged version
+    differed from its working copy names where that version is saved; "no bytes lost" only when none was saved."""
+    parts = []
+    for p in paths:
+        at = (staged_saved or {}).get(p)
+        if at:
+            parts.append(f"{p} had a staged version different from its working copy; that staged version is saved at "
+                         f"{at}; the file is now unstaged")
+        else:
+            parts.append(f"{p} had staged changes: now unstaged, no bytes lost")
+    return "; ".join(parts)
+
+
+def _integrate_carry_said(back, names: dict = None, head: str = None, staged: dict = None,
+                          staged_saved: dict = None) -> str:
+    """One plain sentence for what _integrate_carry_restore did: which files hold the developer's bytes again (and
+    which of them are now unstaged, with where a staged version unlike the working copy is saved), which could not
+    be written or were left alone, and where the saved bytes are, with the next step when a copy from before the
+    merge must not be copied over the file."""
+    done, failed, kept, folder, at_tip = back
+    names = names or {}
+    parts = []
+    if done:
+        now_un = [p for p in done if (staged or {}).get(p) == "M"]
+        parts.append(f"the developer's bytes were put back into {', '.join(done)}, uncommitted"
+                     + (f" ({_integrate_unstaged_said(now_un, staged_saved)})" if now_un else ""))
+    if failed:
+        parts.append(f"the developer's bytes could not be written back to {', '.join(failed)}")
+    if not at_tip and kept:
+        parts.append(f"main is no longer at {(head or '')[:9]}, the tip the uncommitted {', '.join(kept)} was saved "
+                     f"against, so the saved copy (from before the merge) was not written over the file; it is in "
+                     f"{folder}. Do not copy it over the file: to re-add only the developer's own edits, compare "
+                     f"`git show {(head or '')[:9]}:<path>` with the saved copy "
+                     f"({', '.join(str(folder / names[p]) if p in names else p for p in kept)}) and apply that "
+                     "difference by hand")
+    elif kept:
+        parts.append(f"{', '.join(kept)} changed since and keeps its current bytes; the saved bytes are in {folder}: "
+                     f"compare `git show {(head or 'HEAD')[:9]}:<path>` with the saved copy to see the developer's own "
+                     "edits, and re-add them by hand")
+    if failed and folder:
+        parts.append(f"the saved bytes of {', '.join(failed)} are in {folder} (put them back by hand)")
+    return "; ".join(parts) + "." if parts else "nothing needed restoring."
+
+
+def _integrate_merge(main: Path, f: dict, info: dict, finish):
+    """The real merge, after every check passed (see cmd_integrate). `finish(result, suite, message, detail, commits)`
+    records the attempt and ends the command. A journal of the attempt (lane, run, main's tip, the merge commit once
+    made, the suite's state) is kept next to the integrate lock until the record line is written, so an attempt killed
+    mid-run is recorded by the next integrate (_integrate_recover)."""
+    import types
+    name, slug, head, lhead, target = f["name"], f["slug"], f["head"], f["lhead"], f["target"]
+    if not f["commits"]:
+        finish("no-op", "not-run", f"The lane '{name}' is already merged into {target} (its tip is in main's history), "
+               "so nothing was changed.")
+        return
+    cfg = f["mctx"].config()
+    suite = cfg.get("regression_command")
+    if not suite:
+        finish("refused", "not-run", "No regression_command is set, and integrate will not merge code that no suite "
+               "has run on. Set one with `config --set regression_command=...`, then run integrate again. Nothing was "
+               "changed.")
+    timeout = int(cfg.get("test_timeout_sec") or DEFAULT_CONFIG["test_timeout_sec"])
+    layout = _integrate_layout_problem(main, head, lhead)
+    if layout:
+        finish("refused", "not-run", layout)
+
+    def git(d, *a):
+        return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True, timeout=120)
+
+    state = {"suite": "not-run"}
+
+    def rolled(msg, suite_state, detail=None, commits=None, clean=True):
+        # `clean` is False when a carried file could not be put back: then main did change, and the message says how
+        finish("rolled-back", suite_state, msg + (" Nothing was changed." if clean else ""), detail or msg, commits)
+
+    def path_of(r):  # a path git printed for main, made absolute
+        p = Path(r.stdout.strip())
+        return p if p.is_absolute() else main / p
+
+    common = path_of(git(main, "rev-parse", "--git-common-dir"))
+    hooks = git(main, "config", "--get", "core.hooksPath").stdout.strip()
+    if hooks and not hooks.startswith("~") and not os.path.isabs(hooks):
+        hooks = str(Path(git(main, "rev-parse", "--show-toplevel").stdout.strip() or main) / hooks)
+    hooks = hooks or str(path_of(git(main, "rev-parse", "--git-path", "hooks")))
+    entry = {"lane": name, "run": slug, "head": head, "lhead": lhead, "target": target, "sha": None,
+             "suite": "not-run", "started": now()}
+    _write_record(_integrate_journal(common), entry)
+    tmp = Path(tempfile.mkdtemp(prefix=info["prefix"]))
+    try:
+        # a clone of its own that borrows main's objects (so main's worktree list, refs and files are never touched
+        # while the suite runs); its commits come back to main by a fetch once the suite has passed. It takes main's
+        # own local git settings (identity, signing, merge drivers, filters, attributes) and runs main's hooks, so the
+        # merge commit is made the way a merge in main would be
+        who = []
+        for k, d in (("user.name", "Ratchet"), ("user.email", "ratchet@localhost")):
+            who += ["-c", f"{k}={git(main, 'config', k).stdout.strip() or d}"]
+        r = git(main, "clone", "-q", "--shared", "--no-checkout", str(main), str(tmp))
+        if r.returncode == 0:
+            r = git(tmp, "config", "--local", "--add", "include.path", str(common / "config"))
+        if r.returncode == 0:
+            attrs = path_of(git(main, "rev-parse", "--git-path", "info/attributes"))
+            try:
+                if attrs.is_file():
+                    (tmp / ".git" / "info").mkdir(exist_ok=True)
+                    shutil.copyfile(str(attrs), str(tmp / ".git" / "info" / "attributes"))
+            except OSError:
+                pass
+            # no hook runs for this checkout: nothing is checked out in main, so no checkout hook would run there
+            r = git(tmp, "-c", f"core.hooksPath={tmp / '.git' / 'ratchet-no-hooks'}", "checkout", "-q", "--detach", head)
+        if r.returncode != 0:
+            rolled(f"Could not make the scratch copy of main to merge in ({(r.stderr or r.stdout).strip()[:300]}).",
+                   "not-run")
+        mcfg = ["-c", f"core.hooksPath={hooks}"]
+        for dep in DEP_DIRS:
+            if (main / dep).exists() and not (tmp / dep).exists():
+                try:
+                    (tmp / dep).symlink_to(main / dep)
+                except OSError:
+                    pass
+        r = git(tmp, *who, *mcfg, "merge", "--no-ff", "--no-commit", lhead)
+        if r.returncode != 0:
+            files = git(tmp, "diff", "--name-only", "--diff-filter=U").stdout.split()
+            project = [x for x in files if x not in MERGE_SHARED]
+            if project:
+                rolled(f"Merging the lane '{name}' into {target} conflicts in: {', '.join(project)}. Have the lane's "
+                       "agent merge main into the lane (git merge main, resolve the files, commit, then run "
+                       "`ratchet.py merged`), then run integrate again.", "not-run")
+            if not files:
+                rolled(f"git could not merge the lane '{name}' ({(r.stderr or r.stdout).strip()[:300]}).", "not-run")
+        # Ratchet's own shared files are merged by Ratchet's rules, whether git conflicted on them or not
+        info["not_taken"], problem = _integrate_resolve_shared(tmp, head, lhead, name, git)
+        if problem:
+            rolled(problem, "not-run")
+        left = git(tmp, "diff", "--name-only", "--diff-filter=U").stdout.split()
+        if left:
+            rolled(f"Merging the lane '{name}' into {target} left conflicts in: {', '.join(left)}. Have the lane's "
+                   "agent merge main into the lane (git merge main, resolve the files, commit, then run "
+                   "`ratchet.py merged`), then run integrate again.", "not-run")
+        r = git(tmp, *who, *mcfg, "commit", "-q", "-m", f"Merge lane '{name}' (run {slug})", "-m",
+                f"Ratchet-Integrated: {name} {slug}")
+        if r.returncode != 0:
+            rolled(f"git could not commit the merge ({(r.stderr or r.stdout).strip()[:300]}).", "not-run")
+        sha = git(tmp, "rev-parse", "HEAD").stdout.strip()
+        git(tmp, "update-ref", "refs/heads/ratchet-integrate", sha)
+        entry["sha"] = sha
+        _write_record(_integrate_journal(common), entry)
+        commits = [sha] + list(f["hashes"])  # recorded only once the merge commit is in main; until then the record
+        # keeps the lane's tip, since the scratch merge commit exists nowhere else
+        touched = set(git(tmp, "diff", "--name-only", head, sha).stdout.split())
+        # main's uncommitted Ratchet files are carried across the merge: a re-apply the rules cannot do (the
+        # uncommitted standards.md and the merge both change it) is found here, before the suite and before main
+        # is touched; it is checked again under main's lock right before main moves
+        _s, _w, _nt, problem = _integrate_carry_plan(main, tmp, head, sha, [x for x in f["carried"] if x in touched])
+        if problem:
+            rolled(problem, "not-run")
+        # (a carried Ratchet file with a staged removal shows as untracked too: it is carried, not refused)
+        loose = sorted(x for x in _integrate_untracked(main) if x in touched and x not in f["carried"])
+        if loose:
+            rolled(f"Main has a file git does not track yet ({', '.join(loose[:5])}) at a path the lane also adds, so "
+                   "main cannot take the merge. Ask the developer to move or delete that file (or commit it), then run "
+                   "integrate again.", "not-run")
+        _warn_if_foreground(f["mctx"], cfg, what="integrate", rerun=False)
+        code, out, _dur = _run_cmd(types.SimpleNamespace(root=tmp, config=lambda: cfg), suite, tmp / "integrate-suite.log", timeout)
+        if code != 0:
+            tail = "\n".join(out.strip().splitlines()[-40:])[-3000:]
+            how = (f"timed out after {timeout}s" if code == 124 else f"failed (exit {code})")
+            rolled(f"The suite {how} on the merged code, so main was not changed. Last output:\n{tail}\nHave the "
+                   "lane's agent fix the failure in the lane and finish the lane again, then run integrate again.",
+                   "failed", f"The suite {how} on the merged code.")
+        state["suite"] = entry["suite"] = "passed"
+        _write_record(_integrate_journal(common), entry)
+        # what the suite tested must be the merge commit itself: a suite that rewrites tracked files first (a code
+        # generator or formatter that runs before the tests) passed on something else
+        st = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames",
+                             "--untracked-files=no"], cwd=tmp, capture_output=True, text=True, timeout=120)
+        moved = [x[3:] for x in st.stdout.split("\0") if x]
+        if git(tmp, "rev-parse", "HEAD").stdout.strip() != sha or moved:
+            rolled(f"The suite passed, but it changed tracked files in the merged copy ({', '.join(moved[:5]) or 'HEAD'}), "
+                   "so what it tested is not the merge commit. Make the regression command leave tracked files as they "
+                   "are (commit generated files in the lane, or generate them outside the tracked tree), then run "
+                   "integrate again.", "passed", "The suite changed tracked files in the merged copy.")
+
+        carry, saved = [], {}   # main's uncommitted Ratchet files the merge changes, as seen under main's lock
+
+        def main_problem():
+            """(message, short detail) for what changed in main while the suite ran, or None. Run holding main's state
+            lock, right before the fast-forward: the same checks as before the suite, plus the tip and the branch."""
+            cur = git(main, "rev-parse", "HEAD").stdout.strip()
+            if cur != head:
+                return (f"Main moved while the suite ran (it was at {head[:9]}, it is now at {cur[:9]}), so nothing "
+                        "was merged. Run integrate again: it merges onto the new tip.", "Main moved while the suite ran.")
+            br = git(main, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "HEAD"
+            if br != target:
+                return (f"Main's checkout was switched from {target} to {br} while the suite ran, so nothing was "
+                        f"merged. Switch it back to {target}, then run integrate again.",
+                        "Main's branch changed while the suite ran.")
+            if git(main, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+                return ("The suite passed, but a merge was started in the main checkout while it ran. Finish or abort "
+                        "it, then run integrate again.", "A merge started in main while the suite ran.")
+            run_why = _integrate_run_problem(main, f["mctx"])
+            if run_why:
+                return ("The suite passed, but main's own run changed while it ran. " + run_why,
+                        "Main's run was in the middle of a step when the suite ended.")
+            bad, carried = [], []
+            for path in _integrate_dirty(main, False):
+                (carried if path in MERGE_SHARED else bad).append(path)
+            if bad:
+                return (f"The suite passed, but main now has uncommitted changes to project files "
+                        f"({', '.join(bad[:5])}). Ask the developer to commit or stash them (integrate does not touch "
+                        "them), then run integrate again.", "Main got uncommitted changes while the suite ran.")
+            carry[:] = sorted(x for x in carried if x in touched)
+            loose_now = sorted(x for x in _integrate_untracked(main) if x in touched and x not in carried)
+            if loose_now:
+                return (f"The suite passed, but main now has a file git does not track yet ({', '.join(loose_now[:5])}) "
+                        "at a path the lane also adds. Ask the developer to move or delete that file (or commit it), "
+                        "then run integrate again.", "Main got an untracked file the lane adds.")
+            return None
+
+        # nothing in main may change between the last check and the fast-forward, so both happen holding main's
+        # state lock (the lock every command that changes main's run takes); a developer's merge.autoStash setting
+        # must never turn an edit made meanwhile into conflict markers, so the fast-forward is told not to stash
+        slock = _StateLock(main, cmd="integrate")
+        try:
+            lwhy = slock.acquire()
+            if lwhy:
+                rolled("The suite passed, but Ratchet is busy in the main checkout, so integrate could not check main "
+                       f"before moving it ({lwhy.split(' Nothing was done')[0]}). Try again when it finishes.",
+                       "passed", "Main's state was busy when the suite ended.")
+            problem = main_problem()
+            if problem:
+                rolled(problem[0], "passed", problem[1])
+            # main's run's rules and reference files as they stand now, uncommitted edits included, so a rule the
+            # developer changed before (not yet approved) is never taken for one the integrate changed
+            before = _integrate_rules_snapshot(f["mctx"])
+            # main's uncommitted Ratchet files the merge changes: their bytes are saved next to the journal, the
+            # paths are set back to main's tip for the fast-forward only, and the saved copy is re-applied by the
+            # per-file rules afterwards, still uncommitted. A re-apply the rules cannot do stops here, main untouched.
+            saved, writes, carry_nt, problem = _integrate_carry_plan(main, tmp, head, sha, carry)
+            if problem:
+                rolled("The suite passed, but " + problem[0].lower() + problem[1:], "passed", problem)
+            names, staged = {}, {}
+            landed = False
+            try:
+                if saved:
+                    staged = _integrate_carry_staged(main, saved)   # staged edits come back unstaged, listed; a
+                    # staged removal is staged again after the write-back; a staged version unlike the working
+                    # copy is kept in a folder of its own (never removed) and named
+                    try:
+                        names = _integrate_carry_save(common, saved)
+                        info["staged_saved"], _sf = _integrate_carry_staged_save(main, common, saved)
+                    except OSError as e:
+                        rolled(f"The suite passed, but integrate could not save a copy of main's uncommitted "
+                               f"{', '.join(saved)} before moving main ({e}). Make {common} writable, then run integrate "
+                               "again.", "passed", "Main's uncommitted Ratchet files could not be saved.")
+                    entry["carried"], entry["staged"], entry["staged_saved"] = names, staged, info["staged_saved"]
+                    _write_record(_integrate_journal(common), entry)
+                    r = git(main, "checkout", "-q", "HEAD", "--", *sorted(saved))
+                    if r.returncode != 0:
+                        rolled(f"The suite passed, but integrate could not set main's uncommitted {', '.join(saved)} "
+                               f"aside for the fast-forward ({(r.stderr or r.stdout).strip()[:200]}). Run integrate "
+                               "again.", "passed", "Main's uncommitted Ratchet files could not be set aside.")
+                late = ""
+                r = git(main, "fetch", "-q", str(tmp), "refs/heads/ratchet-integrate")  # only brings the commit's objects
+                if r.returncode == 0:
+                    try:
+                        # main's hooks (post-merge, say) run inside this call, so it gets the suite's time limit; a hook
+                        # still running after that does not undo a fast-forward that already happened
+                        r = subprocess.run(["git", "-c", "merge.autoStash=false", "merge", "--ff-only",
+                                            "--no-overwrite-ignore", sha], cwd=main, capture_output=True, text=True,
+                                           timeout=max(120, timeout))
+                    except subprocess.TimeoutExpired:
+                        if git(main, "rev-parse", "HEAD").stdout.strip() != sha:
+                            raise
+                        r = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+                        late = (f" A git hook on main was still running after {max(120, timeout)}s, so integrate stopped "
+                                "waiting for it; check its result yourself.")
+                landed = r.returncode == 0 and git(main, "rev-parse", "HEAD").stdout.strip() == sha
+            finally:
+                # whatever stopped the fast-forward (a refusal, a git timeout), the carried files get their bytes
+                # back while main is still at its old tip; once main holds the merge, the saved copy (from before
+                # it) is never written over the file: it is set aside and named, with the next step
+                if names and not landed:
+                    back = _integrate_carry_restore(main, common, names, head=head, staged=staged)
+                    state["carry"] = _integrate_carry_said(back, names, head, staged, info.get("staged_saved"))
+                    state["carry_ok"] = not (back[1] or back[2])
+                    if back[3]:   # the next integrate's recovery finds the set-aside copy by this name
+                        entry["carry_folder"] = str(back[3])
+                        try:
+                            _write_record(_integrate_journal(common), entry)
+                        except OSError:
+                            pass
+                    if sys.exc_info()[0] is SystemExit:   # a refusal already printed its message: add the note
+                        print("RATCHET: note: main's uncommitted Ratchet files: " + state["carry"], file=sys.stderr,
+                              flush=True)
+            if landed:
+                info["commits"] = commits
+                folder = None
+                if names:
+                    # the saved copy is set aside under its own name before the write-back and named until every
+                    # write succeeded, so a cut-off here (a git timeout) leaves it findable and never overwritten
+                    folder = _integrate_carry_set_aside(common)
+                    entry["carry_folder"] = str(folder)
+                    _write_record(_integrate_journal(common), entry)
+                    state["carry"] = (f"main holds the merge; the developer's uncommitted bytes of "
+                                      f"{', '.join(sorted(names))} (from before it) are saved in {folder}. Do not copy "
+                                      "them over the files: compare `git show "
+                                      f"{head[:9]}:<path>` with the saved copy to see the developer's own edits, and "
+                                      "re-add only those by hand.")
+                failed, err = [], ""
+                for path, data in sorted(writes.items()):   # plain file writes only: no git call in this loop
+                    try:
+                        _write_record(main / path, data, raw=True)   # the working tree only: never staged
+                    except OSError as e:
+                        failed, err = [path], str(e)
+                        break
+                if failed:
+                    # main goes back to its old tip only while it is still at the merge just made: first the carried
+                    # paths are set to the merge commit's own versions (what HEAD holds, so nothing is staged against
+                    # it), then main is moved back; the developer's files get their saved bytes only once main is
+                    # back at that tip. When main already moved on, nothing is written at all.
+                    cur = git(main, "rev-parse", "HEAD").stdout.strip()
+                    undo = types.SimpleNamespace(returncode=1, stdout="", stderr=f"main moved on to {cur[:9]}")
+                    if cur == sha:
+                        undo = git(main, "checkout", "-q", sha, "--", *sorted(saved))
+                        if undo.returncode == 0:
+                            undo = git(main, "reset", "-q", "--keep", head)
+                    back = _integrate_carry_restore(main, common, names, head=head, staged=staged, folder=folder)
+                    said = _integrate_carry_said(back, names, head, staged, info.get("staged_saved"))
+                    if back[4]:   # main is back at its old tip
+                        info["commits"] = [lhead]
+                        rolled(f"Main took the merge, but main's uncommitted {failed[0]} could not be written back "
+                               f"({err}). Main was moved back to {head[:9]} and {said} Make {failed[0]} writable, then "
+                               "run integrate again.", "passed",
+                               f"Main's uncommitted {failed[0]} could not be re-applied after the merge.",
+                               clean=not (back[1] or back[2]))
+                    finish("merged", "passed",
+                           f"Main took the merge (merge commit {sha[:9]}), but main's uncommitted {failed[0]} could not "
+                           f"be written back ({err}), and main could not be moved back "
+                           f"({(undo.stderr or undo.stdout).strip()[:200]}); it stays at the merge with "
+                           f"{', '.join(sorted(saved))} at the merge's version, nothing staged. {said} Make "
+                           f"{failed[0]} writable first. Nothing was pushed.",
+                           f"Main took the merge, but main's uncommitted {failed[0]} could not be re-applied: {err}",
+                           commits)
+                    return
+                for path, how in sorted(staged.items()):
+                    if how == "D" and path in writes:   # the developer's staged removal, staged again
+                        git(main, "rm", "--cached", "-q", "--", path)
+                info["unstaged"] = [p for p in sorted(writes) if staged.get(p) == "M"]
+                if folder:
+                    shutil.rmtree(str(folder), ignore_errors=True)
+                    state.pop("carry", None)
+                info["not_taken"] = list(dict.fromkeys(list(info.get("not_taken") or []) + carry_nt))
+                _integrate_move_base(main, f["mctx"], sha, name, slug, before)
+        finally:
+            slock.release()
+        if not landed:
+            why = (r.stderr or r.stdout).strip()
+            carry_note = (" Main's uncommitted Ratchet files: " + state["carry"]) if state.get("carry") else ""
+            if "untracked" in why.lower() or "ignored" in why.lower():
+                rolled(f"The suite passed, but main could not take the merge: a file git does not track yet would be "
+                       f"overwritten ({why[:300]}). Ask the developer to move or delete that file (or commit it), then "
+                       f"run integrate again.{carry_note}", "passed", "Main could not take the merge: " + why[:200],
+                       clean=state.get("carry_ok", True))
+            rolled(f"The suite passed, but main could not take the merge ({why[:300]}). Ask the developer to commit "
+                   f"the uncommitted changes in main (or stash them), then run integrate again.{carry_note}", "passed",
+                   "Main could not take the merge: " + why[:200], clean=state.get("carry_ok", True))
+        nt = info.get("not_taken") or []
+        finish("merged", "passed", f"Merged the lane '{name}' (run '{slug}') into {target}: {len(f['commits'])} "
+               f"commit(s), merge commit {sha[:9]}. The suite passed on exactly that commit before {target} moved. "
+               f"Nothing was pushed.{late}"
+               + (f"\nLane settings in {RATCHET_DIR}/config.json not taken (main's kept, by Ratchet's rules): "
+                  f"{', '.join(nt)}." if nt else "")
+               + (f"\nMain's uncommitted {', '.join(sorted(saved))} carried across the merge, still uncommitted"
+                  + (f" ({_integrate_unstaged_said(info['unstaged'], info.get('staged_saved'))})"
+                     if info.get("unstaged") else "") + "." if saved else ""), None, commits)
+    except subprocess.TimeoutExpired as e:
+        cmd = " ".join(str(a) for a in (e.cmd if isinstance(e.cmd, (list, tuple)) else [e.cmd]))[:80]
+        carry_note = (" Main's uncommitted Ratchet files: " + state["carry"]) if state.get("carry") else ""
+        try:
+            took = bool(entry.get("sha")) and subprocess.run(["git", "rev-parse", "HEAD"], cwd=main, capture_output=True,
+                                                             text=True, timeout=60).stdout.strip() == entry["sha"]
+        except subprocess.TimeoutExpired:
+            took = False
+        if took:
+            finish("merged", state["suite"], f"A git command timed out ({cmd}) after main took the merge commit "
+                   f"{entry['sha'][:9]}; integrate stopped there. Main's run was not changed: if it is in the middle of "
+                   f"a step, that step's diff also shows the lane's changes. Nothing was pushed.{carry_note}",
+                   "A git command timed out after main took the merge: " + cmd, [entry["sha"]] + list(f["hashes"]))
+        finish("rolled-back", state["suite"], f"A git command timed out ({cmd}), so integrate stopped. Check "
+               "`git status` and `git log -1` in main to see whether it took the merge, then run integrate again (it "
+               f"says 'already merged' if it did).{carry_note}", "A git command timed out: " + cmd, info.get("commits"))
+    finally:
+        _integrate_drop_scratch(tmp)
+
+
+# The routine approvals a director may sign AND apply in one call (`director-sign <action> ... --apply`). Everything
+# else a director signs (plan approval, step and final review, cancel, set-review, hooks-waive, ui-respec, guardrail,
+# feedback) stays a token the lane applies: --apply is refused there and approves nothing.
+DIRECTOR_APPLY_ACTIONS = ("approve-changes", "accept-finding", "raise-limit", "choice")
+
+
+def _director_apply_cmd(ctx, action, cp=None, eng="ratchet.py") -> str:
+    """The one-step director command for a routine approval in this lane, with its arguments spelled out."""
+    tail = {"accept-finding": f" {cp or '<CPn>'} --ids <ids> --reason \"<why>\"",
+            "raise-limit": f" {cp or '<CPn>'} --reason \"<why>\"",
+            "choice": " <letter>"}.get(action, "")
+    return f"{eng} --root {ctx.root} director-sign {action}{tail} --apply"
+
+
+def _director_apply_ask(ctx, st, action, target, ids):
+    """The question step `--apply` runs itself, exactly as the lane's own `ask` records it (pending question,
+    awaiting_since moved, `question_asked` logged), with the chat text it would print kept off stdout: nothing is
+    put to anyone, the director's own command is the answer."""
+    if action == "approve-changes":
+        overtook = _overtake(ctx, st, "approve-changes", None)
+        asked = now()
+        st["pending"] = {"action": "approve-changes", "mode": None, "asked_at": asked,
+                         "prev_awaiting": st.get("awaiting_since"),
+                         "session": _asking_session(ctx, st, "approve-changes"), **overtook}
+        st["awaiting_since"] = asked
+        ctx.log(st, "question_asked", action="approve-changes", mode=None)
+        ctx.save_state(st)
+        return
+    ns = argparse.Namespace(action=action, mode=target, ids=ids, options=None, locked=None, guardrail=None)
+    with contextlib.redirect_stdout(io.StringIO()):
+        if action == "raise-limit":
+            _ask_raise_limit(ctx, st, ns)
+        else:
+            _ask_accept_finding(ctx, st, ns)
+
+
+# ---- the developer's policy for routine approvals ------------------------------------------------------------------
+# One file per user, next to the director key (RATCHET_HOME/director-policy.json), changed only by `director-policy`
+# from the director session (the guard keeps builder sessions out of RATCHET_HOME). With no file, director-sign works
+# as it always did. With a file, each of the four routine approvals is signed only when a rule covers it.
+POLICY_FILE = "director-policy.json"
+POLICY_SEVERITIES = {"major": 1, "minor": 2}
+POLICY_NEVER = ("approve-plan", "human-approve", "feedback", "cancel", "set-review", "hooks-waive", "ui-respec",
+                "guardrail", "paid-provider")
+POLICY_MENU = ("approve-changes=test-files, raise-limit=max:<N> (N of 1 or more signed raises per run), "
+               "choice=no-unlock, accept-finding=max:<minor|major>")
+
+
+def _policy_path() -> Path:
+    return ratchet_home() / POLICY_FILE
+
+
+def _policy_rule_problem(action, rule) -> str | None:
+    """None when `rule` is a rule the menu offers for `action`; otherwise a plain reason."""
+    if action in POLICY_NEVER:
+        return (f"{action} can never be covered by a policy: it is the developer's own approval (plans, scope, final "
+                "approval, cancel, review settings, hooks waivers, paid providers). Nothing was changed.")
+    if action not in DIRECTOR_APPLY_ACTIONS:
+        return f"{action} is not a routine approval. A rule is for one of: {', '.join(DIRECTOR_APPLY_ACTIONS)}. Nothing was changed."
+    rule = rule if isinstance(rule, str) else ""
+    if action == "approve-changes" and rule != "test-files":
+        return "approve-changes takes the rule test-files (changes to test files only). Nothing was changed."
+    if action == "choice" and rule != "no-unlock":
+        return "choice takes the rule no-unlock (lettered options that unlock no locked file). Nothing was changed."
+    if action == "raise-limit" and not (re.fullmatch(r"max:[0-9]+", rule) and int(rule[4:]) >= 1):
+        return "raise-limit takes max:N with N of 1 or more (signed raises per run). Nothing was changed."
+    if action == "accept-finding" and not (rule.startswith("max:") and rule[4:] in POLICY_SEVERITIES):
+        return "accept-finding takes max:minor or max:major (never blocker). Nothing was changed."
+    return None
+
+
+def _load_policy():
+    """(policy or None when no file, problem or None). A policy is {"rules": {action: rule}, "changes": [...]};
+    one that can't be read or holds a rule the menu does not offer is a problem (routine approvals fail closed)."""
+    p = _policy_path()
+    data, why = _read_record(p, missing=None)
+    if why is None and data is not None:
+        rules, changes = data.get("rules"), data.get("changes")
+        if not isinstance(rules, dict) or not isinstance(changes, list) or any(
+                _policy_rule_problem(a, r) for a, r in rules.items()):
+            why = "it does not hold a valid policy"
+    if why:
+        return None, (f"The developer's policy file {p} (director-policy.json) is unreadable or damaged ({why}). "
+                      "Routine approvals are refused until the developer resets it: ask the developer for their rules, then "
+                      "`director-policy --set <action>=<rule>` rewrites the file from scratch (the repair is logged), or "
+                      "`director-policy --clear <action>` deletes it. Nothing was signed.")
+    return data, None
+
+
+def cmd_director_policy(args):
+    """`director-policy` (director session only): show (`--json`), `--set <action>=<rule>` or `--clear <action>` the
+    developer's policy for routine approvals. Every change is logged in the file with its time."""
+    require_director_session("director-policy")
+    pol, bad = _load_policy()
+    setting, clearing = getattr(args, "set", None), getattr(args, "clear", None)
+    if getattr(args, "remove", False):  # the one way back to no policy at all, logged in its own record
+        if pol is None and not bad:
+            die("There is no policy file to remove. Nothing was changed.")
+        try:
+            _append_record(_policy_path().with_name("director-policy-removed.jsonl"), json.dumps(
+                {"at": now(), "removed": True, "rules": (pol or {}).get("rules"), "damaged": bool(bad)}) + "\n")
+            _policy_path().unlink()
+        except OSError as e:
+            die(f"Couldn't remove {_policy_path()} ({e.strerror or e}). Nothing was changed.")
+        ok("The policy was removed (logged in director-policy-removed.jsonl): no policy is set, so director-sign works as it did before any policy.")
+        return
+    if bad and not (setting or clearing):
+        die(bad)
+    if setting or clearing:
+        pol = pol or {"rules": {}, "changes": []}
+        if bad:  # --set or --clear over a damaged file starts again from nothing, and says so in the change log
+            pol["changes"].append({"at": now(), "action": "(policy file)", "repair": "damaged file replaced"})
+            if clearing:  # a damaged file has no rule to clear: replacing it with an empty (fail-closed) policy is the repair
+                _write_record(_policy_path(), pol, pretty=True)
+                ok("The damaged policy file was replaced by a policy with no rules (logged): every routine approval asks the developer.")
+                return
+        if setting:
+            action, _, rule = setting.partition("=")
+            action, rule = action.strip(), rule.strip()
+            why = _policy_rule_problem(action, rule)
+            if why:
+                die(f"{setting}: {why} The menu: {POLICY_MENU}.")
+            pol["rules"][action] = rule
+            pol["changes"].append({"at": now(), "action": action, "rule": rule})
+        else:
+            if clearing not in pol["rules"]:
+                die(f"No rule is set for {clearing}. Nothing was changed.")
+            del pol["rules"][clearing]
+            pol["changes"].append({"at": now(), "action": clearing, "clear": True})
+        try:
+            _write_record(_policy_path(), pol, pretty=True)  # with the last rule gone it keeps only the history
+        except OSError as e:
+            die(f"Couldn't update {_policy_path()} ({e.strerror or e}). Nothing was changed.")
+    if getattr(args, "json", False):
+        print(json.dumps(pol or {"rules": {}, "changes": []}, indent=2))
+        return
+    rules = (pol or {}).get("rules") or {}
+    if pol is not None and not rules:  # a policy file with no rules covers nothing
+        print("A policy with no rules: every routine approval asks the developer. Add a rule with "
+              f"`director-policy --set <action>=<rule>` (the menu: {POLICY_MENU}), or remove the policy with "
+              "`director-policy --remove`.")
+        return
+    if not rules:
+        print("No policy is set: routine approvals are signed as the director sees fit. Set a rule with "
+              f"`director-policy --set <action>=<rule>`; the menu: {POLICY_MENU}.")
+        return
+    print(f"The developer's policy ({_policy_path()}); a routine approval no rule covers is refused:")
+    for a, r in rules.items():
+        print(f"  {a}: {r}")
+
+
+def _policy_field(args) -> dict:
+    """The log field naming the policy rule a director signature used (nothing for a chat approval or no policy)."""
+    r = getattr(args, "policy_rule", None)
+    return {"policy_rule": r} if r else {}
+
+
+def _policy_test_edit_ok(ctx, st, problem: str) -> bool:
+    """Whether an integrity problem on a test file is one the approve-changes=test-files rule covers."""
+    mm = re.match(r"test file (\S+?)(:| \()", problem)
+    if not mm or not (ctx.root / mm.group(1)).exists():
+        return False  # not a test-file problem we can read, or the file is gone
+    rel = mm.group(1)
+    if not rel.endswith(".py"):
+        # Ratchet cannot analyse other languages (an inserted `return;` or `process.exit(0)` above a planned test
+        # looks like an addition); appended tests raise no problem at all, so they need no approval. Ask the developer.
+        return False
+    # Python: covered only when the whole module is unchanged apart from comments and formatting (the freeze proves
+    # the planned tests' own defs, not helpers, imports or module-level code)
+    old_p = ctx.run_dir() / "evidence" / str(st.get("current")) / "red-tests" / rel.replace("/", "__")
+    try:
+        old = ast.dump(ast.parse(old_p.read_text(errors="replace")))
+        new = ast.dump(ast.parse((ctx.root / rel).read_text(errors="replace")))
+    except (OSError, SyntaxError, ValueError, RecursionError):
+        return False
+    return old == new
+
+
+def _policy_apply(args, ctx, st, action, target, ids=()):
+    """A lane command applying a director token re-checks the policy against the lane as it is now, under the same
+    state lock as the apply, and records the rule it finds (so a token signed apart from its apply, by the plain
+    `director-sign`, still logs `policy_rule`, and a token the policy no longer covers is refused). `director-sign
+    --apply` has checked already (policy_checked)."""
+    if getattr(args, "policy_checked", False) or not getattr(args, "director_token", None):
+        return
+    args.policy_rule = _policy_rule_for(ctx, st, action, target, list(ids))
+
+
+def _policy_refuse(what, ask=True):
+    die(f"{what}" + (" Ask the developer; nothing was signed or changed." if ask else ""))
+
+
+def _policy_rule_for(ctx, st, action, target, ids) -> str | None:
+    """The rule text that covers this routine signature, or None when there is no policy file; dies (before anything
+    is signed, asked or written) when a policy exists and no rule covers it, or the file is damaged."""
+    pol, bad = _load_policy()
+    if bad:
+        die(bad)
+    if pol is None:  # no file at all: director-sign works as it always did
+        return None
+    rule = (pol.get("rules") or {}).get(action)
+    if not rule:
+        _policy_refuse(f"The developer's policy has no {action} rule, so the director may not sign {action}.")
+    if action == "approve-changes":
+        errs = validate_plan(ctx.plan())
+        if errs:
+            die("Plan invalid:\n  - " + "\n  - ".join(errs))
+        probs = integrity_problems(ctx, st)
+        # covered: a test file that still exists and keeps every line it had at the red run (only lines added; a
+        # non-Python file is compared line by line, so a skip, a deletion, an emptied body or a swapped assertion is
+        # a replace or delete and is not covered); Python keeps the structural freeze's own refusals (a skipped,
+        # ended-early, removed or re-declared planned test is not covered)
+        frozen = [pr for pr in probs if pr.startswith("test file ") and not _policy_test_edit_ok(ctx, st, pr)]
+        if frozen:
+            _policy_refuse(f"The approve-changes rule covers edits that keep every planned test, but a planned test "
+                           f"was skipped, removed, weakened or its file deleted: {'; '.join(frozen)[:300]}.")
+        other = [pr for pr in probs if not pr.startswith("test file ")]
+        if other:
+            _policy_refuse(f"The approve-changes rule covers test files only, but these changed too: "
+                           f"{_problems_for_director(other)}.")
+    elif action == "raise-limit":
+        n = int(rule[4:])
+        used = sum(1 for e in st.get("history") or [] if e.get("event") == "round_limit_raised" and e.get("by") == "director")
+        if used >= n:
+            _policy_refuse(f"The raise-limit rule ({rule}) is used up: {used} of {n} raises are already signed in this run.")
+        return f"raise-limit: {rule} ({used + 1} of {n})"
+    elif action == "choice":
+        p = st.get("pending") or {}
+        letter = target.upper()
+        files = (p.get("locked") or {}).get(letter) or []
+        kind = (p.get("guardrail") or {}).get(letter)
+        if files or kind:
+            _policy_refuse(f"The choice rule ({rule}) covers options that unlock nothing, but option {letter} "
+                           + (f"unlocks {', '.join(files)}" if files else f"adds a guardrail step for '{kind}'") + ".")
+    elif action == "accept-finding":
+        p = st.get("pending") or {}
+        cp = target or p.get("mode") or ""
+        ids = ids or p.get("ids") or []
+        cps = (st.get("checkpoints") or {}).get(cp) or {}
+        rnd = cps.get("adv_round")
+        opened = _adv_open_findings(ctx, cp, rnd, cps) if rnd else []
+        top = POLICY_SEVERITIES[rule[4:]]
+        over = []  # (id as named, finding) for every named finding above the rule's severity
+        for i in ids:
+            f, _err = _resolve_finding_ref(i, opened)  # a bare id or 'reviewer/id'; unknown ids fail later, as today
+            r = _SEVERITY_RANK.get(str((f or {}).get("severity", "")).strip().lower()) if f else top
+            if r is None or r < top:
+                over.append((i, f))
+        if over:
+            sev = ", ".join(f"{i} ({f.get('severity')})" for i, f in over)
+            _policy_refuse(f"The accept-finding rule ({rule}) does not cover {sev}.")
+    return f"{action}: {rule}"
+
+
 def cmd_director_sign(args):
+    """Sign the lane's current pause for `action` and print the token (stdout's last line) that the lane applies
+    with `--director-token`. With `--apply`, for a routine approval (DIRECTOR_APPLY_ACTIONS) only: the question step
+    the action needs is run here (`ask approve-changes`, `ask accept-finding CPn <ids>`, `ask raise-limit CPn`; a
+    lettered choice is signed from the question the lane itself registered with `ask choice`), the token is signed
+    and applied at once, all under one hold of the lane's state lock (see _changes_state), so the token cannot go
+    stale between the ask and the apply; a refusal (a missing --reason, an unknown id, a letter not offered, the
+    wrong phase, a lane that is not enrolled) comes before anything is asked or written. The old separate steps
+    (the lane's ask, this command without --apply, the lane's command with the token) still work unchanged. When the
+    developer has a policy file (`director-policy`), the four routine actions are policy-checked first, on both paths:
+    one no rule covers (or a damaged policy file) is refused before anything is signed. A covered plain signature
+    prints a token; the lane's command that applies it checks the policy again under its own lock and records the
+    rule as `policy_rule`, the same as `--apply` does."""
     require_director_session("director-sign")
+    action = args.action
+    apply = bool(getattr(args, "apply", False))
+    if apply and action not in DIRECTOR_APPLY_ACTIONS:
+        die(f"director-sign {action} takes no --apply: only the routine approvals ({', '.join(DIRECTOR_APPLY_ACTIONS)}) "
+            f"are signed and applied in one step. Nothing was signed or approved. Without --apply, director-sign "
+            f"{action} prints a token the lane applies with `{action} --director-token <t>`.")
     ctx = Ctx(find_root())
+    if apply and approval_mode(ctx) != "director":
+        die(f"{ctx.root} is not director-enrolled: this lane takes the developer's own approval (its agent asks in "
+            "chat and only the developer's reply counts), so there is nothing for --apply to do. Nothing was asked or "
+            f"approved. To drive it, enroll it first: ratchet.py --root {ctx.root} director-enroll")
     st = ctx.state()
     want = {"approve-plan": ["awaiting_plan_approval"],
             "human-approve": ["awaiting_checkpoint_review", "awaiting_final_review", "blocked"],
             "feedback": ["awaiting_checkpoint_review", "awaiting_final_review", "done"],
-            "approve-changes": ["building", "blocked", "awaiting_checkpoint_review", "awaiting_final_review"],
+            "approve-changes": ["building", "blocked", "paused", "awaiting_checkpoint_review", "awaiting_final_review"],
             "ui-respec": ["building", "blocked"],
             "guardrail": ["building", "blocked"],
             "accept-finding": ["building", "blocked"],
@@ -6678,22 +8557,146 @@ def cmd_director_sign(args):
             "set-review": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
                            "awaiting_checkpoint_review", "awaiting_final_review"],
             "hooks-waive": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
-                            "awaiting_checkpoint_review", "awaiting_final_review"]}[args.action]
+                            "awaiting_checkpoint_review", "awaiting_final_review"],
+            "raise-limit": ["blocked"],
+            "choice": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
+                       "awaiting_checkpoint_review", "awaiting_final_review", "planning_feedback"]}[args.action]
+    pause = None  # a lane that paused itself for the director: the apply works through the pause (in memory
+    # until every check passed), in the phase it paused from, and the lane is parked again afterwards
+    if apply and st["phase"] == "paused":
+        pause = _lift_pause(st)
+    shown = f"paused (from {st['phase']})" if pause else st["phase"]
+    target = (getattr(args, "target", None) or "").strip()
+    if action == "raise-limit" and target:
+        g = ((st.get("checkpoints") or {}).get(target) or {}).get("gates", {}).get("adversarial") or {}
+        if g.get("cap_raised_to"):  # its one raise is spent: said first, since a raised step is rarely still blocked
+            die(f"{target}'s review-round limit was already raised once (to {g['cap_raised_to']} rounds); it is never "
+                "raised a second time. Nothing was " + ("changed." if apply else "signed."))
     if st["phase"] not in want:
-        die(f"Run {st['slug']} is in phase {st['phase']}; {args.action} applies to {want}.")
-    action = args.action
+        if action == "raise-limit":
+            die(f"Run {st['slug']} is in phase {shown}, not blocked; director-sign raise-limit only applies "
+                "when the step is blocked at its review-round limit" + (" (after the lane ran `ask raise-limit CPn`)."
+                                                                       if not apply else "."))
+        if action == "approve-changes" and st["phase"] == "awaiting_plan_approval":
+            die(f"Run {st['slug']} is awaiting plan approval: nothing is approved yet, so there is no baseline for "
+                "approve-changes to move. Approve the plan first (director-sign approve-plan). Nothing was changed.")
+        die(f"Run {st['slug']} is in phase {shown}; {action} applies to {want}." + (" Nothing was changed."
+                                                                                        if apply else ""))
+    reason = (getattr(args, "reason", None) or "").strip()
+    ids = [i.strip() for i in (getattr(args, "ids", None) or "").split(",") if i.strip()]
+    bind = ()
     if action == "guardrail":
         if not args.kind:
             die("director-sign guardrail needs --kind <kind> (from ratchet.py repeats)")
         action = f"guardrail:{norm_kind(args.kind)}"
-    print(_sign(_director_key(), _approval_payload(ctx, st, action)))
+    elif action == "raise-limit":
+        # Signed only for the step the lane asked about, while it is blocked at its review-round limit and its one
+        # raise is unspent: the same checks `ask raise-limit` and `raise-limit` make, so a token is never signed for
+        # a step it could not raise. The step and the reason are bound into the token (_approval_payload), so the
+        # lane applies exactly this raise, with exactly this reason, and nothing else.
+        if not target or not reason:
+            die("director-sign raise-limit needs the step and the reason: director-sign raise-limit CPn --reason \"...\""
+                + (" --apply. Nothing was asked or changed." if apply else ""))
+        p = st.get("pending") or {}
+        if not apply and (p.get("action") != "raise-limit" or p.get("mode") != target):
+            die(f"No raise-limit question is waiting for {target}: the lane runs `ask raise-limit {target}` first "
+                "(it is refused there unless the step is blocked at its review-round limit), then the director signs; "
+                f"or sign and apply in one step with --apply.")
+        g = ((st.get("checkpoints") or {}).get(target) or {}).get("gates", {}).get("adversarial") or {}
+        if g.get("cap_raised_to"):
+            die(f"{target}'s review-round limit was already raised once (to {g['cap_raised_to']} rounds); it is never "
+                "raised a second time. Nothing was " + ("changed." if apply else "signed."))
+        if _adv_block_kind(st, target) not in ("own", "run_wide"):
+            die(f"{target} is not blocked at its review-round limit right now; director-sign raise-limit only applies "
+                "when it is. Nothing was " + ("changed." if apply else "signed."))
+        bind = (target, reason)
+    elif action == "accept-finding" and apply:
+        # The same refusals `ask accept-finding` and `accept-finding` give, made before anything is asked or written:
+        # a missing --reason, an unknown step, an id already accepted (so a repeated --apply records nothing twice).
+        if not target or target not in (st.get("checkpoints") or {}):
+            die(f"director-sign accept-finding needs the step: director-sign accept-finding CPn --ids F1,F2 --reason "
+                "\"...\" --apply" + (f" ({target} is no checkpoint of this run)" if target else "")
+                + ". Nothing was asked or changed.")
+        if not ids:
+            die(f"director-sign accept-finding needs the finding ids: director-sign accept-finding {target} --ids F1,F2 "
+                "--reason \"...\" --apply. Nothing was asked or changed.")
+        if not reason:
+            die(f"director-sign accept-finding needs --reason \"...\" (there is no chat reply to read a reason from): "
+                f"director-sign accept-finding {target} --ids {','.join(ids)} --reason \"...\" --apply. Nothing was "
+                "asked or changed.")
+        cps = st["checkpoints"][target]
+        rnd = cps.get("adv_round")
+        if rnd:
+            deferred_by_key = {_finding_key(f): f for f in _round_deferred(cps, rnd["round"])}
+            already = [i for i in ids if (deferred_by_key.get(i) or {}).get("accepted")]
+            if already:
+                die(f"{', '.join(already)} already accepted earlier for {target}; nothing new to do. Nothing was "
+                    "changed.")
+    elif action == "choice":
+        # Signed only for a letter the waiting question offers; the letter is bound into the token.
+        p = st.get("pending") or {}
+        if p.get("action") != "choice":
+            die("No lettered question is waiting: the lane runs `ask choice --options ...` first, then the director "
+                "signs one of its letters with `director-sign choice <letter>" + (" --apply`" if apply else "`")
+                + ". Nothing was " + ("changed." if apply else "signed."))
+        letter = target.upper()
+        opts = p.get("options") or []
+        if letter not in opts:
+            die(f"director-sign choice needs one of the offered letters ({', '.join(opts)}), got "
+                f"{target or '(none)'}. Nothing was " + ("changed." if apply else "signed."))
+        bind = (letter,)
+        # What the letter does, from the recorded question itself (not the lane's prose), on stderr so stdout
+        # stays the bare token: the director never signs blind.
+        files = (p.get("locked") or {}).get(letter) or []
+        kind = (p.get("guardrail") or {}).get(letter)
+        does = []
+        if files:
+            does.append(f"approves changing the locked file(s) {', '.join(files)} (approve-changes then needs no "
+                        "further signature)")
+        if kind:
+            does.append(f"adds a guardrail step for '{kind}' right after the current step (it may add a tool)")
+        if st["phase"] == "blocked":
+            does.append("is the pick at a blocked run; resuming it still needs director-sign human-approve")
+        print(f"Signing option {letter} of {', '.join(opts)}: it " + ("; ".join(does) if does else
+              "unlocks nothing (it only records the letter)") + ".", file=sys.stderr)
+    rule = _policy_rule_for(ctx, st, action, target, ids) if action in DIRECTOR_APPLY_ACTIONS else None
+    if not apply:
+        print(_sign(_director_key(), _approval_payload(ctx, st, action, bind)))
+        return
+    key = _director_key()  # before anything is asked: a missing key refuses with nothing changed
+    if action == "approve-changes":
+        errs = validate_plan(ctx.plan())  # as approve-changes itself checks first: a malformed plan is named, not asked
+        if errs:
+            die("Plan invalid:\n  - " + "\n  - ".join(errs))
+        if not integrity_problems(ctx, st):
+            ok("Nothing has changed since approval; there is nothing to approve.")
+            return
+    if pause and action == "choice":  # no ask step to save it: the lane is unparked here for the apply (parked
+        ctx.save_state(st)  # again below); for the other three the ask saves the unparked run once its own checks pass
+    try:
+        if action != "choice":  # a lettered question is the lane's own `ask choice`; the other three are asked here
+            _director_apply_ask(ctx, st, action, target, ",".join(ids))
+            st = ctx.state()  # the ask moved awaiting_since: the token is signed for the pause as it now stands
+        token = _sign(key, _approval_payload(ctx, st, action, bind))
+        ns = argparse.Namespace(director_token=token, cp=target, reason=reason, letter=target.upper() or None,
+                                 policy_rule=rule, policy_checked=True)
+        {"approve-changes": cmd_approve_changes, "accept-finding": cmd_accept_finding, "raise-limit": cmd_raise_limit,
+         "choice": cmd_choice}[action](ns)
+    finally:
+        if pause:  # parked again, whatever the apply did (its unblock, if any, is what `resume` now returns to)
+            st = ctx.state()
+            if st["phase"] != "paused":
+                _enter_pause(st, pause["reason"])
+                ctx.save_state(st)
 
 
 def cmd_approve_plan(args):
     ctx = Ctx(find_root())
     st = ctx.state()
     if st["phase"] != "awaiting_plan_approval":
-        die(f"Nothing to approve (phase {st['phase']})")
+        die(f"Nothing to approve (phase {st['phase']})"
+            + (". This lane is enrolled with the director, so its plan is approved only with a director token, "
+               "never by a chat reply." if approval_mode(ctx) == "director" else ""))
     plan = ctx.plan()
     if _plan_hash(plan, ctx) != st["plan_hash"]:
         die("checkpoints.json changed since it was shown to the human. Run plan-submit again and re-review.")
@@ -7461,6 +9464,14 @@ _PY_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 _FROZEN_WHY = ("A planned test can't change after its first run: an edit that skips it or ends it early would let "
                "it pass without checking anything (if it really must change, ask the user: "
                "`ratchet.py ask approve-changes`)")
+_FROZEN_WHY_DIRECTOR = _FROZEN_WHY.split(" (if it really must change")[0] + (
+    " (if it really must change, the director approves it: `director-sign approve-changes --apply`)")
+
+
+def _problems_for_director(probs) -> str:
+    """The integrity problems joined for a director-enrolled lane's refusal: the frozen-test hint names the
+    director's command instead of a chat question nobody there answers."""
+    return "; ".join(probs).replace(_FROZEN_WHY, _FROZEN_WHY_DIRECTOR)
 
 
 def _py_scope_items(body):
@@ -12012,12 +14023,20 @@ def cmd_receipt(args):
     judged = judged or bool(dm and dm["any_proves"])
     if dm is not None and judged:
         _apply_accepted_lines(st, dm["lines"])
+    labels = {"changes_approved": lambda e: "approve-changes",
+              "round_limit_raised": lambda e: f"raise-limit {e.get('cp')}",
+              "choice_made": lambda e: f"choice {e.get('letter')}",
+              "finding_accepted": lambda e: f"accept-finding {e.get('cp')} ({', '.join(e.get('ids') or [])})"}
+    policy_signed = [{"approval": labels.get(e["event"], lambda x: e["event"])(e), "policy_rule": e["policy_rule"]}
+                     for e in st.get("history") or [] if e.get("policy_rule")]
     if getattr(args, "json", False):
         data = {"run": {"elapsed_seconds": run_seconds, "finished": run_status == "finished"},
                 "steps": [{k: s[k] for k in ("id", "title", "commit", "finished", "elapsed_seconds", "reviewers")}
                          for s in steps],
                 "accepted": accepted, "left_for_later": left, "fixed_later": fixed, "done_means": dm,
                 "shortcut_tables": _sc_saved(ctx)["tables"]}
+        if policy_signed:
+            data["policy_approvals"] = policy_signed
         print(json.dumps(data, indent=2))
         return
     print(f"# Proof receipt: {plan.get('feature') or st.get('feature') or st.get('slug')}")
@@ -12055,6 +14074,11 @@ def cmd_receipt(args):
         if not judged:
             print("Note: this plan's tests were never linked to done_means lines (an older test plan, "
                   "approved before the \"proves\" field existed).")
+    if policy_signed:
+        print("")
+        print("Approvals the director signed under the developer's policy:")
+        for pa in policy_signed:
+            print(f"- {pa['approval']}: {pa['policy_rule']}")
     sc_lines = _sc_block_lines(_sc_saved(ctx))
     if sc_lines:
         print("")
@@ -12082,20 +14106,28 @@ def cmd_receipt(args):
         print("No findings were accepted, left for later or fixed later in this run.")
 
 
-def _warn_if_foreground(ctx, cfg):
-    """complete runs the whole regression suite. Unless the guard hook noted that the host runs this exact call in
-    the background, say first (stderr, flushed) that a tool timeout could cut it off. No note, or a note that does
-    not say, counts as foreground. Never changes what complete does."""
-    note = _noted_session(ctx.root, "complete", whole=True)
+def _warn_if_foreground(ctx, cfg, what="complete", rerun=True):
+    """`what` (complete, or integrate) runs the whole regression suite. Unless the guard hook noted that the host runs
+    this exact call in the background, say first (stderr, flushed) that a tool timeout could cut it off. No note, or
+    a note that does not say, counts as foreground. `rerun`: complete may run the suite a second time after a failure.
+    Never changes what the command does."""
+    note = _noted_session(ctx.root, what, whole=True)
+    if not note and what == "integrate":
+        # the guard notes the call under the folder it was run from (a director's own folder, reaching main with
+        # --root), not under main
+        here = find_root(Path.cwd())
+        if here.resolve() != ctx.root.resolve():
+            note = _noted_session(here, what, whole=True)
     if note and note.get("bg") is True:
         return
     secs = int(cfg.get("test_timeout_sec") or DEFAULT_CONFIG["test_timeout_sec"])
     span = f"{secs // 60} minutes" if secs >= 120 else f"{secs} seconds"
     stretch = _load_stretch_max(cfg)
-    print(f"WARNING: a tool timeout could cut this complete call off. It runs the whole regression suite, which "
-          f"can take up to {span} (up to {_secs(stretch)} times that on a busy machine, load_stretch_max), and "
-          f"after a failure it may run the suite a second time, so up to about twice that. Run it in the "
-          f"background instead (run_in_background), then wait for it to finish.", file=sys.stderr, flush=True)
+    again = (", and after a failure it may run the suite a second time, so up to about twice that" if rerun else "")
+    print(f"WARNING: a tool timeout could cut this {what} call off. It runs the whole regression suite, which "
+          f"can take up to {span} (up to {_secs(stretch)} times that on a heavily loaded machine, load_stretch_max){again}. "
+          f"Run it in the background instead (run_in_background), then wait for it to finish.",
+          file=sys.stderr, flush=True)
 
 
 def cmd_complete(args):
@@ -12658,7 +14690,11 @@ def cmd_human_approve(args):
         if changed:  # a checkpoint or test plan edited after approval must be confirmed (approve-changes) first
             die("\n".join(changed), 2)
     allow = st.get("choice_allow") or {}
-    if st["phase"] == "blocked" and allow.get("unblock") and not getattr(args, "director_token", None):
+    if st["phase"] == "blocked" and allow.get("unblock") and not getattr(args, "director_token", None) \
+            and allow.get("by", "human") == "human" and approval_mode(ctx) != "director":
+        # a human's recorded pick at a block is the approval. A director-signed pick never is: resuming a block
+        # (and the run-wide budget reset that comes with it) takes its own director token, so one signed letter
+        # can never do more than record the letter (CP4: the run-wide review budget is never reset by a pick).
         msg = {"by": "human", "prompt": f"picked option {allow['letter']}: {allow.get('reply', '')}"}
     else:
         msg = _require_human(ctx, st, "human-approve", getattr(args, "director_token", None))
@@ -12796,15 +14832,32 @@ def cmd_learn(args):
     ok("Learning recorded in .ratchet/learnings.md")
 
 
+def _enter_pause(st, reason):
+    """Park the run: `paused_from` keeps the phase to come back to, and a blocked run's own reason is kept in
+    `paused_block_reason` (the pause reason takes `blocked_reason` meanwhile) so the block reads the same after."""
+    if st["phase"] == "blocked":
+        st["paused_block_reason"] = st.get("blocked_reason")
+    st["paused_from"] = st["phase"]
+    st["phase"] = "paused"
+    st["blocked_reason"] = reason
+
+
+def _lift_pause(st) -> dict:
+    """Put a paused run back in the phase it paused from, in memory; returns the pause reason for _enter_pause,
+    so a command that only works through the pause (director-sign --apply) can park the run again as it was."""
+    reason = st.get("blocked_reason")
+    st["phase"] = st.pop("paused_from", None) or "building"
+    st["blocked_reason"] = st.pop("paused_block_reason", None) if st["phase"] == "blocked" else None
+    return {"reason": reason}
+
+
 def cmd_pause(args):
     ctx = Ctx(find_root())
     st = ctx.state()
     if st["phase"] in ("paused", "done", "cancelled"):
         ok(f"Nothing to pause (phase {st['phase']}).")
         return
-    st["paused_from"] = st["phase"]
-    st["phase"] = "paused"
-    st["blocked_reason"] = args.reason or "paused"
+    _enter_pause(st, args.reason or "paused")
     ctx.log(st, "paused", reason=args.reason)
     ctx.save_state(st)
     ok("Paused. The Stop hook now lets the agent stop. Resume with ratchet.py resume.")
@@ -12908,8 +14961,7 @@ def cmd_resume(args):
         st["owner_session"] = msg.get("session") or st.get("owner_session")
         _clear_pending(st)
     if st["phase"] == "paused":
-        st["phase"] = st.pop("paused_from", "building")
-        st["blocked_reason"] = None
+        _lift_pause(st)
     register_active(ctx.root, st["slug"])
     ctx.log(st, "resumed")  # also restarts the stop hook's count of stops without progress
     ctx.save_state(st)
@@ -13160,9 +15212,10 @@ def _approval_question(ctx, st, action) -> str:
 
 
 def _ask_choice(ctx, st, args):
-    """A lettered-options question. An option may approve a change to locked files: then picking it is the approval."""
-    if approval_mode(ctx) == "director":
-        die("This lane is director-enrolled: a chat reply can't approve anything here. Put the options to the director.")
+    """A lettered-options question. An option may approve a change to locked files: then picking it is the approval.
+    In a director-enrolled lane the question is recorded the same way, but it waits for the director (who signs a
+    letter with `director-sign choice <L>`), not for a chat reply: it is not shown to the user as a question."""
+    director = approval_mode(ctx) == "director"
     opts = [o.strip().upper() for o in (args.options or "").split(",") if o.strip()]
     if len(opts) < 2 or len(set(opts)) != len(opts) or not all(re.fullmatch(r"[A-Z]", o) for o in opts):
         die("ask choice needs --options with two or more single letters, e.g. --options A,B,C")
@@ -13201,6 +15254,20 @@ def _ask_choice(ctx, st, args):
     ctx.save_state(st)
     if overtook:
         print(_not_asked_text("the same `ratchet.py ask choice ...` command", overtook))
+        return
+    if director:
+        lines = [f"FOR THE DIRECTOR (this lane is director-enrolled, so a chat reply picks nothing): options "
+                 f"{', '.join(opts)} are recorded as waiting. Do not put them to the user as a chat question; say in "
+                 "one line what each option is, with your recommendation, and that the director picks one with "
+                 "`director-sign choice <letter> --apply` (or signs it with `director-sign choice <letter>` for a "
+                 "token you apply)."]
+        for letter, paths in locked.items():
+            lines.append(f"  Option {letter} approves changing {', '.join(paths)} (locked since the plan was approved).")
+        for letter, kind in guards.items():
+            lines.append(f"  Option {letter} adds an automatic check for '{kind}' as its own step right after the "
+                         "current one.")
+        lines.append("Apply the director's pick with `ratchet.py choice <letter> --director-token <t>`.")
+        print("\n".join(lines))
         return
     lines = [f"ASK THE USER: give them options {', '.join(opts)} in your own words, with your recommendation, and ask "
              f"them to reply with just the letter."]
@@ -13512,10 +15579,14 @@ def _ask_paid_provider(ctx, st, args):
 
 
 def cmd_choice(args):
-    """Record which lettered option the user picked, from their first reply after `ask choice`."""
+    """Record which lettered option the user picked, from their first reply after `ask choice`. In a
+    director-enrolled lane a chat reply picks nothing (the same rule as every other approval there): the letter
+    comes from `choice <L> --director-token <t>`, where the token was signed for exactly that letter
+    (`director-sign choice <L>`, after the lane's own `ask choice`); it is recorded exactly as a user's pick,
+    including what the option unlocks."""
     ctx = Ctx(find_root())
     st = ctx.state()
-    _require_pending(st, "choice")
+    _require_pending(st, "choice", ctx=ctx)
     p = st["pending"]
     if p.get("overtook"):
         _clear_pending(st)
@@ -13524,32 +15595,50 @@ def cmd_choice(args):
         die("These options were printed while another question was still waiting for the user's first reply, so their "
             "reply could be meant for either. Nothing was recorded. Run `ratchet.py ask choice ...` again on its own "
             "and wait for their pick.")
-    msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the options were put to can pick one
-    if not msgs:
-        die("No reply from the user yet. End your turn and wait for them to pick an option.")
-    entry = msgs[0]  # the first reply answers the question
-    letter = choice_letter(entry.get("prompt", ""), p.get("options") or [])
-    if ctx.config().get("verify_transcripts", True) and not human_override(
-            "record the option the user picked", ctx, "choice (recorded without the transcript check)"):
-        good, why = _transcript_ok(entry, p.get("asked_at"))
-        if not good:
-            die(f"Couldn't confirm that reply came from the user ({why}). Ask them to reply again in this chat.")
-    if not letter:
-        _clear_pending(st)
-        ctx.log(st, "choice_unclear", reply=entry.get("prompt", "")[:200])
-        ctx.save_state(st)
-        die(f"The user's reply isn't a clear pick of one option: \"{entry.get('prompt', '')[:120]}\". Nothing was "
-            "recorded. Answer what they said; if you still need a decision, ask again (`ratchet.py ask choice ...`).")
+    opts = p.get("options") or []
+    token = getattr(args, "director_token", None)
+    given = (getattr(args, "letter", None) or "").strip().upper()
+    if token or approval_mode(ctx) == "director":
+        if token and given not in opts:
+            die(f"choice needs the signed letter with a director token (one of {', '.join(opts)}): "
+                "`ratchet.py choice <letter> --director-token <t>`. Nothing was recorded.")
+        # _require_approval's own director check and token verification (the letter is bound into the token, so a
+        # token for another letter, lane, question or pause is refused): dies here when this lane is
+        # director-enrolled and no (or a bad) director token was given; a chat letter is never enough in that lane.
+        by = _require_approval(ctx, st, "choice", token, bind=(given,))["by"]
+        _policy_apply(args, ctx, st, "choice", given)
+        letter, reply = given, f"director-signed choice {given}"
+    else:
+        msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the options were put to can pick one
+        if not msgs:
+            die("No reply from the user yet. End your turn and wait for them to pick an option.")
+        entry = msgs[0]  # the first reply answers the question
+        letter = choice_letter(entry.get("prompt", ""), opts)
+        if ctx.config().get("verify_transcripts", True) and not human_override(
+                "record the option the user picked", ctx, "choice (recorded without the transcript check)"):
+            good, why = _transcript_ok(entry, p.get("asked_at"))
+            if not good:
+                die(f"Couldn't confirm that reply came from the user ({why}). Ask them to reply again in this chat.")
+        if not letter:
+            _clear_pending(st)
+            ctx.log(st, "choice_unclear", reply=entry.get("prompt", "")[:200])
+            ctx.save_state(st)
+            die(f"The user's reply isn't a clear pick of one option: \"{entry.get('prompt', '')[:120]}\". Nothing was "
+                "recorded. Answer what they said; if you still need a decision, ask again (`ratchet.py ask choice ...`).")
+        if given and given != letter:
+            die(f"The user's reply picked option {letter}, not {given}. Nothing was recorded; run `ratchet.py choice` "
+                "with no letter (or with theirs) to record their pick.")
+        by, reply = "human", entry.get("prompt", "")[:200]
     files = (p.get("locked") or {}).get(letter) or []
     guard = (p.get("guardrail") or {}).get(letter)
     unblock = st["phase"] == "blocked"
     if files or unblock or guard:
         st["choice_allow"] = {"letter": letter, "files": files, "cp": st.get("current"), "at": now(),
-                              "reply": entry.get("prompt", "")[:200], "unblock": unblock, "guardrail": guard}
+                              "reply": reply, "unblock": unblock, "guardrail": guard, "by": by}
     _clear_pending(st)
-    ctx.log(st, "choice_made", letter=letter, approves=files)
+    ctx.log(st, "choice_made", letter=letter, approves=files, by=by, **_policy_field(args))
     ctx.save_state(st)
-    msg = f"The user picked option {letter}."
+    msg = f"The {'director' if by == 'director' else 'user'} picked option {letter}."
     if files:
         msg += (f" That approves changing {', '.join(files)}: make that change (through the sub-agent that owns it), "
                 "then run `ratchet.py approve-changes`. No further question is needed.")
@@ -13558,7 +15647,9 @@ def cmd_choice(args):
                 "--why \"...\" --check-command \"<check> {target}\" --bad-example <fixture path> "
                 "--test-command \"...\" --test-file <path>`.")
     if unblock:
-        msg += " The run is blocked: run `ratchet.py human-approve` to resume it, then act on their choice."
+        msg += (" The run is blocked: run `ratchet.py human-approve`"
+                + (" with a director token (`director-sign human-approve`)" if by == "director" else "")
+                + " to resume it, then act on the choice.")
     ok(msg)
 
 
@@ -13566,14 +15657,27 @@ def _choice_covers(allow: dict, probs: list[str]) -> bool:
     files = allow.get("files") or []
     if not files:
         return False
-    return bool(probs) and all(any(pr == f"reference file {f}" or pr.startswith(f"test file {f} ") for f in files)
-                               for pr in probs)
+    return bool(probs) and all(any(pr == f"reference file {f}" or pr.startswith(f"test file {f} ")
+                                   or pr.startswith(f"test file {f}:") for f in files) for pr in probs)
 
 
 def _require_pending(st, action, mode=None, ctx=None):
+    """Die unless the question for `action` is the one waiting. With `ctx`, in a director-enrolled lane the refusal
+    names the director's one-step command instead of a chat question: nobody there answers one."""
     p = st.get("pending") or {}
     if p.get("action") != action or (mode and p.get("mode") != mode):
-        die(f"First run {_ask_now(ctx, st, action) if ctx else _ask_cmd(action, mode)}, show the user the question it prints, "
+        if ctx is not None and action in DIRECTOR_APPLY_ACTIONS and approval_mode(ctx) == "director":
+            if action == "choice":
+                die("No lettered question is waiting, and in this director-enrolled lane a chat reply picks nothing. "
+                    "Run `ratchet.py ask choice --options ...` to register the options, then the director picks one "
+                    f"with `{_director_apply_cmd(ctx, 'choice')}` (or signs it with `director-sign choice <letter>` "
+                    "and you apply the token with `ratchet.py choice <letter> --director-token <t>`). Nothing was changed.")
+            die("This lane is director-enrolled, so there is no question to put in chat for this: the director "
+                f"approves it in one step with `{_director_apply_cmd(ctx, action, mode)}` (or signs it after this "
+                f"lane's `ask` with `director-sign {action}`, and you apply the token with `ratchet.py {action}"
+                f"{' ' + mode if mode else ''} --director-token <t>`). Nothing was changed; end your turn saying "
+                "what you are waiting for.")
+        die(f"First run {_ask_now(ctx, st, action) if ctx and not mode else _ask_cmd(action, mode)}, show the user the question it prints, "
             "and wait for their reply. Replies from before the question don't count.")
 
 
@@ -13639,7 +15743,8 @@ def cmd_approve_changes(args):
     allow = st.get("choice_allow") or {}
     if allow and allow.get("cp") == st.get("current") and not getattr(args, "director_token", None) \
             and _choice_covers(allow, probs):
-        msg = {"by": "human", "prompt": f"picked option {allow['letter']}: {allow.get('reply', '')}"}
+        # the recorded pick is the approval (a director-signed pick counts as the director's)
+        msg = {"by": allow.get("by", "human"), "prompt": f"picked option {allow['letter']}: {allow.get('reply', '')}"}
         allow["files"] = []
         if not allow.get("unblock") and not allow.get("guardrail"):
             st.pop("choice_allow", None)
@@ -13647,23 +15752,29 @@ def cmd_approve_changes(args):
         if allow.get("files") and allow.get("cp") == st.get("current") \
                 and (st.get("pending") or {}).get("action") != "approve-changes":
             extra = [pr for pr in probs if not _choice_covers(allow, [pr])]
+            if approval_mode(ctx) == "director":
+                die(f"The director's pick of option {allow['letter']} approved changing {', '.join(allow['files'])}, "
+                    f"but these changed too: {_problems_for_director(extra)}. Undo them, or have the director approve them all "
+                    f"with `{_director_apply_cmd(ctx, 'approve-changes')}`. Nothing was changed.")
             die(f"The user's pick of option {allow['letter']} approved changing {', '.join(allow['files'])}, but these "
                 f"changed too: {'; '.join(extra)}. Undo them, or show the user exactly what changed and ask "
                 "(`ratchet.py ask approve-changes`).")
-        _require_pending(st, "approve-changes")
+        _require_pending(st, "approve-changes", ctx=ctx)
         msg = _require_human(ctx, st, "approve-changes", getattr(args, "director_token", None))
+        if msg["by"] == "director":
+            _policy_apply(args, ctx, st, "approve-changes", "")
     plan = ctx.plan()
     new_ids = [c["id"] for c in plan["checkpoints"] if c["id"] not in st["checkpoints"]]
     if new_ids:
         _validate_new_checkpoints(ctx, plan, new_ids)
     for cid in new_ids:
         st["checkpoints"][cid] = new_cp_state(cp_by_id(plan, cid))
-    st["approved"] = _approval_snapshot_keeping_dm(ctx, st)
     cur = st.get("current")
     if cur and (st["checkpoints"].get(cur) or {}).get("red_tests") is not None:
         st["checkpoints"][cur]["red_tests"] = _snapshot_tests(ctx, cp_by_id(ctx.plan(), cur))
+    st["approved"] = _approval_snapshot_keeping_dm(ctx, st)  # after the red baseline moved, so the snapshot records it
     _clear_pending(st)
-    ctx.log(st, "changes_approved", by=msg["by"], changed="; ".join(probs)[:400])
+    ctx.log(st, "changes_approved", by=msg["by"], changed="; ".join(probs)[:400], **_policy_field(args))
     ctx.save_state(st)
     build_viewer(ctx)
     ok("Accepted as the new baseline: " + "; ".join(probs))
@@ -13834,7 +15945,7 @@ def cmd_accept_finding(args):
     nothing left to pause on."""
     ctx = Ctx(find_root())
     st = ctx.state()
-    _require_pending(st, "accept-finding", args.cp)
+    _require_pending(st, "accept-finding", args.cp, ctx=ctx)
     p = st["pending"]
     cp = p["mode"]
     ids = p.get("ids") or []
@@ -13863,6 +15974,7 @@ def cmd_accept_finding(args):
         # no (or a bad) director token was given; a chat "accept: ..." reply is never enough in that lane.
         appr = _require_approval(ctx, st, "accept-finding", token)
         by = appr["by"]
+        _policy_apply(args, ctx, st, "accept-finding", cp, ids)
     else:
         msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the question was asked in can answer it
         if not msgs:
@@ -13922,7 +16034,7 @@ def cmd_accept_finding(args):
         die(f"{', '.join(missing)} is not an open finding of {cp}'s current round. Nothing was accepted.")
     at = now()
     accepted_entries = [dict(open_by_key[i], accepted=True, reason=reason, accepted_at=at, accepted_by=by,
-                            round=rnd["round"]) for i in ids]
+                            round=rnd["round"], **_policy_field(args)) for i in ids]
     remaining_open = [f for f in open_findings if _finding_key(f) not in ids]
     dest = _adv_round_dir(ctx, cp, rnd["round"])
 
@@ -13969,7 +16081,7 @@ def cmd_accept_finding(args):
     if round_rec is not None:
         round_rec.setdefault("accepted", []).extend(
             [{"id": i, "reason": reason, "at": at, "by": by} for i in ids])
-    ctx.log(st, "finding_accepted", cp=cp, ids=ids, reason=reason[:200], by=by)
+    ctx.log(st, "finding_accepted", cp=cp, ids=ids, reason=reason[:200], by=by, **_policy_field(args))
     unblocked_to = None
     if not remaining_open:
         g["status"] = "passed"
@@ -14055,10 +16167,14 @@ def cmd_raise_limit(args):
     and agents, exactly like any other human-review learning. Refuses outright, before recording anything,
     unless `_adv_block_kind(st, cp)` is "own" or "run_wide": the one-time raise only ever applies while the step
     is genuinely blocked on an adversarial round limit, the same precondition `_ask_raise_limit` enforces before
-    asking."""
+    asking. In a director-enrolled lane a chat `raise:` reply never counts (same rule as every other approval
+    there): a director token signed for this step and this reason is required (`director-sign raise-limit CPn
+    --reason "..."`, after the lane's own `ask raise-limit CPn`), with `--reason` repeating the signed reason since
+    there is no chat reply to read one from; every other check (one raise per step, the block kind, the attempt
+    count kept, the run-wide budget never reset) is the same as for a chat raise."""
     ctx = Ctx(find_root())
     st = ctx.state()
-    _require_pending(st, "raise-limit", args.cp)
+    _require_pending(st, "raise-limit", args.cp, ctx=ctx)
     p = st["pending"]
     cp = p["mode"]
     cps = (st.get("checkpoints") or {}).get(cp)
@@ -14084,24 +16200,42 @@ def cmd_raise_limit(args):
         ctx.save_state(st)
         die(f"{cp} is not blocked on an adversarial review-round limit right now; raise-limit only applies then. "
             "Nothing was changed.")
-    msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the question was asked in can answer it
-    if not msgs:
-        die("No reply has been recorded in the owning chat since this question was asked. End your turn and wait "
-            "for the user's reply, exactly `raise: <reason>`; a reply typed in another chat does not count.")
-    entry = msgs[0]  # the first reply answers the question; later messages never do
-    reply = entry.get("prompt", "")
-    reason = _raise_reply_reason(reply)
-    if reason is None:
-        _spend_question(ctx, st, reply)
-        die(f"The user's first reply after the question was not the exact form `raise: <reason>`: \"{reply[:120]}\". "
-            "Nothing was raised, and the question is closed, so a later reply in that form does not count. Run "
-            f"`ratchet.py ask raise-limit {cp}` again if they still want to raise it.")
-    if ctx.config().get("verify_transcripts", True):
-        good, why = _transcript_ok(entry, p.get("asked_at"))
-        if not good:
+    token = getattr(args, "director_token", None)
+    if token or approval_mode(ctx) == "director":
+        reason = (getattr(args, "reason", None) or "").strip()
+        if not token:  # enrolled lane, no token: the missing token is the cause, named first (a chat reply is nothing)
+            _require_approval(ctx, st, "raise-limit", None, bind=(cp,))
+        # With a token, --reason is checked BEFORE the token is verified or anything is cleared (as accept-finding
+        # does): the question stays pending and nothing is saved, so the SAME token with --reason added works.
+        if not reason:
+            die(f"raise-limit needs --reason \"...\" when a director token approves it (the reason the director "
+                f"signed; there is no chat reply to read one from). Nothing was raised, and the question is still "
+                f"waiting: run the same command again with --reason \"...\" added.")
+        # _require_approval's own director check and token verification (the step and the reason are bound into
+        # the token, so a token for another step, reason, lane or pause is refused): dies here when this lane is
+        # director-enrolled and no (or a bad) director token was given; a chat `raise:` reply is never enough there.
+        by = _require_approval(ctx, st, "raise-limit", token, bind=(cp, reason))["by"]
+        _policy_apply(args, ctx, st, "raise-limit", cp)
+    else:
+        msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the question was asked in can answer it
+        if not msgs:
+            die("No reply has been recorded in the owning chat since this question was asked. End your turn and wait "
+                "for the user's reply, exactly `raise: <reason>`; a reply typed in another chat does not count.")
+        entry = msgs[0]  # the first reply answers the question; later messages never do
+        reply = entry.get("prompt", "")
+        reason = _raise_reply_reason(reply)
+        if reason is None:
             _spend_question(ctx, st, reply)
-            die(f"Couldn't confirm that reply came from the user ({why}). Nothing was raised. Run `ratchet.py ask "
-                f"raise-limit {cp}` again and ask them to reply in this chat.")
+            die(f"The user's first reply after the question was not the exact form `raise: <reason>`: \"{reply[:120]}\". "
+                "Nothing was raised, and the question is closed, so a later reply in that form does not count. Run "
+                f"`ratchet.py ask raise-limit {cp}` again if they still want to raise it.")
+        if ctx.config().get("verify_transcripts", True):
+            good, why = _transcript_ok(entry, p.get("asked_at"))
+            if not good:
+                _spend_question(ctx, st, reply)
+                die(f"Couldn't confirm that reply came from the user ({why}). Nothing was raised. Run `ratchet.py ask "
+                    f"raise-limit {cp}` again and ask them to reply in this chat.")
+        by = "human"
     cfg = ctx.config()
     prev_attempts = g.get("attempts", 0)  # preserved across _unblock below so the raise grants exactly one more
     # round, not a fresh budget: _unblock() resets failing-gate attempt counters to 0 for every other unblock path,
@@ -14111,13 +16245,13 @@ def cmd_raise_limit(args):
     # grant happen in, instead of compounding on top of each other (see _adv_base_cap/_adv_round_cap).
     g["cap_raised_to"] = cap
     _clear_pending(st)
-    ctx.log(st, "round_limit_raised", cp=cp, cap=cap, reason=reason[:300])
+    ctx.log(st, "round_limit_raised", cp=cp, cap=cap, reason=reason[:300], by=by, **_policy_field(args))
     _append_learning(ctx, f"{cp}'s review-round limit was raised to {cap} rounds: {reason}", source="raise-limit")
     unblocked_to = None
     if _adv_block_kind(st, cp) == "own":  # raise-limit only ever lifts CP's own step cap, so it only ever
         # unblocks CP's own round-limit block, never the run-wide cap (raising one step's cap does not touch
         # the run-wide budget; that needs a plain human-approve, same as any other failing gate).
-        unblocked_to = _unblock(ctx, st, "human", f"raised {cp}'s round limit to {cap}")
+        unblocked_to = _unblock(ctx, st, by, f"raised {cp}'s round limit to {cap}")
         g["attempts"] = prev_attempts
     ctx.save_state(st)
     build_viewer(ctx)
@@ -14758,7 +16892,85 @@ def status_json(ctx: Ctx) -> dict:
             "checkpoints": cps, "updated_at": st.get("updated_at")}
 
 
+def _lanes_request(args):
+    """`lanes --request NAME [--json]`: every lane of a request made by lanes-start, in the request's order, with its
+    phase, steps done, who it waits on and since when, whether its branch is merged into main, and, for a finished lane
+    not merged yet, `integrate` as the director's next action. Reads only (the same run reads plain `lanes` makes),
+    needs no director, and works from the main checkout or from inside any lane's worktree: the request record is read
+    from the main checkout. merged is git's answer alone: the lane branch's tip is an ancestor of main's HEAD AND the
+    branch has a commit of its own (its tip is not the commit it was created at, read from the branch's oldest reflog
+    entry; a branch with no reflog counts as having one). integrations.jsonl never changes it."""
+    def git(d, *a):
+        return subprocess.run(["git", "--no-optional-locks", *a], cwd=d, capture_output=True, text=True, timeout=60)
+
+    here = find_root()
+    wl = git(here, "worktree", "list", "--porcelain")
+    first = next((ln[9:] for ln in wl.stdout.splitlines() if ln.startswith("worktree ")), None)
+    main = Path(first) if wl.returncode == 0 and first else here
+    name = args.request
+    rdir = main / RATCHET_DIR / "requests"
+    rec, why = None, "missing"
+    if re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name or ""):
+        rec, why = _read_record(rdir / f"{name}.json", missing=None)
+        if rec is None and why is None:
+            why = "missing"
+    if why:
+        if why != "missing":
+            die(f"The request record for '{name}' in {main} can't be read ({why}). Restore "
+                f".ratchet/requests/{name}.json there.")
+        known = sorted(p.stem for p in rdir.glob("*.json")) if rdir.is_dir() else []
+        die(f"There is no request named '{name}' recorded in {main}; "
+            + (f"recorded requests: {', '.join(known)}." if known else "no requests are recorded there."))
+    lanes_in = rec.get("lanes")
+    if not isinstance(lanes_in, list):
+        die(f"The request record for '{name}' in {main} has no lane list, so there is nothing to show.")
+    ok_main = git(main, "rev-parse", "--verify", "-q", "HEAD").returncode == 0
+    out = []
+    for x in lanes_in:
+        if not isinstance(x, dict):
+            continue
+        lane, branch, wt = str(x.get("name")), str(x.get("branch") or x.get("name")), str(x.get("worktree") or "")
+        missing = not (wt and os.path.isdir(wt))
+        phase, done, total, waiting, since = "not_started", 0, 0, None, None
+        if not missing:
+            lctx = Ctx(Path(wt))
+            slug = lctx.active_slug()
+            if slug and lctx.state_path(slug).is_file():
+                try:
+                    sj = status_json(lctx)
+                    phase, done, total = sj["phase"], sj["done"], sj["total"]
+                    waiting, since = sj["waiting_on"], sj["awaiting_since"]
+                except SystemExit:
+                    phase = "unreadable"
+        merged = False
+        tip = git(main, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").stdout.strip()
+        if tip and ok_main and git(main, "merge-base", "--is-ancestor", tip, "HEAD").returncode == 0:
+            made = git(main, "reflog", "show", "--format=%H", f"refs/heads/{branch}").stdout.split()
+            merged = not made or made[-1] != tip
+        out.append({"lane": lane, "branch": branch, "worktree": wt, "worktree_missing": missing, "phase": phase,
+                    "done": done, "total": total, "waiting_on": waiting, "awaiting_since": since, "merged": merged,
+                    "next_director_action": "integrate" if phase == "done" and not merged and not missing else None})
+    if args.json:
+        print(json.dumps({"request": name, "lanes": out}, indent=2))
+        return
+    print(f"Request '{name}': {len(out)} lane(s)")
+    for l in out:
+        print(f"{l['lane']}: {l['phase']}, {l['done']}/{l['total']} steps, "
+              + ("merged into main" if l["merged"] else "not merged into main"))
+        if l["waiting_on"]:
+            print(f"  waiting on the {l['waiting_on']} since {l['awaiting_since']}")
+        if l["phase"] == "not_started" and not l["worktree_missing"]:
+            print("  not started: the lane's agent has not run init yet")
+        if l["worktree_missing"]:
+            print(f"  worktree gone ({l['worktree']})" + (": the work is in main, nothing to do" if l["merged"] else
+                  f": recreate it with git worktree add {l['worktree']} {l['branch']}, or drop the lane"))
+        if l["next_director_action"]:
+            print("  next: integrate this lane")
+
+
 def cmd_lanes(args):
+    if args.request:
+        return _lanes_request(args)
     base = Path(args.scan).resolve()
     state_file = base / ".ratchet-lanes.json"
     if args.stop:
@@ -15701,6 +17913,12 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                    "question.")
                 if p["action"] == "choice":
                     letter = choice_letter(n["prompt"], p.get("options") or [])
+                    if _question_waiter(ctx) == "director":  # read-only: never exits or writes from a hook
+                        return False, (f"[ratchet] Your lettered question ({', '.join(p.get('options') or [])}) is "
+                                       "waiting on the director: this lane is director-enrolled, so a letter typed "
+                                       "in chat picks nothing. Do not run `choice` on it. The director signs a "
+                                       f"letter with `director-sign choice <letter>`; apply it with `{eng} choice "
+                                       "<letter> --director-token <t>`.")
                     return False, (f"[ratchet] This reply answers your lettered question ({', '.join(p.get('options') or [])}). "
                                    + (f"It reads as option {letter}. " if letter else "It is NOT a clear pick of one option. ")
                                    + f"Run `{eng} choice` to record it, then continue. It does NOT approve the plan or a "
@@ -15957,7 +18175,7 @@ def _expand(cmd: str) -> str:
             continue
         cmd = re.sub(r"\$\{" + name + r"\}|\$" + name + r"(?![A-Za-z0-9_])", lambda _m: val, cmd)
     return cmd
-DIRECTOR_CALL_RE = re.compile(r"""ratchet\.py["']?\s+(?:--root\s+\S+\s+)?director-(sign|key|enroll)\b""")
+DIRECTOR_CALL_RE = re.compile(r"""ratchet\.py["']?\s+(?:--root\s+\S+\s+)?(?:director-(?:sign|key|enroll|policy)|integrate|lanes-start)\b""")
 # Variables a builder session may read but never set. Each is matched however it is set: VAR=, export/declare/
 # typeset/local/readonly/setenv/fish `set -x`, a dict or kwargs entry (python3 -c os.environ / env=...), putenv-style
 # calls, or indirectly (the name stored in another variable, or built from pieces, then used by eval, env -S,
@@ -17470,6 +19688,21 @@ MERGE_AGAIN = ("RATCHET GUARD: finish this step before merging main again. An ea
                "merge yet. Run the step through `complete`, then merge main, then run `ratchet.py merged`.")
 
 
+def _between_steps(st, root: Path, merging: bool = False) -> bool:
+    """Whether a run is between steps: waiting for a review, or building at step 'tests' with a clean tree (while a
+    merge is in progress, only untracked files count as not clean). Used by the merge rule and by integrate."""
+    phase, cur = (st or {}).get("phase"), (st or {}).get("current")
+    if phase in ("awaiting_checkpoint_review", "awaiting_final_review"):
+        return True
+    if phase == "building" and cur and st["checkpoints"][cur].get("step") == "tests":
+        r = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain", "--", ".", f":(exclude){RATCHET_DIR}",
+                            *JUNK_PATHSPECS],
+                           cwd=root, capture_output=True, text=True, timeout=20)
+        return r.returncode == 0 and not any(ln for ln in r.stdout.splitlines()
+                                             if not merging or ln.startswith("??"))
+    return False
+
+
 def _merge_rule(cmd: str, cwd: str, root: Path) -> tuple[str, str | None]:
     """The merge rule, as (command for the other guard checks, refusal or None). In the middle of a step `git merge`
     and `git pull` are refused (finishing or aborting a merge already begun is not). Between steps, while a merge is in
@@ -17491,14 +19724,7 @@ def _merge_rule(cmd: str, cwd: str, root: Path) -> tuple[str, str | None]:
         phase, cur = (st or {}).get("phase"), (st or {}).get("current")
         g = lambda *a: subprocess.run(["git", *a], cwd=root, capture_output=True, text=True, timeout=20)
         merging = g("rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0
-        if phase in ("awaiting_checkpoint_review", "awaiting_final_review"):
-            between = True
-        elif phase == "building" and cur and st["checkpoints"][cur].get("step") == "tests":
-            r = g("status", "--porcelain", "--", ".", f":(exclude){RATCHET_DIR}", *JUNK_PATHSPECS)
-            between = r.returncode == 0 and not any(ln for ln in r.stdout.splitlines()
-                                                    if not merging or ln.startswith("??"))
-        else:
-            between = False
+        between = _between_steps(st, root, merging)
         if phase == "building" and not between and any(merge):
             return cmd, MERGE_MID_STEP
         last = next((e for e in reversed((st or {}).get("history") or [])
@@ -18236,6 +20462,10 @@ def _changes_state(args) -> bool:
         return bool(getattr(args, "offered", None))
     if args.cmd == "spec":
         return getattr(args, "spec_cmd", None) in ("import", "keep")
+    if args.cmd == "director-sign":
+        # --apply asks, signs and applies in one call: locked for the whole of it, so the token it signs cannot go
+        # stale between the ask and the apply, and two applies at once never both apply. Signing alone reads only.
+        return bool(getattr(args, "apply", False))
     if args.cmd == "providers":
         # --add is the only form that can consume the developer's one-time paid-provider OK (_consume_paid_ok)
         # and send a real test request; locking it the same way every other question-consuming command is
@@ -18507,6 +20737,16 @@ class _StateLock(_BreakerLock):
     def __exit__(self, *exc):
         self.release()
         return False
+
+
+class _IntegrateLock(_StateLock):
+    """The one-integrate-at-a-time lock: a lock file in the repository's git common dir (shared by the main checkout and
+    every lane worktree), built like the state lock so it is cleared at once when the integrate that made it was
+    killed (_StateLock's dead-owner check), and refused quickly as busy while a live one runs."""
+
+    def __init__(self, main: Path, common: Path, cmd: str):
+        super().__init__(main, wait=STATE_LOCK_BUSY_WAIT_SECONDS, cmd=cmd, refresh=True)
+        self.path = common / "ratchet-integrate.lock"
 
 
 def _may_use_override(args) -> bool:
@@ -18965,9 +21205,10 @@ def main(argv=None):
     a.add_argument("--reason", help="director mode only: the director's reason (there is no chat reply to read one from)")
     a.set_defaults(fn=cmd_accept_line)
     a = sp.add_parser("raise-limit", help="raise one checkpoint's review-round limit by one round (after `ask "
-                                          "raise-limit` and the owning chat's own 'raise: <reason>' reply); "
-                                          "offered at most once per step, ever")
-    a.add_argument("cp")
+                                          "raise-limit` and the owning chat's own 'raise: <reason>' reply, or a "
+                                          "director token with --reason); offered at most once per step, ever")
+    a.add_argument("cp"); a.add_argument("--director-token")
+    a.add_argument("--reason", help="director mode only: the reason the director signed (there is no chat reply to read one from)")
     a.set_defaults(fn=cmd_raise_limit)
     a = sp.add_parser("hooks-waive", help="record the user's choice to build without hooks (after `ask hooks-waive`)")
     a.add_argument("--director-token")
@@ -18977,7 +21218,10 @@ def main(argv=None):
     a = sp.add_parser("set-review", help="change how often the user reviews (needs their confirmation)")
     a.add_argument("mode", choices=["end", "each", "none"]); a.add_argument("--director-token")
     a.set_defaults(fn=cmd_set_review)
-    a = sp.add_parser("choice", help="after `ask choice`: record which option the user picked")
+    a = sp.add_parser("choice", help="after `ask choice`: record which option the user picked (or, with a director "
+                                     "token, the letter the director signed)")
+    a.add_argument("letter", nargs="?", help="the letter; required with --director-token (it must match the signed one)")
+    a.add_argument("--director-token")
     a.set_defaults(fn=cmd_choice)
     a = sp.add_parser("ui-respec", help="after `ask ui-respec CPn` and the user's yes: allow one change to a frozen UI check")
     a.add_argument("cp"); a.add_argument("--director-token"); a.set_defaults(fn=cmd_ui_respec)
@@ -19061,7 +21305,7 @@ def main(argv=None):
     a.set_defaults(fn=cmd_triage)
     a = sp.add_parser("reviewer-status"); a.add_argument("--reset", metavar="ID")
     a.add_argument("--mark", metavar="ID"); a.add_argument("--reason"); a.set_defaults(fn=cmd_reviewer_status)
-    a = sp.add_parser("lanes"); a.add_argument("--scan", default="."); a.add_argument("--json", action="store_true")
+    a = sp.add_parser("lanes"); a.add_argument("--scan", default="."); a.add_argument("--request", metavar="NAME"); a.add_argument("--json", action="store_true")
     a.add_argument("--serve", action="store_true"); a.add_argument("--stop", action="store_true")
     a.add_argument("--open", action="store_true"); a.add_argument("--port", type=int)
     a.add_argument("--bind", default="127.0.0.1"); a.add_argument("--public-host")
@@ -19070,11 +21314,34 @@ def main(argv=None):
     a.set_defaults(fn=cmd_lanes)
     a = sp.add_parser("director-key"); a.add_argument("--rotate", action="store_true"); a.set_defaults(fn=cmd_director_key)
     sp.add_parser("director-enroll").set_defaults(fn=cmd_director_enroll)
+    a = sp.add_parser("lanes-start", help="director only: start several lanes (branch, worktree, enrollment, brief) from one request")
+    a.add_argument("--request", required=True, help="the developer's request, in words")
+    a.add_argument("--lane", action="append", metavar="NAME=FEATURE", help="a lane: its name and its part of the request (repeat)")
+    a.add_argument("--name", help="the request's name (default: a slug of the request text)")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(fn=cmd_lanes_start)
+    a = sp.add_parser("integrate", help="director only: merge a finished lane into main (suite first), or check it with --dry-run")
+    a.add_argument("lane", help="the lane's folder (a git worktree) or its branch name")
+    a.add_argument("--dry-run", action="store_true", help="say what integrate would do; change nothing")
+    a.set_defaults(fn=cmd_integrate)
+    a = sp.add_parser("director-policy", help="director only: show, set or clear the developer's rules for routine approvals")
+    g_ = a.add_mutually_exclusive_group()
+    g_.add_argument("--set", metavar="ACTION=RULE"); g_.add_argument("--clear", metavar="ACTION")
+    g_.add_argument("--remove", action="store_true", help="delete the policy file (logged): back to no policy at all")
+    a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_director_policy)
     a = sp.add_parser("director-sign"); a.add_argument("action", choices=["approve-plan", "human-approve", "feedback",
                                                                           "approve-changes", "cancel", "set-review",
                                                                           "hooks-waive", "ui-respec", "guardrail",
-                                                                          "accept-finding", "accept-line"])
+                                                                          "accept-finding", "accept-line",
+                                                                          "raise-limit", "choice"])
+    a.add_argument("target", nargs="?", help="raise-limit: the step (CPn); choice: the letter")
     a.add_argument("--kind", help="guardrail: the kind of finding it covers")
+    a.add_argument("--reason", help="raise-limit, accept-finding: the reason (required; without --apply the lane "
+                                    "repeats it to raise-limit --reason)")
+    a.add_argument("--ids", help="accept-finding with --apply: the finding ids to accept, comma-separated (e.g. F1,F2)")
+    a.add_argument("--apply", action="store_true",
+                   help="approve-changes, accept-finding, raise-limit, choice: run the question step, sign and apply "
+                        "in one call (under one hold of the lane's state lock)")
     a.set_defaults(fn=cmd_director_sign)
     sp.add_parser("fingerprint").set_defaults(fn=cmd_fingerprint)
     a = sp.add_parser("config"); a.add_argument("--set", nargs="*"); a.set_defaults(fn=cmd_config)
