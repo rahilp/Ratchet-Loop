@@ -14127,7 +14127,85 @@ def status_json(ctx: Ctx) -> dict:
             "checkpoints": cps, "updated_at": st.get("updated_at")}
 
 
+def _lanes_request(args):
+    """`lanes --request NAME [--json]`: every lane of a request made by lanes-start, in the request's order, with its
+    phase, steps done, who it waits on and since when, whether its branch is merged into main, and, for a finished lane
+    not merged yet, `integrate` as the director's next action. Reads only (the same run reads plain `lanes` makes),
+    needs no director, and works from the main checkout or from inside any lane's worktree: the request record is read
+    from the main checkout. merged is git's answer alone: the lane branch's tip is an ancestor of main's HEAD AND the
+    branch has a commit of its own (its tip is not the commit it was created at, read from the branch's oldest reflog
+    entry; a branch with no reflog counts as having one). integrations.jsonl never changes it."""
+    def git(d, *a):
+        return subprocess.run(["git", "--no-optional-locks", *a], cwd=d, capture_output=True, text=True, timeout=60)
+
+    here = find_root()
+    wl = git(here, "worktree", "list", "--porcelain")
+    first = next((ln[9:] for ln in wl.stdout.splitlines() if ln.startswith("worktree ")), None)
+    main = Path(first) if wl.returncode == 0 and first else here
+    name = args.request
+    rdir = main / RATCHET_DIR / "requests"
+    rec, why = None, "missing"
+    if re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name or ""):
+        rec, why = _read_record(rdir / f"{name}.json", missing=None)
+        if rec is None and why is None:
+            why = "missing"
+    if why:
+        if why != "missing":
+            die(f"The request record for '{name}' in {main} can't be read ({why}). Restore "
+                f".ratchet/requests/{name}.json there.")
+        known = sorted(p.stem for p in rdir.glob("*.json")) if rdir.is_dir() else []
+        die(f"There is no request named '{name}' recorded in {main}; "
+            + (f"recorded requests: {', '.join(known)}." if known else "no requests are recorded there."))
+    lanes_in = rec.get("lanes")
+    if not isinstance(lanes_in, list):
+        die(f"The request record for '{name}' in {main} has no lane list, so there is nothing to show.")
+    ok_main = git(main, "rev-parse", "--verify", "-q", "HEAD").returncode == 0
+    out = []
+    for x in lanes_in:
+        if not isinstance(x, dict):
+            continue
+        lane, branch, wt = str(x.get("name")), str(x.get("branch") or x.get("name")), str(x.get("worktree") or "")
+        missing = not (wt and os.path.isdir(wt))
+        phase, done, total, waiting, since = "not_started", 0, 0, None, None
+        if not missing:
+            lctx = Ctx(Path(wt))
+            slug = lctx.active_slug()
+            if slug and lctx.state_path(slug).is_file():
+                try:
+                    sj = status_json(lctx)
+                    phase, done, total = sj["phase"], sj["done"], sj["total"]
+                    waiting, since = sj["waiting_on"], sj["awaiting_since"]
+                except SystemExit:
+                    phase = "unreadable"
+        merged = False
+        tip = git(main, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").stdout.strip()
+        if tip and ok_main and git(main, "merge-base", "--is-ancestor", tip, "HEAD").returncode == 0:
+            made = git(main, "reflog", "show", "--format=%H", f"refs/heads/{branch}").stdout.split()
+            merged = not made or made[-1] != tip
+        out.append({"lane": lane, "branch": branch, "worktree": wt, "worktree_missing": missing, "phase": phase,
+                    "done": done, "total": total, "waiting_on": waiting, "awaiting_since": since, "merged": merged,
+                    "next_director_action": "integrate" if phase == "done" and not merged and not missing else None})
+    if args.json:
+        print(json.dumps({"request": name, "lanes": out}, indent=2))
+        return
+    print(f"Request '{name}': {len(out)} lane(s)")
+    for l in out:
+        print(f"{l['lane']}: {l['phase']}, {l['done']}/{l['total']} steps, "
+              + ("merged into main" if l["merged"] else "not merged into main"))
+        if l["waiting_on"]:
+            print(f"  waiting on the {l['waiting_on']} since {l['awaiting_since']}")
+        if l["phase"] == "not_started" and not l["worktree_missing"]:
+            print("  not started: the lane's agent has not run init yet")
+        if l["worktree_missing"]:
+            print(f"  worktree gone ({l['worktree']})" + (": the work is in main, nothing to do" if l["merged"] else
+                  f": recreate it with git worktree add {l['worktree']} {l['branch']}, or drop the lane"))
+        if l["next_director_action"]:
+            print("  next: integrate this lane")
+
+
 def cmd_lanes(args):
+    if args.request:
+        return _lanes_request(args)
     base = Path(args.scan).resolve()
     state_file = base / ".ratchet-lanes.json"
     if args.stop:
@@ -18415,7 +18493,7 @@ def main(argv=None):
     a.set_defaults(fn=cmd_triage)
     a = sp.add_parser("reviewer-status"); a.add_argument("--reset", metavar="ID")
     a.add_argument("--mark", metavar="ID"); a.add_argument("--reason"); a.set_defaults(fn=cmd_reviewer_status)
-    a = sp.add_parser("lanes"); a.add_argument("--scan", default="."); a.add_argument("--json", action="store_true")
+    a = sp.add_parser("lanes"); a.add_argument("--scan", default="."); a.add_argument("--request", metavar="NAME"); a.add_argument("--json", action="store_true")
     a.add_argument("--serve", action="store_true"); a.add_argument("--stop", action="store_true")
     a.add_argument("--open", action="store_true"); a.add_argument("--port", type=int)
     a.add_argument("--bind", default="127.0.0.1"); a.add_argument("--public-host")
