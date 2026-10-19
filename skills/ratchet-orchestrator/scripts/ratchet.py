@@ -37,6 +37,7 @@ import re
 import shlex
 import unicodedata
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -170,13 +171,24 @@ DEFAULT_CONFIG = {
     "doc_exclude_globs": ["SKILL.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", "agents/*.md"],
     "test_globs": ["test_*", "*_test.*", "*.test.*", "*.spec.*"],
     "doc_test_command": None,
+    # Related tests before the full suite (`complete`): related_test_command (with a {files} placeholder) runs
+    # the step's own planned test files, the test files it changed, and the test files (test_globs) that name a
+    # file it changed, ranked by the function names that changed, at most related_tests_max of them (a value that
+    # is not a whole number of 1 or more falls back to 8); unset, the step goes straight to the full suite.
+    # related_always lists test files that join that list outside the cap when the step adds a test file, changes
+    # a doc, or adds or changes a code line holding a quoted string (for Ratchet's own repo: tests/test_docs.py).
+    "related_test_command": None,
+    "related_tests_max": 8,
+    "related_always": [],
     "small_edit_lines": 20,
     "commit_per_checkpoint": True,
     "design_md": "DESIGN.md",
     "standards": [".ratchet/standards.md"],
     "app": {"start_command": None, "url": None, "healthcheck": None},
     "test_timeout_sec": 900,
-    "max_stop_blocks": 40,          # safety valve for the Stop hook (reset whenever a gate makes progress)
+    "load_stretch_max": 4,          # a busy machine stretches test_timeout_sec by load average / CPUs, up to this many times
+    "suite_watch_seconds": 30,      # while a step's tests run, look this often for an edit to the code under them; a positive number
+    "max_stop_blocks": 40,         # safety valve for the Stop hook (reset whenever a gate makes progress)
     "fingerprint_include": [],      # gitignored files that still matter to behaviour (e.g. ".env.test"); added to fingerprints
     "ui_single_reviewer_ok": False, # allow a UI review with only one of visual/behaviour (human-set, locked at approval)
     "min_review_timeout_sec": 120,  # other-provider reviewers can't be given a timeout short enough to knock them out
@@ -368,6 +380,34 @@ def _is_git(root: Path) -> bool:
 JUNK_PATHSPECS = [":(exclude,glob)**/__pycache__/**", ":(exclude,glob)**/*.pyc", ":(exclude,glob)**/.DS_Store"]
 
 
+class _LookFailed(Exception):
+    """A look at the code could not be taken: git could not read the tree (a file the running command created and
+    removed between git's walk and its open, or one it cannot read) or could not list the files. The code watch
+    skips such a look and notes it; outside the watch the same failure dies."""
+
+
+def _git_tree_id(root: Path, env: dict, strict: bool = True, extra: list | None = None) -> str:
+    """The tree id of the working tree (tracked + untracked, respecting .gitignore, minus .ratchet and junk, plus
+    `extra`: the config's fingerprint_include, gitignored files that tests still depend on, read by the caller),
+    built in the index `env` names (GIT_INDEX_FILE), which must already be seeded. With `strict` a git failure
+    dies; otherwise it raises _LookFailed with the same message."""
+    def fail(msg):
+        if strict:
+            die(msg)
+        raise _LookFailed(msg)
+    r = subprocess.run(["git", "add", "-A", "--", ".", f":(exclude){RATCHET_DIR}", *JUNK_PATHSPECS],
+                       cwd=root, env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(f"git add for fingerprint failed: {r.stderr.strip()}")
+    if extra:  # gitignored files that tests still depend on
+        subprocess.run(["git", "add", "-f", "--", *extra], cwd=root, env=env, capture_output=True, text=True)
+    t = subprocess.run(["git", "write-tree"], cwd=root, env=env,
+                       capture_output=True, text=True)
+    if t.returncode != 0:
+        fail(f"git write-tree failed: {t.stderr.strip()}")
+    return t.stdout.strip()
+
+
 def fingerprint(root: Path) -> dict:
     """Hash of the working tree (tracked + untracked, respecting .gitignore, minus .ratchet)."""
     if _is_git(root):
@@ -376,18 +416,8 @@ def fingerprint(root: Path) -> dict:
             # seed from HEAD if it exists so the add is fast
             subprocess.run(["git", "read-tree", "HEAD"], cwd=root, env=env,
                            capture_output=True)
-            r = subprocess.run(["git", "add", "-A", "--", ".", f":(exclude){RATCHET_DIR}", *JUNK_PATHSPECS],
-                               cwd=root, env=env, capture_output=True, text=True)
-            if r.returncode != 0:
-                die(f"git add for fingerprint failed: {r.stderr.strip()}")
             extra = (read_json(root / RATCHET_DIR / "config.json", {}) or {}).get("fingerprint_include") or []
-            if extra:  # gitignored files that tests still depend on
-                subprocess.run(["git", "add", "-f", "--", *extra], cwd=root, env=env, capture_output=True, text=True)
-            t = subprocess.run(["git", "write-tree"], cwd=root, env=env,
-                               capture_output=True, text=True)
-            if t.returncode != 0:
-                die(f"git write-tree failed: {t.stderr.strip()}")
-            return {"kind": "git-tree", "id": t.stdout.strip()}
+            return {"kind": "git-tree", "id": _git_tree_id(root, env, extra=extra)}
     # non-git fallback: manifest of file hashes
     manifest = {}
     for dp, dns, fns in os.walk(root):
@@ -558,9 +588,48 @@ def _code_size(ctx: "Ctx", from_id: str, to_id: str, code_files: list[str]) -> t
     return (None if unknown else total), unknown
 
 
+_PY_EXT = (".py",)
+_JS_EXT = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+
+
+def _import_forms(path: str) -> list[re.Pattern]:
+    """The import shapes under which a test names the code file `path` without spelling its path or file name:
+    for Python, its dotted module path and the `from <package> import <module>` statement (`src/app/billing.py`:
+    `src.app.billing`, `app.billing`, `src/app/billing`, `app/billing`, `from app import billing`; a top-level
+    `billing.py`: `import billing`, `from billing import`); for JS/TS, its extension-less repo path and a quoted
+    module specifier ending in `/<stem>` (`src/billing.ts`: `src/billing`, `'../billing'`, `'./billing.js'`).
+    Never a bare stem on its own, which would pull in the whole suite. Empty for any other file kind."""
+    stem, ext = os.path.splitext(path)
+    parts = stem.split("/")
+    forms: list[re.Pattern] = []
+    if ext in _PY_EXT and parts[-1] != "__init__":
+        for i in range(len(parts) - 1):
+            tail = parts[i:]
+            forms.append(re.compile(r"(?<![\w.])" + r"\.".join(map(re.escape, tail)) + r"(?!\w)"))
+            forms.append(re.compile(re.escape("/".join(tail)) + r"(?!\w)"))
+            forms.append(re.compile(r"\bfrom\s+" + r"\.".join(map(re.escape, tail[:-1])) + r"\s+import\s+[^\n]*\b"
+                                    + re.escape(tail[-1]) + r"\b"))
+        if len(parts) == 1:
+            forms.append(re.compile(r"^\s*(?:import\s+" + re.escape(stem) + r"\b|from\s+" + re.escape(stem)
+                                    + r"\s+import\b)", re.M))
+    elif ext in _JS_EXT:
+        forms.append(re.compile(re.escape(stem) + r"(?![\w$])"))  # src/billing, never src/billing2
+        forms.append(re.compile(r"/" + re.escape(parts[-1]) + r"(?:\.(?:js|jsx|ts|tsx|mjs|cjs))?['\"]"))
+    return forms
+
+
+def _names_file(text: str, path: str) -> bool:
+    """Whether `text` names the file `path`: its repo-relative path or file name as a plain substring, or one of
+    the import shapes `_import_forms` lists for its kind (so a test that imports a changed module counts)."""
+    if path in text or os.path.basename(path) in text:
+        return True
+    return any(p.search(text) for p in _import_forms(path))
+
+
 def _tests_naming(ctx: "Ctx", cfg: dict, fp: dict, docs: list[str]) -> list[str]:
     """Which test files (test_globs) name any of `docs` by its repo-relative path or file name (a plain
-    substring match, never guessed). Shared by both of classify_changes's ranges (base_tree and since_approval)
+    substring match, never guessed), or import it (`_names_file`: a Python module's dotted path, a JS/TS module's
+    extension-less path). Shared by both of classify_changes's ranges (base_tree and since_approval)
     so a doc that is changed and then restored in one range, but not the other, still gets the tests that name
     it from whichever range actually lists it as changed."""
     if not docs:
@@ -572,7 +641,7 @@ def _tests_naming(ctx: "Ctx", cfg: dict, fp: dict, docs: list[str]) -> list[str]
             text = (ctx.root / t).read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if any(d in text or os.path.basename(d) in text for d in docs):
+        if any(_names_file(text, d) for d in docs):
             out.append(t)
     return out
 
@@ -712,6 +781,277 @@ def _skip_full_suite(ctx: "Ctx", cfg: dict, st: dict, fp: dict) -> tuple[bool, l
     return (not code_files), doc_files
 
 
+# --------------------------------------------------------------------------- related tests before the full suite
+# Right before `complete` runs regression_command, it runs the few test files related to what the step changed
+# since its base_tree (related_test_command with {files}): the step's own planned test files ("planned test"),
+# the test files it changed ("changed test"), and the test files that name a changed file, deleted ones included,
+# by its path or file name or by importing it ("names <file>", _tests_naming's match through _names_file), ranked
+# by the function names the step changed and capped at related_tests_max. A
+# failure stops the step at once, naming the file, and the full suite is never started; it is not a suite
+# failure, so it spends no flaky re-run and leaves every gate as it was. The files in related_always join the
+# list outside the cap whenever the step adds a test file, changes a doc, or adds or changes a code line holding
+# a quoted string ("doc check: <trigger>"). The pass runs only when the full suite is about to run.
+
+_RELATED_LABEL_PLANNED = "planned test"
+_RELATED_LABEL_CHANGED = "changed test"
+_NO_FILES_PLACEHOLDER_MSG = ("related_test_command has no {files} placeholder, so it cannot run only the related "
+                             "files (it would run the whole suite twice); set it to a command with {files} (for "
+                             "example 'pnpm vitest run {files}') or unset it to turn the related pass off.")
+_DEF_LINE_RE = re.compile(r"^\s*(?:(?:export|default|async|static|public|private|protected|pub|abstract|override|"
+                          r"final|unsafe|extern)\s+)*(?:def|function|fn|func|class|struct|interface|trait|impl|enum|"
+                          r"sub|proc|method)\b")
+_DEF_SKIP_WORDS = {"export", "default", "async", "static", "public", "private", "protected", "pub", "abstract",
+                   "override", "final", "unsafe", "extern", "def", "function", "fn", "func", "class", "struct",
+                   "interface", "trait", "impl", "enum", "sub", "proc", "method", "const", "let", "var", "type",
+                   "import", "from", "if", "else", "for", "while", "return", "switch", "case", "try", "catch",
+                   "with", "as", "new", "this", "self", "module", "package", "use", "require"}
+_STRING_LITERAL_RE = re.compile(r'"[^"\n]*"|\'[^\'\n]*\'|`[^`\n]*`')
+
+
+def _related_tests_max(cfg: dict) -> tuple[int, str | None]:
+    """(the cap on the related list, a note when the configured value was ignored): related_tests_max must be a
+    whole number of 1 or more; anything else (0, a word, a fraction) falls back to the default so the pass is
+    never run with no files by accident."""
+    default = int(DEFAULT_CONFIG["related_tests_max"])
+    raw = cfg.get("related_tests_max", default)
+    try:
+        v = int(raw) if not isinstance(raw, bool) and float(raw) == int(raw) else None
+    except (TypeError, ValueError):
+        v = None
+    if v is None or v < 1:
+        return default, (f"related_tests_max is {json.dumps(raw)}, not a whole number of 1 or more; "
+                         f"ignored, using the default {default}")
+    return v, None
+
+
+def _defined_name(line: str) -> str | None:
+    """The name a definition-shaped line defines (git's own funcname rule, a line starting in column 0 with a
+    letter, `_` or `$`, plus indented def/function/class/fn lines so a Python method or a nested function
+    counts too): its first word that is not a keyword or modifier. None for any other line."""
+    if not line or not (line[0].isalpha() or line[0] in "_$" or _DEF_LINE_RE.match(line)):
+        return None
+    for m in re.finditer(r"[A-Za-z_$][\w$]*", line):
+        if m.group(0) not in _DEF_SKIP_WORDS:
+            return m.group(0)
+    return None
+
+
+def _enclosing_names(text: str) -> list[str | None]:
+    """For every line of `text` (by index), the name of the nearest definition-shaped line at or above it."""
+    out, cur = [], None
+    for line in text.splitlines():
+        name = _defined_name(line)
+        if name:
+            cur = name
+        out.append(cur)
+    return out
+
+
+def _changed_lines(ctx: "Ctx", base: str, fp: dict, files: list[str]) -> dict:
+    """Per file (git diff -U0 between the step's base tree and `fp`): {"added": [(line number in the new file,
+    text)], "removed": [line numbers in the old file]}. Only the files given are diffed."""
+    out: dict = {}
+    if not files:
+        return out
+    r = subprocess.run(["git", "diff", "-U0", "--no-color", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/",
+                        base, fp["id"], "--", *files], cwd=ctx.root, capture_output=True, text=True, errors="replace")
+    cur, new_no, old_no, in_header = None, 0, 0, False
+    for line in r.stdout.splitlines():
+        # `--- `/`+++ ` are file headers only between a `diff --git` line and the first hunk; inside a hunk a
+        # removed `-- note` or an added `++ x` line looks the same and must count as content.
+        if line.startswith("diff --git "):
+            in_header, cur = True, None
+            continue
+        if in_header and line.startswith("+++ "):
+            path = line[4:]
+            cur = path[2:] if path.startswith("b/") else (None if path == "/dev/null" else path)
+            if cur is not None:
+                out.setdefault(cur, {"added": [], "removed": []})
+            in_header = False
+            continue
+        if in_header or cur is None:
+            continue
+        m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if m:
+            old_no, new_no = int(m.group(1)), int(m.group(2))
+            continue
+        if line.startswith("+"):
+            out[cur]["added"].append((new_no, line[1:]))
+            new_no += 1
+        elif line.startswith("-"):
+            out[cur]["removed"].append(old_no)
+            old_no += 1
+    return out
+
+
+def _changed_function_names(ctx: "Ctx", base: str, lines: dict) -> set[str]:
+    """The names of the functions (definition-shaped lines, `_defined_name`) that hold an added or changed line
+    in the working tree, or a removed line in the base tree, for the files in `lines` (`_changed_lines`)."""
+    names: set[str] = set()
+    for path, d in lines.items():
+        if d["added"]:
+            try:
+                encl = _enclosing_names((ctx.root / path).read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                encl = []
+            for no, _ in d["added"]:
+                if 0 < no <= len(encl) and encl[no - 1]:
+                    names.add(encl[no - 1])
+        if d["removed"]:
+            r = subprocess.run(["git", "show", f"{base}:{path}"], cwd=ctx.root, capture_output=True, text=True,
+                               errors="replace")
+            encl = _enclosing_names(r.stdout) if r.returncode == 0 else []
+            for no in d["removed"]:
+                if 0 < no <= len(encl) and encl[no - 1]:
+                    names.add(encl[no - 1])
+    return names
+
+
+def _related_tests(ctx: "Ctx", cfg: dict, cp: dict, cps: dict, fp: dict) -> dict:
+    """Which test files `complete` runs before the full suite, and why: {"picked": [(file, reason)], "notes":
+    [plain lines for the output], "candidates": how many files beyond the step's own planned ones were found,
+    "cap": the cap in force}. The step's own planned test files come first ("planned test"), then the test files
+    (test_globs) it changed ("changed test"), then the test files naming a file it changed ("names <file>"),
+    those mentioning a changed function name before the rest; the cap (related_tests_max) keeps the first N of
+    that order. Each file in related_always is then added once, outside the cap, when the step added a test file,
+    changed a doc, or added or changed a code line (not a test, not a doc) holding a quoted string, with a reason
+    naming the trigger(s) ("doc check: new test file"); a file already picked keeps its first reason; one that
+    does not exist is skipped with a note. A deleted file is never handed to the command."""
+    base = cps.get("base_tree")
+    cap, cap_note = _related_tests_max(cfg)
+    notes = [cap_note] if cap_note else []
+    test_globs = cfg.get("test_globs") or []
+    exists = set(_project_files(ctx.root, fp))
+    picked: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(f, reason):
+        if f not in seen:
+            seen.add(f)
+            picked.append((f, reason))
+
+    for f in _as_list((cp.get("tests") or {}).get("files") or []):
+        if f in exists:
+            add(f, _RELATED_LABEL_PLANNED)
+        else:
+            notes.append(f"planned test file {f} is not in the project; not run")
+    status: dict = {}
+    if base:
+        r = subprocess.run(["git", "diff-tree", "-r", "-z", "--no-renames", "--name-status", base, fp["id"]],
+                           cwd=ctx.root, capture_output=True)
+        parts = r.stdout.decode("utf-8", "surrogateescape").split("\0") if r.returncode == 0 else []
+        for s, f in zip(parts[0::2], parts[1::2]):
+            if f and f != RATCHET_DIR and not f.startswith(RATCHET_DIR + "/"):
+                status[f] = s[:1]
+    changed = sorted(status)
+    changed_tests = [f for f in changed if _glob_hit(f, test_globs) and f in exists]
+    for f in changed_tests:
+        add(f, _RELATED_LABEL_CHANGED)
+    doc_files, code_files = _classify_doc_code(cfg, changed)
+    code_files = [f for f in code_files if not _glob_hit(f, test_globs)]
+    # Deleted and renamed-away files stay search keys: a test naming a module the step removed is the one most
+    # likely to break. Only the test files handed to the command must exist.
+    named = [f for f in changed if not _glob_hit(f, test_globs)]
+    naming = [t for t in _tests_naming(ctx, cfg, fp, named) if t not in seen]
+    lines = _changed_lines(ctx, base, fp, code_files) if base else {}
+    hot = _changed_function_names(ctx, base, lines) if base else set()
+    ranked = []
+    for t in naming:
+        try:
+            text = (ctx.root / t).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        names_it = [f for f in named if _names_file(text, f)]
+        hits = sum(1 for n in hot if re.search(r"\b" + re.escape(n) + r"\b", text))
+        ranked.append((-hits, t, names_it))
+    for _, t, names_it in sorted(ranked):
+        add(t, "names " + ", ".join(names_it[:3]) + (", ..." if len(names_it) > 3 else ""))
+    candidates = len(picked) - sum(1 for _, r in picked if r == _RELATED_LABEL_PLANNED)
+    picked = picked[:cap]
+    triggers = []
+    if any(status.get(f) == "A" for f in changed_tests):
+        triggers.append("new test file")
+    if doc_files:
+        triggers.append("doc file changed")
+    if any(_STRING_LITERAL_RE.search(text) for d in lines.values() for _, text in d["added"]):
+        triggers.append("user-facing text")
+    always = _as_list(cfg.get("related_always") or [])
+    if triggers:
+        kept = {f for f, _ in picked}
+        for f in always:
+            if f in kept:
+                continue
+            if f not in exists:
+                notes.append(f"{f} is named in related_always but was not found in the project; skipped")
+                continue
+            kept.add(f)
+            picked.append((f, "doc check: " + ", ".join(triggers)))
+    return {"picked": picked, "notes": notes, "candidates": candidates, "cap": cap}
+
+
+def _failing_files(out: str, files: list[str]) -> list[str]:
+    """The picked files the runner's output reports as failed: each file whose repo-relative path or bare file
+    name (word-bounded, as tests/run_all.py prints `FAILED (exit 1)  test_x.py` and `Failed: test_x.py`) sits on
+    a failure line: one carrying a failure status token (the whole word FAIL/FAILED/failed in any case, or a
+    ✗/✕/× mark, never `fails` inside a test title) and no pass mark (PASS/PASSED/passed/ok, ✓/√), so a passing
+    test whose title says "fails" (vitest `✓ ... > login fails`, pytest `::test_login_fails PASSED`) is never
+    named."""
+    lines = [l for l in out.splitlines()
+             if re.search(r"\bfail(?:ed)?\b|[✗✕×]", l, re.I) and not re.search(r"\b(?:pass(?:ed)?|ok)\b|[✓√]", l, re.I)]
+    hit = []
+    for f in files:
+        name = re.escape(os.path.basename(f))
+        if any(f in l or re.search(r"(?<![\w/.-])" + name + r"(?![\w-])", l) for l in lines):
+            hit.append(f)
+    return hit
+
+
+def _run_related_tests(ctx: "Ctx", cfg: dict, cp: dict, cps: dict, fp: dict, watch: "_Watch | None" = None) -> None:
+    """The related pass at `complete`, right before the full suite: says which files were picked and why, runs
+    related_test_command on them (evidence/CPn/related-tests.log) and dies, naming the failing file(s), when it
+    fails, without saving state (same as the full suite's failure branch); the full suite is then never started
+    and no gate, attempt count or flaky allowance changes. With related_test_command unset it only says the pass
+    is off; a value without {files} is refused before anything runs. `watch` is `complete`'s code watch: an edit
+    during the related run stops it the same way (code changed, nothing saved, run `complete` again)."""
+    cp_id = cp["id"]
+    if not cfg.get("related_test_command"):
+        print("Related tests: off (related_test_command is not configured); running the full suite directly.")
+        return
+    if "{files}" not in str(cfg["related_test_command"]):
+        die(_NO_FILES_PLACEHOLDER_MSG, 2)
+    sel = _related_tests(ctx, cfg, cp, cps, fp)
+    picked, notes, cap = sel["picked"], sel["notes"], sel["cap"]
+    for n in notes:
+        print(f"Related tests: {n}")
+    ranked = [f for f, r in picked if not r.startswith("doc check")]
+    own = sum(1 for _, r in picked if r == _RELATED_LABEL_PLANNED)
+    if sel["candidates"] + own > cap:
+        print(f"Related tests: picked {len(ranked)} of {sel['candidates']} other candidate(s) and {own} planned test "
+              f"file(s) together (cap related_tests_max={cap})"
+              + ("; the doc check is added on top of the cap" if len(picked) > len(ranked) else ""))
+    if not picked:
+        print("Related tests: nothing to run before the full suite (no planned, changed or naming test file).")
+        return
+    print(f"Related tests (before the full suite), {len(picked)} file(s):")
+    for f, reason in picked:
+        print(f"  - {f}: {reason}")
+    files = [f for f, _ in picked]
+    cmd = cfg["related_test_command"].replace("{files}", " ".join(shlex.quote(f) for f in files))
+    code, out, _ = _run_cmd(ctx, cmd, ctx.evidence(cp_id) / "related-tests.log", cfg["test_timeout_sec"], watch=watch)
+    if code != 0:
+        # Like the full suite's failure branch below in `complete`: print the tail and die without saving state,
+        # so nothing from this failed call (a doc quick-path record above it) is persisted.
+        print(_tail(out))
+        failing = _failing_files(out, files)
+        die(f"{cp_id} cannot complete: a related test failed (exit {code}) before the full suite, which was not "
+            f"started" + (f"; failing: {', '.join(failing)}" if failing else "") + ". Fix it and run complete again; "
+            f"this was not a suite failure, so no flaky re-run was spent and no gate changed. Files run:\n  - "
+            + "\n  - ".join(f"{f} ({r})" for f, r in picked), 2)
+    if fingerprint(ctx.root)["id"] != fp["id"]:
+        die("The related test command changed files in the project. Those changes were never reviewed; find out "
+            "what wrote them (generated files? snapshots?) and either add them to .gitignore or re-run the gates.", 2)
+
+
 def _doc_edit_status_lines(st: dict) -> list[str]:
     """One plain line per checkpoint whose doc edit(s) after review were never re-reviewed (CP2's quick path),
     for `status`, the commit message and the final review to all say the same thing about the same files."""
@@ -788,6 +1128,120 @@ def _small_fix_review_lines(st: dict) -> list[str]:
         line = _small_fix_review_line(cid, c)
         if line:
             lines.append(line)
+    return lines
+
+
+# ------------------------------------------------------------------- the fix round after a block (CP5, lane H)
+# The second trigger on the one-reviewer round: once a review round has BLOCKED and the fixer has run (the code
+# changed since the tree that round reviewed, and at least one of its blocking findings was triaged `fix`), the
+# next round opens with exactly ONE reviewer, whatever the fix's size and whatever the step's risk. It is the
+# same `small_fix` round lane B opens after an approval, told apart by `kind`: FIX_AFTER_BLOCK here,
+# FIX_AFTER_APPROVAL for lane B's own small fix. Only the reviewer resolution differs: never review_depth["low"]
+# (host-both would be the host checking another company's finding), but the reviewer whose blocking finding was
+# fixed -- same provider, same lens -- chosen only among the blocked round's own reviewers, preferring a company
+# other than the host's and then the lowest slot number. When that reviewer cannot run (benched, or at its share
+# of review starts), its slot's own stand-in for the same lens takes the round through resolve_reviewers (lane
+# G's logic, nothing re-implemented), so no provider that never reviewed the step is ever added.
+FIX_AFTER_BLOCK = "after a block"
+FIX_AFTER_APPROVAL = "after approval"
+
+
+def _is_fix_after_block(rnd: dict | None) -> bool:
+    return bool(rnd) and bool(rnd.get("small_fix")) and (rnd.get("kind") or "") == FIX_AFTER_BLOCK
+
+
+def _round_blocking_findings(ctx, cp_id: str, round_no: int, cps: dict) -> list:
+    """The findings that actually BLOCKED one recorded round and are still open: its own open-findings.json,
+    which `adv-record` wrote as exactly what was left blocking after every one of the round's own rules ran
+    (the severity bar for the step's risk, the later-round scope rule and `converge_after_round`, all applied by
+    `split_findings` then), so a round that blocked only on minor findings -- an ordinary first round at normal
+    or high risk, where every severity blocks -- counts here too, and a minor one the round itself deferred
+    never does. No severity rule is re-applied here: re-deciding it would risk a different answer than the gate
+    gave. The findings the user has accepted since are filtered out, the same way `_adv_open_findings` does for
+    the latest round: state is the authoritative record of an acceptance, the file only its mirror."""
+    accepted = {_finding_key(f) for f in _round_deferred(cps, round_no) if f.get("accepted")}
+    return [f for f in _read_findings_file(_adv_round_dir(ctx, cp_id, round_no) / "open-findings.json")
+            if _finding_key(f) not in accepted]
+
+
+def _fix_round_pick(ctx, cfg, cp_id: str, cp: dict, cps: dict, g: dict, fp_id: str) -> dict | None:
+    """{"round", "reviewer", "slot"} when this round follows a blocked round whose fix has been made, else None.
+
+    The blocked round is the step's own last RECORDED round (`gates.adversarial.rounds`, which only a recorded
+    round is ever added to): it blocked when it recorded findings, and the fixer has run when the tree is no
+    longer the one that round reviewed. The reviewer is picked from that round's own reviewers, and only from
+    those with a finding that blocked that round, whatever its severity (`_round_blocking_findings`), and that
+    the orchestrator triaged `fix` (a rebutted finding, or one the user accepted, is not a fix to re-check),
+    preferring a company other than the host's, then the lowest slot number. A
+    checkpoint that pins its own `reviewers` list keeps that list, as it does for lane B's small fix."""
+    if cp.get("reviewers"):
+        return None
+    last = (g.get("rounds") or [])[-1:]
+    if not last:
+        return None
+    last = last[0]
+    if not last.get("findings"):
+        return None  # that round was approved, not blocked
+    if last.get("fingerprint") == fp_id:
+        return None  # the code is still the tree that round reviewed: the fixer has not run yet
+    round_no = last.get("round")
+    rows = last.get("reviewers") or []
+    slots = {r.get("id"): r.get("slot") or i + 1 for i, r in enumerate(rows) if r.get("id")}
+    triage = _read_triage(_adv_round_dir(ctx, cp_id, round_no))
+    fixing = {f.get("reviewer") for f in _round_blocking_findings(ctx, cp_id, round_no, cps)
+              if (triage.get(_finding_key(f)) or {}).get("decision") == "fix"}
+    host = detect_host(cfg)
+
+    def host_company(rid):  # 0 for another company (preferred), 1 for the host's own
+        spec = _roster_spec(cfg, rid) or {}
+        return 0 if spec.get("kind") == "command" and spec.get("vendor") and spec["vendor"] != host else 1
+    cands = sorted((rid for rid in slots if rid in fixing), key=lambda rid: (host_company(rid), slots[rid]))
+    if not cands:
+        return None
+    pick = {"round": round_no, "reviewer": cands[0], "slot": slots[cands[0]]}
+    if pick["slot"] not in {r["slot"] for r in resolve_reviewers(ctx, cfg, cp)}:
+        return None  # the step's review slots changed since that round: the normal full round applies
+    return pick
+
+
+def _fix_round_reviewers(ctx, cfg, cp: dict, pick: dict, share=None) -> list[dict]:
+    """The one reviewer a post-block fix round opens with: the reviewer whose blocking finding was fixed when it
+    can run now (resolved as a pinned one-slot list, so reviewer_availability and the provider share decide the
+    same way they do for any other round), else that slot's own same-lens stand-in through resolve_reviewers'
+    existing fallback for the slot, with the reviewer it stands in for and the reason named on the row."""
+    rid, slot = pick["reviewer"], pick["slot"]
+    own = resolve_reviewers(ctx, cfg, dict(cp, reviewers=[rid]), share=share)
+    if len(own) == 1 and own[0]["id"] == rid:
+        own[0]["slot"] = slot  # the slot it held in the blocked round, so a same-round refill replaces that slot
+        return own
+    return resolve_reviewers(ctx, cfg, cp, exclude={rid}, only_slots={slot}, share=share)
+
+
+def _record_fix_round(cps: dict, rnd: dict, approved: bool) -> None:
+    """Keep what each post-block fix round was and who reviewed it, so `status`, `status --json` and the commit
+    message can all name the same round and the same reviewer, blocked or approved."""
+    entry = {"round": rnd["round"], "reviewer": (rnd.get("reviewers") or [None])[0],
+             "outcome": "approved" if approved else "blocked"}
+    kept = [x for x in cps.get("fix_rounds") or [] if x.get("round") != entry["round"]]
+    cps["fix_rounds"] = kept + [entry]
+
+
+def _fix_round_lines_for(cid: str, cps: dict) -> list[str]:
+    lines = []
+    for e in cps.get("fix_rounds") or []:
+        who = e.get("reviewer") or "a reviewer"
+        tail = ("and approved it" if e.get("outcome") == "approved"
+                else "and still found something to fix (it blocked again)")
+        lines.append(f"{cid}: round {e.get('round')} was a fix round after a block: one reviewer, {who}, "
+                     f"re-checked the fix {tail}.")
+    return lines
+
+
+def _fix_round_lines(st: dict) -> list[str]:
+    """One plain line per post-block fix round of the run, naming its round, its one reviewer and how it ended."""
+    lines = []
+    for cid, c in (st.get("checkpoints") or {}).items():
+        lines.extend(_fix_round_lines_for(cid, c))
     return lines
 
 
@@ -1975,7 +2429,8 @@ RULE_KEYS = ["review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "host_provider", "ui_reviewers", "design_md", "max_stop_blocks", "unavailable_ttl_hours",
              "verify_transcripts", "min_review_seconds", "commit_per_checkpoint", "blocking_severities",
              "scope_later_rounds", "host_models", "role_models", "checks", "checkin_round", "converge_after_round",
-             "doc_globs", "doc_exclude_globs", "test_globs", "doc_test_command", "small_edit_lines"]
+             "doc_globs", "doc_exclude_globs", "test_globs", "doc_test_command", "related_test_command",
+             "related_tests_max", "related_always", "small_edit_lines", "load_stretch_max", "suite_watch_seconds"]
 
 
 def _file_sha(p: Path) -> str | None:
@@ -3281,6 +3736,8 @@ def cmd_status_text(ctx: Ctx):
         print(line)
     for line in _small_fix_review_lines(st):
         print(line)
+    for line in _fix_round_lines(st):
+        print(line)
     for line in _docs_only_skip_lines(st):
         print(line)
     w = live_wait(st)
@@ -3440,6 +3897,10 @@ def cmd_plan_summary(args):
     if not cfg.get("doc_test_command"):
         print("Note: doc_test_command is not configured, so the docs quick path is off right now: every step, "
               "docs-only ones included, gets the normal full review and tests.")
+    if not cfg.get("related_test_command"):
+        print("Note: related_test_command is not configured, so the related pass before the full suite is off: a "
+              "break is found only when the full suite runs at the end of each step. To turn it on, set it to the "
+              "project's test command with a {files} placeholder (for example 'pnpm vitest run {files}').")
     rows = dict(models_table(cfg))
     groups = {}
     for role, m in rows.items():
@@ -6086,9 +6547,360 @@ def cmd_tests_written(args):
     ok(f"{args.cp}: all {len(_planned_cases(ctx, args.cp))} planned cases are present. Next: ratchet.py red {args.cp}")
 
 
-def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None):
-    """Run a test or check command. With `report`, the command gets that path in RATCHET_TEST_REPORT, and any file
-    already there is deleted first, so a report left by an earlier run can never count for this one."""
+RUN_POLL_SECONDS = 0.25  # how often a running test command's deadline is recomputed from the machine load
+
+
+def _read_load():
+    """(one-minute load average, CPU count) right now, or None when there is no usable reading. The environment
+    variables RATCHET_FAKE_LOADAVG ("unavailable", a number, or "@file" holding a number) and RATCHET_FAKE_CPUS
+    replace the real values (the tests use them; tests/run_all.py reads the same two). Never raises."""
+    fake = os.environ.get("RATCHET_FAKE_LOADAVG")
+    try:
+        if fake is not None:
+            fake = fake.strip()
+            if fake.startswith("@"):
+                with open(fake[1:], "r", encoding="utf-8") as f:
+                    fake = f.read().strip()
+            load = float(fake)
+        else:
+            load = os.getloadavg()[0]
+        cpus = int(os.environ.get("RATCHET_FAKE_CPUS") or 0) or (os.cpu_count() or 1)
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not (load == load and load < float("inf")) or load < 0 or cpus < 1:
+        return None
+    return load, cpus
+
+
+def _stretch_factor(max_stretch: float):
+    """(factor, load, cpus): how many times longer than test_timeout_sec a command may run right now. The factor is
+    load / cpus, at least 1 and at most max_stretch; 1 when there is no usable reading."""
+    reading = _read_load()
+    if reading is None:
+        return 1.0, None, None
+    load, cpus = reading
+    return min(max(1.0, load / cpus), max_stretch), load, cpus
+
+
+def _load_stretch_max(cfg) -> float:
+    """The configured ceiling on the stretch (load_stretch_max), a number of 1 or more; the default otherwise."""
+    try:
+        v = float(cfg.get("load_stretch_max"))
+    except (TypeError, ValueError):
+        return float(DEFAULT_CONFIG["load_stretch_max"])
+    return v if 1.0 <= v < float("inf") else float(DEFAULT_CONFIG["load_stretch_max"])
+
+
+def _suite_watch_seconds(cfg) -> float | None:
+    """How often a running command's code is compared with the tree it started on (suite_watch_seconds): a number
+    above 0, or None when the configured value is not one (then the default applies)."""
+    v = cfg.get("suite_watch_seconds")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or not (0 < v < float("inf")):
+        return None
+    return float(v)
+
+
+def _watch_every(cfg) -> float:
+    """The interval a _Watch uses: the configured suite_watch_seconds, or the default when it is not a usable one."""
+    v = _suite_watch_seconds(cfg)
+    return float(DEFAULT_CONFIG["suite_watch_seconds"]) if v is None else v
+
+
+class _Watch:
+    """The code-under-the-run watch for one command: the tree (`fp`) it started on, how often to look (`every`
+    seconds), and the command the agent should run again if the code changes. `changed()` is the one check: a
+    fingerprint, and only when its id differs, the list of files the run started with that were edited or deleted
+    meanwhile, plus the new project source files that appeared (_new_source: any added file git would commit counts
+    as new source unless a fixed generated list (build, cache, test-report, snapshot and scratch folders and file
+    names) or the doc list names it; there is no extension allow-list, and a plain `report` or `reports` folder is
+    not treated as generated). Ratchet's own folder and the agent's chat transcript never
+    count, and neither does any other file that only appeared: suites write snapshots and reports of their own,
+    and those are left to the command's own 'changed files' check. A periodic
+    look (`final=False`) builds its tree in one private index kept across looks, so git rehashes only the files
+    whose stat changed since the last look, and a look git cannot take (a file the command created and removed
+    under git's walk, one it cannot read, a failed diff-tree) is skipped and noted in `skipped`, never fatal with
+    the command still running; the last look (`final=True`, the command has ended) is the full fingerprint() and
+    a git failure there dies as it does everywhere else. `found_at_end` says whether the change was found by that
+    last look (the command ended on its own) rather than by a periodic one (the command was stopped)."""
+
+    def __init__(self, ctx, fp: dict, every: float, again: str, extra: list | None = None):
+        self.ctx, self.fp, self.every, self.again = ctx, fp, every, again
+        self.extra = list(extra or [])   # the config's fingerprint_include, so a look's tree is fingerprint()'s
+        self.skipped: list = []      # one reason per look that could not be taken (noted in the command's log)
+        self.found_at_end = False
+        self.added: list = []        # the changed files that are new source (not in the tree the run started on)
+        self._index = None           # the private index for periodic looks (git projects only), seeded on first use
+
+    def _look_fp(self) -> dict:
+        """A periodic look's fingerprint: the same tree id fingerprint() gives, from the kept index."""
+        root = self.ctx.root
+        if not _is_git(root):
+            return fingerprint(root)
+        if self._index is None:
+            self._index = tempfile.TemporaryDirectory()
+            env = dict(os.environ, GIT_INDEX_FILE=str(Path(self._index.name) / "index"))
+            subprocess.run(["git", "read-tree", "HEAD"], cwd=root, env=env, capture_output=True)
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(self._index.name) / "index"))
+        return {"kind": "git-tree", "id": _git_tree_id(root, env, strict=False, extra=self.extra)}
+
+    def changed(self, final: bool = False) -> list:
+        try:
+            now_fp = fingerprint(self.ctx.root) if final else self._look_fp()
+            if now_fp["id"] == self.fp["id"]:
+                return []
+            added = []
+            files = _edited_or_deleted(self.ctx.root, self.fp, now_fp, added)
+            self.added = added
+        except _LookFailed as e:
+            if final:  # the tree differs, so this is a change; what changed could not be listed: say so, never pass
+                return [f"(the files could not be listed: {e})"]
+            self.skipped.append(str(e))
+            return []
+        chat = _chat_transcript_paths(self.ctx, None)
+        return [f for f in files if f != RATCHET_DIR and not f.startswith(RATCHET_DIR + "/") and f not in chat]
+
+
+# A new file counts as a code change under a running suite when git would commit it and it is neither generated
+# output nor a doc: no folder on its path that holds generated output (FINGERPRINT_EXCLUDES, _WATCH_GENERATED_DIRS,
+# .NET's bin/<configuration>/, any dot folder), not a generated name, not a doc. There is no source-extension
+# allow-list: a template, a stylesheet, a config file or a module in a folder called reports/ is project code.
+_WATCH_GENERATED_DIRS = {
+    "__snapshots__", "__generated__", "generated", "htmlcov", "lib-cov", "test-results", "test-reports", "junit",
+    "logs", "log", "tmp", "temp", "scratch", "artifacts", "obj", "vendor", "bower_components", "jspm_packages",
+}
+# `bin` holds source in many projects (Rust's src/bin/, a package's bin/ scripts): it is build output only as .NET's
+# bin/<configuration>/
+_WATCH_BUILD_CONFIGS = {"debug", "release"}
+_WATCH_GENERATED_NAMES = ("*.min.*", "*.map", "*.bundle.*", "*.pyc", "*.pyo", ".#*", "*~", "*.log", "*.lcov",
+                          "coverage*", ".coverage*", "junit*.xml", "*results*.xml", "*.orig", "*.rej", "*.swp",
+                          "*.tmp", "*.bak")
+_WATCH_DOC_NAMES = (*DEFAULT_CONFIG["doc_globs"], "*.txt")  # a doc that appears is not a code change
+
+
+def _new_source(path: str) -> bool:
+    """Whether a file that appeared under a running suite is a new project source file (a change that stops the
+    run) rather than generated build, cache, report, snapshot or scratch output, or a doc (never a change). Any
+    file git would commit counts unless one of those fixed exclusions names it; there is no extension allow-list."""
+    parts = path.split("/")
+    name = parts[-1]
+    if any(d in FINGERPRINT_EXCLUDES or d in _WATCH_GENERATED_DIRS or d.startswith(".") for d in parts[:-1]):
+        return False
+    if any(d == "bin" and nxt.lower() in _WATCH_BUILD_CONFIGS for d, nxt in zip(parts[:-2], parts[1:-1])):
+        return False
+    if any(fnmatch.fnmatch(name, g) for g in _WATCH_GENERATED_NAMES):
+        return False
+    return not any(fnmatch.fnmatch(name, g) for g in _WATCH_DOC_NAMES)
+
+
+def _edited_or_deleted(root: Path, fp_a: dict, fp_b: dict, added: list | None = None) -> list:
+    """The files in fp_a's tree that fp_b's tree changed or lacks, plus the files fp_b added that are new project
+    source (_new_source; any other added file is left out), named relative to `root` (diff-tree's `--relative`:
+    a project below the repository's top gets project-relative names, the way `.ratchet/` and the chat
+    transcript paths are named). The new source files are also put in `added` when it is given. For two git
+    trees a failed diff-tree raises _LookFailed: the trees are known to differ, so the answer is never 'nothing'; only two manifests are compared as manifests, and a manifest that is
+    missing or damaged raises _LookFailed the same way (read through _read_record)."""
+    if fp_a["kind"] == fp_b["kind"] == "git-tree":
+        r = subprocess.run(["git", "diff-tree", "-r", "-z", "--no-renames", "--name-status",
+                            "--relative", fp_a["id"], fp_b["id"]], cwd=root, capture_output=True)
+        if r.returncode != 0:
+            raise _LookFailed(f"git diff-tree failed: {r.stderr.decode('utf-8', 'replace').strip()}")
+        parts = r.stdout.decode("utf-8", "surrogateescape").split("\0")
+        pairs = [(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2) if parts[i]]
+        if added is not None:
+            added.extend(f for st, f in pairs if st == "A" and _new_source(f))
+        return [f for st, f in pairs if st != "A" or _new_source(f)]
+    mdir = root / RATCHET_DIR / "manifests"
+    sides = []
+    for fp in (fp_a, fp_b):  # a manifest that is missing or damaged cannot say 'nothing changed': a failed look
+        data, why = _read_record(mdir / f"{fp['id']}.json", missing=None)
+        if data is None:
+            raise _LookFailed(f"fingerprint manifest {fp['id']} cannot be read ({why or 'missing'})")
+        sides.append(data)
+    a, b = sides
+    new = [k for k in b if k not in a and _new_source(k)]
+    if added is not None:
+        added.extend(new)
+    return sorted([k for k in a if b.get(k) != a[k]] + new)
+
+
+def _signal_group(proc, sig) -> None:
+    """Send `sig` to a command's whole process group (the command alone where there are no groups). Never raises."""
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, sig)
+        else:
+            proc.send_signal(sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _group_alive(proc) -> bool:
+    """Whether any process of the command's group is still there (the leader is reaped first, so an exited shell
+    leader no longer counts; its children do until they are gone)."""
+    if proc.poll() is None:
+        return True
+    if not hasattr(os, "killpg"):
+        return False
+    try:
+        os.killpg(proc.pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+
+
+def _stop_group(proc, grace: float = 2.0) -> None:
+    """Stop a command and everything it started, politely first: SIGTERM to its process group (a runner that
+    manages helpers of its own, like tests/run_all.py, gets to stop them), then, once the whole group is gone or
+    `grace` seconds have passed (the group, not only its leader: under `sh -c` the shell leader dies at once while
+    the runner is still cleaning up), SIGKILL to whatever ignored it (_kill_group). Never raises."""
+    _signal_group(proc, signal.SIGTERM)
+    end = time.monotonic() + grace
+    while time.monotonic() < end and _group_alive(proc):
+        time.sleep(0.05)
+    _kill_group(proc)
+
+
+def _secs(x: float) -> str:
+    """A number of seconds for a log line: whole when it is whole (`2s`), else one decimal (`2.5s`)."""
+    return str(int(x)) if float(x) == int(x) else f"{x:.1f}"
+
+
+def _kill_group(proc) -> None:
+    """Stop a command and everything it started (its own process group), then reap it. Never raises."""
+    _signal_group(proc, signal.SIGKILL)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+_STOP_SIGNALS = tuple(s for s in ("SIGTERM", "SIGINT", "SIGHUP") if hasattr(signal, s))
+
+
+def _forward_stop(proc) -> list:
+    """While `proc` runs, a SIGTERM, SIGINT or SIGHUP sent to ratchet.py (an agent's tool timeout cutting a
+    foreground call off) first stops the command's whole process group, then takes its usual course (the previous
+    handler, or the default exit), so no suite is left running behind a stopped ratchet.py. A signal the process
+    ignores stays ignored. Returns the previous handlers for _restore_handlers; [] when handlers cannot be set
+    (not the main thread)."""
+    saved = []
+
+    def on_stop(signum, frame):
+        _kill_group(proc)
+        _restore_handlers(saved)
+        os.kill(os.getpid(), signum)
+
+    for name in _STOP_SIGNALS:
+        sig = getattr(signal, name)
+        try:
+            prev = signal.getsignal(sig)
+            if prev == signal.SIG_IGN:
+                continue
+            signal.signal(sig, on_stop)
+        except (ValueError, OSError):
+            continue
+        saved.append((sig, prev))
+    return saved
+
+
+def _restore_handlers(saved: list) -> None:
+    for sig, prev in saved:
+        try:
+            signal.signal(sig, prev if prev is not None else signal.SIG_DFL)
+        except (ValueError, OSError, TypeError):
+            pass
+
+
+def _wait_stretched(proc, timeout: float, max_stretch: float, watch: "_Watch | None" = None):
+    """Wait for a command, polling. The deadline is `timeout` times the highest stretch factor read while the
+    command runs (re-read every RUN_POLL_SECONDS, so a load spike while the command runs still extends it; a load
+    drop never shortens a limit already granted), never earlier than `timeout` and never later than `timeout` times
+    `max_stretch`. Stops the whole process group when the deadline passes. With a `watch`, every `watch.every`
+    seconds the code is compared with the tree the command started on, and once more when the command ends on its
+    own, so a quick command that finishes before the next look still never counts (a command killed by the time
+    limit gets no last look: it is a timeout even when the tree also changed); a change
+    stops the command and everything it started (_stop_group; on the last look too, so a helper the ended
+    command left in its group never outlives the run), and `watch.found_at_end` says which look found it.
+    A periodic look git cannot take is skipped (noted on the watch), never fatal; the last look is the full
+    fingerprint and may die, which the caller (_run_cmd) turns into a kill of the group first. Returns
+    (timed_out, limit, note, changed): the
+    limit in force when the command ended, a line saying the limit was stretched (the highest reading taken during
+    the run, or a fresh one when the command ended within one poll of passing `timeout`), or "" when the command
+    ran within the configured limit, and the files the watch found edited or deleted ([] when none, or no watch)."""
+    t0 = time.monotonic()
+    peak = None  # the reading that set the highest limit so far: the limit in force never shrinks
+    timed_out = False
+    limit = float(timeout)
+    next_look = t0 + watch.every if watch else None
+    changed = []
+    while True:
+        factor, load, cpus = _stretch_factor(max_stretch)
+        if timeout * factor > limit:
+            limit = timeout * factor
+            peak = (factor, load, cpus)
+        elapsed = time.monotonic() - t0
+        if elapsed >= limit:
+            timed_out = True
+            _kill_group(proc)
+            break
+        if watch and time.monotonic() >= next_look:
+            changed = watch.changed()
+            if changed:
+                watch.found_at_end = False
+                _stop_group(proc)
+                break
+            next_look = time.monotonic() + watch.every
+        try:
+            proc.wait(timeout=min(RUN_POLL_SECONDS, limit - elapsed))
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    if watch and not changed and not timed_out:  # a kill by the time limit wins: a timeout, counted as one
+        changed = watch.changed(final=True)  # the last look: the tree the command ended on
+        watch.found_at_end = bool(changed)
+        if changed:  # the leader has ended, but a helper it left in its group belongs to a run that no longer counts
+            _stop_group(proc)
+    ran_past = timed_out or time.monotonic() - t0 >= timeout
+    if ran_past and not timed_out:
+        fresh = _stretch_factor(max_stretch)  # ended within one poll of passing the configured limit
+        if timeout * fresh[0] > limit:
+            limit = timeout * fresh[0]
+            peak = fresh
+    if peak is None or not ran_past:
+        return timed_out, (limit if timed_out else float(timeout)), "", changed
+    factor, load, cpus = peak
+    note = (f"time limit stretched {factor:.1f}x ({_secs(timeout)}s to {_secs(limit)}s) at load {load:.1f} "
+            f"on {cpus} CPUs")
+    return timed_out, limit, note, changed
+
+
+def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None, watch: "_Watch | None" = None):
+    """Run a test or check command in its own process group and wait for it with _wait_stretched: on a busy machine
+    its time limit is `timeout` (test_timeout_sec) times the load average over the CPU count, re-read while it runs
+    (the highest reading wins: a load drop never shortens the limit), never below `timeout` and at most
+    `load_stretch_max` times it; a command still running at that limit is stopped with its whole process group and
+    logged as `TIMEOUT after <limit>s` (exit 124). When the limit was stretched the log header gets one line saying
+    so, with the factor, both limits, the load and the CPU count. A SIGTERM, SIGINT or SIGHUP to ratchet.py while
+    the command runs stops the command's process group first (_forward_stop). With `report`, the
+    command gets that path in RATCHET_TEST_REPORT, and any file already there is deleted first, so a report left by
+    an earlier run can never count for this one. With a `watch` (a _Watch: the tree the step's work started on and
+    suite_watch_seconds), an edit to the code while the command runs stops it with everything it started, writes
+    the log as `stopped: code changed` and dies through the normal path (the state lock is released, nothing is
+    saved: no attempt, no gate status, no flaky allowance changes), telling the agent to run `watch.again`. Each
+    such stop is recorded in `stopped-runs.json` next to the log, keyed by the command, and cleared when the same
+    command next ends unstopped: when the previous call of this command was stopped on the same files, the message
+    adds that the command itself may be the writer, with the restore guidance. A change found only by the last look
+    (the command ended on its own, so the writer cannot be told: the command itself, or an edit while it ran) is
+    not a stop but a refusal naming both causes (log header `# code changed under the run, found when it ended`),
+    with the restore guidance (_restore_guidance: every named file is restored from the run's starting tree, a
+    file the run started with is never deleted, and a new source file is kept if the agent added it), equally
+    uncounted. A command killed by its time limit is reported as a timeout even when the tree also changed: the
+    time-limit kill wins over the last look, so it gets the `TIMEOUT after <limit>s` log and is counted exactly
+    like any other timeout.
+    Anything that escapes the wait (a git failure on the last look, a signal) kills the command's group first.
+    Output goes through temp files, so a command that prints a lot never stalls on a full pipe."""
     env = dict(os.environ, CI="1", FORCE_COLOR="0")
     env.pop("RATCHET_TEST_REPORT", None)
     if report is not None:
@@ -6099,17 +6911,119 @@ def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None):
         except OSError as e:
             die(f"Could not delete the old test report at {report.relative_to(ctx.root)} ({e}); remove it and re-run.")
         env["RATCHET_TEST_REPORT"] = str(report)
+    max_stretch = _load_stretch_max(ctx.config())
+    if watch:  # one watch serves every command of a call: the per-command parts start clean
+        watch.skipped = []
+        watch.found_at_end = False
     t0 = _dt.datetime.now()
-    try:
-        r = subprocess.run(command, shell=True, cwd=ctx.root, capture_output=True, text=True,
-                           timeout=timeout, env=env)
-        code, out = r.returncode, (r.stdout or "") + "\n" + (r.stderr or "")
-    except subprocess.TimeoutExpired as e:
-        code, out = 124, f"TIMEOUT after {timeout}s\n{e.stdout or ''}{e.stderr or ''}"
-    dur = (_dt.datetime.now() - t0).total_seconds()
+    with tempfile.TemporaryFile() as so, tempfile.TemporaryFile() as se:
+        proc = subprocess.Popen(command, shell=True, cwd=ctx.root, stdout=so, stderr=se, env=env,
+                                start_new_session=True)
+        saved = _forward_stop(proc)
+        try:
+            timed_out, limit, note, changed = _wait_stretched(proc, float(timeout), max_stretch, watch)
+        except BaseException:
+            _kill_group(proc)  # whatever escapes the wait, the command never outlives ratchet.py
+            raise
+        finally:
+            _restore_handlers(saved)
+        so.seek(0)
+        se.seek(0)
+        stdout = so.read().decode("utf-8", errors="replace")
+        stderr = se.read().decode("utf-8", errors="replace")
+    skipped = ""
+    if watch and watch.skipped:
+        skipped = (f"# {len(watch.skipped)} look(s) at the code could not be taken and were skipped "
+                   f"(last reason: {watch.skipped[-1]})\n")
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text(f"$ {command}\n# exit={code} duration={dur:.1f}s at {now()}\n\n{out}")
+    dur = (_dt.datetime.now() - t0).total_seconds()
+    if changed:
+        names = ", ".join(changed[:5]) + (f" and {len(changed) - 5} more" if len(changed) > 5 else "")
+        guidance = _restore_guidance(ctx.root, changed, watch.fp.get("id") if watch.fp.get("kind") == "git-tree" else None,
+                                     added=watch.added)
+        if watch.found_at_end:
+            # the command ended on its own and the tree it ended on is not the one it started on: the writer cannot
+            # be told (the command itself, or an edit while it ran), so name both and refuse; never a stop, never
+            # a pass, never a counted failure
+            log_path.write_text(f"$ {command}\n# exit={proc.returncode} duration={dur:.1f}s at {now()}\n"
+                                f"# code changed under the run, found when it ended ({names})\n{skipped}\n"
+                                f"{stdout}{stderr}")
+            die(f"The code changed while this command ran, found only when it ended ({names}): either the "
+                "command itself wrote these files (a regenerated snapshot, a tracked report, a formatter), or they "
+                "were edited while it ran. Either way its result cannot count, and nothing was recorded: no "
+                f"attempt, no gate status and no flaky re-run allowance changed. {guidance} Put the files right "
+                f"first (a file left changed is a code change at the next command), then run `ratchet.py "
+                f"{watch.again}` again. Log: {log_path.relative_to(ctx.root)}", 2)
+        record = log_path.parent / "stopped-runs.json"
+        stops = read_json(record, {}, record="Ratchet treats it as holding no earlier stop") or {}
+        prev = stops.get(command) if isinstance(stops, dict) else None
+        same = bool(prev) and sorted(prev.get("files") or []) == sorted(changed)
+        stops = stops if isinstance(stops, dict) else {}
+        stops[command] = {"files": changed, "again": watch.again, "at": now()}
+        write_json(record, stops)
+        hint = ""
+        if same:
+            hint = (" This is the second run in a row stopped on the same file(s): if you did not edit them, the "
+                    "command itself rewrites them, and a test or check command must not change the files it started "
+                    f"with. {guidance}")
+        log_path.write_text(f"$ {command}\n# stopped: code changed under the run ({names}) duration={dur:.1f}s "
+                            f"at {now()}\n{skipped}\n{stdout}{stderr}")
+        die(f"Stopped: the code changed while this command was running ({names}), so its result cannot "
+            "count. Nothing was recorded: no attempt, no gate status and no flaky re-run allowance changed. "
+            f"Run `ratchet.py {watch.again}` again when the edit is finished.{hint} "
+            f"Log: {log_path.relative_to(ctx.root)}", 2)
+    if watch:
+        record = log_path.parent / "stopped-runs.json"
+        stops = read_json(record, {}, record="Ratchet treats it as holding no earlier stop") or {}
+        if isinstance(stops, dict) and command in stops:  # this command ended unstopped: its stop record is spent
+            del stops[command]
+            write_json(record, stops)
+    if timed_out:
+        code, out = 124, f"TIMEOUT after {_secs(limit)}s\n{stdout}{stderr}"
+    else:
+        code, out = proc.returncode, stdout + "\n" + stderr
+    header = f"$ {command}\n# exit={code} duration={dur:.1f}s at {now()}\n"
+    if note:
+        header += f"# {note}\n"
+    log_path.write_text(f"{header}{skipped}\n{out}")
     return code, out, dur
+
+
+def _restore_guidance(root: Path, files: list, tree: str | None, added: list | None = None) -> str:
+    """What to do about files a watched command's tree lost, changed or gained, never at the cost of the agent's
+    own work. A new source file (`added`: not in the tree the run started on) is kept if the agent added it, and
+    removed or ignored if the command wrote it (_added_guidance). Every other named file was in the tree the run started on (`tree`, the git tree id `fingerprint()` wrote: the step's
+    uncommitted work included, files untracked at HEAD included, never HEAD or the index), so the advice is the
+    same for all of them: an edit the agent made is kept (run again); a file the command wrote is put back from
+    that tree, and the command is fixed or the file taken out of the fingerprint (.gitignore, `git rm --cached`
+    first when git tracks it). Nothing is ever told to be deleted. The `(the files could not be listed: ...)`
+    marker gets no per-file advice."""
+    new = [f for f in files if f in (added or [])]
+    named = [f for f in files if not f.startswith("(") and f not in new]
+    if new:
+        tail = _added_guidance(new)
+        return f"{_restore_guidance(root, named, tree)} {tail}" if named else tail
+    if not named:
+        return "Find out what wrote them, and restore the files before running again."
+    if not _is_git(root):
+        return ("Restore the files before running again; if the command wrote them, fix it so a test or check "
+                "command never changes the files it started with.")
+    q = " ".join(shlex.quote(f) for f in named)
+    back = (f"git checkout {tree} -- {q}; that tree is the code the run started on, your uncommitted work and "
+            "files untracked at HEAD included, not HEAD" if tree else "from the code the run started on, not from HEAD")
+    return (f"{', '.join(named)} differ from when the run began. If you edited them, keep your edit and run again. "
+            f"If the command wrote them, put them back as they were when the run began ({back}), then stop the "
+            f"command writing into the tree, or take them out of the fingerprint: add them to .gitignore (and "
+            f"git rm --cached {q} first if git tracks them). Never delete a file the run started with.")
+
+
+def _added_guidance(files: list) -> str:
+    """What to do about new source files that appeared while a watched command ran: they were not there when it
+    began, so an edit is kept and a file the command wrote is taken out again (removed, or ignored)."""
+    q = " ".join(shlex.quote(f) for f in files)
+    return (f"{', '.join(files)} did not exist when the run began. If you added them, keep them and run again. If "
+            f"the command wrote them, remove them (rm {q}) or add them to .gitignore, and stop the command writing "
+            "source files into the project.")
 
 
 def _report_path(ctx, cp):
@@ -6861,6 +7775,24 @@ def cmd_implemented(args):
     ok(f"{args.cp}: implementation recorded. Next: {cps['step']} gate.")
 
 
+def _record_behavior_failure(ctx, st, g: dict, cfg, cp_id: str, code: int, log: Path, check: dict | None = None):
+    """The one record of a failed behavior attempt (the tests, their re-run, or an automatic check `check`): the
+    gate's status and `last`, the attempt limit (`blocked` so a human decides), the `behavior_failed` history
+    event, the saved state and the viewer. The caller prints the tail and dies with its own message."""
+    g["status"] = "failed"
+    g["last"] = {"exit": code, "log": str(log.relative_to(ctx.root)), "at": now()}
+    if check:
+        g["last"]["check"] = check.get("kind")
+    if g["attempts"] >= cfg["max_behavior_attempts"]:
+        _set_blocked(st, f"{cp_id}: behavior gate failed {g['attempts']} times — needs a human decision.")
+    if check:
+        ctx.log(st, "behavior_failed", cp=cp_id, attempt=g["attempts"], check=check.get("kind"))
+    else:
+        ctx.log(st, "behavior_failed", cp=cp_id, attempt=g["attempts"])
+    ctx.save_state(st)
+    build_viewer(ctx)
+
+
 def cmd_behavior(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -6882,10 +7814,14 @@ def cmd_behavior(args):
         die(f"Behavior gate FAILED: planned cases were removed from tests: {', '.join(missing)}. "
             "Tests may not be deleted or weakened to pass the gate.")
     rpath = _report_path(ctx, cp)
+    # the code under the run: an edit to it while the tests, the re-run or a check runs stops that command and
+    # ends here with nothing saved (see _run_cmd); the same watch covers every command of this call
+    watch = _Watch(ctx, fingerprint(ctx.root), _watch_every(cfg), f"behavior {args.cp}",
+                   extra=cfg.get("fingerprint_include") or [])
 
     def run_once(suffix):
         log_ = ctx.evidence(args.cp) / f"behavior-{g['runs']:02d}{suffix}.log"
-        code_, out_, dur_ = _run_cmd(ctx, cp["tests"]["command"], log_, cfg["test_timeout_sec"], rpath)
+        code_, out_, dur_ = _run_cmd(ctx, cp["tests"]["command"], log_, cfg["test_timeout_sec"], rpath, watch)
         bad_ = []
         if rpath:
             cases, why = _read_test_report(ctx, rpath)
@@ -6895,9 +7831,9 @@ def cmd_behavior(args):
     code, out, dur, bad, log = run_once("")
     flaky = False
     if (code != 0 or bad) and not g.get("flaky_used"):
-        # One immediate automatic re-run, once per step: a failure that passes on it is flaky, not a real attempt.
-        # The allowance is spent the moment this retry is attempted, win or lose, so a second failing call never
-        # gets a free retry of its own just because this one's retry also failed.
+        # One immediate automatic re-run, once per step: a failure that passes on it is flaky, not a real
+        # attempt. The allowance is spent the moment this retry is attempted, win or lose, so a second failing
+        # call never gets a free retry of its own just because this one's retry also failed.
         g["flaky_used"] = True
         code2, out2, dur2, bad2, log2 = run_once("b")
         if code2 == 0 and not bad2:
@@ -6913,7 +7849,7 @@ def cmd_behavior(args):
             if not isinstance(chk, dict) or not chk.get("command"):
                 continue
             clog = ctx.evidence(args.cp) / f"check-{re.sub(r'[^a-z0-9]+', '-', str(chk.get('kind', 'x')))}-{g['runs']:02d}.log"
-            ccode, cout, _ = _run_cmd(ctx, chk["command"], clog, cfg["test_timeout_sec"])
+            ccode, cout, _ = _run_cmd(ctx, chk["command"], clog, cfg["test_timeout_sec"], watch=watch)
             if ccode != 0:
                 code, out, log, failed_check = ccode, cout, clog, chk
                 break
@@ -6924,25 +7860,13 @@ def cmd_behavior(args):
         die(f"Behavior gate FAILED for {args.cp}: an automatic check changed files in the project. Checks must only read "
             "the code; restore the files (git) and fix the check's command.", 2)
     if code != 0 and failed_check:
-        g["status"] = "failed"
-        g["last"] = {"exit": code, "log": str(log.relative_to(ctx.root)), "at": now(), "check": failed_check.get("kind")}
-        if g["attempts"] >= cfg["max_behavior_attempts"]:
-            _set_blocked(st, f"{args.cp}: behavior gate failed {g['attempts']} times — needs a human decision.")
-        ctx.log(st, "behavior_failed", cp=args.cp, attempt=g["attempts"], check=failed_check.get("kind"))
-        ctx.save_state(st)
-        build_viewer(ctx)
+        _record_behavior_failure(ctx, st, g, cfg, args.cp, code, log, check=failed_check)
         print(_tail(out))
         die(f"Behavior gate FAILED for {args.cp}: the automatic check '{failed_check.get('kind')}' "
             f"({failed_check.get('command')}) failed. Log: {log.relative_to(ctx.root)}. Give it to ratchet-implementer; "
             "the check stays as it is.", 2)
     if code != 0 or bad:
-        g["status"] = "failed"
-        g["last"] = {"exit": code, "log": str(log.relative_to(ctx.root)), "at": now()}
-        if g["attempts"] >= cfg["max_behavior_attempts"]:
-            _set_blocked(st, f"{args.cp}: behavior gate failed {g['attempts']} times — needs a human decision.")
-        ctx.log(st, "behavior_failed", cp=args.cp, attempt=g["attempts"])
-        ctx.save_state(st)
-        build_viewer(ctx)
+        _record_behavior_failure(ctx, st, g, cfg, args.cp, code, log)
         print(_tail(out))
         die(f"Behavior gate FAILED for {args.cp} (exit {code}" + ("; " + "; ".join(bad) if bad else "") +
             f"). Log: {log.relative_to(ctx.root)}. "
@@ -7898,6 +8822,15 @@ def cmd_adv_record(args):
     subs = rnd.get("substitutions") or []
     reviews = {}
     round_dir = _review_round_dir(ctx, args.cp, "adv", rnd["round"])
+    # Lane H CP6: a scoped round (fix_round or small_fix) was shown only the diff since the last round actually
+    # reviewed, so both the minimum review time and the files_reviewed sanity check below are judged against
+    # THAT scope, never the whole checkpoint's base_tree -- the reviewer could never list a file it was never
+    # shown. Every other round (first, narrowed, full) is unaffected: scope is None and both checks fall back to
+    # the pre-CP6 behavior exactly.
+    scope = _scope_for_round(ctx, args.cp, rnd, cps, fp["id"])
+    min_seconds = (_scoped_min_review_seconds(ctx, cfg, scope["since_tree"], fp["id"], scope["changed_files"])
+                  if scope is not None else cfg.get("min_review_seconds", 20))
+    scoped_changed = set(scope["changed_files"]) if scope is not None else None
     for rp in args.reviews:
         rpath, raw, fst = _read_round_review(
             ctx, rp, round_dir, f"Adversarial reviews for round {rnd['round']}",
@@ -7914,13 +8847,18 @@ def cmd_adv_record(args):
         origin = check_review_origin(ctx, cfg, st, args.cp, rnd["round"], rp, rpath, r, rid, rnd["nonce"])
         r = clean_review_text(r)  # its signature is checked: from here on it only feeds records and messages
         age = fst.st_mtime - _iso(rnd["opened_at"])
-        if age < cfg.get("min_review_seconds", 20):
+        if age < min_seconds:
             die(f"{rp} ({rid}) was written {age:.0f}s after the round opened — too fast to be a real review. "
                 "Launch the reviewer and let it do the work.")
+        if r.get("omitted_files"):  # whatever its findings, the risk or the round: it never saw the whole fix
+            die(f"{rp} ({rid}) is a review of a fix that was too large to show it whole: it never saw "
+                f"{', '.join(sorted(r['omitted_files'])[:8])}. Such a review never counts, even with findings. "
+                "Re-review the fix with a reviewer that can read all of it.")
         if not r.get("findings"):
             seen = set(r.get("files_reviewed") or [])
-            changed = set(changed_files(ctx.root, {"kind": "git-tree", "id": cps.get("base_tree")}, fp)) \
-                if cps.get("base_tree") else set()
+            changed = scoped_changed if scoped_changed is not None else \
+                (set(changed_files(ctx.root, {"kind": "git-tree", "id": cps.get("base_tree")}, fp))
+                 if cps.get("base_tree") else set())
             if not seen or (changed and not (seen & changed)):
                 die(f"{rp} ({rid}) approves without listing the changed files it reviewed (files_reviewed). "
                     f"Changed in this checkpoint: {', '.join(sorted(changed)[:8]) or '(none recorded)'}.")
@@ -7996,7 +8934,10 @@ def cmd_adv_record(args):
                                           "blocking_files": sorted({_norm_path(f.get("file") or f.get("path") or f.get("location"), ctx.root)
                                                                     for f in all_findings} - {""}),
                                           "reviewers": [{"id": rr["id"], "vendor": rr.get("vendor"),
-                                                         "model": rr.get("model")} for rr in rnd.get("resolved") or []]}]
+                                                         "model": rr.get("model"), "slot": rr.get("slot")}
+                                                        for rr in rnd.get("resolved") or []]}]
+    if _is_fix_after_block(rnd):  # CP5: what this fix round was and who reviewed it, blocked or approved
+        _record_fix_round(cps, rnd, approved)
     if not approved:
         g["status"] = "failed"
         ci_note = _checkin_trigger(ctx, st, args.cp, cps, g, rnd, all_findings)
@@ -8017,7 +8958,8 @@ def cmd_adv_record(args):
             + (f" {ci_note}" if ci_note else ""), 2)
     g.update(status="passed", fingerprint=fp, passed_at=now(), evidence=str(dest.relative_to(ctx.root)))
     if rnd.get("small_fix"):  # CP3: approved as a one-reviewer small-fix round -- named for the commit/status
-        cps["small_fix_review"] = {"round": rnd["round"], "reviewer": (rnd.get("reviewers") or [None])[0]}
+        if not _is_fix_after_block(rnd):  # CP5's post-block fix round has its own record (`fix_rounds`)
+            cps["small_fix_review"] = {"round": rnd["round"], "reviewer": (rnd.get("reviewers") or [None])[0]}
     else:
         # CP3: anchor for `_is_small_fix_round` -- only a FULL round's approval moves this, so a run of small
         # fixes keeps measuring against the same baseline and their sizes add up.
@@ -8069,6 +9011,81 @@ def _adv_open_findings(ctx, cp_id: str, rnd, cps=None) -> list:
         return raw
     accepted_keys = {_finding_key(f) for f in _round_deferred(cps, rnd["round"]) if f.get("accepted")}
     return [f for f in raw if _finding_key(f) not in accepted_keys]
+
+
+# --------------------------------------------------------------------------- scoped diff & timing (lane H CP6)
+# A fix round, and a small fix opened after an approval, show their one reviewer only what changed since the
+# last round actually reviewed -- never the whole checkpoint diff -- plus, for a fix round, the specific
+# findings still open in the round it answers (full details: id, reviewer, severity, location, description,
+# suggested fix, and any rebuttal reason already recorded for it). A first round, a narrowed round (the old
+# convergence fallback), and any full round (including a fix over small_edit_lines after an approval, and every
+# high-risk step's own full round) are never scoped this way: they keep the whole step diff exactly as CP5 left
+# it. `prev_round_tree` (already carried forward through a free replacement -- see cmd_reviewers) is reused
+# as-is for the scope boundary, so a second fix round in a row scopes to just that second fix, and a round that
+# replaces one nobody reviewed yet scopes to everything since the last round actually reviewed, not just the
+# latest edit.
+
+def _scope_for_round(ctx: "Ctx", cp_id: str, rnd: dict | None, cps: dict, fp_id: str) -> dict | None:
+    """The CP6 scope for `rnd`, or None when it keeps the whole step diff. Returns {"since_tree", "changed_files",
+    "findings"}: `since_tree` is the tree id the diff is scoped since (the last round actually reviewed, or the
+    checkpoint's own base_tree if that is somehow unset); `changed_files` is sorted; `findings` is the full
+    finding dicts still open in the round a fix round answers (each with "rebuttal_reason" added when that
+    round's own triage rebutted it), or [] for a small fix after a clean approval -- nothing to re-check."""
+    if not rnd or not rnd.get("small_fix"):  # both kinds of fix round are small_fix rounds; `kind` tells them apart
+        return None
+    since_tree = rnd.get("prev_round_tree") or cps.get("base_tree")
+    if not since_tree:
+        return None
+    changed = sorted(changed_files(ctx.root, {"kind": "git-tree", "id": since_tree},
+                                   {"kind": "git-tree", "id": fp_id}))
+    findings = []
+    ff = rnd.get("fix_round") if _is_fix_after_block(rnd) else None  # the pick: {"round", "reviewer", "slot"}
+    if ff and ff.get("round"):
+        raw = _adv_open_findings(ctx, cp_id, {"round": ff["round"], "recorded": True}, cps)
+        triage = _read_triage(_adv_round_dir(ctx, cp_id, ff["round"]))
+        for f in raw:
+            entry = dict(f)
+            dec = triage.get(_finding_key(f)) or {}
+            if dec.get("decision") == "rebut":
+                entry["rebuttal_reason"] = dec.get("reason")
+            findings.append(entry)
+    return {"since_tree": since_tree, "changed_files": changed, "findings": findings}
+
+
+def _render_finding_line(f: dict) -> str:
+    """One plain line naming a finding's id, reviewer, severity, location, description, suggested fix and any
+    rebuttal reason -- used both in a host sub-agent's launch instructions and in an external reviewer's prompt,
+    so the two ways a fix round's reviewer is told about an open finding always say the same things about it."""
+    loc = str(f.get("file") or f.get("path") or f.get("location") or "(no file)")
+    if f.get("line"):
+        loc = f"{loc}:{f['line']}"
+    line = (f"finding id={f.get('id', '?')} reviewer={f.get('reviewer', '?')} severity={f.get('severity', '?')} "
+            f"location={loc} description={json.dumps(str(f.get('description') or ''))} "
+            f"fix={json.dumps(str(f.get('fix') or ''))}")
+    if f.get("rebuttal_reason"):
+        line += f" rebuttal={json.dumps(str(f['rebuttal_reason']))}"
+    return line
+
+
+_FIX_ROUND_MIN_REVIEW_FLOOR_SEC = 1       # never below this once ANY code changed, so a 0-second review always fails
+_FIX_ROUND_MIN_REVIEW_SEC_PER_LINE = 0.05  # 20 changed lines/second: a ~400-line fix reaches a 20s minimum
+
+
+def _scoped_min_review_seconds(ctx: "Ctx", cfg: dict, since_tree: str, fp_id: str, files: list[str]) -> int | float:
+    """The minimum age a scoped round's (lane H CP6: fix_round or small_fix) review must have, scaled down from
+    the configured `min_review_seconds` by how much actually changed in its own scope -- a tiny fix is never
+    held to the same wait as a full review, while a fix large enough to approach the configured minimum still
+    gets it in full. Never exceeds the configured minimum, whatever it is (a config of 5, or even 0, seconds is
+    still the hard ceiling). A change of unknown size (a binary file) gets the full configured minimum, never a
+    shortcut -- there is nothing here to measure it against."""
+    configured = cfg.get("min_review_seconds", 20)
+    lines, unknown = _code_size(ctx, since_tree, fp_id, files) if files else (0, [])
+    if unknown or lines is None:
+        return configured  # size can't be measured (a binary file): no shortcut, the full configured minimum applies
+    if lines <= 0:
+        return min(configured, 0)  # nothing to measure; never above the configured ceiling either
+    scaled = max(_FIX_ROUND_MIN_REVIEW_FLOOR_SEC, round(lines * _FIX_ROUND_MIN_REVIEW_SEC_PER_LINE))
+    return min(configured, scaled)
 
 
 def _open_blocking_lenses(ctx, cfg, cp_id: str, rnd, cps=None) -> set:
@@ -8307,8 +9324,15 @@ def cmd_repeats(args):
         print(f"- {r['kind']}: found {r['times']} times ({', '.join(r['checkpoints'])}); e.g. {r['example']}")
 
 
-def review_rules(ctx, cfg, cp, g, rnd, fp_id) -> tuple[set | None, list[str]]:
-    """What the reviewers of this round are told about the severity bar and the round's focus."""
+def review_rules(ctx, cfg, cp, g, rnd, fp_id, cps=None) -> tuple[set | None, list[str], dict | None]:
+    """What the reviewers of this round are told about the severity bar, the round's focus and (lane H CP6) its
+    scope. `cps` (the checkpoint's own state dict) is needed to compute the CP6 scope; omit it only for a caller
+    that only wants the pre-CP6 fields (focus, rules) and is not itself a fix_round/small_fix round, since
+    `_scope_for_round` needs it to find `base_tree`."""
+    scope = _scope_for_round(ctx, cp["id"], rnd, cps or {}, fp_id) if cps is not None else None
+    # `focus_files` is kept as compatibility metadata on every round > 1, scoped or not (older callers, and
+    # `status`/the viewer, read it regardless of scope) -- but the "look hardest" RULE TEXT below is given only
+    # on an unscoped round; a scoped round gets the CP6 scope text instead, never both.
     focus = _changed_since_last_round(ctx, cfg, g, fp_id) if rnd["round"] > 1 else None
     bar = (cfg.get("blocking_severities") or {}).get(cp.get("risk", "normal"), "all")
     rules = []
@@ -8320,19 +9344,36 @@ def review_rules(ctx, cfg, cp, g, rnd, fp_id) -> tuple[set | None, list[str]]:
         rules.append("These kinds of mistake are already caught by automatic checks that run with the tests: "
                      + ", ".join(kinds) + ". Still report a blocker or major problem of these kinds (it still blocks); "
                      "minor ones of these kinds are noted, not fixed.")
-    if focus is not None:
+    if scope is None and focus is not None:
         rules.append("Round " + str(rnd["round"]) + ": look hardest at the code changed since the last round ("
                      + (", ".join(sorted(focus)[:20]) or "nothing changed") + "). Re-raise any earlier finding that "
                      "still isn't fixed, wherever it is. Beyond that, a new minor problem outside those files is "
                      "recorded, not fixed; blocker and major problems count anywhere.")
-    if rnd["round"] > 1:
+    elif scope is not None:
+        since_short = scope["since_tree"][:10]
+        if scope["findings"]:
+            rules.append(f"This is a fix round: you are shown ONLY what changed since the last round actually "
+                         f"reviewed ({since_short}), never the whole checkpoint, plus the open finding(s) "
+                         "below from the round you are fixing. Judge only this diff and these findings: re-check "
+                         "whether each one is actually fixed, re-raising any that isn't. A new problem outside "
+                         "this diff is out of scope for this round.")
+            for f in scope["findings"]:
+                rules.append(_render_finding_line(f))
+        else:
+            rules.append(f"This is a small fix made after an approval: you are shown ONLY the lines that changed "
+                         f"since the last round actually reviewed ({since_short}), never the whole "
+                         "checkpoint. There are no open findings to re-check for this round; judge only this diff.")
+    if rnd["round"] > 1 and scope is None:
+        # A scoped round's own rebuttal info (if any) is already attached to each finding in `scope["findings"]`
+        # above (its "rebuttal_reason"), so this generic, round-number-based block would only ever duplicate it;
+        # it stays only for a narrowed or full round, exactly as before CP6.
         prev_triage = _read_triage(_adv_round_dir(ctx, cp["id"], rnd["round"] - 1))
         for ref, dec in prev_triage.items():
             if dec.get("decision") == "rebut":
                 rules.append(f"Rebuttal from the last round on {ref}: {dec.get('reason', '')} — withdraw this "
                              "finding if the rebuttal holds up, or re-raise it with a stronger user_impact if it "
                              "doesn't.")
-    return focus, rules
+    return focus, rules, scope
 
 
 def _announce_repeats(ctx, st):
@@ -9721,10 +10762,11 @@ def _warn_if_foreground(ctx, cfg):
         return
     secs = int(cfg.get("test_timeout_sec") or DEFAULT_CONFIG["test_timeout_sec"])
     span = f"{secs // 60} minutes" if secs >= 120 else f"{secs} seconds"
+    stretch = _load_stretch_max(cfg)
     print(f"WARNING: a tool timeout could cut this complete call off. It runs the whole regression suite, which "
-          f"can take up to {span}, and after a failure it may run the suite a second time, so up to about "
-          f"twice that. Run it in the background instead (run_in_background), then wait for it to "
-          f"finish.", file=sys.stderr, flush=True)
+          f"can take up to {span} (up to {_secs(stretch)} times that on a busy machine, load_stretch_max), and "
+          f"after a failure it may run the suite a second time, so up to about twice that. Run it in the "
+          f"background instead (run_in_background), then wait for it to finish.", file=sys.stderr, flush=True)
 
 
 def cmd_complete(args):
@@ -9832,16 +10874,23 @@ def cmd_complete(args):
                     "out what wrote them (generated files? snapshots?) and either add them to .gitignore or "
                     "re-run the gates.", 2)
     if cfg.get("regression_command") and not skip_full:
+        # The related pass runs only here, when the full suite is about to run: a break in the step's own,
+        # changed or naming test files stops the step in seconds, before the suite; it never replaces the suite.
+        # the code under the run: an edit to it while the related pass, the suite or its re-run runs stops that
+        # command and ends here with nothing saved (see _run_cmd); the gates above were checked against `fp`
+        watch = _Watch(ctx, fp, _watch_every(cfg), f"complete {args.cp}", extra=cfg.get("fingerprint_include") or [])
+        _run_related_tests(ctx, cfg, cp, cps, fp, watch)
         code, out, _ = _run_cmd(ctx, cfg["regression_command"], ctx.evidence(args.cp) / "regression.log",
-                                cfg["test_timeout_sec"])
+                                cfg["test_timeout_sec"], watch=watch)
         if code != 0 and not st.get("regression_flaky_used"):
             # The run's own one-time allowance (not per-step): a regression failure that passes on one
-            # immediate automatic re-run is flaky, never spending this; a second one anywhere is never forgiven.
-            # Spent the moment this retry is attempted, win or lose, so a later failed complete call never gets
-            # its own free retry just because this one's retry also failed.
+            # immediate automatic re-run is flaky, never spending this; a second one anywhere is never
+            # forgiven. Spent the moment this retry is attempted, win or lose, so a later failed complete call
+            # never gets its own free retry just because this one's retry also failed.
             st["regression_flaky_used"] = True
             code2, out2, _ = _run_cmd(ctx, cfg["regression_command"],
-                                      ctx.evidence(args.cp) / "regression-retry.log", cfg["test_timeout_sec"])
+                                      ctx.evidence(args.cp) / "regression-retry.log", cfg["test_timeout_sec"],
+                                      watch=watch)
             if code2 == 0:
                 code, out = code2, out2
                 cps["regression_flaky"] = True
@@ -9882,6 +10931,8 @@ def cmd_complete(args):
         small_fix_line = _small_fix_review_line(args.cp, cps)
         if small_fix_line:
             msg += "\n" + small_fix_line
+        for fix_round_line in _fix_round_lines_for(args.cp, cps):
+            msg += "\n" + fix_round_line
         docs_only_skip_line = _docs_only_skip_line(args.cp, cps)
         if docs_only_skip_line:
             msg += "\n" + docs_only_skip_line
@@ -11653,12 +12704,28 @@ def cmd_reviewers(args):
         # actually comes back as exactly one both-lens reviewer -- a customized review_depth["low"] (two slots,
         # or a single-lens id) falls back to the step's normal full round instead of mislabeling it. It is picked
         # and reserved through the same share-aware pick as a full round (pick_round below).
-        small_fix = _is_small_fix_round(ctx, cfg, args.cp, cp, cps, g)
-        if small_fix and _small_fix_reviewers(ctx, cfg, cp) is None:
-            small_fix = False
+        # CP5 (lane H): the second trigger on that same one-reviewer round. A round that follows a blocked round,
+        # once the fixer has run, opens with exactly one reviewer whatever the fix's size and whatever the step's
+        # risk: the reviewer whose blocking finding was fixed (same provider, same lens), never
+        # review_depth["low"]'s catch-all. `kind` says which of the two triggers opened the round. A fix round
+        # replaced before anyone reviewed it stays one (its reviewer and slot are carried forward), since the
+        # blocked round it follows is no longer the latest recorded one once this round has advanced past it.
+        fix_pick = _fix_round_pick(ctx, cfg, args.cp, cp, cps, g, fp)
+        if fix_pick is None and _is_fix_after_block(rnd) and not rnd.get("recorded") and rnd.get("fix_round"):
+            fix_pick = rnd["fix_round"]
+        kind = FIX_AFTER_BLOCK if fix_pick else None
+        small_fix = bool(fix_pick)
+        if not small_fix:
+            small_fix = _is_small_fix_round(ctx, cfg, args.cp, cp, cps, g)
+            if small_fix and _small_fix_reviewers(ctx, cfg, cp) is None:
+                small_fix = False
+            kind = FIX_AFTER_APPROVAL if small_fix else None
 
         def pick_round(share):
             nonlocal narrow_now
+            if fix_pick:
+                narrow_now = False
+                return _fix_round_reviewers(ctx, cfg, cp, fix_pick, share=share)
             if small_fix:
                 low_resolved = _small_fix_reviewers(ctx, cfg, cp, share=share)
                 if low_resolved is not None:
@@ -11706,8 +12773,21 @@ def cmd_reviewers(args):
             for pid in due:
                 good, detail = probe_shared(ctx, cfg, provider_by_id(cfg, pid))
                 print(f"  checked {pid}: {'working' if good else 'not usable now (' + detail + ')'}", file=sys.stderr)
-        if small_fix and not (len(resolved) == 1 and (_roster_spec(cfg, resolved[0]["id"]) or {}).get("lens") == "both"):
+        if fix_pick:
+            if len(resolved) != 1:
+                # The fix round's one slot did not come back as exactly one reviewer (resolve_reviewers never
+                # returns an empty set for a round, so this is a guard, not a path a working setup reaches):
+                # open a normal round, RE-RESOLVED, so a round can never open with no reviewer at all. The
+                # starts already reserved for the abandoned pick go back and the new picks' are recorded here,
+                # outside the lock, best effort, the same way a lock-busy round records its own.
+                abandoned = [r["id"] for r in resolved]
+                fix_pick, small_fix, kind = None, False, None
+                resolved = pick_round({"data": provider_health(), "ignore": set(ignore_old)})
+                if reserved:
+                    update_review_starts(cfg, new_nonce, add=[r["id"] for r in resolved], give_back=abandoned)
+        elif small_fix and not (len(resolved) == 1 and (_roster_spec(cfg, resolved[0]["id"]) or {}).get("lens") == "both"):
             small_fix = False  # the share-aware pick fell back to a normal round: never label it a small fix
+            kind = None
         g["attempts"] += 1
         st["adv_rounds_total"] = int(st.get("adv_rounds_total", 0)) + 1
         prev = rnd["round"] if rnd else 0
@@ -11730,6 +12810,7 @@ def cmd_reviewers(args):
             prev_round_tree = rnd["fingerprint"] if rnd else None
         rnd = {"round": prev + 1, "nonce": new_nonce, "fingerprint": fp, "opened_at": now(),
                "reviewers": [r["id"] for r in resolved], "narrowed": narrow_now, "small_fix": small_fix,
+               "kind": kind, "fix_round": fix_pick,
                "prev_round_tree": prev_round_tree,
                "substitutions": [{"used": r["id"], "instead_of": r["fallback_for"], "why": r["reasons"]}
                                  for r in resolved if r["fallback_for"]],
@@ -11771,7 +12852,7 @@ def cmd_reviewers(args):
         newly_failed = sorted(failed_now) != sorted(rnd.get("failed_providers") or [])
         if newly_failed:
             rnd["failed_providers"] = sorted(failed_now)
-        if rnd.get("small_fix"):
+        if rnd.get("small_fix") and not _is_fix_after_block(rnd):
             # A small-fix round's one reviewer must always cover both lenses, so re-resolve it the same way
             # the round was opened (_small_fix_reviewers), never via the step's own (possibly single-lens)
             # risk. When that can't produce a both-lens replacement, this stops being a small-fix round. A
@@ -11801,7 +12882,8 @@ def cmd_reviewers(args):
         else:
             # A slot is refilled when it has no finished review and its reviewer is out of the round or no longer
             # available; every other slot keeps its reviewer, and the refill never repeats one of those (same id, or the
-            # same company, model and lens under another id).
+            # same company, model and lens under another id). A post-block fix round (CP5) is refilled here too: its
+            # one slot gets that slot's own same-lens stand-in, and the round stays a one-reviewer fix round.
             replace = [i for i, r in enumerate(rnd["resolved"])
                        if not (out_dir_now / f"{r['id']}.json").exists()
                        and (not reviewer_availability(ctx, cfg, r["id"])[0] or r["id"] in round_cutoff
@@ -11880,7 +12962,7 @@ def cmd_reviewers(args):
     fixes = ctx.run_dir() / "reviews" / args.cp / f"adv-round-{rnd['round'] - 1:02d}" / "fixes.md"
     fixes_arg = f" --fixes {fixes}" if rnd["round"] > 1 else ""
     ext_script = SKILL_DIR.parent / "ratchet-adversarial-loop" / "scripts" / "external_review.py"
-    focus, rules = review_rules(ctx, cfg, cp, g, rnd, fp)
+    focus, rules, scope = review_rules(ctx, cfg, cp, g, rnd, fp, cps)
     rows = []
     for res_r in rnd["resolved"]:
         rid = res_r["id"]
@@ -11889,9 +12971,16 @@ def cmd_reviewers(args):
         if spec["kind"] == "agent":
             want = ("a model DIFFERENT from yours: " + " or ".join(host_model_map(cfg).get("alternates") or [])
                     if spec.get("alt") else role_model(cfg, "ratchet-adversary"))
+            # Lane H CP6: a scoped round (fix_round or small_fix) tells the host sub-agent the SAME scope an
+            # external reviewer's own prompt gets -- the prior reviewed tree, this round's fingerprint (already
+            # above), and the files changed since then; the open findings themselves (or "no open findings") are
+            # already in `rules` below (review_rules appends one line per finding via _render_finding_line).
+            scope_note = (f", since {scope['since_tree'][:10]}, changed files: "
+                         f"{', '.join(scope['changed_files']) or '(none)'}" if scope is not None else "")
             spec["how"] = (f"Objective: {obj_oneline} | Spawn a ratchet-adversary sub-agent (model: {want}): "
                            f"lens={spec['lens']}, reviewer id '{rid}', "
                            f"fingerprint {fp}, round_nonce {rnd['nonce']}, checkpoint {args.cp}, output {spec['output']}"
+                           + scope_note
                            + (f", fixes.md {fixes}" if rnd["round"] > 1 else "")
                            + ("" if not rules else ". Review rules for this round (tell it): " + " ".join(rules)))
         else:
@@ -11900,8 +12989,10 @@ def cmd_reviewers(args):
     res = {"checkpoint": args.cp, "objective": obj if isinstance(obj, dict) and obj else NO_OBJECTIVE_NOTE,
            "risk": cp.get("risk", "normal"), "round": rnd["round"], "fingerprint": fp,
            "review_rules": rules, "focus_files": sorted(focus) if focus is not None else None,
+           "scope": scope,
            "round_nonce": rnd["nonce"], "output_dir": str(out_dir), "narrowed": rnd.get("narrowed", False),
-           "small_fix": rnd.get("small_fix", False),
+           "small_fix": rnd.get("small_fix", False), "kind": rnd.get("kind"),
+           "fix_round": rnd.get("fix_round"),
            "fixes_md": str(fixes) if rnd["round"] > 1 else None,
            "run_rounds_used": st.get("adv_rounds_total", 0), "run_rounds_cap": cfg["max_adversarial_rounds_run"],
            "reviewers": rows}
@@ -11910,7 +13001,15 @@ def cmd_reviewers(args):
         return
     print(f"{args.cp} risk={res['risk']} round={rnd['round']} fingerprint={fp[:12]} nonce={rnd['nonce']} "
           f"(run rounds {res['run_rounds_used']}/{res['run_rounds_cap']})")
-    if res["small_fix"]:
+    if _is_fix_after_block(rnd):
+        fr = rnd.get("fix_round") or {}
+        print(f"Fix round after a block: one reviewer re-checks the fix, {rnd['reviewers'][0]}"
+              + (f" (the reviewer whose blocking finding was fixed in round {fr.get('round')})"
+                 if fr.get("reviewer") == rnd["reviewers"][0] else
+                 f" (standing in for {fr.get('reviewer')}, the reviewer whose blocking finding was fixed in "
+                 f"round {fr.get('round')})")
+              + ". It counts toward the round limits like any other round.")
+    elif res["small_fix"]:
         print(f"Small fix since approval (at or under {cfg.get('small_edit_lines', 20)} changed code lines): "
               "one reviewer, scoped to the files changed since approval.")
     off_note = _docs_only_quick_path_off_note(ctx, cfg, cp, cps)
@@ -11989,7 +13088,7 @@ def status_json(ctx: Ctx) -> dict:
             "hooks": hs, "hook_errors": hook_errors_view(ctx.root, hs.get("host", "unknown")),
             "viewer_url": viewer_link(ctx)["url"], "viewer_live": viewer_link(ctx)["live"],
             "done": sum(1 for c in cps if c["status"] == "done"), "total": len(cps),
-            "small_fix_reviews": _small_fix_review_lines(st),
+            "small_fix_reviews": _small_fix_review_lines(st), "fix_rounds": _fix_round_lines(st),
             "docs_only_review_skips": _docs_only_skip_lines(st),
             "checkpoints": cps, "updated_at": st.get("updated_at")}
 
@@ -12049,6 +13148,10 @@ def cmd_config(args):
                 val = v
             if k == "quota_retest_minutes":
                 quota_retest_minutes({k: val})
+            if k == "related_test_command" and val and "{files}" not in str(val):
+                die(_NO_FILES_PLACEHOLDER_MSG, 2)
+            if k == "suite_watch_seconds" and _suite_watch_seconds({k: val}) is None:
+                die(f"suite_watch_seconds must be a number of seconds above 0 (got {v!r}); the value was not changed.", 2)
             cur = user
             parts = k.split(".")
             for p in parts[:-1]:
