@@ -299,7 +299,7 @@ def build_nocommit(name):
     (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
                                                       "checkpoints": cps}))
     for cid in ("CP1", "CP2"):
-        (run / "tests" / f"{cid}.json").write_text(json.dumps({"cases": [{"id": f"{cid}-T01", "layer": "code"}]}))
+        (run / "tests" / f"{cid}.json").write_text(json.dumps({"cases": [{"id": f"{cid}-T01", "layer": "code", "proves": [1]}]}))
     r = rx(d, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout
     tg.approve_plan(d)

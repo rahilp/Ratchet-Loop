@@ -553,8 +553,10 @@ def t13_a_host_reviewer_in_a_full_round_gets_no_fix_only_instruction():
     check("[CP6-T13] round 1 carries no previous-tree range and no findings-to-fix list",
           "findings to fix" not in low and "meant to fix" not in low and "since the reviewed round" not in low
           and "open findings" not in low, t1[-600:])
-    check("[CP6-T13] round 1's review rules are the same as today's (none at normal risk)",
-          (rnd1.get("review_rules") or []) == [], rnd1.get("review_rules"))
+    _rules1 = list(rnd1.get("review_rules") or [])
+    _dm_rules = [x for x in _rules1 if x.startswith("A finding that names a done-means line it contradicts")]
+    check("[CP6-T13] round 1's review rules are no rules except the done-means always-block rule (none else at normal risk)",
+          len(_dm_rules) == 1 and [x for x in _rules1 if x not in _dm_rules] == [], rnd1.get("review_rules"))
     d2 = tf._start("h13b")
     _seed(d2)
     r1 = tf._open(d2)

@@ -319,7 +319,7 @@ def legacy_no_objective_project(name):
         "tests": {"files": ["tests/cp1.test.js"], "command": "node --test tests/cp1.test.js"},
     }]}
     (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
-    (run / "checkpoints.json").write_text(json.dumps(plan))
+    (run / "checkpoints.json").write_text(json.dumps(plan))  # no proves link on purpose: this plan has no objective at all (a run approved before the proves field existed; CP2-T11 legacy case)
     ctx = rt.Ctx(d)
     st = ctx.state()
     loaded_plan = ctx.plan()

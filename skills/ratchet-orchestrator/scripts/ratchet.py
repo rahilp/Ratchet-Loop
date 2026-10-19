@@ -127,14 +127,17 @@ DEFAULT_CONFIG = {
     "probe_ttl_minutes": 120,       # a provider that answered a test request this recently isn't tested again
     "probe_timeout_sec": 120,
     # Which finding severities block approval, by checkpoint risk. "all" = every finding must be fixed. On a low-risk
-    # checkpoint minor findings are recorded for later (`ratchet.py deferred`) instead of starting another round.
+    # checkpoint minor findings are recorded for later (`ratchet.py deferred`) instead of starting another round,
+    # except a finding that names a done-means line (`names_done_means`), which blocks at any severity.
     "blocking_severities": {"low": ["blocker", "major"], "normal": "all", "high": "all"},
-    # From round 2 on, a minor finding only blocks if it is in code changed since the previous round; blocker and
-    # major findings block wherever they are. Stops each round from turning into a fresh review of everything.
+    # From round 2 on, a minor finding only blocks if it is in code changed since the previous round, unless it
+    # names a done-means line (`names_done_means`); blocker and major findings block wherever they are. Stops each
+    # round from turning into a fresh review of everything.
     "scope_later_rounds": True,
     # From round converge_after_round + 1 on (default: round 3), a minor finding never blocks, even in code changed
-    # since the previous round; it is recorded for later instead (`ratchet.py deferred`). Blocker and major
-    # findings always block, at any round. Keeps reviews converging instead of chasing ever-narrower nits.
+    # since the previous round, unless it names a done-means line (`names_done_means`); it is recorded for later
+    # instead (`ratchet.py deferred`). Blocker and major findings always block, at any round. Keeps reviews
+    # converging instead of chasing ever-narrower nits.
     "converge_after_round": 2,
     # After this many blocking adversarial rounds in a row (or a second round where an unseen finding kind shows
     # up in a file an earlier round already flagged), pause for a check-in (`ratchet.py check-in CPn`) before
@@ -1188,7 +1191,11 @@ def _fix_round_pick(ctx, cfg, cp_id: str, cp: dict, cps: dict, g: dict, fp_id: s
     rows = last.get("reviewers") or []
     slots = {r.get("id"): r.get("slot") or i + 1 for i, r in enumerate(rows) if r.get("id")}
     triage = _read_triage(_adv_round_dir(ctx, cp_id, round_no))
-    fixing = {f.get("reviewer") for f in _round_blocking_findings(ctx, cp_id, round_no, cps)
+    blocking = _round_blocking_findings(ctx, cp_id, round_no, cps)
+    if (any(names_done_means(f) for f in blocking)
+            and _dm_findings_block(ctx, ctx.state(), ctx.plan() or {})):
+        return None  # done-means CP3: a still-open finding naming a line brings back every lens it narrows to
+    fixing = {f.get("reviewer") for f in blocking
               if (triage.get(_finding_key(f)) or {}).get("decision") == "fix"}
     host = detect_host(cfg)
 
@@ -1259,8 +1266,20 @@ def _docs_only_review_skip(ctx: "Ctx", st: dict, cfg: dict, cp: dict, cps: dict,
                            json_out: bool = False) -> bool:
     """True once this call has handled the adversarial gate for a docs-only step (the caller returns without
     opening a round); False when the normal full round still applies (code changed, high risk, a pinned
-    reviewer list, or the docs quick path is off)."""
+    reviewer list, the docs quick path is off, or, CP3, the step's latest RECORDED round still has an open
+    finding that names a done-means line (`names_done_means`, while `_dm_findings_block` applies to this plan):
+    a miss against what done means is fixed, re-reviewed or accepted by the user, never passed over because the
+    diff that remains is docs only). That round is read from the gate's own `rounds` list, not from
+    `cps['adv_round']`: `reviewers` replaces that pointer with a newer, unrecorded round the moment one opens
+    (and again after a reviewer times out and it is re-run), and the earlier round's finding is still open
+    until a later round records it fixed or the user accepts it."""
     if cp.get("risk", "normal") == "high" or not cfg.get("doc_test_command"):
+        return False
+    recorded = ((cps.get("gates") or {}).get("adversarial") or {}).get("rounds") or []
+    last_no = recorded[-1].get("round") if recorded else None
+    last_rec = {"round": last_no, "recorded": True} if last_no is not None else None
+    if last_rec and _dm_findings_block(ctx, st, ctx.plan() or {}) \
+            and any(names_done_means(f) for f in _adv_open_findings(ctx, cp_id, last_rec, cps)):
         return False
     if cp.get("reviewers"):
         return False  # the checkpoint pins its own reviewer list; that override always gets a normal full
@@ -2561,7 +2580,7 @@ def objective_problems(plan) -> list[str]:
 
 
 def _proves_values(case) -> list:
-    """Normalize one test-plan case's "proves" field for every consumer (proves_problems, _unproven_done_means,
+    """Normalize one test-plan case's "proves" field for every consumer (proves_problems, _done_means_links,
     _done_means_proof): a missing value is [] (nothing to prove), a scalar int counts as [int] (the common
     planner slip of writing "proves": 1 instead of [1]), a list is used as-is. Any other shape is not a number
     or a list of numbers, so there is nothing valid to normalize here; plan-submit's proves_problems is the one
@@ -2579,7 +2598,8 @@ def _proves_values(case) -> list:
 def proves_problems(ctx, plan) -> list[str]:
     """CP3: a test-plan case's optional "proves" (the spec_ref precedent's sibling) names, 1-based, the lines
     of the objective's done_means it proves. plan-submit refuses any number that is not really a done_means
-    line, naming the offending case; a plan with no objective or no done_means lines (objective_problems
+    line, naming the offending case (plan-extend applies the same check to the appended checkpoints' cases only,
+    passing a plan holding just those); a plan with no objective or no done_means lines (objective_problems
     already refuses that on its own) simply has nothing valid to name, so every number is refused. "proves" may
     be a single integer (normalized to a one-item list, see _proves_values) or a list; any other shape (a
     string, a dict, a list containing one) is refused here by name, so plan-summary and receipt never have to
@@ -2590,6 +2610,23 @@ def proves_problems(ctx, plan) -> list[str]:
     errs = []
     for cp in plan.get("checkpoints") or []:
         for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
+            if case.get("layer") == "shortcuts":  # names a shortcut table that exists (tests/shortcuts/<table>.json)
+                t = case.get("table")
+                if not isinstance(t, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", t):
+                    errs.append(f"{case.get('id', '?')}: a shortcuts case must name its table in \"table\" "
+                                f"(tests/shortcuts/<table>.json)")
+                elif not (ctx.root / SHORTCUT_DIR / f"{t}.json").is_file():
+                    errs.append(f"{case.get('id', '?')}: shortcut table {t!r} does not exist "
+                                f"({SHORTCUT_DIR}/{t}.json)")
+                else:
+                    try:
+                        tdef, twhy = _sc_parse((ctx.root / SHORTCUT_DIR / f"{t}.json").read_text(errors="replace"))
+                    except OSError as e:
+                        tdef, twhy = None, f"unreadable: {e}"
+                    gone = _sc_watch_missing(ctx, None, tdef["watches"]) if tdef else []
+                    if twhy or gone:
+                        errs.append(f"{case.get('id', '?')}: shortcut table {t!r} cannot be used: "
+                                    + (twhy or f"it watches {', '.join(gone)}, which does not exist"))
             proves = case.get("proves")
             if proves is None:
                 continue
@@ -2607,11 +2644,17 @@ def proves_problems(ctx, plan) -> list[str]:
 NO_OBJECTIVE_NOTE = "no objective was stated for this run (an older plan, approved before this feature existed)"
 
 
-def objective_brief(plan) -> str:
+def objective_brief(plan, proof_notes=None) -> str:
     """Plain text of the plan's objective, for the top of every reviewer prompt and every sub-agent's brief: who
-    the result is for, what they want, what done means, what is out of scope. A plan with no objective at all
-    (a run approved before CP1's objective_problems() existed) gets a plain note instead of a crash, so a legacy
-    run keeps reviewing normally."""
+    the result is for, what they want, what done means, what is out of scope. With `proof_notes` (the dict
+    `_done_means_proof_notes` builds: {1-based done_means line number: one note line}), each done-means bullet is
+    followed by its note (`Proved by: <case ids>`, or the plain `Heads up` for a line no case proves yet); this is
+    the one rendering `plan-summary`, `brief` and the launch guard share, so a brief's objective matches
+    plan-summary's word for word. Done-means lines are numbered 1..N (`  - 1. <line>`, still a "- " bullet so
+    the objective block reads the same as the other bullets), the same 1-based numbers a test case's "proves"
+    and a review finding's `done_means` (CP3) use, so a reviewer can name the line a finding contradicts. A
+    plan with no objective at all (a run approved before CP1's
+    objective_problems() existed) gets a plain note instead of a crash, so a legacy run keeps reviewing normally."""
     obj = plan.get("objective") if isinstance(plan, dict) else None
     if not isinstance(obj, dict) or not obj:
         return f"Objective: {NO_OBJECTIVE_NOTE}."
@@ -2619,7 +2662,10 @@ def objective_brief(plan) -> str:
     dm = obj.get("done_means") or []
     if dm:
         lines.append("Done means:")
-        lines += [f"  - {x}" for x in dm]
+        for i, x in enumerate(dm, 1):
+            lines.append(f"  - {i}. {x}")
+            if proof_notes and proof_notes.get(i):
+                lines.append(f"    {proof_notes[i]}")
     oos = obj.get("out_of_scope") or []
     if oos:
         lines.append("Out of scope:")
@@ -2648,13 +2694,22 @@ ROLE_BRIEFS = {
     "reviewer": ("Rules: judge every finding against the realistic-use bar: this project's users run a cooperative "
                  "agent, not an attacker, and a finding must describe real harm to them in realistic, normal use, "
                  "not a case no real user would hit. Every blocking finding (blocker or major) must say who is hurt "
-                 "and how; leave that out and it does not block. Approve only when you genuinely find nothing."),
+                 "and how; leave that out and it does not block. The one exception: a finding that names a done-means "
+                 "line of the objective (done_means) blocks at any severity and any round, with no separate "
+                 "user_impact needed, so name a line only when that line is not met in normal use; a plan approved "
+                 "before that rule keeps the older severity and round rules, and the round's review rules say so when "
+                 "that is the case. Approve only when you genuinely find nothing."),
     "scout": ("Rules: verify the app, its tests and its dev server actually run before anyone else relies on your "
               "report; don't guess. Record what's already green, what's already broken, and what's missing, so a "
               "later checkpoint is never blamed for a problem that was there before the build started."),
     "planner": ("Rules: write the plan's objective first. Slice the work into small checkpoints of increasing "
                 "complexity a human can approve in minutes. Ask a question instead of guessing on anything that "
                 "changes the plan's shape. A high-risk step needs its own risk_reason naming who could be harmed."),
+    "test-planner": ("Rules: plan this checkpoint's test cases before any code exists, through public entry "
+                     "points, with every done_when line covered. Every objective done-means line above needs at "
+                     "least one case, in some step's tests/CPn.json, whose \"proves\" names it by its 1-based "
+                     "number; plan-submit refuses a plan that leaves a done-means line unlinked, naming the line. "
+                     "Don't write test code."),
 }
 
 ROLE_ORDER = ["implementer", "fixer", "test-writer", "reviewer", "scout", "planner"]
@@ -2664,12 +2719,13 @@ ROLE_ORDER = ["implementer", "fixer", "test-writer", "reviewer", "scout", "plann
 # wording per agent (the fix this round deliberately keeps smaller than a custom brief for each one).
 _GENERIC_ROLE_RULES = ("Rules: follow your own agent instructions for this role. Serve the objective above. Make "
                         "the smallest change for the job. Don't run the full test suite unless asked.")
-for _generic_role in ("behavior-reviewer", "design-system", "prototyper", "test-planner", "test-runner",
-                      "variant-writer", "visual-reviewer"):
+for _generic_role in ("behavior-reviewer", "design-system", "prototyper", "test-runner", "variant-writer",
+                      "visual-reviewer"):
     ROLE_BRIEFS[_generic_role] = _GENERIC_ROLE_RULES
 
 # agents/*.md names that don't match a ROLE_BRIEFS key directly (the rest of the agents/ file stems -- adversary,
-# behavior-reviewer, checkpoint-planner, design-system, fixer, implementer, prototyper, test-planner, test-runner,
+# behavior-reviewer, checkpoint-planner, design-system, fixer, implementer, prototyper, test-planner (its own
+# entry above: the done-means link rule), test-runner,
 # test-writer, variant-writer, visual-reviewer, app-scout -- already equal a ROLE_BRIEFS key once the optional
 # `ratchet-` prefix is stripped). Keep this to just the renames so `--role` accepts every agent the orchestrator
 # spawns without a bespoke rule set per agent.
@@ -2970,7 +3026,10 @@ def cmd_brief(args):
     the agent's name (any file stem under agents/, with or without the `ratchet-` prefix) as well as the six
     original role names; see `_normalize_role`. CPn is optional: the scout and the planner are briefed before any
     checkpoint exists, before checkpoints.json even exists (that die is only reached when a CPn is given, since a
-    CPn can't be looked up with no plan at all). A plan with no stated objective (approved before that rule existed)
+    CPn can't be looked up with no plan at all). Under each done-means line it prints the same `Proved by` or
+    `Heads up` note plan-summary prints (`_done_means_proof_notes`), so the two stay word for word the same and the
+    launch guard (`_brief_guard`) compares against this same rendering. A plan with no
+    stated objective (approved before that rule existed)
     gets the plain NO_OBJECTIVE_NOTE instead of a crash. An unknown CPn is refused by `cp_by_id`, the same shared
     lookup every other command uses. The planner's brief, and only the planner's, ends with one more block: the
     "What earlier work says" section from `_earlier_work_lines` (see there), so the plan builds on what earlier
@@ -2990,7 +3049,9 @@ def cmd_brief(args):
         header = f"Brief for the {role} (no checkpoint yet)"
     print(header)
     print("")
-    print(objective_brief(plan))
+    st, _why = _read_record(ctx.state_path())
+    plan = _plan_for_briefs(plan, st)  # the approved done-means lines once approved (CP4), see _plan_for_briefs
+    print(objective_brief(plan, _done_means_proof_notes(ctx, plan, st)))
     print("")
     print(ROLE_BRIEFS[role])
     if role == "planner":
@@ -2998,23 +3059,76 @@ def cmd_brief(args):
         print("\n".join(_earlier_work_lines(ctx)))
 
 
-def _final_review_lines(plan) -> list[str]:
-    """What `status` (and `status --json`'s own fields, read by the human-approve question) opens the final review
-    with: the objective's goal and users, then every done_means line, plain, for the user to judge against the
-    evidence themselves. Completing every checkpoint never proves a done_means line is actually met (simplifying a
-    step, or the user accepting a finding, can leave one unmet), so no line here claims met or not met; `status`
+def _final_review_lines(ctx, st, plan) -> list[str]:
+    """What `status` opens the finish pause with (`_finish_pending`: the final review, or the last step's review
+    in human_review `each` mode): the objective's goal and users, then a table of every
+    done_means line marked proven or unproven (`done_means_table`, the same verdicts `status --json` and the
+    receipt carry): the tests behind the line with their results, and for an unproven line why (no test linked,
+    a linked test failed or has no result, a browser test no UI gate checked, or an open finding that names the
+    line). A line the user accepted (CP5, verdict "accepted") shows who accepted it, what held the line (its
+    real `reasons`, which the acceptance covered) and their reason in place of its tests, never the word unproven;
+    a line held again after an acceptance (`_apply_accepted_lines`: a new reason, or a new open finding naming it)
+    reads unproven with a "held again" reason that names the earlier acceptance. Completing every checkpoint never
+    proves a line is met, so the verdict comes from the recorded test results and findings, not from the agent's
+    judgment. The objective and its lines are the APPROVED ones
+    (`_plan_as_approved`), so an edit to checkpoints.json after approval never changes the table. `status`
     prints the findings accepted along the way (`_accepted_findings_lines`) and anything left for later right
-    after, so the user judges each line with that context, not a bare claim. A plan with no stated objective
-    (approved before this existed) gets a plain note instead of a crash."""
+    after, and (cmd_status_text) the finish block or the older-run note. A plan with no stated objective, or
+    whose tests are linked to no line (approved before that existed), gets a plain note instead of a table, and
+    never a crash."""
+    plan = _plan_as_approved(plan, st)
     obj = plan.get("objective") if isinstance(plan, dict) else None
     if not isinstance(obj, dict) or not obj:
         return [f"Objective: {NO_OBJECTIVE_NOTE}."]
-    lines = [f"Objective: {obj.get('goal', '')}", f"Who it's for: {obj.get('users', '')}",
-              "Done means (check each against what was actually built and the findings below; finishing the "
-              "checkpoints does not by itself mean these are met):"]
-    for dm in obj.get("done_means") or []:
-        lines.append(f"  - check: {dm}")
-    return lines
+    out = [f"Objective: {obj.get('goal', '')}", f"Who it's for: {obj.get('users', '')}"]
+    table = done_means_table(ctx, plan, st)
+    if not isinstance(table, list):
+        if not obj.get("done_means"):
+            out.append(f"Done means: {table}.")
+            return out
+        out.append("Done means:")
+        out += [f"  - {dm}" for dm in obj.get("done_means") or []]
+        out.append(table)
+        return out
+    n_ok = sum(1 for e in table if e["verdict"] == "proven")
+    n_acc = sum(1 for e in table if e["verdict"] == "accepted")
+    n_un = len(table) - n_ok - n_acc
+    out.append(f"Done means ({n_ok} of {len(table)} lines proven" + (f", {n_acc} accepted" if n_acc else "") + (
+        f", {n_un} unproven" if n_un else "") +
+        "; a line is proven only when every test linked to it passed and no open finding names it):")
+    for e in table:
+        out.append(f"  {e['number']}. {e['text']}: {e['verdict']}")
+        if e["verdict"] == "accepted":
+            out.append(f"     {_accepted_line_text(e)}")
+            continue
+        out += [f"     - {c['id']}: {c['result']}" for c in e["cases"]]
+        if e["reasons"]:
+            out.append(f"     Why unproven: {'; '.join(e['reasons'])}")
+    return out
+
+
+def _accepted_line_text(e: dict, with_ids: bool = True) -> str:
+    """The one line `status` and the receipt print under a done-means line the user accepted (CP5): who accepted
+    it, what held the line (the entry's real `reasons`: a failed or missing test result, an open finding naming
+    it, no test linked; all of them covered by the acceptance, `_apply_accepted_lines`) and their reason, on one
+    line (a multi-line reason is collapsed), in place of its tests. Never a fixed cause: a line held by an open
+    finding alone must not read as if its tests failed. The receipt (cmd_receipt) passes `with_ids=False`: there
+    an accepted line is shown apart from the proven lines, without its test ids, so each test reason reads "a
+    linked test failed" / "a linked test has no result" instead of naming the case (`receipt --json` keeps the
+    full `reasons`); an open finding is named either way."""
+    a = e.get("accepted") or {}
+    who = "the director" if a.get("accepted_by") == "director" else "the user"
+    reasons = [str(r) for r in e.get("reasons") or []]
+    if not with_ids:
+        for c in e.get("cases") or []:
+            cid = str(c.get("id") or "")
+            # by slice on a space boundary, never `replace`: with ids CP1-T1 and CP1-T10 on one line, a prefix
+            # replace would leave "a linked test0 failed"
+            reasons = ["a linked test" + r[len(cid):] if cid and (r == cid or r.startswith(cid + " ")) else r
+                       for r in reasons]
+    held = "; ".join(reasons) or "not judged"
+    return (f"Accepted by {who}. What held it: {held}. Their reason: "
+            f"{' '.join(str(a.get('reason') or '').split())}")
 
 
 def _objective_fill_ins(obj: dict) -> list[str]:
@@ -3267,6 +3381,12 @@ def next_action(ctx: Ctx, st=None, compute_accept_note: bool = True) -> dict:
                "Waiting for the user to approve the plan. " + _after_next(PLAN_ASK_NEXT))
         return {"phase": phase, "action": how + extra, "stop_ok": not missing}
     if phase in ("awaiting_checkpoint_review", "awaiting_final_review"):
+        blockers = _finish_blockers(ctx, st) if _finish_pending(st) else []
+        if blockers:  # CP4: the finish is held; the agent is never told to put the approval question
+            return {"phase": phase, "action": "\n".join(_finish_block_lines(ctx, st, blockers)), "stop_ok": True}
+        changed = _finish_integrity_lines(ctx, st) if _finish_pending(st) else []
+        if changed:  # CP4: a checkpoint or test plan changed after approval; approve-changes first, no approval question
+            return {"phase": phase, "action": "\n".join(changed), "stop_ok": True}
         asked = (st.get("pending") or {}).get("action") == "human-approve"
         how = ("The review question is printed: wait for the user's reply. Run ratchet.py human-approve only if "
                "their first reply after it is one of the listed yes replies; if they ask for changes, run "
@@ -3480,9 +3600,21 @@ def _cached_code_changed_since_round(ctx, st, rnd) -> bool:
 
 
 def plain_now(ctx: Ctx, st, plan=None) -> str:
-    """One plain sentence about what is happening now (no phase ids, no commands)."""
+    """One plain sentence about what is happening now (no phase ids, no commands). At the finish pause
+    (`_finish_pending`) while the finish is held (`_finish_held`, CP4: an unproven line, or a checkpoint or test
+    plan edited after approval) it says so instead of inviting an approval, so the sentence the agent relays never
+    contradicts the block printed under it."""
     phase = st.get("phase")
     plan = plan if plan is not None else (ctx.plan() or {})
+    if phase in ("awaiting_final_review", "awaiting_checkpoint_review") and _finish_pending(st):
+        held = _finish_blockers(ctx, st)
+        if held:
+            n = len(held)
+            return (f"Everything is built, but {n} done-means line{'s are' if n != 1 else ' is'} unproven, so the "
+                    "run cannot be approved as done yet.")
+        if _finish_integrity_lines(ctx, st):
+            return ("Everything is built, but a checkpoint or test plan changed after the plan was approved, so the "
+                    "run cannot be approved as done yet (the change must be confirmed or undone first).")
     # c.get("id", f"#{i}"): a checkpoint missing "id" must not crash `status`; validate_plan is what names it.
     titles = {c.get("id", f"#{i}"): c.get("title", c.get("id", f"#{i}"))
               for i, c in enumerate(plan.get("checkpoints", []))}
@@ -3604,11 +3736,13 @@ QUESTION_WORDS = {"approve-plan": "the plan", "human-approve": "an approval", "a
                   "cancel": "cancelling the run", "set-review": "how often to review", "claim": "continuing the run in this chat",
                   "hooks-waive": "building without the hooks", "ui-respec": "a change to the UI check",
                   "choice": "a choice between options", "accept-finding": "accepting a review finding as a known limit",
-                  "raise-limit": "raising the review limit by one round"}
+                  "raise-limit": "raising the review limit by one round",
+                  "accept-line": "accepting an unproven done-means line"}
 
 
 GATING_QUESTIONS = ("approve-plan", "human-approve", "choice")  # while the run is at a pause or blocked
-ALWAYS_GATING_QUESTIONS = ("accept-finding", "raise-limit")  # a step whose review round blocked waits on them
+ALWAYS_GATING_QUESTIONS = ("accept-finding", "raise-limit", "accept-line")  # a blocked review round, or the held
+                                                                               # finish (CP5), waits on them
 GATING_PHASES = ("awaiting_plan_approval", "awaiting_checkpoint_review", "awaiting_final_review", "blocked",
                  "paused")
 CARRY_ON_QUESTIONS = ("cancel", "set-review", "claim", "hooks-waive", "ui-respec", "choice")
@@ -3649,7 +3783,8 @@ def waiting_question(ctx: Ctx, st):
     question the user has replied to is answered, so it is dropped even before the agent runs the command that
     clears `pending`; in a director lane a chat reply answers nothing, so the question shows until `pending`
     clears. `stops_run` says whether the run really waits for it: only the approval pauses, a blocked run's
-    questions and the accept-a-finding / raise-the-limit questions of a blocked review round do (True); the others
+    questions, the accept-a-finding / raise-the-limit questions of a blocked review round and the accept-a-line
+    question of a held finish (CP5, `about` names its lines) do (True); the others
     (a review-frequency or cancel question, a building-phase choice...) leave a building run building (False);
     approve-changes and the like, and the carry-on kinds outside the building phase, are left unsaid (None)."""
     p = st.get("pending")
@@ -3659,10 +3794,15 @@ def waiting_question(ctx: Ctx, st):
         return None
     if p.get("overtook"):  # printed as NOT ASKED: it never reached the user, and the question it replaced is gone too
         return None
+    if p["action"] == "human-approve" and _finish_held(ctx, st):
+        return None  # CP4: the finish is held, so a question asked before it was held no longer waits
     waiting_on = _question_waiter(ctx, p["action"] == "claim")
     if waiting_on == "user" and _question_answered(ctx, st, p):
         return None
-    about = p.get("mode") if p["action"] in ("accept-finding", "raise-limit", "ui-respec") else None
+    _m, _t = _pq(p)
+    about = (_t or _m) if p["action"] in ("accept-finding", "raise-limit", "ui-respec") else None
+    if p["action"] == "accept-line":
+        about = _lines_word([int(x) for x in str(_t or "").split(",") if x.strip().isdigit()]) or None
     stops = None
     if p["action"] in ALWAYS_GATING_QUESTIONS or (p["action"] in GATING_QUESTIONS and st.get("phase") in GATING_PHASES):
         stops = True
@@ -3686,8 +3826,8 @@ def question_line(q):
 def cmd_status_text(ctx: Ctx):
     st = ctx.state()
     plan = ctx.plan() or {"checkpoints": []}
-    if st.get("phase") == "awaiting_final_review":
-        for line in _final_review_lines(plan):
+    if _finish_pending(st):  # the final review, or the last step's review in `each` mode: the same table either way
+        for line in _final_review_lines(ctx, st, plan):
             print(line)
         left = [f for c in (st.get("checkpoints") or {}).values() for f in left_for_later(c)]
         if left:
@@ -3699,6 +3839,11 @@ def cmd_status_text(ctx: Ctx):
         if flaky_steps:
             print(f"Flaky (a test run failed once, then passed on an immediate automatic re-run): "
                   f"{', '.join(flaky_steps)}.")
+        print("")
+    sc_lines = _sc_block_lines(_sc_saved(ctx))  # CP6: the shortcut tables that ran (none: nothing is printed)
+    if sc_lines:  # part of the final review at the finish pause; otherwise shown as it stands (stale if the code moved)
+        for line in sc_lines:
+            print(line)
         print("")
     cps = plan.get("checkpoints", [])
     total = len(cps)
@@ -3719,6 +3864,22 @@ def cmd_status_text(ctx: Ctx):
     q = waiting_question(ctx, st)
     if q:
         print(question_line(q))
+    if _finish_pending(st):
+        # CP4: the finish is held while an approved done-means line is unproven (never for a plan approved before
+        # this rule, which gets the plain note instead), or while a checkpoint or test plan changed after approval
+        # (`_finish_integrity_lines`: the table would otherwise read links the user never approved). Printed after
+        # the table and the step count, so the table's own lines stay as they are.
+        blockers = _finish_blockers(ctx, st)
+        for line in _finish_block_lines(ctx, st, blockers) if blockers else []:
+            print(line)
+        if blockers and not q:
+            print("Nothing is waiting on a reply from the user for this: the approval question is not asked while a "
+                  "line is unproven.")
+        for line in _finish_integrity_lines(ctx, st):
+            print(line)
+        note = _finish_legacy_note(ctx, st) if not blockers else ""
+        if note:
+            print(note)
     cur = (st.get("checkpoints") or {}).get(st.get("current")) or {}
     if st.get("phase") == "building" and any(g.get("status") in ("stale", "invalid")
                                              for g in (cur.get("gates") or {}).values()):
@@ -3825,22 +3986,91 @@ def _review_preview(ctx, cfg, cp) -> tuple[list[str], bool]:
     return names, host_only
 
 
-def _unproven_done_means(ctx, plan) -> list[tuple]:
-    """[(1-based line number, its own text), ...] for every objective.done_means line that no test-plan
-    case's "proves" names, across every checkpoint. Empty when the plan has no objective or no done_means at
-    all (nothing to flag). A heads-up only, never a refusal: plan-submit's proves_problems is the gate that
-    actually blocks a bad number."""
+def _done_means_links(ctx, plan) -> dict:
+    """{1-based line number: [case id, ...]} for every objective.done_means line, across every checkpoint's
+    test plan (a step with no tests/CPn.json contributes nothing): the case ids whose "proves" names that line,
+    in plan order. Empty when the plan has no objective or no done_means list at all. Shared by
+    _done_means_proof_notes (the Proved by / Heads up note under each line in plan-summary, brief, the
+    reviewers `how` line and the launch guard) and _unproven_done_means."""
     obj = plan.get("objective") if isinstance(plan, dict) else None
     dm = obj.get("done_means") if isinstance(obj, dict) else None
     if not isinstance(dm, list) or not dm:
-        return []
-    proved = set()
+        return {}
+    links = {i: [] for i in range(1, len(dm) + 1)}
     for cp in plan.get("checkpoints") or []:
         for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
             for p in _proves_values(case):
-                if isinstance(p, int) and not isinstance(p, bool):
-                    proved.add(p)
-    return [(i, t) for i, t in enumerate(dm, 1) if i not in proved]
+                if isinstance(p, int) and not isinstance(p, bool) and p in links:
+                    links[p].append(str(case.get("id", "?")))
+    return links
+
+
+def _unproven_done_means(ctx, plan) -> list[tuple]:
+    """[(1-based line number, its own text), ...] for every objective.done_means line that no test-plan
+    case's "proves" names, across every checkpoint. Empty when the plan has no objective or no done_means at
+    all (nothing to flag). One consumer: unlinked_done_means_problems, the refusal plan-submit applies to every
+    line and plan-extend applies to the lines feedback added since the approval snapshot. The Proved by / Heads
+    up notes plan-summary and brief print come from _done_means_proof_notes, not from here, and CP3's
+    `_dm_findings_block` reads the approval marker (`_approved_after_dm`), never today's links."""
+    links = _done_means_links(ctx, plan)
+    dm = (plan.get("objective") or {}).get("done_means") if links else []
+    return [(i, t) for i, t in enumerate(dm, 1) if not links.get(i)]
+
+
+def unlinked_done_means_problems(ctx, plan, approved_lines=()) -> list[str]:
+    """The "Plan invalid" refusal for unlinked done-means lines: one message per objective.done_means line that
+    no test-plan case's "proves" names, naming the line by its 1-based number and its exact text and telling the
+    agent what to add. Only that line is named (two lines with the same wording are told apart by number). A
+    plan with no objective or no done_means list has nothing to link, so this is empty and objective_problems
+    does the refusing. plan-submit calls it next to proves_problems for every line. plan-extend passes
+    approved_lines=_approved_done_means(st): a line whose text the approved plan already had is skipped, so a run
+    whose plan was approved before this rule keeps taking feedback and new steps, while a line feedback added
+    after the approval is refused like a new plan's."""
+    return [f"done_means line {i} (\"{t}\") has no test case proving it. Add a case to a step's tests/CPn.json "
+            f"whose \"proves\" names line {i}."
+            for i, t in _unproven_done_means(ctx, plan) if t not in approved_lines]
+
+
+def _approved_done_means(st) -> list[str]:
+    """The objective.done_means lines the approved plan had, read from the approval snapshot
+    (st["approved"]["objective"], written by approve-plan and refreshed only by plan-extend, which may append
+    lines but never change one; approve-changes and merged carry the lines forward unchanged). [] for a run that
+    has no approval yet or whose approved plan had no objective or no done_means list. Used by plan-extend (which
+    lines feedback added, and its append-only check), _unlinked_done_means_note and `_finish_block_lines`; CP3's
+    `_dm_findings_block` does not read it (it reads the `done_means_rules` marker through `_approved_after_dm`)."""
+    obj = (st.get("approved") or {}).get("objective")
+    dm = obj.get("done_means") if isinstance(obj, dict) else None
+    return [t for t in dm if isinstance(t, str)] if isinstance(dm, list) else []
+
+
+def _unlinked_done_means_note(st, line) -> str:
+    """Why the Heads up note under an unlinked done_means line (plan-summary, brief, the reviewers `how` line and
+    the launch guard, via _done_means_proof_notes) says what it says, from the run's state and never assumed: while the plan is still being planned, plan-submit is what refuses it; a line the approved
+    plan already had predates the rule (the only way an approved plan has one) and keeps working; any other line
+    was added after the approval and plan-extend refuses the extension until a case proves it."""
+    if st.get("phase") in ("planning", "awaiting_plan_approval"):
+        return "plan-submit refuses the plan until a case's \"proves\" names it"
+    if line in _approved_done_means(st):
+        return "this plan was approved before every line needed one; it keeps working"
+    return "it was added after the plan was approved; plan-extend refuses the extension until a case's \"proves\" names it"
+
+
+def _done_means_proof_notes(ctx, plan, st) -> dict:
+    """{1-based done_means line number: the one note line objective_brief prints under that line}: `Proved by:
+    <case ids>` from _done_means_links, or the plain `Heads up` (worded by _unlinked_done_means_note from the run's
+    state `st`, which may be {} when it can't be read) for a line no case proves yet. {} when the plan has no
+    objective or no done_means list. Shared by plan-summary, brief and the sub-agent launch guard, so all three
+    render the objective the same way."""
+    links = _done_means_links(ctx, plan)
+    dm = (plan.get("objective") or {}).get("done_means") if links else []
+    notes = {}
+    for i, line in enumerate(dm, 1):
+        if links.get(i):
+            notes[i] = f"Proved by: {', '.join(links[i])}"
+        else:
+            notes[i] = (f"Heads up: done_means line {i} (\"{line}\") has no test case proving it yet "
+                        f"({_unlinked_done_means_note(st or {}, line)}).")
+    return notes
 
 
 def cmd_plan_summary(args):
@@ -3853,16 +4083,11 @@ def cmd_plan_summary(args):
     print(f"Plan: {plan.get('feature') or st.get('feature')} ({len(plan['checkpoints'])} steps)")
     obj = plan.get("objective")
     if isinstance(obj, dict) and obj:
-        print(f"\nWho it's for: {obj.get('users', '')}")
-        print(f"What they want: {obj.get('goal', '')}")
-        print("Done means:")
-        for line in obj.get("done_means") or []:
-            print(f"  - {line}")
-        print("Out of scope:")
-        for line in obj.get("out_of_scope") or []:
-            print(f"  - {line}")
-        for i, text in _unproven_done_means(ctx, plan):
-            print(f"  Heads up: done_means line {i} (\"{text}\") has no test case proving it yet.")
+        print("")
+        # the same rendering brief prints (minus its "Objective" heading), so the two match word for word; the
+        # approved done-means lines once approved (CP4), see _plan_for_briefs
+        shown = _plan_for_briefs(plan, st)
+        print("\n".join(objective_brief(shown, _done_means_proof_notes(ctx, shown, st)).splitlines()[1:]))
     for line in spec_summary_lines(ctx, plan):
         print(line)
     all_host = True
@@ -3874,7 +4099,8 @@ def cmd_plan_summary(args):
         print(f"\n{i}. {cp['title']}")
         print(f"   Done when: {(cp.get('done_when') or [''])[0]}")
         print(f"   UI review: {'yes' if (cp.get('gates') or {}).get('ui') else 'no'}")
-        print(f"   Risk: {risk}" + ("" if bar == "all" else f" (only {' and '.join(bar)} findings block; minor ones are noted for later)"))
+        print(f"   Risk: {risk}" + ("" if bar == "all" else f" (only {' and '.join(bar)} findings block; minor ones are noted for later, "
+                                                             "unless one names a done-means line, which always blocks)"))
         print(f"   Reviewed by: {'; '.join(who)}")
         ecl = exit_code_only_line(cp)
         if ecl:
@@ -4505,7 +4731,7 @@ def _consume_paid_ok(ctx, st, pv) -> str:
         ctx.log(st, "paid_provider_unclear", tool=tool, model=model)
         ctx.save_state(st)
         die(f"This question was printed while another one (shall I "
-            f"{_question_what(p['overtook'], p.get('overtook_mode'))}?) was still waiting for the user's first "
+            f"{_question_what(p['overtook'], p.get('overtook_mode'), p.get('overtook_target'))}?) was still waiting for the user's first "
             "reply, so their reply could be meant for either. Nothing was added. Run `ratchet.py ask "
             f"paid-provider {tool} {model}` again on its own.")
     msgs = _replies(ctx, st, p.get("asked_at"), p)
@@ -5799,6 +6025,12 @@ REVIEW_ASK_NEXT = ("Settle any other question or offer first, in its own turn. T
 
 
 def cmd_plan_submit(args):
+    """Validates a new plan and moves the run to awaiting_plan_approval. Refused as "Plan invalid" (nothing
+    saved, so approve-plan has nothing to approve) for a shape error, a missing objective, a spec gap, a missing
+    risk_reason, a bad "proves" number, or, since the done-means-proven run, an objective.done_means line that no
+    test-plan case's "proves" names (unlinked_done_means_problems: each such line named by number and text).
+    plan-extend applies that last check only to the lines feedback added since the approval snapshot, so a plan
+    approved before it keeps working."""
     ctx = Ctx(find_root())
     st = ctx.state()
     if st["phase"] not in ("planning", "awaiting_plan_approval"):
@@ -5807,7 +6039,8 @@ def cmd_plan_submit(args):
     if plan is None:
         die("checkpoints.json not found in the run folder")
     errs = (validate_plan(plan) + objective_problems(plan) + spec_plan_problems(ctx, plan)
-            + risk_reason_problems(plan.get("checkpoints", [])) + proves_problems(ctx, plan))
+            + risk_reason_problems(plan.get("checkpoints", [])) + proves_problems(ctx, plan)
+            + unlinked_done_means_problems(ctx, plan))
     if errs:
         die("Plan invalid:\n  - " + "\n  - ".join(errs))
     st["phase"] = "awaiting_plan_approval"
@@ -6258,14 +6491,39 @@ def _require_approval(ctx, st, action, token=None):
 ASKED_APPROVALS = ("approve-plan", "human-approve", "cancel", "set-review", "approve-changes", "claim", "ui-respec")
 
 
-def _ask_cmd(action, mode=None, eng="ratchet.py") -> str:
+def _pq(p):
+    """(mode, target) of a pending question. `mode` is the argument the follow-up command takes; `target` is what
+    the question is about (accept-line: the line numbers, sorted and comma-joined). A pending written before
+    `target` existed kept accept-line's line numbers in `mode`: read them as the target."""
+    if "target" not in p and p.get("action") == "accept-line":
+        return None, p.get("mode") or None
+    return p.get("mode") or None, p.get("target") or None
+
+
+def _ask_cmd(action, mode=None, eng="ratchet.py", target=None) -> str:
+    """The `ask` command that prints this question again: it takes the target when there is one, else the mode."""
     if action == "paid-provider" and mode and ":" in mode:
         tool, model = mode.split(":", 1)  # `mode` is stored as "tool:model"; the real command takes two args
         return f"`{eng} ask paid-provider {tool} {model}`"
-    return f"`{eng} ask {action}{' ' + mode if mode else ''}`"
+    arg = target or mode
+    return f"`{eng} ask {action}{' ' + str(arg) if arg else ''}`"
 
 
-def _question_what(action, mode=None) -> str:
+def _ask_now(ctx, st, action) -> str:
+    """The `ask` command that prints `action`'s question now, for a hint where no question of it is waiting.
+    `ask accept-line` needs line numbers, so a bare one would die: name the lines unproven right now."""
+    if action == "accept-line":
+        try:
+            nums = [e["number"] for e in (done_means_table(ctx, ctx.plan() or {"checkpoints": []}, st) or [])
+                    if e.get("verdict") == "unproven"]
+        except Exception:
+            nums = []
+        if nums:
+            return _ask_cmd(action, target=",".join(str(i) for i in nums))
+    return _ask_cmd(action)
+
+
+def _question_what(action, mode=None, target=None) -> str:
     """The question `ask <action>` put to the user, in the words it used ("shall I <this>?")."""
     if action == "set-review":
         return f"change how often they review to: {REVIEW_MODE_WORDS.get(mode, mode)}"
@@ -6273,6 +6531,11 @@ def _question_what(action, mode=None) -> str:
         tool, model = mode.split(":", 1)
         return (f"use {tool}'s {model} (costs money per use, or whose cost is unknown, treated the same way) "
                 "for reviews instead of only flat-rate ones")
+    if action == "accept-line" and target:
+        nums = [int(t) for t in str(target).split(",") if t.strip().isdigit()]
+        if nums:
+            return (f"accept done-means {_lines_word(nums)} as unproven, with your own reason, so "
+                    f"{'they' if len(nums) != 1 else 'it'} no longer {'hold' if len(nums) != 1 else 'holds'} the finish")
     return ASKABLE.get(action, action)
 
 
@@ -6307,16 +6570,17 @@ def _asked_reply(ctx, st, action, p):
     want = p.get("action")
     if want != action:
         if want:
-            what = _question_what(want, p.get("mode"))
+            wm, wt = _pq(p)
+            what = _question_what(want, wm, wt)
             die(f"A different question is waiting for the user's answer: shall I {what}? Their reply answers THAT "
-                f"question, not this one. If they said yes to it, run `ratchet.py {_pending_followup(want, p.get('mode'))}"
+                f"question, not this one. If they said yes to it, run `ratchet.py {_pending_followup(want, wm)}"
                 "`. If they said no or moved on, run `ratchet.py ask withdraw`. Then print this question "
-                f"with {_ask_cmd(action)}, show it to them word for word, and wait for their reply.")
+                f"with {_ask_now(ctx, st, action)}, show it to them word for word, and wait for their reply.")
         die(f"Ratchet has not asked the user this question yet, so no reply counts as their answer. Run "
-            f"{_ask_cmd(action)}, show them the question it prints word for word, and end your turn. Only their first "
+            f"{_ask_now(ctx, st, action)}, show them the question it prints word for word, and end your turn. Only their first "
             "reply after the question counts; a yes from before it does not.")
     asked = p.get("asked_at")
-    again = _ask_cmd(action, p.get("mode"))
+    again = _ask_cmd(action, _pq(p)[0], target=_pq(p)[1])
     if p.get("phase") and p["phase"] != st.get("phase"):
         _spend_question(ctx, st)
         die(f"That question was asked while the run was {PHASE_PLAIN.get(p['phase'], p['phase'])}; it is now "
@@ -6324,7 +6588,7 @@ def _asked_reply(ctx, st, action, p):
             f"you still need their yes, print the question again ({again}).")
     if p.get("overtook"):
         _spend_question(ctx, st)
-        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'))}"
+        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'), p.get('overtook_target'))}"
             "?) was still waiting for the user's first reply, so their reply could be meant for either. Nothing was "
             f"approved and the question is closed. Print it again on its own ({again}), with no other question or "
             "offer in that message, and wait for their reply.")
@@ -6408,6 +6672,7 @@ def cmd_director_sign(args):
             "ui-respec": ["building", "blocked"],
             "guardrail": ["building", "blocked"],
             "accept-finding": ["building", "blocked"],
+            "accept-line": ["awaiting_final_review", "awaiting_checkpoint_review"],  # the finish pause (CP5)
             "cancel": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
                        "awaiting_checkpoint_review", "awaiting_final_review", "planning_feedback"],
             "set-review": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
@@ -6439,6 +6704,12 @@ def cmd_approve_plan(args):
     if (st.get("pending") or {}).get("action") == "approve-plan":
         st.pop("pending", None)  # answered
     st["approved"] = approval_snapshot(ctx, st)  # the owner chat is unchanged: only `resume --claim` moves a run
+    links = _done_means_links(ctx, plan)
+    if not links or any(links.values()):
+        # written once, here: this plan is under the done-means rules. A plan with done-means lines that no case
+        # anywhere links could not have passed plan-submit under those rules (it was submitted before they
+        # existed), so it is approved as an older plan: no marker, the plain notes, no finish block (CP4 round 2).
+        st["approved"]["done_means_rules"] = DM_RULES_VERSION
     st["phase"] = "building"
     st["current"] = plan["checkpoints"][0]["id"]
     first = st["checkpoints"][st["current"]]
@@ -6446,6 +6717,9 @@ def cmd_approve_plan(args):
     first["started_at"] = now()
     first["base_tree"] = fingerprint(ctx.root)["id"]
     first["base_head"] = _head_sha(ctx.root)  # the commit `merged` counts the lane's own commits from
+    # where the run started, written once and never rewritten (`merged` moves the step's base_tree/base_head, not
+    # this): the shortcut tables compare the current code with it (`_sc_old_version`)
+    st.setdefault("run_start", {"tree": first["base_tree"], "head": first["base_head"]})
     st["awaiting_since"] = None
     ctx.log(st, "plan_approved", by=msg["by"], note=msg.get("prompt", "")[:200])
     ctx.save_state(st)
@@ -6470,7 +6744,7 @@ def _expect_step(cps, allowed, cp_id):
 
 def _planned_cases(ctx, cp_id):
     tp = test_plan(ctx, cp_id) or {}
-    return [c for c in tp.get("cases", []) if c.get("layer", "code") != "browser"]
+    return [c for c in tp.get("cases", []) if c.get("layer", "code") not in ("browser", "shortcuts")]
 
 
 def _coverage(ctx, cp):
@@ -8601,7 +8875,10 @@ def _checkin_brief(ctx, plan, cp_id, cps, g, ci) -> dict:
             "objective": obj if isinstance(obj, dict) and obj else NO_OBJECTIVE_NOTE,
             "findings": [{"id": _finding_key(f), "severity": f.get("severity"),
                           "file": f.get("file") or f.get("path") or f.get("location"), "kind": finding_kind(f),
-                          "description": f.get("description"), "user_impact": f.get("user_impact")}
+                          "description": f.get("description"), "user_impact": f.get("user_impact"),
+                          # CP3: the done-means line(s) the finding names, as written, so a line-naming minor is
+                          # never read as a plain "(minor)" at a decision point
+                          "done_means": f.get("done_means") if names_done_means(f) else None}
                          for f in findings],
             "kinds_by_file": _checkin_kinds_by_file(ctx, findings),
             "options": CHECKIN_OPTIONS, "decided": ci.get("decided") or []}
@@ -8617,11 +8894,14 @@ def _print_checkin_brief(brief: dict):
     else:
         print(f"Note: {obj}.")
     print("Open findings:")
+    dm_lines = (obj.get("done_means") if isinstance(obj, dict) else None) or []
     for f in brief["findings"]:
         line = f"  - {f['id']} ({f.get('severity', '?')}) {f.get('file') or ''}: {f.get('description', '') or ''}"
         print(line.rstrip())
         if f.get("user_impact"):
             print(f"      user impact: {f['user_impact']}")
+        if f.get("done_means") is not None:
+            print(f"      {_dm_named_text(dm_lines, f).strip().strip('[]')}")
     if brief["kinds_by_file"]:
         print("Finding kinds by file:")
         for fl, kinds in brief["kinds_by_file"].items():
@@ -8898,27 +9178,38 @@ def cmd_adv_record(args):
                       and str(f.get("severity", "")).strip().lower() not in MINOR_SEVERITIES})
     for kind in escaped:
         _auto_strengthen(ctx, st, cfg, kind, args.cp)
+    # CP3: a finding that names a done-means line blocks at any severity, round or scope, but only for a plan
+    # approved since that rule exists (`_dm_findings_block`); an older plan keeps the rules it was approved under
+    # and gets a plain note (DM_LEGACY_FINDINGS_NOTE) instead of a surprise block.
+    dm_blocks = _dm_findings_block(ctx, st, ctx.plan())
+    dm_named = [f for f in all_findings if names_done_means(f)]
+    legacy_note = f"Note: {DM_LEGACY_FINDINGS_NOTE}." if dm_named and not dm_blocks else ""
     covered_minor = [dict(f, deferred_because=f"an automatic check already covers '{finding_kind(f)}'")
                      for f in all_findings if finding_kind(f) in covered
-                     and str(f.get("severity", "")).strip().lower() in MINOR_SEVERITIES]
+                     and str(f.get("severity", "")).strip().lower() in MINOR_SEVERITIES
+                     and not (dm_blocks and names_done_means(f))]
     # only MINOR findings of a covered kind step aside (their check runs at the behavior gate); blocker and major
-    # findings always block, whatever label they carry
+    # findings always block, whatever label they carry, and so does a minor one that names a done-means line
+    # (CP3, `names_done_means`): a check covering its kind does not prove the line is met
     all_findings = [f for f in all_findings if not any(f is c or (f.get("id"), f.get("reviewer")) == (c.get("id"), c.get("reviewer"))
                                                        for c in covered_minor)]
     # Realistic-use bar: a blocker, major or unknown-severity finding that does not say who is hurt and how
     # (user_impact) never blocks, at any round and any risk. It is recorded for the final review instead. This
     # is narrower than the existing minor-severity rules below: minor findings keep following those, whether or
-    # not they carry a user_impact.
+    # not they carry a user_impact. A finding that names a done-means line (CP3, `names_done_means`) is exempt:
+    # the named line stands in for user_impact, since the plan's objective already says who is hurt when that
+    # line is not met.
     no_impact = [f for f in all_findings
                  if str(f.get("severity", "")).strip().lower() not in MINOR_SEVERITIES
-                 and not str(f.get("user_impact") or "").strip()]
+                 and not str(f.get("user_impact") or "").strip()
+                 and not (dm_blocks and names_done_means(f))]
     if no_impact:
         all_findings = [f for f in all_findings if not any(f is n for n in no_impact)]
     no_impact_deferred = [dict(f, deferred_because="no user impact stated") for f in no_impact]
     changed_since = _changed_since_last_round(ctx, cfg, g, fp["id"])
     raw_count = len(all_findings)
     all_findings, deferred = split_findings(cfg, cp.get("risk", "normal"), all_findings, changed_since, ctx.root,
-                                             round_no=rnd["round"])
+                                             round_no=rnd["round"], dm_blocks=dm_blocks)
     deferred = covered_minor + no_impact_deferred + deferred
     if deferred:
         write_json(dest / "deferred-findings.json", deferred)
@@ -8950,7 +9241,11 @@ def cmd_adv_record(args):
         build_viewer(ctx)
         write_json(dest / "open-findings.json", all_findings)
         _announce_repeats(ctx, st)
+        if legacy_note:
+            print(legacy_note)
+        open_named = sum(1 for f in all_findings if names_done_means(f))
         die(f"Gate 3 (adversarial) NOT approved: {len(all_findings)} blocking finding(s)"
+            + (f", {open_named} of them naming a done-means line (these block at any severity)" if open_named and dm_blocks else "")
             + (f" ({len(deferred)} minor ones recorded for later)" if deferred else "") + " → "
             f"{(dest / 'open-findings.json').relative_to(ctx.root)}. Decide fix or rebut for each (`ratchet.py "
             f"triage {args.cp} <id>=fix:\"reason\"` or `=rebut:\"reason\"`), then spawn ratchet-fixer with "
@@ -8974,6 +9269,8 @@ def cmd_adv_record(args):
     note = (f" {len(deferred)} minor finding(s) were recorded for later instead of blocking (`ratchet.py deferred`)."
             if deferred else "")
     _announce_repeats(ctx, st)
+    if legacy_note:
+        print(legacy_note)
     ok(f"Gate 3 (adversarial) APPROVED by all {need} reviewer(s) for {args.cp}.{note} Next: ratchet.py complete {args.cp}")
 
 
@@ -9088,13 +9385,15 @@ def _scoped_min_review_seconds(ctx: "Ctx", cfg: dict, since_tree: str, fp_id: st
     return min(configured, scaled)
 
 
-def _open_blocking_lenses(ctx, cfg, cp_id: str, rnd, cps=None) -> set:
-    """Lenses with a still-open BLOCKER or MAJOR finding (never a minor one) in a checkpoint's latest recorded
-    adversarial round. `reviewers` narrows the next round to just these lenses; a lens whose only open finding
-    was minor doesn't keep it in the loop, and a lens that approved isn't in here at all."""
+def _open_blocking_lenses(ctx, cfg, cp_id: str, rnd, cps=None, dm_blocks: bool = True) -> set:
+    """Lenses with a still-open BLOCKER or MAJOR finding, or a still-open finding of any severity that names a
+    done-means line (CP3, `names_done_means`; only while `dm_blocks`, i.e. `_dm_findings_block` for this plan),
+    in a checkpoint's latest recorded adversarial round. `reviewers` narrows the next round to just these
+    lenses; a lens whose only open finding was a plain minor (naming no line) doesn't keep it in the loop, and
+    a lens that approved isn't in here at all."""
     out = set()
     for f in _adv_open_findings(ctx, cp_id, rnd, cps):
-        if str(f.get("severity", "")).strip().lower() in MINOR_SEVERITIES:
+        if str(f.get("severity", "")).strip().lower() in MINOR_SEVERITIES and not (dm_blocks and names_done_means(f)):
             continue
         spec = _roster_spec(cfg, f.get("reviewer")) if f.get("reviewer") else None
         if spec and spec.get("lens"):
@@ -9116,6 +9415,127 @@ def _learnings_text(ctx) -> str:
 
 
 MINOR_SEVERITIES = {"minor", "nit", "nitpick", "trivial", "info", "suggestion", "low", "style"}
+
+
+def _dm_line_number(x) -> bool:
+    """`x` is a line number as a reviewer writes one: an int (not a bool), a float with an integer value (3.0),
+    or a string with a run of digits in it ("3", "3, 4", "line 3", "#3"). A string with no digit ("none",
+    "N/A", "") is not one."""
+    if isinstance(x, bool):
+        return False
+    if isinstance(x, int) or (isinstance(x, float) and x.is_integer()):
+        return True
+    return isinstance(x, str) and re.search(r"\d", x) is not None
+
+
+def _dm_line_values(x) -> list[int]:
+    """The line numbers one `done_means` value carries (`_dm_line_number`): [3] for 3, "3" or 3.0; every run of
+    digits for a string such as "3, 4" or "line 3"; [] for a value that names none."""
+    if not _dm_line_number(x):
+        return []
+    if isinstance(x, (int, float)):
+        return [int(x)]
+    return [int(m) for m in re.findall(r"\d+", x)]
+
+
+def names_done_means(f) -> bool:
+    """True when a finding names the done-means line(s) it contradicts in its optional `done_means` field (CP3,
+    schemas.md section 7): a line number (`_dm_line_number`: an int, a float with an integer value, or a string
+    with a run of digits in it such as "3", "3, 4" or "line 3"; never a bool) or a list holding at least one. A
+    value with no number in it (`false`, `"none"`, `"N/A"`, `[null]`, `[""]`, `[]`, `null`) names nothing, so a
+    reviewer that fills the field with a "no line" value does not turn every plain finding into a blocking one,
+    while a value that does carry a number never slips through as a plain minor. A number is taken exactly as the reviewer wrote it: a bare number, or one that is not a real
+    line of the plan's objective (0, past the end), names a line too and the finding is shown as written; the
+    engine never judges the number here, so a reviewer's miscount still blocks rather than slipping through.
+    `_finding_dm_lines` is the other reader of the field: the final review's done-means table keeps only real
+    line numbers and ignores the rest, while this blocking rule does not. `cmd_adv_record` (covered-kind and
+    no-user_impact set-asides), `split_findings` (risk bar, converge round, later-round scope),
+    `_open_blocking_lenses` and `_docs_only_review_skip` all read it, each only while `_dm_findings_block` says
+    the rule applies to this plan: such a finding blocks at any severity and any round, and its lens is asked
+    again next round. The display readers (`_checkin_brief`'s per-finding `done_means`, `_dm_named_text` for
+    `ask accept-finding`'s question and the check-in brief, and `adv-record`'s open count) read it whether or
+    not `_dm_findings_block` applies: the line a finding names is always shown."""
+    dm = f.get("done_means") if isinstance(f, dict) else None
+    vals = dm if isinstance(dm, list) else [dm]
+    return any(_dm_line_number(x) for x in vals)
+
+
+DM_LEGACY_FINDINGS_NOTE = ("this plan was approved before a finding naming a done-means line always blocked; "
+                           "such findings follow the older severity, round and scope rules here")
+
+# The done-means rules a plan was approved under. `approve-plan` writes this version into the approval snapshot
+# (`st["approved"]["done_means_rules"]`, schemas.md section 7) once, at approval; `plan-extend`, `approve-changes`
+# and `merged` keep the value the snapshot already has and never add one to a run approved without it. A snapshot
+# with no such key was approved before this change (older rules, a plain note); approve-plan also withholds it from a
+# plan whose done-means lines no case links at all (one submitted before plan-submit required a link per line, so an
+# older plan however it was approved). Two readers: `_approved_after_dm`
+# (does the rule apply?) and `_approval_snapshot_keeping_dm` (the carry-forward plan-extend and approve-changes use).
+DM_RULES_VERSION = 1
+
+
+def _approved_after_dm(st) -> bool:
+    """True when the run's plan was approved since the done-means rules exist: the approval snapshot carries the
+    `done_means_rules` marker `approve-plan` writes (DM_RULES_VERSION). False for a run with no approval yet or
+    one approved before this change (the snapshot has no marker; nothing infers the era from today's links).
+    The marker's one reader that judges it; `_dm_findings_block` (CP3), `_finish_blockers` / `_finish_legacy_note`
+    (CP4), `_ask_accept_line` (CP5: an older run gets a plain note, never an accept question) and cmd_plan_extend's
+    append-only check on the approved lines share it. Its other reader,
+    `_approval_snapshot_keeping_dm`, only copies it forward."""
+    return bool((st.get("approved") or {}).get("done_means_rules"))
+
+
+def _approval_snapshot_keeping_dm(ctx, st, keep_objective: bool = True) -> dict:
+    """A fresh `approval_snapshot` that keeps the `done_means_rules` marker the run's current snapshot already
+    carries, and adds none when it has none: the one carry-forward `plan-extend` and `approve-changes` share, so a
+    run approved under the done-means rules stays under them and a run approved before them never gains the
+    marker (`merged` does not rewrite the snapshot, so it needs no carry). With `keep_objective` (the default,
+    `approve-changes`) the approved objective's done_means lines are carried forward too, whatever checkpoints.json
+    says now: confirming some other plan change can never slip in an edited done-means line (CP4). `plan-extend`
+    passes keep_objective=False after checking the approved lines are an unchanged prefix of the new ones, so the
+    lines feedback appended become approved."""
+    old = st.get("approved") or {}
+    dm_rules = old.get("done_means_rules")
+    snap = approval_snapshot(ctx, st)
+    if dm_rules:
+        snap["done_means_rules"] = dm_rules
+    old_obj = old.get("objective")
+    if keep_objective and isinstance(old_obj, dict) and isinstance(old_obj.get("done_means"), list):
+        new_obj = snap.get("objective") if isinstance(snap.get("objective"), dict) else {}
+        snap["objective"] = {**old_obj, **new_obj, "done_means": list(old_obj["done_means"])}
+    return snap
+
+
+def _dm_findings_block(ctx, st, plan) -> bool:
+    """CP3: whether a finding that names a done-means line (`names_done_means`) blocks at any severity, round and
+    scope for this run. True for a plan with done-means lines whose approval snapshot carries the
+    `done_means_rules` marker (`_approved_after_dm`), i.e. one approved since that rule exists. False for a plan
+    approved without the marker (before this change), and for one with no objective or no done_means lines at
+    all (nothing to contradict): line-naming findings then follow exactly the older rules (`blocking_severities`,
+    `converge_after_round`, `scope_later_rounds`, covered kinds, `user_impact`), with no crash, and `adv-record`
+    prints DM_LEGACY_FINDINGS_NOTE instead of blocking. Never inferred from today's "proves" links: an older
+    plan with every line linked stays older, and a newer plan whose approved test-plan change dropped a link
+    stays newer. Read by `cmd_adv_record`, `review_rules`, `cmd_reviewers` (for `_open_blocking_lenses`) and
+    `_docs_only_review_skip`."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    dm = obj.get("done_means") if isinstance(obj, dict) else None
+    if not isinstance(dm, list) or not dm:
+        return False
+    return _approved_after_dm(st)
+
+
+def _dm_named_text(dm_lines: list, f) -> str:
+    """' [contradicts done-means line 3: "<line text>"]' for a finding that names a line (number and the line's
+    own text from `dm_lines`, the plan's objective.done_means; a number that is not a real line is shown as
+    written, with no text), '' for a finding that names none. Shown wherever a decision is made on the finding:
+    `ask accept-finding`'s question and the check-in brief."""
+    if not names_done_means(f):
+        return ""
+    dm = f.get("done_means")
+    parts = []
+    for n in [n for x in (dm if isinstance(dm, list) else [dm]) for n in _dm_line_values(x)]:
+        text = dm_lines[n - 1] if 1 <= n <= len(dm_lines) and isinstance(dm_lines[n - 1], str) else None
+        parts.append(f"{n}: \"{text}\"" if text is not None else f"{n} (not a line of this plan, shown as written)")
+    return f" [contradicts done-means line{'s' if len(parts) > 1 else ''} {'; '.join(parts)}]"
 
 
 def _norm_path(p, root=None) -> str:
@@ -9153,20 +9573,23 @@ def _in_scope(path: str, scope: set) -> bool:
 
 
 def split_findings(cfg, risk: str, findings: list, changed_since: set | None, root=None,
-                    round_no: int | None = None) -> tuple[list, list]:
+                    round_no: int | None = None, dm_blocks: bool = True) -> tuple[list, list]:
     """(blocking, deferred). Severities not known to be minor always block (a reviewer can't escape the bar by
     inventing a severity name). `changed_since` is the round's scope: files changed since the previous round plus
     files that had a blocking finding last round (a finding the fixer ignored can't be waved through). `round_no`
     is this round's own number; from round `converge_after_round` + 1 (config, default 2, so round 3 by default)
     a minor finding never blocks any more, whatever its scope — blocker and major findings keep blocking at every
-    round."""
+    round. While `dm_blocks` (the caller's `_dm_findings_block` answer for this plan; False for a plan approved
+    before CP3), a finding that names a done-means line (CP3, `names_done_means`) is never deferred here,
+    whatever its severity, round or scope: a line of the objective not met in normal use blocks until it is
+    fixed or the user accepts it. Findings that name no line follow exactly the rules above."""
     bar = (cfg.get("blocking_severities") or {}).get(risk, "all")
     bar_l = [str(x).strip().lower() for x in (bar or [])] if bar != "all" else None
     converge_after = int(cfg.get("converge_after_round", 2))
     blocking, deferred = [], []
     for f in findings:
         sev = str(f.get("severity", "")).strip().lower()
-        minor = sev in MINOR_SEVERITIES
+        minor = sev in MINOR_SEVERITIES and not (dm_blocks and names_done_means(f))
         where = _norm_path(f.get("file") or f.get("path") or f.get("location"), root)
         if minor and bar_l is not None and sev not in bar_l:
             deferred.append(dict(f, deferred_because=f"{risk}-risk step: only {' and '.join(bar)} findings block"))
@@ -9326,29 +9749,36 @@ def cmd_repeats(args):
 
 def review_rules(ctx, cfg, cp, g, rnd, fp_id, cps=None) -> tuple[set | None, list[str], dict | None]:
     """What the reviewers of this round are told about the severity bar, the round's focus and (lane H CP6) its
-    scope. `cps` (the checkpoint's own state dict) is needed to compute the CP6 scope; omit it only for a caller
-    that only wants the pre-CP6 fields (focus, rules) and is not itself a fix_round/small_fix round, since
-    `_scope_for_round` needs it to find `base_tree`."""
+    scope. CP3: when the plan's done-means lines are under the always-block rule (`_dm_findings_block`), every
+    rule that sets a minor finding aside carries the exception (a finding naming a done-means line always
+    blocks), and one rule says so outright; for a plan approved before that rule the older wording stands, no
+    exception is claimed, and one rule says plainly that this plan predates the rule (the qualifier the reviewer
+    role brief, agents/ratchet-adversary.md and the external prompt point at). `cps` (the checkpoint's own state
+    dict) is needed to compute the CP6 scope; omit it only for a caller that only wants the pre-CP6 fields
+    (focus, rules) and is not itself a fix_round/small_fix round, since `_scope_for_round` needs it to find
+    `base_tree`."""
     scope = _scope_for_round(ctx, cp["id"], rnd, cps or {}, fp_id) if cps is not None else None
     # `focus_files` is kept as compatibility metadata on every round > 1, scoped or not (older callers, and
     # `status`/the viewer, read it regardless of scope) -- but the "look hardest" RULE TEXT below is given only
     # on an unscoped round; a scoped round gets the CP6 scope text instead, never both.
     focus = _changed_since_last_round(ctx, cfg, g, fp_id) if rnd["round"] > 1 else None
     bar = (cfg.get("blocking_severities") or {}).get(cp.get("risk", "normal"), "all")
+    dm_blocks = _dm_findings_block(ctx, ctx.state(), ctx.plan() or {})
+    dm_x = " (unless one names a done-means line in done_means, which always blocks)" if dm_blocks else ""
     rules = []
     if bar != "all":
         rules.append(f"This is a {cp.get('risk', 'normal')}-risk step: only {' and '.join(bar)} findings block; "
-                     "report minor ones too, they are recorded for later.")
+                     f"report minor ones too, they are recorded for later{dm_x}.")
     kinds = sorted(enforced_kinds(cfg))
     if kinds:
         rules.append("These kinds of mistake are already caught by automatic checks that run with the tests: "
                      + ", ".join(kinds) + ". Still report a blocker or major problem of these kinds (it still blocks); "
-                     "minor ones of these kinds are noted, not fixed.")
+                     f"minor ones of these kinds are noted, not fixed{dm_x}.")
     if scope is None and focus is not None:
         rules.append("Round " + str(rnd["round"]) + ": look hardest at the code changed since the last round ("
                      + (", ".join(sorted(focus)[:20]) or "nothing changed") + "). Re-raise any earlier finding that "
                      "still isn't fixed, wherever it is. Beyond that, a new minor problem outside those files is "
-                     "recorded, not fixed; blocker and major problems count anywhere.")
+                     f"recorded, not fixed{dm_x}; blocker and major problems count anywhere.")
     elif scope is not None:
         since_short = scope["since_tree"][:10]
         if scope["findings"]:
@@ -9363,6 +9793,14 @@ def review_rules(ctx, cfg, cp, g, rnd, fp_id, cps=None) -> tuple[set | None, lis
             rules.append(f"This is a small fix made after an approval: you are shown ONLY the lines that changed "
                          f"since the last round actually reviewed ({since_short}), never the whole "
                          "checkpoint. There are no open findings to re-check for this round; judge only this diff.")
+    if dm_blocks:
+        rules.append("A finding that names a done-means line it contradicts (done_means, the numbers in front of "
+                     "the objective's Done means lines above) always blocks, at any severity, round or scope, and "
+                     "needs no separate user_impact; raise it wherever you find it, and name a line only when that "
+                     "line is not met in normal use.")
+    elif (ctx.plan() or {}).get("objective"):
+        rules.append(f"This plan was approved before a finding naming a done-means line always blocked: "
+                     f"{DM_LEGACY_FINDINGS_NOTE}. Still fill in done_means when a line is not met in normal use.")
     if rnd["round"] > 1 and scope is None:
         # A scoped round's own rebuttal info (if any) is already attached to each finding in `scope["findings"]`
         # above (its "rebuttal_reason"), so this generic, round-number-based block would only ever duplicate it;
@@ -9675,6 +10113,506 @@ def _check_cmd(gr: dict, target: str) -> str:
     return gr["check_command"].replace("{target}", shlex.quote(target))
 
 
+# --------------------------------------------------------------------------- shortcut tables
+# A guard-like part of the code (one the table names in "watches") has a fixed table of shortcut commands in
+# tests/shortcuts/<name>.json: {"name", "watches": [files], "runner": "<command>", "rows": [{"id", "command",
+# "expect": "refused"|"allowed"}]}. `ratchet.py shortcuts` runs each table whose watched files this run changed,
+# once per row against the code the run started from and once against the current code, and says which rows got
+# worse, stayed open, got fixed or errored. It only shows the result: nothing here ever blocks a finish.
+
+SHORTCUT_DIR = "tests/shortcuts"
+SHORTCUT_TIMEOUT_SEC = 60
+SC_ZERO = {"worse": 0, "still_open": 0, "fixed": 0, "held": 0, "errored": 0, "unknown": 0}
+SC_HEADINGS = (("worse", "got worse"), ("still_open", "still open"), ("fixed", "fixed"), ("errored", "errored"),
+               ("unknown", "unknown"))
+
+
+_SC_PATH_RE = re.compile(r"[A-Za-z0-9_.@+-]+(/[A-Za-z0-9_.@+-]+)*")
+
+
+def _sc_canonical(p: str) -> bool:
+    """A plain project-relative path: no leading ./ or /, no .. or . segment, no empty segment, no glob, no
+    backslash, no space (one trailing / is allowed for a folder by the caller)."""
+    return bool(_SC_PATH_RE.fullmatch(p)) and not any(seg in (".", "..") for seg in p.split("/"))
+
+
+def _sc_runner_argv(runner: str):
+    """(argument list, None) for an allowed runner, else (None, why). Exactly one shape is allowed:
+    `python3 <path to a file under tests/shortcuts/>`. It is run as an argument list, never through a shell."""
+    parts = runner.split(" ")
+    path = parts[-1]
+    if len(parts) == 1 and path.startswith(SHORTCUT_DIR + "/"):
+        return None, (f"its runner {runner!r} is not allowed: write `python3 {path}` (the copy the rows run in has "
+                      "no exec bit, so a bare file cannot run)")
+    if len(parts) != 2 or parts[0] != "python3":
+        return None, (f"its runner {runner!r} is not allowed: use `python3 {SHORTCUT_DIR}/<file>` (no other "
+                      "interpreter, no arguments, no shell)")
+    if not path.startswith(SHORTCUT_DIR + "/") or not _sc_canonical(path):
+        return None, (f"its runner {runner!r} is not allowed: the file must be a plain relative path under "
+                      f"{SHORTCUT_DIR}/ (no .., absolute path, glob or shell syntax)")
+    return [parts[0], "./" + path], None
+
+
+def _sc_watch_why(w: str):
+    """None for a canonical watch entry, else why it is refused. Entries are never normalised."""
+    if not _sc_canonical(w[:-1] if w.endswith("/") else w):
+        return (f"its watch {w!r} is not a canonical project path (no leading ./ or /, no .., no glob, no "
+                "backslash, no empty part)")
+    return None
+
+
+def _sc_watch_missing(ctx, tree, watches):
+    """The watches that exist in neither the starting tree nor the current folder."""
+    out = []
+    for w in watches:
+        p = w.rstrip("/")
+        if (ctx.root / p).exists():
+            continue
+        if tree and subprocess.run(["git", "cat-file", "-e", f"{tree}:{p}"], cwd=ctx.root,
+                                   capture_output=True).returncode == 0:
+            continue
+        out.append(w)
+    return out
+
+
+def _sc_parse(text: str):
+    """(table definition, None) for a readable table file, else (None, why it is unreadable)."""
+    raw = text if isinstance(text, bytes) else text.encode("utf-8", "replace")
+    d, bad = _read_record(Path("shortcut-table.json"), kind=None, data=raw)  # a people-written file, parsed from text
+    if bad:
+        return None, f"unreadable: not valid JSON ({bad.split(': ', 1)[-1][:80]})"
+    if not isinstance(d, dict):
+        return None, "unreadable: the file is not a JSON object"
+    rows, watches, runner = d.get("rows"), d.get("watches"), d.get("runner")
+    if not isinstance(runner, str) or not runner.strip():
+        return None, "unreadable: it has no \"runner\" command"
+    _argv, why = _sc_runner_argv(runner)
+    if why:
+        return None, f"unreadable: {why}"
+    if not isinstance(watches, list) or not watches or not all(isinstance(w, str) and w for w in watches):
+        return None, "unreadable: \"watches\" must list at least one file"
+    for w in watches:
+        why = _sc_watch_why(w)
+        if why:
+            return None, f"unreadable: {why}"
+    if not isinstance(rows, list) or not rows or not all(
+            isinstance(r, dict) and isinstance(r.get("id"), str) and isinstance(r.get("command"), str) for r in rows):
+        return None, "unreadable: \"rows\" must be a list of {id, command, expect}"
+    for r in rows:
+        if r.get("expect") not in ("allowed", "refused") or not isinstance(r.get("expect"), str):
+            return None, (f"unreadable: row {r['id']!r} has expect {json.dumps(r.get('expect'))[:40]}; "
+                          "expect must be the string \"allowed\" or \"refused\"")
+    return {"watches": watches, "runner": runner, "rows": rows}, None
+
+
+def _sc_start_tree(st):
+    """The tree this run recorded at its start (run_start.tree, else its first step's starting tree), or None. It
+    is where the starting copy of every table (rows, expectations, runner) is read, whatever the comparison
+    version turns out to be."""
+    rs = st.get("run_start") if isinstance(st.get("run_start"), dict) else {}
+    first = next(iter((st.get("checkpoints") or {}).values()), None) or {}
+    return rs.get("tree") or first.get("base_tree") or None
+
+
+def _sc_merge_tree(ctx, a, b):
+    """(exit code, tree id or "", set of conflicted paths) of `git merge-tree --write-tree a b`. A conflicted merge
+    still writes a tree (the conflicted files hold markers), so only its conflicted paths are unusable."""
+    r = subprocess.run(["git", "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", a, b],
+                       cwd=ctx.root, capture_output=True)
+    parts = r.stdout.decode("utf-8", "surrogateescape").split("\0") if r.returncode in (0, 1) else []
+    tree = parts[0].strip() if parts else ""
+    paths = set(x for x in parts[1:] if x) if r.returncode == 1 else set()
+    return r.returncode, tree, paths
+
+
+def _sc_old_version(ctx, st):
+    """(tree id of the code this run started from, None, paths that conflicted laying main on the start, paths that
+    conflicted redoing the lane/main merge), or (None, a plain note, set(), set()) when it
+    cannot be worked out. run_start.tree (written once at plan approval; `merged` never rewrites it) while main was
+    never merged in. After a merge, main's side laid onto the run's starting commit (`git merge-tree --write-tree
+    <run_start.head> M^2` for the latest merged_main commit M), so main's own changes are not counted as this run's.
+    A conflict there, or in redoing the lane/main merge itself (a hand-made resolution mixes the run's lines with
+    main's), does not make the whole version unknown: the tree is still built and the conflicted paths are returned
+    (the two causes apart, so a note names the merge that conflicted),
+    so only a table that watches one of them is unknown. A run approved before run_start existed falls back to its
+    first step's starting tree, unless main was merged in."""
+    merges = [e for e in (st.get("history") or []) if e.get("event") == "merged_main" and e.get("commit")]
+    rs = st.get("run_start") if isinstance(st.get("run_start"), dict) else {}
+    if not merges:
+        tree = _sc_start_tree(st)
+        if not tree:
+            return None, "The starting version cannot be worked out: this run recorded no starting tree.", set(), set()
+        return tree, None, set(), set()
+    if not rs.get("head"):
+        return None, ("The starting version cannot be worked out: this run began before starting versions were "
+                      "recorded and main was merged into it."), set(), set()
+    m = merges[-1]["commit"]
+    side = m + "^2"
+    if subprocess.run(["git", "rev-parse", "-q", "--verify", side], cwd=ctx.root, capture_output=True).returncode != 0:
+        side = m  # a fast-forward: the commit is main's tip itself
+    code, tree, conflicts = _sc_merge_tree(ctx, rs["head"], side)
+    conflicts2 = set()
+    if side != m:  # the same merge as git made it: a hand-made resolution shows up as a conflict here
+        code2, _t2, conflicts2 = _sc_merge_tree(ctx, m + "^1", side)
+        if code2 not in (0, 1):
+            return None, "The starting version cannot be worked out: git could not redo the merge of main.", set(), set()
+    if code not in (0, 1) or not tree:
+        return None, "The starting version cannot be worked out: git could not build main's side onto the start.", set(), set()
+    return tree, None, conflicts, conflicts2
+
+
+def _sc_old_files(ctx, tree: str) -> dict:
+    """{table name: file text} for every tests/shortcuts/*.json in the starting tree."""
+    r = subprocess.run(["git", "ls-tree", "-r", "--name-only", "-z", tree, "--", SHORTCUT_DIR], cwd=ctx.root,
+                       capture_output=True)
+    out = {}
+    for path in r.stdout.decode("utf-8", "surrogateescape").split("\0") if r.returncode == 0 else []:
+        rest = path[len(SHORTCUT_DIR) + 1:] if path.startswith(SHORTCUT_DIR + "/") else ""
+        if rest.endswith(".json") and "/" not in rest:
+            s = subprocess.run(["git", "show", f"{tree}:{path}"], cwd=ctx.root, capture_output=True)
+            if s.returncode == 0:
+                out[rest[:-5]] = s.stdout.decode("utf-8", "replace")
+    return out
+
+
+def _sc_run_row(runner: str, cwd: Path, root: Path, command: str):
+    """(ALLOWED | REFUSED | error, note): run in `cwd` (the version's own folder, the same as `root`); the runner's whole trimmed output must be exactly ALLOWED or REFUSED and
+    its exit code 0; anything else (a crash, a timeout, a runner that cannot start) is an error, never refused."""
+    argv, why = _sc_runner_argv(runner)
+    if why:
+        return "error", why
+    try:
+        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, errors="replace",
+                           timeout=SHORTCUT_TIMEOUT_SEC,
+                           env=dict(os.environ, RATCHET_SHORTCUT_ROOT=str(root), RATCHET_SHORTCUT_COMMAND=command))
+    except subprocess.TimeoutExpired:
+        return "error", f"the runner timed out after {SHORTCUT_TIMEOUT_SEC}s"
+    except (OSError, ValueError) as e:  # ValueError: a NUL byte in the runner or the row's command
+        return "error", f"the runner could not be started ({e})"
+    out = (r.stdout or "").strip()
+    if r.returncode == 0 and out in ("ALLOWED", "REFUSED"):
+        return out, None
+    if r.returncode == 0:
+        return "error", f"the runner printed {out[:60]!r}, not exactly ALLOWED or REFUSED"
+    lines = [x for x in ((r.stderr or "") + "\n" + (r.stdout or "")).splitlines() if x.strip()]
+    err = (r.stderr or "").strip().splitlines()
+    return "error", f"the runner exited {r.returncode}: {(err[-1] if err else (lines[-1] if lines else 'no output'))[:160]}"
+
+
+def _sc_verdict(expect, old, new):
+    want = {"refused": "REFUSED", "allowed": "ALLOWED"}.get(expect)
+    if want is None or old == "error" or new == "error":
+        return "errored"
+    if old == "unknown":
+        return "unknown"
+    if old == want:
+        return "held" if new == want else "worse"
+    return "fixed" if new == want else "still_open"
+
+
+def _sc_table(ctx, name, old_def, cur_def, cur_why, old_root, new_root, old_note):
+    """One table's result: its rows run on the starting code and the current code. The rows, expectations and
+    runner of a table that existed at the start always come from its starting copy (a row cannot be dropped or
+    flipped by editing or deleting the file); rows added since run too and are marked new_row."""
+    notes = []
+    if old_note:
+        notes.append(old_note)
+    base = old_def or cur_def
+    rows = [dict(r, new_row=False) for r in (old_def["rows"] if old_def else [])]
+    if old_def:
+        cur_rows = {r["id"]: r for r in (cur_def["rows"] if cur_def else [])}
+        if cur_def is None and cur_why is None:
+            notes.append(f"The table file for {name} was deleted since the run started; its starting copy was used.")
+        elif cur_def is None:
+            notes.append(f"The current {name} table file is unreadable ({cur_why}); its starting copy was used.")
+        else:
+            gone = [r["id"] for r in rows if r["id"] not in cur_rows]
+            changed = [r["id"] for r in rows if r["id"] in cur_rows and (
+                cur_rows[r["id"]].get("command") != r["command"] or cur_rows[r["id"]].get("expect") != r.get("expect"))]
+            if gone:
+                notes.append(f"Row(s) {', '.join(gone)} no longer in the {name} table file (removed since the run "
+                             "started); they still run from the starting copy.")
+            if changed:
+                notes.append(f"Row(s) {', '.join(changed)} changed since the run started; the starting version "
+                             "of each was used.")
+            have = {r["id"] for r in rows}
+            rows += [dict(r, new_row=True) for r in cur_def["rows"] if r["id"] not in have]
+    elif cur_def:
+        rows = [dict(r, new_row=old_root is not None) for r in cur_def["rows"]]
+    out_rows, counts = [], dict(SC_ZERO)
+    for r in rows:
+        expect = r.get("expect")
+        if old_root is None:
+            old, onote = "unknown", None
+        else:
+            old, onote = _sc_run_row(base["runner"], old_root, old_root, r["command"])
+        new, nnote = _sc_run_row(base["runner"], new_root, new_root, r["command"])
+        verdict = _sc_verdict(expect, old, new)
+        if old_def is None and old == "error" and new != "error" and expect in ("refused", "allowed"):
+            # a table added during the run has no old side (its runner may not exist there): the row is new and is
+            # judged on the current code only
+            old, onote = "none", None
+            verdict = "held" if new == {"refused": "REFUSED", "allowed": "ALLOWED"}[expect] else "still_open"
+        row = {"id": r["id"], "command": r["command"], "expect": expect, "old": old, "new": new,
+               "verdict": verdict, "new_row": bool(r.get("new_row"))}
+        why = "; ".join(x for x in (onote, nnote) if x)
+        if verdict == "errored" and not why:
+            why = f"expect must be \"refused\" or \"allowed\", not {expect!r}"
+        if why:
+            row["note"] = why
+        counts[verdict] += 1
+        out_rows.append(row)
+    return {"name": name, "ran": True, "stale": False, "note": notes[0] if notes else None, "notes": notes,
+            "counts": counts, "rows": out_rows, "watches": base["watches"]}
+
+
+def _sc_not_run(name, note, failed=False):
+    """A table that did not run. `failed`: it should have (unreadable file, code could not be rebuilt), so the
+    result is saved and shown; otherwise it was skipped on purpose (its watched files did not change)."""
+    return {"name": name, "ran": False, "failed": failed, "stale": False, "note": note, "notes": [note],
+            "counts": dict(SC_ZERO), "rows": [], "watches": []}
+
+
+def _sc_lay_runner(src: Path, dst: Path):
+    """Lays the starting copy of tests/shortcuts (runner scripts and helpers) over the current copy, so a runner the
+    builder edited or deleted still runs as it was at the start; the code under test is untouched."""
+    sdir = src / SHORTCUT_DIR
+    if sdir.is_dir():
+        shutil.copytree(sdir, dst / SHORTCUT_DIR, dirs_exist_ok=True, symlinks=False, ignore_dangling_symlinks=True)
+
+
+def _sc_hits(paths, watches) -> bool:
+    return any(c == w.rstrip("/") or c.startswith(w.rstrip("/") + "/") for c in paths for w in watches)
+
+
+def _sc_compute(ctx, st, only=None) -> dict:
+    """Runs every shortcut table whose watched files this run changed (all of them when the starting code cannot
+    be worked out); returns {"tables": [...]}. Changes nothing in the project: both versions are throwaway copies."""
+    if not _is_git(ctx.root):
+        return {"tables": [], "notes": ["Shortcut tables need a git project, so none were run."]}
+    old_tree, old_note, conflicts, conflicts_redo = _sc_old_version(ctx, st)
+    # the starting rows and expectations always come from the run's starting tree, never from the comparison
+    # version (main's own edits to a table must not drop or flip a row); only the code compared comes from old_tree
+    start_tree = _sc_start_tree(st) or old_tree
+    old_files = _sc_old_files(ctx, start_tree) if start_tree else {}
+    cmp_files = _sc_old_files(ctx, old_tree) if old_tree and old_tree != start_tree else {}
+    cur_dir = ctx.root / SHORTCUT_DIR
+    cur_files = {p.stem: p for p in sorted(cur_dir.glob("*.json")) if p.is_file()} if cur_dir.is_dir() else {}
+    names = sorted(set(old_files) | set(cur_files))
+    if only:
+        names = [n for n in names if n == only]
+    if not names:
+        return {"tables": []}
+    fp = fingerprint(ctx.root)
+    changed = changed_files(ctx.root, {"kind": "git-tree", "id": old_tree}, fp) if old_tree else None
+    old_root = new_root = start_root = None
+    laid = False
+    tables = []
+    try:
+        for name in names:
+            old_def = old_why = cur_def = cur_why = None
+            if name in old_files:
+                old_def, old_why = _sc_parse(old_files[name])
+            if name in cur_files:
+                try:
+                    cur_def, cur_why = _sc_parse(cur_files[name].read_text(errors="replace"))
+                except OSError as e:
+                    cur_why = f"unreadable: {e}"
+            if old_def and name in cmp_files:  # rows main added are extra rows; they never replace a starting row
+                main_def, _w = _sc_parse(cmp_files[name])
+                if main_def:
+                    have = {r["id"] for r in old_def["rows"]}
+                    old_def = dict(old_def, rows=old_def["rows"] + [r for r in main_def["rows"] if r["id"] not in have])
+            base = old_def or cur_def
+            if base is None:
+                tables.append(_sc_not_run(name, f"Not run: the {name} table file is {old_why or cur_why}.", True))
+                continue
+            gone = _sc_watch_missing(ctx, start_tree, base["watches"])
+            if gone:
+                tables.append(_sc_not_run(name, f"Not run: the {name} table watches {', '.join(gone)}, which exists "
+                                                "neither in the starting code nor in the current code.", True))
+                continue
+            if changed is not None and not _sc_hits(changed, base["watches"]):
+                tables.append(_sc_not_run(name, f"{name} was not run: the files it watches "
+                                                f"({', '.join(base['watches'])}) did not change in this run."))
+                continue
+            if new_root is None:
+                new_root = _materialize(ctx, fp["id"], [])
+                old_root = _materialize(ctx, old_tree, []) if old_tree else None
+                if new_root is None or (old_tree and old_root is None):
+                    tables.append(_sc_not_run(name, "Not run: Ratchet could not rebuild the code to run it on.", True))
+                    for d in (old_root, new_root):
+                        if d is not None:
+                            shutil.rmtree(d, ignore_errors=True)
+                    new_root = old_root = None
+                    continue
+            if old_def and not laid:  # a table that existed at the start keeps its starting runner files
+                src = old_root if old_tree == start_tree else None
+                if src is None and start_tree:
+                    src = start_root = _materialize(ctx, start_tree, [])
+                if src is not None:
+                    _sc_lay_runner(src, new_root)
+                    if old_root is not None and src is not old_root:
+                        _sc_lay_runner(src, old_root)
+                laid = True
+            t_old, t_note = old_root, old_note
+            for cset, cwhy in ((conflicts, "laying main's side onto the code this run started from hit a conflict there"),
+                               (conflicts_redo, "main's merge into this lane had a conflict resolved by hand in a "
+                                                "file this table watches")):
+                if t_old is not None and _sc_hits(cset, base["watches"]):  # only this table's watched files conflict
+                    t_old = None
+                    t_note = f"The starting version of the files this table watches cannot be worked out: {cwhy}."
+            res = _sc_table(ctx, name, old_def, cur_def, cur_why, t_old, new_root, t_note)
+            res["fingerprint"] = fp["id"]
+            tables.append(res)
+    finally:
+        for d in (old_root, new_root, start_root):
+            if d is not None:
+                shutil.rmtree(d, ignore_errors=True)
+    return {"tables": tables}
+
+
+def _has_shortcut_case(ctx, plan) -> bool:
+    """True when some test-plan case has layer "shortcuts": status --json then carries `done_means_table` at any
+    phase, so the agent can see mid-run whether a line linked to a shortcut table is proven."""
+    return any(c.get("layer") == "shortcuts" for cp in (plan or {}).get("checkpoints") or []
+               if isinstance(cp, dict) and cp.get("id")
+               for c in (test_plan(ctx, cp["id"]) or {}).get("cases") or [])
+
+
+def _sc_dir(ctx) -> Path:
+    return ctx.run_dir() / "evidence" / "shortcuts"
+
+
+def _sc_save(ctx, result: dict):
+    """Saves each table that ran, and each that failed to run (unreadable file, code that could not be rebuilt:
+    shown as a failure, its linked line stays unproven), as evidence/shortcuts/<name>.json with the code
+    fingerprint it ran on. A table skipped because its watched files did not change writes nothing and never deletes
+    an earlier saved result (a valid result is not thrown away)."""
+    d = _sc_dir(ctx)
+    for t in result["tables"]:
+        p = d / f"{t['name']}.json"
+        if not t.get("ran") and not t.get("failed"):
+            continue
+        d.mkdir(parents=True, exist_ok=True)
+        _write_record(p, dict(t, saved_at=now()), pretty=True)
+
+
+def _sc_saved(ctx) -> dict:
+    """The saved table results (no running), each with `stale`: true when the code changed since it ran."""
+    d = _sc_dir(ctx)
+    files = sorted(d.glob("*.json")) if d.is_dir() else []
+    tables = []
+    for p in files:
+        t, bad = _read_record(p, kind=dict)
+        if bad:
+            continue
+        if isinstance(t, dict) and isinstance(t.get("rows"), list) and (t.get("ran") or t.get("failed")):
+            tables.append(t)
+    if tables:
+        now_id = fingerprint(ctx.root)["id"]
+        for t in tables:
+            t["stale"] = t.get("fingerprint") != now_id
+    return {"tables": tables}
+
+
+def _sc_counts_line(t: dict) -> str:
+    if t.get("failed"):
+        return f"Shortcut table {t['name']}: could not run. {t.get('note') or ''}".rstrip()
+    c = t.get("counts") or {}
+    return (f"Shortcut table {t['name']}: {c.get('worse', 0)} worse, {c.get('still_open', 0)} still open, "
+            f"{c.get('fixed', 0)} fixed, {c.get('held', 0)} held, {c.get('errored', 0)} errored"
+            + (f", {c['unknown']} unknown (the starting version could not be run)" if c.get("unknown") else ""))
+
+
+def _sc_table_lines(t: dict) -> list[str]:
+    """One table's block, shared by `shortcuts`, `status` (the final review), and the receipt: its counts, its
+    notes, then a heading per verdict that has rows (got worse, still open, fixed, errored, unknown) with each
+    row's command. Held rows are only counted."""
+    out = [_sc_counts_line(t)]
+    if t.get("stale"):
+        out.append("  This saved result is out of date: the code changed after it ran. Run `ratchet.py "
+                   "shortcuts` again.")
+    if not t.get("failed"):  # a failed table's one note is already in its first line
+        out += [f"  Note: {n}" for n in t.get("notes") or []]
+    for verdict, heading in SC_HEADINGS:
+        rows = [r for r in t.get("rows") or [] if r.get("verdict") == verdict]
+        if not rows:
+            continue
+        out.append(f"  {heading} ({len(rows)}):")
+        for r in rows:
+            tail = f" [{r['note']}]" if r.get("note") else ""
+            new = " (added since the run started)" if r.get("new_row") else ""
+            out.append(f"    {r['id']}: {r['command']}   expected {r.get('expect')}; at the start {r.get('old')}, "
+                       f"now {r.get('new')}{new}{tail}")
+    return out
+
+
+def _sc_block_lines(saved: dict) -> list[str]:
+    out = []
+    for t in saved.get("tables") or []:
+        out += _sc_table_lines(t)
+    return out
+
+
+def cmd_shortcuts(args):
+    """`ratchet.py shortcuts [<name>] [--json]`: runs the shortcut tables whose watched files this run changed,
+    against the code the run started from and the current code, and saves each result under the run's
+    evidence/shortcuts. Shows rows that got worse, stayed open, got fixed or errored; changes no project file."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    result = _sc_compute(ctx, st, getattr(args, "name", None))
+    _sc_save(ctx, result)
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return
+    if not result["tables"]:
+        print("There are no shortcut tables in this project (tests/shortcuts/*.json)."
+              if not result.get("notes") else result["notes"][0])
+        return
+    for t in result["tables"]:
+        if not t.get("ran"):
+            print(t["note"])
+            continue
+        for line in _sc_table_lines(t):
+            print(line)
+        print("")
+
+
+def _sc_case_status(ctx, case: dict) -> str:
+    """A 'shortcuts'-layer case's own state for the done-means table: "passed" only when a saved result for its
+    table, made on the current code, has every row right on the current code (the starting side never matters);
+    otherwise the table's wrong rows by id, or that the saved result is out of date, or DM_NO_RESULT."""
+    name = case.get("table")
+    p = _sc_dir(ctx) / f"{name}.json" if isinstance(name, str) and name else None
+    if p is None or not p.is_file():
+        return DM_NO_RESULT
+    saved = _sc_saved(ctx)
+    t = next((x for x in saved["tables"] if x.get("name") == name), None)
+    if t is None:
+        return DM_NO_RESULT
+    if t.get("failed"):
+        return f"shortcut table {name}: could not run ({t.get('note')})"
+    if t.get("stale"):
+        return f"shortcut table {name}: the saved result is out of date (the code changed since it ran)"
+    want = {"refused": "REFUSED", "allowed": "ALLOWED"}
+    wrong = [r["id"] for r in t["rows"] if r.get("verdict") == "errored" or r.get("new") != want.get(r.get("expect"))]
+    if wrong:
+        return f"shortcut table {name}: rows wrong on the current code: {', '.join(wrong)}"
+    return "passed"
+
+
+def _sc_run_at_finish(ctx, st) -> list[str]:
+    """Called when the last step completes: runs and saves the tables; the lines to print. Never blocks a finish:
+    a failure here is a plain note."""
+    try:
+        result = _sc_compute(ctx, st)
+        _sc_save(ctx, result)
+    except Exception as e:  # shows a note, never refuses the finish
+        return [f"The shortcut tables could not be run ({str(e)[:160]}); run `ratchet.py shortcuts` to see why."]
+    return [_sc_counts_line(t) for t in result["tables"] if t.get("ran") or t.get("failed")]
+
+
 def _finish_guardrail(ctx, st, cp):
     """A guardrail step passed every gate: its check becomes permanent (config `checks`) and is noted in learnings."""
     gr = cp.get("guardrail") or {}
@@ -9763,6 +10701,8 @@ def spec_coverage(ctx, plan, items) -> dict:
             unmapped[ref] = u["reason"].strip()
     by_case, by_step, ui_steps, unknown = {}, {}, {}, set()
     for cp in plan.get("checkpoints") or []:
+        if not isinstance(cp, dict) or not cp.get("id"):
+            continue  # a malformed step is refused by plan validation; this table just skips it
         for ref in _as_list(cp.get("spec_refs") or []):
             by_step.setdefault(ref, []).append(cp["id"])
             if (cp.get("gates") or {}).get("ui"):
@@ -10162,7 +11102,7 @@ def living_spec_text(ctx, st) -> str:
                 out.append(f"- **GIVEN** {c['given']}")
             out.append(f"- **WHEN** {c.get('when') or 'this behaviour is exercised'}")
             out.append(f"- **THEN** {c.get('then') or c.get('title') or 'it works as described'}")
-            how = "checked by the UI review" if c.get("layer") == "browser" else f"test {c['id']}" + (f" in {files}" if files else "")
+            how = "checked by the UI review" if c.get("layer") == "browser" else f"shortcut table {c.get('table')}" if c.get("layer") == "shortcuts" else f"test {c['id']}" + (f" in {files}" if files else "")
             out += [f"<!-- proven by {how}" + (f", commit {commit}" if commit else "") + " -->", ""]
     return "\n".join(out).rstrip() + "\n"
 
@@ -10610,9 +11550,19 @@ def _receipt_fixed_later(st) -> list:
     return out
 
 
-def _dm_case_status(ctx, cp_id: str, case: dict, behavior_status: str | None = None) -> str:
-    """One linked test case's own state for the receipt's done-means section. A browser-layer case is never
-    run by `ratchet.py behavior`, so it always reads "checked by the UI gate". Otherwise, this checkpoint's
+DM_NO_UI_GATE = "not checked by any UI gate"
+DM_NO_RESULT = "no result recorded yet"
+DM_NO_TESTS_NOTE = ("No tests are linked to any of these lines (an older plan, from before tests could be linked "
+                    "to a done-means line), so there is no result to show for them.")
+DM_NO_LINES_NOTE = "no done-means lines were stated for this run's objective"
+
+
+def _dm_case_status(ctx, cp_id: str, case: dict, behavior_status: str | None = None,
+                    ui_status: str | None = None) -> str:
+    """One linked test case's own state for the receipt's and the final review's done-means section. A
+    browser-layer case is never run by `ratchet.py behavior`, so it reads "checked by the UI gate" when this
+    checkpoint's UI gate (`ui_status`, passed by the caller) passed, and DM_NO_UI_GATE when it did not (never
+    required, skipped, failed or still pending: nothing checked it). Otherwise, this checkpoint's
     latest per-case test report in evidence (whatever report format is actually on disk, read directly rather
     than only when the approved plan names one, so a report already written always counts) decides passed vs
     failed vs error vs skipped. With no report, or no result for this case in it, a supported exit-code-only
@@ -10624,7 +11574,9 @@ def _dm_case_status(ctx, cp_id: str, case: dict, behavior_status: str | None = N
     repeated runs); it counts as passed only when every matching entry passed, so one failed, errored or
     skipped instance among several still shows as failed."""
     if case.get("layer") == "browser":
-        return "checked by the UI gate"
+        return "checked by the UI gate" if ui_status == "passed" else DM_NO_UI_GATE
+    if case.get("layer") == "shortcuts":  # never run by `behavior`: its saved shortcut-table result decides
+        return _sc_case_status(ctx, case)
     case_id = case.get("id") or ""
     pat = _case_id_re(case_id) if case_id else None
     for name in ("test-report.json", "test-report.xml"):
@@ -10641,34 +11593,387 @@ def _dm_case_status(ctx, cp_id: str, case: dict, behavior_status: str | None = N
         return "step tests passed, by exit code only (not checked per case)"
     if behavior_status == "failed":
         return "step tests failed, by exit code only (not checked per case)"
-    return "no result recorded yet"
+    return DM_NO_RESULT
 
 
-def _done_means_proof(ctx, plan, cps_map: dict | None = None) -> dict | None:
+def _finding_dm_lines(f: dict, n: int) -> set:
+    """The 1-based done-means line numbers a review finding names in its optional "done_means" field: one
+    number or a list of them (the shapes "proves" takes). Anything that is not a real line of this plan (a
+    string, a bool, 0, a number past the last line) names nothing here and is ignored by the final review's
+    done-means table; the blocking rule in `names_done_means` (CP3) does not ignore such a number, so that
+    finding still blocks its round and is shown as written."""
+    v = f.get("done_means")
+    vals = v if isinstance(v, list) else [v]
+    return {x for x in vals if isinstance(x, int) and not isinstance(x, bool) and 1 <= x <= n}
+
+
+def _dm_case_reason(c: dict) -> str | None:
+    """Why one linked case does not prove its line, or None when it does (passed, passed by exit code only, or
+    checked by a passed UI gate). A failed case says failed (by exit code only when that is all that is known),
+    a case with nothing recorded says it has no result, a browser case no UI gate passed for says so."""
+    st, cid = c.get("status") or "", c.get("id")
+    if st in ("passed", "checked by the UI gate") or st.startswith("step tests passed"):
+        return None
+    if st.startswith("shortcut table"):
+        return f"{cid}: {st}"
+    if st == DM_NO_UI_GATE:
+        return f"{cid} is a browser test and no UI gate checked it"
+    if st.startswith("step tests failed"):
+        return f"{cid} failed, by exit code only (the step's tests were not checked per case)"
+    if st == "failed":
+        return f"{cid} failed"
+    return f"{cid} has no result"  # DM_NO_RESULT, or any status this function does not know
+
+
+def _done_means_proof(ctx, plan, cps_map: dict | None = None, older_plan_note: bool = True) -> dict | None:
     """None when the plan has no objective.done_means at all (an older plan, approved before either existed):
-    the receipt prints NO_OBJECTIVE_NOTE instead of this section. Otherwise {"lines": [{"text", "cases":
-    [{"id", "title", "file", "status"}]}], "any_proves": bool}; "any_proves" is False only when not one case
-    anywhere in the plan names a "proves" line (an old test plan from before that field existed), so the
-    receipt can add one plain note beside every line's own "no test linked" instead of pretending it checked.
-    `cps_map` (the run state's own checkpoint-by-id dict, passed by the caller) feeds each case's checkpoint's
-    recorded behavior-gate status into _dm_case_status, so an exit-code-only step still shows its real result."""
+    the receipt prints a plain note instead of this section (`_dm_none_note`: NO_OBJECTIVE_NOTE for a plan with
+    no objective, DM_NO_LINES_NOTE for an objective with no done_means lines). Otherwise {"lines": [{"number", "text",
+    "cases": [{"id", "title", "file", "status", "result"}], "verdict", "reasons"}], "any_proves": bool}; "any_proves"
+    is False only when not one case anywhere in the plan names a "proves" line (an old test plan from before that
+    field existed), so the receipt and the final review can add one plain note instead of pretending they
+    checked. "result" is the same text as "status". `verdict` is the one verdict every consumer shares (the
+    final review's table in `status` and `status --json`'s "done_means_table", and the receipt): "proven" when
+    the line has at least one linked case, every linked case passed (per case, or by exit code only, or checked
+    by a passed UI gate) and no open finding names the line; otherwise "unproven", with one plain string in
+    `reasons` for each cause (`done_means_table` and cmd_receipt then turn an unproven line the user accepted
+    into "accepted" through `_apply_accepted_lines`, CP5; this function never reads state's `accepted_lines`):
+    "no test linked", a linked case that failed / has no result / is a browser case no UI gate checked, and each
+    open finding that names the line in its "done_means" field. When "any_proves" is
+    False and `older_plan_note` is True (the default) every line's `verdict` is None and `reasons` is [] (an older
+    plan is not "unproven", it was never linked), so no consumer reads a verdict that was never computed. With
+    `older_plan_note=False` (a plan approved under the done-means rules, `_approved_after_dm`: `done_means_table`
+    and the receipt pass it) the verdicts stay, so every line with no case is "unproven" ("no test linked") even
+    when no case anywhere links a line any more (links removed after approval, CP4 round 2). An open finding is
+    exactly an entry `left_for_later` lists (so this agrees with `ratchet.py deferred`). `cps_map` (the run
+    state's own checkpoint-by-id dict, passed by the caller) feeds each case's checkpoint's recorded behavior-
+    and UI-gate status into _dm_case_status, and supplies the findings."""
     obj = plan.get("objective") if isinstance(plan, dict) else None
     dm = obj.get("done_means") if isinstance(obj, dict) else None
     if not isinstance(dm, list) or not dm:
         return None
-    lines = [{"text": t, "cases": []} for t in dm]
+    lines = [{"number": i, "text": t, "cases": []} for i, t in enumerate(dm, 1)]
     any_proves = False
     cps_map = cps_map or {}
     for cp in plan.get("checkpoints") or []:
-        behavior_status = (((cps_map.get(cp["id"]) or {}).get("gates") or {}).get("behavior") or {}).get("status")
+        gates = (cps_map.get(cp["id"]) or {}).get("gates") or {}
+        behavior_status = (gates.get("behavior") or {}).get("status")
+        ui_status = (gates.get("ui") or {}).get("status")
         for case in (test_plan(ctx, cp["id"]) or {}).get("cases") or []:
             for p in _proves_values(case):
                 if isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= len(dm):
                     any_proves = True
+                    status = _dm_case_status(ctx, cp["id"], case, behavior_status, ui_status)
                     lines[p - 1]["cases"].append({"id": case.get("id"), "title": case.get("title", ""),
-                                                  "file": case.get("file", ""),
-                                                  "status": _dm_case_status(ctx, cp["id"], case, behavior_status)})
+                                                  "file": case.get("file", ""), "status": status,
+                                                  "result": status})
+    findings = [f for c in cps_map.values() for f in left_for_later(c)]
+    for line in lines:
+        reasons = [r for r in (_dm_case_reason(c) for c in line["cases"]) if r] or (
+            [] if line["cases"] else ["no test linked"])
+        for f in findings:
+            if line["number"] in _finding_dm_lines(f, len(dm)):
+                reasons.append(f"open finding {_finding_key(f)}: {(f.get('description') or '').strip()[:240]}")
+        line["verdict"], line["reasons"] = ("unproven" if reasons else "proven"), reasons
+        if not any_proves and older_plan_note:
+            # an older test plan (no case names a line): nothing was checked, so no line is proven or unproven;
+            # every output (status, the receipt, receipt --json) then shows the one older-plan note instead
+            line["verdict"], line["reasons"] = None, []
     return {"lines": lines, "any_proves": any_proves}
+
+
+def _dm_none_note(plan) -> str:
+    """The plain note for a plan _done_means_proof returns None for: NO_OBJECTIVE_NOTE when the plan states no
+    objective at all, DM_NO_LINES_NOTE when it has an objective with no done_means lines."""
+    obj = plan.get("objective") if isinstance(plan, dict) else None
+    return DM_NO_LINES_NOTE if isinstance(obj, dict) and obj else NO_OBJECTIVE_NOTE
+
+
+def _plan_as_approved(plan, st) -> dict:
+    """`plan` with its objective replaced by the one the user approved (st["approved"]["objective"], written by
+    approve-plan and refreshed only by plan-extend), when that snapshot has a done_means list. The final review's
+    table (`done_means_table`), the finish check (`_finish_blockers`), `_final_review_lines` and the receipt all
+    read the done-means lines through this, so an edit to checkpoints.json after approval (a line dropped,
+    reworded or reordered) changes nothing they show or decide. A run with no approval yet, or whose approved plan
+    had no objective or no done_means list, reads the plan as it is."""
+    obj = (st.get("approved") or {}).get("objective")
+    if not isinstance(plan, dict) or not isinstance(obj, dict) or not isinstance(obj.get("done_means"), list):
+        return plan
+    return {**plan, "objective": obj}
+
+
+def _plan_for_briefs(plan, st) -> dict:
+    """The plan whose objective `plan-summary`, `brief`, the adversarial `how` prompt and the sub-agent launch guard
+    render (through `objective_brief`): once the plan is approved and the run is building or pausing, the APPROVED
+    done-means lines (`_plan_as_approved`), so a brief or reviewer prompt never shows an edited checkpoints.json
+    line under a number the final review's table and `_finish_blockers` read differently (a finding's
+    `done_means: [2]` then names the same line everywhere). While planning (no approval yet) or in
+    `planning_feedback` (the planner appends lines that plan-extend has not approved yet) it is the plan as it is,
+    so a brief for the extend planner and plan-summary show the new lines. `st` may be {} or None."""
+    st = st or {}
+    if st.get("phase") in ("planning", "awaiting_plan_approval", "planning_feedback"):
+        return plan
+    return _plan_as_approved(plan, st)
+
+
+def _lines_word(nums) -> str:
+    """'line 2' or 'lines 2, 3': the plain words for a list of 1-based done-means line numbers."""
+    nums = list(nums)
+    return "line" + ("s " if len(nums) != 1 else " ") + ", ".join(str(x) for x in nums)
+
+
+def _accepted_lines(st) -> dict:
+    """CP5: the done-means lines the user (or the director, in an enrolled lane) accepted as unproven with
+    `accept-line`, by 1-based line number: {n: {"number", "text", "reason", "accepted_by", "accepted_at",
+    "covered"}} ("covered": the line's `reasons` at the moment it was accepted, what the acceptance covered), read
+    from state.json's `accepted_lines` (a dict keyed by the line number as a string, written by cmd_accept_line
+    only). {} when none, or when the key has some other shape. Read by `_apply_accepted_lines` and
+    `_ask_accept_line` (a line that reads "accepted" cannot be asked about again; one held again can)."""
+    acc = st.get("accepted_lines")
+    out = {}
+    if not isinstance(acc, dict):
+        return out
+    for k, v in acc.items():
+        try:
+            n = int(k)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(v, dict):
+            out[n] = v
+    return out
+
+
+HELD_AGAIN_PREFIX = "held again: "
+
+
+def _apply_accepted_lines(st, lines: list) -> list:
+    """CP5: marks the accepted lines in a `_done_means_proof` lines list, in place, and returns it. An entry whose
+    verdict is "unproven" and whose number the user accepted (`_accepted_lines`) gets verdict "accepted" and an
+    "accepted" record {"reason", "accepted_by", "accepted_at", "covered"} ONLY while every one of its current
+    `reasons` is in the record's "covered" list (the reasons at accept time): its `reasons` stay (what the
+    acceptance covered, printed by `_accepted_line_text`). A line that is unproven for a reason the acceptance did
+    not cover (a linked test that failed since, a NEW open finding naming the line, a link removed) is HELD AGAIN:
+    it keeps verdict "unproven", gets an "accepted_earlier" record and one more plain reason string starting with
+    HELD_AGAIN_PREFIX that names the earlier acceptance, what it covered and what is new, so status, status --json,
+    the receipt, `_finish_blockers` and every refusal built on them show it, and `ask accept-line` may be run for
+    it again. A record without "covered" (none is written any more) covers whatever holds the line. A line that is
+    proven stays "proven" even when it was accepted earlier (the tests prove it now), and a line never accepted is
+    untouched, so acceptance is per line and never a blanket flag. The one place the verdict "accepted" is made:
+    `done_means_table` (status, status --json, `_finish_blockers`, which then no longer holds the finish on that
+    line) and cmd_receipt both call it."""
+    acc = _accepted_lines(st)
+    for e in lines:
+        rec = acc.get(e.get("number"))
+        if not rec or e.get("verdict") != "unproven":
+            continue
+        record = {k: rec.get(k) for k in ("reason", "accepted_by", "accepted_at", "covered")}
+        covered = rec.get("covered")
+        reasons = e.get("reasons") or []
+        new = [r for r in reasons if r not in covered] if isinstance(covered, list) else []
+        if not new:
+            e["verdict"] = "accepted"
+            e["accepted"] = record
+            continue
+        who = "the director" if rec.get("accepted_by") == "director" else "the user"
+        e["accepted_earlier"] = record
+        why = " ".join(str(rec.get("reason") or "").split())
+        e["reasons"] = list(reasons) + [
+            f"{HELD_AGAIN_PREFIX}{who} accepted this line on {rec.get('accepted_at') or '?'} (reason: {why}) when "
+            f"it was held by: {'; '.join(covered) or 'nothing'}; that acceptance does not cover what holds it now: "
+            f"{'; '.join(new)}"]
+    return lines
+
+
+def done_means_table(ctx, plan, st):
+    """The final review's done-means table, one source for plain `status`, `status --json`'s "done_means_table",
+    the receipt and the finish check (`_finish_blockers`): the list of per-line entries from _done_means_proof
+    ("number", "text", "verdict", "cases", "reasons"; verdict "accepted" with an "accepted" record for an unproven
+    line the user accepted, `_apply_accepted_lines`, CP5), or one plain note string instead of a list when there is
+    nothing to tabulate (no objective at all: NO_OBJECTIVE_NOTE; an objective with no done-means lines:
+    DM_NO_LINES_NOTE; no test linked to any line on an OLDER plan: DM_NO_TESTS_NOTE). The lines are the
+    APPROVED ones (`_plan_as_approved`), never a later edit of checkpoints.json. A plan approved under the
+    done-means rules (`_approved_after_dm`) always gets the list: when no case links a line any more (every
+    `proves` link removed after approval) each line is "unproven" with "no test linked", so the finish check
+    (`_unproven_finish_lines`) holds on every line instead of reading a note as nothing to block."""
+    plan = _plan_as_approved(plan, st)
+    marked = _approved_after_dm(st)
+    dm = _done_means_proof(ctx, plan, st.get("checkpoints") or {}, older_plan_note=not marked)
+    if dm is None:
+        return _dm_none_note(plan)
+    return _apply_accepted_lines(st, dm["lines"]) if dm["any_proves"] or marked else DM_NO_TESTS_NOTE
+
+
+def _finish_pending(st) -> bool:
+    """True at the pause whose approval would mark the run done: the final review (`awaiting_final_review`), or a
+    step review in human_review `each` mode when no step is left to build (that approval finishes the run, see
+    cmd_human_approve). False at every other pause, so a step review mid-run, a blocked round or a building run
+    is never judged by the finish rule."""
+    phase = st.get("phase")
+    if phase == "awaiting_final_review":
+        return True
+    if phase == "awaiting_checkpoint_review":
+        cps = st.get("checkpoints") or {}
+        return bool(cps) and all((c or {}).get("status") == "done" for c in cps.values())
+    return False
+
+
+def _unproven_finish_lines(ctx, st) -> list:
+    """The final review table's entries whose verdict is "unproven" (a linked test failed or has no result, a
+    browser case no UI gate checked, no test linked, or an open finding names the line), read from the approved
+    lines (`done_means_table`); a line the user accepted reads "accepted" there (CP5), so it is not in this list,
+    while a line held again after its acceptance (a reason the acceptance did not cover) is. [] when the table is
+    a plain note instead (no objective, no done-means lines, or
+    an OLDER plan whose tests link to no line; a plan under the done-means rules whose links were all removed
+    gets every line as unproven instead, never a note) or every line is proven. Shared by `_finish_blockers` and
+    `_finish_legacy_note`, so the block and the older-run note judge the same lines."""
+    table = done_means_table(ctx, ctx.plan() or {"checkpoints": []}, st)
+    if not isinstance(table, list):
+        return []
+    return [e for e in table if e.get("verdict") == "unproven"]
+
+
+def _finish_blockers(ctx, st) -> list:
+    """CP4: the done-means lines that hold the finish, one table entry each ("number", "text", "cases",
+    "reasons"), or [] when the run may be marked done. Non-empty only for a plan approved under the done-means
+    rules (`_approved_after_dm`) with at least one unproven line; a run approved before this change
+    (no marker) never blocks here and gets `_finish_legacy_note` instead. A line the user accepted with
+    `accept-line` (CP5, verdict "accepted") no longer holds the finish; every other unproven line still does,
+    including an accepted line held again by a reason the acceptance did not cover (`_apply_accepted_lines`: its
+    entry carries the "held again" reason). One verdict, read at the moment it
+    matters and never cached: cmd_human_approve (a chat yes and a director token alike, before any counter, gate
+    or round changes, and only where the approval would finish the run: `_finish_pending`; its one state change
+    is dropping a pending human-approve question, so a yes given before the line went unproven never finishes
+    the run later), `_approval_question` (so `ask human-approve` prints no question while blocked), next_action,
+    cmd_status_text / status_json (the lines and the ways forward), `plain_now` (the held-finish sentence),
+    `waiting_question` (a pending human-approve question no longer waits), the prompt hook (`decide_prompt`:
+    never a hint to ask or run human-approve while held) and cmd_complete's last-step move in human_review `none`
+    mode (which then stops at the final review instead of finishing). The review-limit unblock path (phase
+    `blocked`) never reads it."""
+    if not _approved_after_dm(st):
+        return []
+    return _unproven_finish_lines(ctx, st)
+
+
+def _finish_integrity_lines(ctx, st) -> list[str]:
+    """CP4: what the agent is told at the finish pause (`_finish_pending`) when a file that decides the done-means
+    verdicts changed after the user approved the plan: a test plan (tests/CPn.json, whose `proves` links the
+    table reads as they are on disk, so an edit after approval could re-point a line at a passed case) or a
+    checkpoint in checkpoints.json (the step the cases belong to). Compared through the approval snapshot's own
+    "cps" and "tests" hashes against `approval_snapshot`, and NOTHING else `integrity_problems` watches: an edit
+    to standards.md or the design file, a config rule, a custom reviewer, the spec, the host agent CLI or the
+    review mode cannot change a verdict, so none of them holds the finish (they were never checked at this pause
+    before CP4, and the building-phase `verify_integrity` still catches them where they matter). Only for a plan
+    approved under the done-means rules (`_approved_after_dm`): a run approved before this change is never held
+    here, so it finishes as before (objective line 7). Until the user confirms the change (`approve-changes`,
+    after which the table reads the links they confirmed) or it is undone, the run cannot be marked done and the
+    approval question is not asked. [] when nothing relevant changed, or for a run with no approval yet. Printed by
+    cmd_status_text and next_action; the same text is the refusal in cmd_human_approve and `_approval_question`;
+    `_finish_held` folds it into the one held-finish verdict plain_now, waiting_question and the prompt hook
+    read."""
+    snap = st.get("approved")
+    if not snap or not _approved_after_dm(st):
+        return []
+    now_ = approval_snapshot(ctx, st)
+    probs = [f"checkpoint {cid} in checkpoints.json" for cid, h in snap.get("cps", {}).items()
+             if now_["cps"].get(cid) != h]
+    probs += [f"test plan tests/{cid}.json" for cid, h in snap.get("tests", {}).items()
+              if now_["tests"].get(cid) != h]
+    if not probs:
+        return []
+    return ["The run cannot be marked done yet: these changed after the user approved the plan: " + "; ".join(probs)
+            + ". The done-means table reads each test plan's `proves` links and its step as they are now, so the "
+            "approval question is not asked until the change is settled.",
+            "Ways forward: undo the change, or show the user exactly what changed and run `ratchet.py ask "
+            "approve-changes`; run `ratchet.py approve-changes` only if their first reply after it is a listed yes. "
+            "Never ask them to approve the finish while this stands."]
+
+
+def _finish_held(ctx, st) -> bool:
+    """CP4: True when the finish pause (`_finish_pending`) is held for either reason: an unproven done-means line
+    (`_finish_blockers`) or a checkpoint or test plan edited after approval (`_finish_integrity_lines`). The one
+    verdict `plain_now` (the held sentence instead of an invitation to approve), `waiting_question` (a pending
+    human-approve question no longer waits), the prompt hook (`decide_prompt`: never a hint to ask for or run the
+    approval) and cmd_human_approve's pending-question drop read, so no output invites an approval that
+    `human-approve` would refuse. False at every other pause."""
+    return _finish_pending(st) and bool(_finish_blockers(ctx, st) or _finish_integrity_lines(ctx, st))
+
+
+def _finish_legacy_note(ctx, st) -> str:
+    """The plain note for a run approved before unproven lines blocked the finish: when its plan has no
+    `done_means_rules` marker and at least one line is unproven, the one sentence `status` (at the finish
+    pause) and `complete` (human_review `none`, last step) print instead of a block. "" for a plan under the
+    done-means rules, or with nothing unproven."""
+    if _approved_after_dm(st) or not _unproven_finish_lines(ctx, st):
+        return ""
+    return ("Note: this run's plan was approved before unproven done-means lines blocked the finish, so its "
+            "unproven lines are shown but do not stop the run from being marked done.")
+
+
+def _finish_block_lines(ctx, st, blockers: list) -> list[str]:
+    """What the agent is told while `_finish_blockers` holds the finish (the human-approve and ask refusals,
+    next_action, status and complete all print these same lines): that the run cannot be marked done yet, each
+    blocking line by number and its approved text with its reasons (the table's own: "<id> failed", "<id> has no
+    result", "open finding <key>: ..."), for each open finding the step it belongs to and the mark-fixed command
+    that closes it once a clean review round confirms the fix, and the ways forward, one per kind of reason, each
+    a path that really clears it: an open finding is closed with mark-fixed; a line with no test linked gets a
+    step through feedback whose tests prove it; a linked test that failed, has no result, or is a browser case no
+    UI gate checked sits in a step that is already done, whose tests are not re-run, so no new step can clear it
+    (every test linked to a line must pass) and the agent is told to say so plainly instead of being sent down
+    that path. Never an instruction to put the approval question to the user: that question is not asked while a
+    line is unproven. CP5: also the one way the user themselves can release a line (`ask accept-line <n>`, their
+    own `accept: <reason>` reply, or a director token in an enrolled lane) and, while that question is waiting
+    (`waiting_question`), one line saying so, so `next` and `status` name what the run waits for; once the reply
+    has landed (the question no longer waits, `pending` still accept-line), one line pointing at `accept-line` to
+    record it, never back at `ask accept-line`."""
+    n = len(blockers)
+    out = [f"The run cannot be marked done yet: {n} done-means line{'s are' if n != 1 else ' is'} unproven, so the "
+           "finish is held and the approval question is not asked."]
+    q = waiting_question(ctx, st)
+    p = st.get("pending") if isinstance(st.get("pending"), dict) else {}
+    if q and q.get("kind") == "accept-line":
+        out.append(f"A question to accept {q.get('about') or 'a line'} as unproven is waiting for the user's reply "
+                   "(exactly `accept: <reason>`, their first reply after it); when it arrives, run `ratchet.py "
+                   "accept-line`.")
+    elif p.get("action") == "accept-line" and not p.get("overtook"):
+        # the reply landed (so the question no longer "waits") but accept-line has not read it yet: keep pointing
+        # at the command that records it, never back at `ask accept-line` (a re-ask would ask the user again)
+        about = _lines_word([i for i in (p.get("ids") or []) if isinstance(i, int)]) or "a line"
+        out.append(f"The user has replied to your question to accept {about} as unproven: run `ratchet.py "
+                   "accept-line` now to record it (it accepts only a first reply in the exact form "
+                   "`accept: <reason>`; any other first reply closes the question). Do not ask it again first.")
+    cps = st.get("checkpoints") or {}
+    dm_n = len(_approved_done_means(st)) or max((int(e.get("number") or 0) for e in blockers), default=0)
+    unlinked, stuck = [], []
+    for e in blockers:
+        reasons = e.get("reasons") or []
+        out.append(f"  - line {e['number']}: \"{e['text']}\": {'; '.join(reasons) or 'unproven'}")
+        for cid, c in cps.items():
+            for f in left_for_later(c):
+                if e["number"] in _finding_dm_lines(f, dm_n):
+                    key = _finding_key(f)
+                    out.append(f"    finding {key} on {cid} is open: fix it, get a clean review round, then run "
+                               f"`ratchet.py mark-fixed {cid} {key}=\"<how it was fixed>\"`.")
+        if "no test linked" in reasons:
+            unlinked.append(e["number"])
+        if any(not r.startswith(("open finding ", HELD_AGAIN_PREFIX)) and r != "no test linked" for r in reasons):
+            stuck.append(e["number"])
+
+    _lines = _lines_word
+    out.append("Ways forward: tell the user plainly which lines are unproven and why. An open finding is closed with "
+               "mark-fixed as above. If the user asks for changes, `ratchet.py feedback` is still open. A line is "
+               "proven only when every test linked to it passed and no open finding names it.")
+    if unlinked:
+        out.append(f"  {_lines(unlinked)}: no test is linked, so if the user asks for the work, run `ratchet.py "
+                   "feedback` and plan a step whose tests prove the line.")
+    if stuck:
+        out.append(f"  {_lines(stuck)}: a linked test failed, has no result or is a browser test no UI gate checked, "
+                   "in a step that is already done. A done step's tests are not re-run and every test linked to a "
+                   "line must pass, so a new step cannot clear this: do not offer one for it. Say so plainly.")
+    out.append("  If the user decides a line may stay unproven, run `ratchet.py ask accept-line <n>[,<n>]` and show the "
+               "question it prints; only their own first reply `accept: <reason>` (in a director-enrolled lane, a "
+               "director token with --reason) accepts it, and an accepted line no longer holds the finish. You "
+               "cannot accept a line yourself.")
+    return out
 
 
 def cmd_receipt(args):
@@ -10677,7 +11982,14 @@ def cmd_receipt(args):
     including any time spent waiting on you; never cost or tokens), who reviewed each step (a host-company
     fallback marked as such, with why when Ratchet recorded it), the findings you accepted with their reason, and
     findings left for later or fixed later in the run (CP1's own `left_for_later`/`_fixed_later` rule, so this
-    always agrees with `ratchet.py deferred` and `status`)."""
+    always agrees with `ratchet.py deferred` and `status`). Also the done-means proof (`_done_means_proof`): every
+    objective line with the tests linked to it and their results, a proven / unproven verdict and a "Why
+    unproven:" line per unproven line, the same verdicts `status` shows; a line the user accepted
+    (`_apply_accepted_lines`, CP5) reads "accepted" with who accepted it, what held it and their reason in place
+    of its tests (`_accepted_line_text`), and one held again after its acceptance reads unproven with the "held
+    again" reason. A plan whose tests link to no line
+    (an older plan) gets one plain note instead of verdicts (`--json` then carries `verdict: null` on each
+    line); a plan with no objective, or an objective with no done-means lines, gets its own plain note."""
     ctx = Ctx(find_root())
     st = ctx.state()
     cfg = ctx.config()
@@ -10693,12 +12005,19 @@ def cmd_receipt(args):
                       "finished": status == "finished", "status": status, "elapsed_seconds": seconds,
                       "reviewers": _step_reviewer_entries(cfg, cps)})
     accepted, left, fixed = _receipt_accepted(st), _receipt_left_for_later(st), _receipt_fixed_later(st)
-    dm = _done_means_proof(ctx, plan, cps_map)
+    # the approved lines, as status shows them; a plan under the done-means rules keeps its verdicts even with
+    # no link left anywhere (every line then reads "unproven", as the finish check judges it)
+    judged = _approved_after_dm(st)
+    dm = _done_means_proof(ctx, _plan_as_approved(plan, st), cps_map, older_plan_note=not judged)
+    judged = judged or bool(dm and dm["any_proves"])
+    if dm is not None and judged:
+        _apply_accepted_lines(st, dm["lines"])
     if getattr(args, "json", False):
         data = {"run": {"elapsed_seconds": run_seconds, "finished": run_status == "finished"},
                 "steps": [{k: s[k] for k in ("id", "title", "commit", "finished", "elapsed_seconds", "reviewers")}
                          for s in steps],
-                "accepted": accepted, "left_for_later": left, "fixed_later": fixed, "done_means": dm}
+                "accepted": accepted, "left_for_later": left, "fixed_later": fixed, "done_means": dm,
+                "shortcut_tables": _sc_saved(ctx)["tables"]}
         print(json.dumps(data, indent=2))
         return
     print(f"# Proof receipt: {plan.get('feature') or st.get('feature') or st.get('slug')}")
@@ -10718,19 +12037,29 @@ def cmd_receipt(args):
     print(f"Whole run time: {run_txt}")
     print("")
     if dm is None:
-        print(f"Done-means proof: {NO_OBJECTIVE_NOTE}.")
+        print(f"Done-means proof: {_dm_none_note(plan)}.")
     else:
         print("Done-means proof (which tests prove each objective line):")
         for i, line in enumerate(dm["lines"], 1):
-            print(f"{i}. {line['text']}")
+            print(f"{i}. {line['text']}" + (f" - {line['verdict']}" if judged else ""))
+            if judged and line["verdict"] == "accepted":
+                print(f"   {_accepted_line_text(line, with_ids=False)}")
+                continue
             if not line["cases"]:
                 print("   - no test linked")
             else:
                 for c in line["cases"]:
                     print(f"   - {c['id']} {c['title']} ({c['file']}): {c['status']}")
-        if not dm["any_proves"]:
+            if judged and line["reasons"]:
+                print(f"   Why unproven: {'; '.join(line['reasons'])}")
+        if not judged:
             print("Note: this plan's tests were never linked to done_means lines (an older test plan, "
                   "approved before the \"proves\" field existed).")
+    sc_lines = _sc_block_lines(_sc_saved(ctx))
+    if sc_lines:
+        print("")
+        for line in sc_lines:
+            print(line)
     acc_lines = _accepted_findings_lines(st)
     if acc_lines:
         print("")
@@ -10951,6 +12280,9 @@ def cmd_complete(args):
     order = [c["id"] for c in ctx.plan()["checkpoints"]]
     remaining = [c for c in order if st["checkpoints"][c]["status"] != "done"]
     mode = st.get("human_review", "end")
+    finish_lines: list[str] = []  # CP4: the held-finish lines or the older-run note, printed after the ok line
+    if not remaining:  # CP6: the last step is done: run the shortcut tables (shown, never blocking)
+        finish_lines += _sc_run_at_finish(ctx, st)
     if mode == "each":
         st["phase"] = "awaiting_checkpoint_review"
         st["awaiting_since"] = now()
@@ -10959,11 +12291,21 @@ def cmd_complete(args):
         _advance(st, remaining[0], fingerprint(ctx.root)["id"], _head_sha(ctx.root))
     else:
         st["current"] = None
-        st["phase"] = "awaiting_final_review" if mode != "none" else "done"
+        # CP4: in human_review `none` the run finishes here, unless an approved done-means line is unproven: then
+        # it stops at the final review like every other mode (a plan approved before this rule finishes with a
+        # plain note instead). Read with the step already marked done, so this step's own results count.
+        held = _finish_blockers(ctx, st) if mode == "none" else []
+        st["phase"] = "awaiting_final_review" if mode != "none" or held else "done"
         st["awaiting_since"] = now()
         if st["phase"] == "done":
             spec_notes += _spec_finish(ctx, st)
             register_active(ctx.root, None)
+            legacy = _finish_legacy_note(ctx, st) if mode == "none" else ""
+            if legacy:
+                finish_lines.append(legacy)
+        if held:
+            finish_lines.append("All steps are complete, but the run is not finished:")
+            finish_lines += _finish_block_lines(ctx, st, held)
     ctx.save_state(st)
     if st["phase"] == "done":
         _ci_export_hint(ctx)
@@ -10971,6 +12313,8 @@ def cmd_complete(args):
     ok(f"{args.cp} complete{f' (commit {commit})' if commit else ''}.")
     for n_ in spec_notes:
         print(n_ if n_.startswith("Offer:") else f"Spec: {n_}")
+    for n_ in finish_lines:
+        print(n_)
     print(json.dumps(next_action(ctx, st), indent=2))
 
 
@@ -11296,6 +12640,23 @@ def cmd_human_approve(args):
     st = ctx.state()
     if st["phase"] not in ("awaiting_checkpoint_review", "awaiting_final_review", "blocked"):
         die(f"Nothing awaiting human approval (phase {st['phase']})")
+    if _finish_pending(st):
+        # CP4: judged here, at the moment of approval, before the reply or token is read and before any state
+        # changes (counters, pending, gates): a yes or a director token cannot finish a run past an unproven line.
+        # Only where this approval would mark the run done; the review-limit unblock path (phase blocked) and a
+        # step review with steps left are not finishes.
+        blockers = _finish_blockers(ctx, st)
+        changed = [] if blockers else _finish_integrity_lines(ctx, st)
+        if (blockers or changed) and (st.get("pending") or {}).get("action") == "human-approve":
+            # a question asked before the finish was held is withdrawn: a yes given to it can never finish the
+            # run once the hold clears without the question being put again (status and the prompt hook stop
+            # treating it as waiting)
+            st.pop("pending", None)
+            ctx.save_state(st)
+        if blockers:
+            die("\n".join(_finish_block_lines(ctx, st, blockers)), 2)
+        if changed:  # a checkpoint or test plan edited after approval must be confirmed (approve-changes) first
+            die("\n".join(changed), 2)
     allow = st.get("choice_allow") or {}
     if st["phase"] == "blocked" and allow.get("unblock") and not getattr(args, "director_token", None):
         msg = {"by": "human", "prompt": f"picked option {allow['letter']}: {allow.get('reply', '')}"}
@@ -11375,6 +12736,18 @@ def cmd_plan_extend(args):
     had_objective = (st.get("approved") or {}).get("objective")
     if had_objective and not objective_problems({"objective": had_objective}) and objective_problems(plan):
         die("Feedback cannot drop the objective the approved plan had (" + "; ".join(objective_problems(plan)) + ").")
+    approved_dm = _approved_done_means(st)
+    if approved_dm and _approved_after_dm(st):
+        # CP4: the approved done-means lines are what the finish is judged against, so feedback may only APPEND
+        # lines: a dropped, reworded or reordered approved line is refused by number and approved text. A plan
+        # approved before the done-means rules keeps today's behavior (its objective is re-read, never blocks).
+        now_dm = (plan.get("objective") or {}).get("done_means") if isinstance(plan.get("objective"), dict) else None
+        now_dm = now_dm if isinstance(now_dm, list) else []
+        changed = [(i, t) for i, t in enumerate(approved_dm, 1) if i > len(now_dm) or now_dm[i - 1] != t]
+        if changed:
+            die("Feedback cannot remove, reword or reorder an approved done-means line; it may only append new lines "
+                "at the end. Restore these lines as approved (same text, same position):\n  - "
+                + "\n  - ".join(f"done_means line {i}: \"{t}\"" for i, t in changed), 2)
     new_ids = [c["id"] for c in plan["checkpoints"] if c["id"] not in st["checkpoints"]]
     if not new_ids:
         die("No new checkpoints were appended to checkpoints.json")
@@ -11385,15 +12758,25 @@ def cmd_plan_extend(args):
     edited = [c["id"] for c in plan["checkpoints"] if c["id"] in approved_cps and _sha(c) != approved_cps[c["id"]]]
     if edited:
         die(f"Existing checkpoint(s) {edited} were edited. Feedback only APPENDS new checkpoints; restore the originals.")
-    rr_errs = risk_reason_problems([cp_by_id(plan, cid) for cid in new_ids])  # only the APPENDED checkpoints: an
-    if rr_errs:                                                              # existing high-risk one predating
-        die("Plan invalid:\n  - " + "\n  - ".join(rr_errs))                  # this rule keeps working untouched.
+    appended = [cp_by_id(plan, cid) for cid in new_ids]
+    # Only the APPENDED checkpoints are judged here: an existing high-risk step predating the risk_reason rule,
+    # or an existing case whose "proves" plan-submit already accepted, keeps working untouched. The appended
+    # cases' "proves" get plan-submit's own shape and range check, and the done-means lines feedback ADDED must
+    # be proved (a line the approved plan already had keeps working unlinked: it predates the rule). One refusal
+    # names everything, the bad "proves" first so the agent sees the real cause before the unproved line.
+    errs = (proves_problems(ctx, {"objective": plan.get("objective"), "checkpoints": appended})
+            + risk_reason_problems(appended)
+            + unlinked_done_means_problems(ctx, plan, approved_lines=_approved_done_means(st)))
+    if errs:
+        die("Plan invalid:\n  - " + "\n  - ".join(errs))
     _validate_new_checkpoints(ctx, plan, new_ids)
     for cid in new_ids:
         st["checkpoints"][cid] = new_cp_state(cp_by_id(plan, cid))
     st["plan_hash"] = _plan_hash(plan, ctx)
     _advance(st, new_ids[0], fingerprint(ctx.root)["id"], _head_sha(ctx.root))
-    st["approved"] = approval_snapshot(ctx, st)  # the user's feedback is the approval for the appended checkpoints
+    # the user's feedback is the approval for the appended checkpoints and the appended done-means lines (the
+    # approved lines were checked above to be an unchanged prefix)
+    st["approved"] = _approval_snapshot_keeping_dm(ctx, st, keep_objective=False)
     register_active(ctx.root, st["slug"])
     ctx.log(st, "plan_extended", added=new_ids)
     ctx.save_state(st)
@@ -11547,12 +12930,14 @@ ASKABLE = {"approve-plan": "start building the plan as it is",
                              "of running another review round",
            "raise-limit": "raise this step's review-round limit by one round, with your own reason, so the "
                           "reviewers can keep going (offered at most once per step, ever)",
+           "accept-line": "accept the done-means line(s) named above as unproven, with your own reason, so they no "
+                          "longer hold the finish",
            "paid-provider": "use a provider that costs money per use (or whose cost is unknown, treated the "
                             "same way) for reviews, named above, instead of only flat-rate ones"}
 # the command that carries out a "yes" to each question
 PENDING_COMMAND = {"approve-plan": "approve-plan", "human-approve": "human-approve", "approve-changes": "approve-changes", "cancel": "cancel", "set-review": "set-review",
                    "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec", "choice": "choice",
-                   "accept-finding": "accept-finding", "raise-limit": "raise-limit"}
+                   "accept-finding": "accept-finding", "raise-limit": "raise-limit", "accept-line": "accept-line"}
 REVIEW_MODE_WORDS = {"end": "only at the end", "each": "after every step", "none": "never (fully autonomous)"}
 
 
@@ -11560,7 +12945,9 @@ def _pending_followup(action, mode=None) -> str:
     """The real command that carries out a developer's yes to a waiting question, for the re-ask/overtaken
     hints that build it from PENDING_COMMAND and the question's mode. paid-provider's mode is "tool:model"
     (joined only for display/comparison); its real follow-up needs them as separate --preset/--model flags
-    and an id for the new provider, not PENDING_COMMAND's plain command-plus-mode form."""
+    and an id for the new provider, not PENDING_COMMAND's plain command-plus-mode form. The follow-up takes only
+    the question's `mode` (the argument its command takes), never its `target` (what it is about, e.g. accept-line's
+    line numbers, which `accept-line` reads from `pending`), so accept-line's is the bare command."""
     if action == "paid-provider" and mode and ":" in mode:
         tool, model = mode.split(":", 1)
         return f"providers --add <id> --preset {tool} --model {model}"
@@ -11597,11 +12984,14 @@ def cmd_ask(args):
     if args.action == "paid-provider" and not (args.mode and getattr(args, "ids", None)):
         die("ask paid-provider needs the tool and model, e.g. `ratchet.py ask paid-provider opencode "
             "openrouter/z-ai/glm-5`")
-    if args.action not in ("set-review", "ui-respec", "accept-finding", "raise-limit", "paid-provider") and args.mode:
+    if args.action not in ("set-review", "ui-respec", "accept-finding", "raise-limit", "paid-provider",
+                           "accept-line") and args.mode:
         die(f"ask {args.action} takes no extra value")
     _bind_owner(ctx, st, args.action, asker)
     if args.action == "raise-limit":
         return _ask_raise_limit(ctx, st, args)
+    if args.action == "accept-line":
+        return _ask_accept_line(ctx, st, args)
     if args.action == "choice":
         return _ask_choice(ctx, st, args)
     if args.action == "accept-finding":
@@ -11687,7 +13077,7 @@ def _bind_owner(ctx, st, action, asker):
         ctx.log(st, "owner_recorded", session=asker, via="ask")
 
 
-def _overtake(ctx, st, action, mode, asker=None) -> dict:
+def _overtake(ctx, st, action, mode, asker=None, target=None) -> dict:
     """A new question while a DIFFERENT one still waits for the user's first reply: the user may see both, and one
     reply can't answer two questions. Plan and step approvals are refused until the waiting one is answered or
     withdrawn. Any other question is recorded but marked as overtaking, so no reply approves it; the agent asks it
@@ -11696,16 +13086,17 @@ def _overtake(ctx, st, action, mode, asker=None) -> dict:
     oa = old.get("action")
     if not oa:
         return {}  # nothing waiting
+    om, ot = _pq(old)
     first = _replies(ctx, st, old.get("asked_at"), old)[:1]
     answered = bool(first)
     new_sess = _asking_session(ctx, st, action, asker)
     if not answered and old.get("session") and new_sess != old.get("session"):
         # the waiting question belongs to another chat: a question asked here (even the same one) must not drop it
-        die(f"A question is waiting for the user's first reply in another chat (shall I {_question_what(oa, old.get('mode'))}?), "
+        die(f"A question is waiting for the user's first reply in another chat (shall I {_question_what(oa, om, ot)}?), "
             "so nothing was asked here. Try again after it is answered there. If the user tells you that chat is "
             "gone, run `ratchet.py ask withdraw` first (that drops its question; it is logged, and that chat has to "
             "ask it again).")
-    if oa == action and (old.get("mode") or None) == (mode or None):
+    if oa == action and om == (mode or None) and ot == (target or None):
         return {}  # the same question printed again in its own chat
     if oa == "hooks-waive" and (not answered or hooks_waive_intent(first[0].get("prompt", "")) == "approve"):
         # `hooks-waive` reads its answer from this question: replacing it before the reply, or after the user agreed,
@@ -11721,17 +13112,17 @@ def _overtake(ctx, st, action, mode, asker=None) -> dict:
             "on its own.")
     if not answered and action in ("approve-plan", "human-approve"):
         die(f"A different question is still waiting for the user's first reply: shall I "
-            f"{_question_what(oa, old.get('mode'))}? One reply can't answer two questions. Get that one answered "
-            f"(if they say yes, run `ratchet.py {_pending_followup(oa, old.get('mode'))}`"
+            f"{_question_what(oa, om, ot)}? One reply can't answer two questions. Get that one answered "
+            f"(if they say yes, run `ratchet.py {_pending_followup(oa, om)}`"
             ") or run `ratchet.py ask withdraw` if you no longer need it, then ask this question on its own.")
-    ctx.log(st, "question_overtaken", action=oa, mode=old.get("mode"), by=action, answered=answered)
+    ctx.log(st, "question_overtaken", action=oa, mode=om, target=ot, by=action, answered=answered)
     if answered:
         return {}  # the old question already had its one reply; this one starts clean
-    return {"overtook": oa, "overtook_mode": old.get("mode")}
+    return {"overtook": oa, "overtook_mode": om, "overtook_target": ot}
 
 
 def _not_asked_text(again, overtook) -> str:
-    return (f"NOT ASKED: a different question (shall I {_question_what(overtook['overtook'], overtook.get('overtook_mode'))}"
+    return (f"NOT ASKED: a different question (shall I {_question_what(overtook['overtook'], overtook.get('overtook_mode'), overtook.get('overtook_target'))}"
             "?) was still waiting for the user's first reply. It is now withdrawn, and this question is recorded as "
             "overtaking it, so no reply approves it: if the user saw both, their reply could be meant for either. Do "
             f"not show it. Run {again} again to ask it on its own, then show the user only that "
@@ -11749,6 +13140,13 @@ def _approval_question(ctx, st, action) -> str:
         if phase != "awaiting_plan_approval":
             die(f"There is no plan waiting for approval (the run is {PHASE_PLAIN.get(phase, phase)}).")
         return "start building the plan shown above, as it is"
+    if _finish_pending(st):
+        blockers = _finish_blockers(ctx, st)  # CP4: no approval question while a done-means line is unproven
+        if blockers:
+            die("\n".join(_finish_block_lines(ctx, st, blockers)), 2)
+        changed = _finish_integrity_lines(ctx, st)  # nor while a checkpoint or test plan changed after approval
+        if changed:
+            die("\n".join(changed), 2)
     if phase == "awaiting_checkpoint_review":
         titles = {c["id"]: c.get("title", c["id"]) for c in (ctx.plan() or {}).get("checkpoints", [])}
         left = [c for c, s in (st.get("checkpoints") or {}).items() if s.get("status") != "done"]
@@ -11822,7 +13220,7 @@ ACCEPT_FINDING_RE = re.compile(r"^accept:\s*(.+)$", re.I | re.S)
 
 def _accept_reply_reason(text: str) -> str | None:
     """The reason in a reply of the exact form `accept: <reason>`, or None when the reply is not that form (or
-    gives no reason)."""
+    gives no reason). Read by cmd_accept_finding and cmd_accept_line (CP5): the one reply form that accepts."""
     m = ACCEPT_FINDING_RE.match((text or "").strip())
     if not m:
         return None
@@ -11912,10 +13310,13 @@ def _ask_raise_limit(ctx, st, args):
 def _ask_accept_finding(ctx, st, args):
     """`ask accept-finding CPn F1,F2` (or 'reviewer/F1' when a bare id is ambiguous): only when that checkpoint's
     latest adversarial round blocked, and only for ids that are still open (blocking) findings of that round. An id
-    that never existed, or that was only ever a deferred/minor finding, is refused here; an id already accepted is
-    left to `accept-finding` itself to refuse (so this can be asked again without first re-deriving which ids are
-    already done). A bare id matching more than one reviewer's finding here is refused too, naming the colliding
-    reviewers: say which one as 'reviewer/id'."""
+    that never existed, or that was only ever deferred (set aside, never blocking; a minor that names a done-means
+    line is open, not deferred, so it can be asked here), is refused here; an id already accepted is left to
+    `accept-finding` itself to refuse (so this can be asked again without first re-deriving which ids are already
+    done). A bare id matching more than one reviewer's finding here is refused too, naming the colliding
+    reviewers: say which one as 'reviewer/id'. CP3: a finding that names a done-means line is shown in the
+    question with the line's number and text (`_dm_named_text`), never as a bare severity, so the user knows the
+    accept closes a miss against what done means."""
     cp = args.mode
     ids = list(dict.fromkeys(i.strip() for i in (args.ids or "").split(",") if i.strip()))  # de-dupe repeated ids
     if not ids:
@@ -11966,12 +13367,122 @@ def _ask_accept_finding(ctx, st, args):
     if overtook:
         print(_not_asked_text(f"`ratchet.py ask accept-finding {cp} {','.join(canon_ids)}`", overtook))
         return
+    obj = (ctx.plan() or {}).get("objective")
+    dm_lines = obj.get("done_means") if isinstance(obj, dict) else None
+    dm_lines = dm_lines if isinstance(dm_lines, list) else []
     named = "; ".join(f"{key} ({by_key[key].get('severity', '?')}): "
-                      f"{str(by_key[key].get('description', '')).strip()[:160]}" for key in canon_ids)
+                      f"{str(by_key[key].get('description', '')).strip()[:160]}"
+                      f"{_dm_named_text(dm_lines, by_key[key])}" for key in canon_ids)
     print(f"ASK THE USER: {cp}'s review is blocked on: {named}. Shall I accept {', '.join(canon_ids)} as a known "
           "limit, with their reason, instead of running another review round? To accept them, their reply must be "
           "exactly: accept: <their reason>. Only their first reply counts, and only that exact form (starting with "
           "\"accept: \") accepts them; any other reply accepts nothing.")
+    print(ASK_ALONE)
+
+
+def _ask_accept_line(ctx, st, args):
+    """`ask accept-line <n>[,<n>...]` (CP5; `args.mode` carries the 1-based numbers of the approved done-means
+    lines, as the final review's table numbers them): the one way a line that holds the finish can be released
+    without proving it. Only at the finish pause (`_finish_pending`) of a plan approved under the done-means rules
+    (`_approved_after_dm`; an older run gets a plain note and nothing is asked, since nothing holds its finish),
+    and only for lines the table (`done_means_table`) reads as "unproven" right now: a line that is proven, not a
+    real line (0, past the last line, not a number, an empty entry), or already accepted is refused naming it,
+    and a mixed list is refused whole, so no line slips past the check; a line accepted earlier but held again
+    (`_apply_accepted_lines`: unproven for a reason that acceptance did not cover) reads unproven and can be
+    asked about again, the question naming the earlier acceptance. Repeated numbers count once. Records the
+    question (`pending`: action accept-line, `target` the line numbers sorted and comma-joined ("2,3" whether typed
+    as 2,3 or 3,2; what the question is about, `mode` stays null, so `_overtake` treats a question about other lines as a different
+    question, a re-print in another order as the same one, and NOT ASKED names the lines; two space-separated
+    values are refused rather than one being dropped),
+    `ids` the numbers parsed, `covered` the reasons the question showed per line (what a reply accepts; a
+    reason that appears later is not accepted unseen, cmd_accept_line), `phase`) through the same `_overtake` /
+    `_asking_session` rules as every other `ask`, and prints it with the only reply that counts: the user's own
+    FIRST reply, exactly `accept: <reason>`; the listed yes words are never offered. `accept-line` reads the
+    reply."""
+    phase = st.get("phase")
+    if not _finish_pending(st):
+        die("A done-means line can be accepted only at the final review, when an unproven line holds the finish; the "
+            f"run is {PHASE_PLAIN.get(phase, phase)} (not at the final review). Nothing was asked.")
+    if not _approved_after_dm(st):
+        ok("This run's plan was approved before unproven done-means lines held the finish, so no line needs "
+           "accepting: its unproven lines are shown but do not stop the run from being marked done. Nothing was "
+           "asked; ask for the final approval as usual (`ratchet.py ask human-approve`).")
+        return
+    table = done_means_table(ctx, ctx.plan() or {"checkpoints": []}, st)
+    if not isinstance(table, list):
+        die(f"There is no done-means table to accept a line from ({table}). Nothing was asked.")
+    n = len(table)
+    unproven = [e["number"] for e in table if e.get("verdict") == "unproven"]
+    none_left = ("Nothing is unproven: every done-means line is proven or already accepted, so the finish is not held "
+                 "and there is nothing to accept.")
+    spec = (args.mode or "").strip()
+    if getattr(args, "ids", None):
+        die(f"ask accept-line takes the line numbers as one comma-separated value, e.g. `ratchet.py ask accept-line "
+            f"{spec},{args.ids}`, not `{spec} {args.ids}` (the second value would be dropped). Nothing was asked.")
+    if not spec and not unproven:
+        die(f"{none_left} Nothing was asked.")
+    if not spec:
+        die("ask accept-line needs the line numbers to accept, e.g. `ratchet.py ask accept-line 2` or `ratchet.py ask "
+            f"accept-line 2,3` (the numbers the final review's table shows; unproven now: {_lines_word(unproven)}). "
+            "Nothing was asked.")
+    nums, bad = [], []
+    for tok in spec.split(","):
+        t = tok.strip()
+        try:
+            v = int(t)
+        except ValueError:
+            bad.append(t)
+            continue
+        if not 1 <= v <= n:
+            bad.append(t)
+            continue
+        if v not in nums:
+            nums.append(v)
+    if bad:
+        shown = ", ".join(f'"{b}"' if b else "an empty entry" for b in bad)
+        die(f"{shown} is not a done-means line of this plan: the real line numbers are 1 to {n} (unproven now: "
+            f"{_lines_word(unproven)}). Nothing was asked.")
+    by_num = {e["number"]: e for e in table}
+    acc = _accepted_lines(st)
+    probs = []
+    for v in nums:
+        verdict = by_num[v].get("verdict")
+        if verdict == "accepted":
+            rec = by_num[v].get("accepted") or acc.get(v) or {}
+            probs.append(f"line {v} is already accepted (by {rec.get('accepted_by', '?')}: "
+                         f"{' '.join(str(rec.get('reason') or '').split())[:120]})")
+        elif verdict == "proven":
+            probs.append(f"line {v} is already proven")
+        elif verdict != "unproven":
+            probs.append(f"line {v} is {verdict or 'not judged'}")
+    if probs:
+        die(f"{'; '.join(probs)}. " + (none_left if not unproven else "Only a line that is unproven right now can be "
+            f"accepted (unproven now: {_lines_word(unproven)}).") + " Nothing was asked.")
+    nums.sort()  # "3,2" and "2,3" are the same question, so a re-print in another order is not an overtake
+    spec_txt = ",".join(str(i) for i in nums)
+    # the lines are the question's target (what it is about), not a mode (the argument `accept-line` takes: none), so
+    # `_overtake` tells a question about other lines from this one printed again, and NOT ASKED names its lines
+    overtook = _overtake(ctx, st, "accept-line", None, target=spec_txt)
+    asked = now()
+    shown = {str(v): [r for r in (by_num[v].get("reasons") or []) if not str(r).startswith(HELD_AGAIN_PREFIX)]
+             for v in nums}
+    st["pending"] = {"action": "accept-line", "mode": None, "target": spec_txt, "ids": nums, "covered": shown, "asked_at": asked,
+                     "phase": phase, "prev_awaiting": st.get("awaiting_since"),
+                     "session": _asking_session(ctx, st, "accept-line"), **overtook}
+    st["awaiting_since"] = asked
+    ctx.log(st, "question_asked", action="accept-line", ids=nums)
+    ctx.save_state(st)
+    if overtook:
+        print(_not_asked_text(f"`ratchet.py ask accept-line {spec_txt}`", overtook))
+        return
+    named = "; ".join(f"line {v}: \"{by_num[v]['text']}\" ({'; '.join(by_num[v].get('reasons') or []) or 'unproven'})"
+                      for v in nums)
+    them, hold = ("them", "hold") if len(nums) != 1 else ("it", "holds")
+    print(f"ASK THE USER: The finish is held because {'these done-means lines are' if len(nums) != 1 else 'this done-means line is'} "
+          f"unproven: {named}. Shall I accept {_lines_word(nums)} as unproven, with your own reason, so {'they' if len(nums) != 1 else 'it'} "
+          f"no longer {hold} the finish? To accept, your reply must be exactly: accept: <your reason>. Only your first "
+          f"reply counts, and only that exact form (starting with \"accept: \") accepts {them}; any other reply accepts "
+          "nothing.")
     print(ASK_ALONE)
 
 
@@ -12059,10 +13570,10 @@ def _choice_covers(allow: dict, probs: list[str]) -> bool:
                                for pr in probs)
 
 
-def _require_pending(st, action, mode=None):
+def _require_pending(st, action, mode=None, ctx=None):
     p = st.get("pending") or {}
     if p.get("action") != action or (mode and p.get("mode") != mode):
-        die(f"First run {_ask_cmd(action, mode)}, show the user the question it prints, "
+        die(f"First run {_ask_now(ctx, st, action) if ctx else _ask_cmd(action, mode)}, show the user the question it prints, "
             "and wait for their reply. Replies from before the question don't count.")
 
 
@@ -12147,7 +13658,7 @@ def cmd_approve_changes(args):
         _validate_new_checkpoints(ctx, plan, new_ids)
     for cid in new_ids:
         st["checkpoints"][cid] = new_cp_state(cp_by_id(plan, cid))
-    st["approved"] = approval_snapshot(ctx, st)
+    st["approved"] = _approval_snapshot_keeping_dm(ctx, st)
     cur = st.get("current")
     if cur and (st["checkpoints"].get(cur) or {}).get("red_tests") is not None:
         st["checkpoints"][cur]["red_tests"] = _snapshot_tests(ctx, cp_by_id(ctx.plan(), cur))
@@ -12331,7 +13842,7 @@ def cmd_accept_finding(args):
         _clear_pending(st)
         ctx.log(st, "accept_finding_unclear", cp=cp, ids=ids)
         ctx.save_state(st)
-        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'))}"
+        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'), p.get('overtook_target'))}"
             "?) was still waiting for the user's first reply, so their reply could be meant for either. Nothing was "
             f"accepted. Run `ratchet.py ask accept-finding {cp} {','.join(ids)}` again on its own.")
     token = getattr(args, "director_token", None)
@@ -12559,7 +14070,7 @@ def cmd_raise_limit(args):
         _clear_pending(st)
         ctx.log(st, "raise_limit_unclear", cp=cp)
         ctx.save_state(st)
-        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'))}"
+        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'), p.get('overtook_target'))}"
             "?) was still waiting for the user's first reply, so their reply could be meant for either. Nothing was "
             f"raised. Run `ratchet.py ask raise-limit {cp}` again on its own.")
     g = cps["gates"]["adversarial"]
@@ -12619,6 +14130,149 @@ def cmd_raise_limit(args):
     ok(msg)
 
 
+def cmd_accept_line(args):
+    """CP5: record the unproven done-means lines the user accepted, with their reason: only their FIRST reply
+    after `ask accept-line`, from the owning chat, in the exact form `accept: <reason>`, accepts them (the same
+    consent machinery as cmd_accept_finding: _require_pending, _replies, _accept_reply_reason, _spend_question, the
+    transcript check); a reply from another chat, from before the question, or a host-generated turn never counts,
+    and a first reply in any other form closes the question. `--reason` on its own never stands in for the reply.
+    In a director-enrolled lane a chat reply never counts: a director token signed for this action after the ask
+    (`director-sign accept-line`, bound to `awaiting_since`, which `ask` moves) is required, with --reason carrying
+    the director's own reason, checked before the token so a forgotten flag costs no second signature. The lines
+    are re-judged at accept time (`done_means_table`): a line that is not unproven any more clears the question
+    and accepts nothing, and so does a line whose reasons differ from the ones the question showed (`pending`'s
+    `covered`, recorded by `_ask_accept_line`): the reply accepts exactly what the user saw, never a reason that
+    appeared between the question and the reply, so the agent asks again with the current reasons. Then, in this
+    order: one `.ratchet/learnings.md` line per line (keyed by a marker unique
+    to this run, line and what held the line, so a retry after a crash never duplicates it while a re-accept of a
+    line held again for a new reason gets its own line; the reason collapsed to one line there, kept verbatim in
+    state), the `accepted_lines` record in state ({"<n>": {"number", "text", "reason", "accepted_by",
+    "accepted_at", "covered"}}, "covered" being the line's reasons right now, what this acceptance covers; a
+    re-accept replaces the line's record), `pending` cleared, and the state commit last, so a crash before it
+    leaves the accept not made and a plain retry finishes once. Never finishes the run, never touches a review
+    counter, a gate or a stored choice: the accepted line simply reads "accepted" in the table and no longer holds
+    the finish (`_finish_blockers`) until a reason the acceptance did not cover appears (`_apply_accepted_lines`);
+    the agent still asks for the final approval afterwards. The closing line reads the whole finish verdict
+    (`_finish_blockers` and `_finish_integrity_lines`, as `_finish_held` does): it never says the finish is free
+    while a checkpoint or test plan edited after approval still holds it."""
+    ctx = Ctx(find_root())
+    st = ctx.state()
+    _require_pending(st, "accept-line", ctx=ctx)
+    p = st["pending"]
+    ids = [i for i in (p.get("ids") or []) if isinstance(i, int) and not isinstance(i, bool)]
+    again = _ask_cmd("accept-line", target=",".join(str(i) for i in ids))
+    them = "them" if len(ids) != 1 else "it"
+    if p.get("overtook"):
+        _clear_pending(st)
+        ctx.log(st, "accept_line_unclear", ids=ids)
+        ctx.save_state(st)
+        die(f"This question was printed while another one (shall I {_question_what(p['overtook'], p.get('overtook_mode'), p.get('overtook_target'))}"
+            "?) was still waiting for the user's first reply, so their reply could be meant for either. Nothing was "
+            f"accepted. Run {again} again on its own.")
+    token = getattr(args, "director_token", None)
+    reason_flag = (getattr(args, "reason", None) or "").strip()
+    if token or approval_mode(ctx) == "director":
+        if token and not reason_flag:
+            # checked BEFORE the token is verified or anything is cleared, as cmd_accept_finding does: the same
+            # command with --reason added then simply works
+            die("accept-line needs --reason \"...\" when a director token accepts the line (there is no chat reply to "
+                "read a reason from). Nothing was accepted, and the question is still waiting: run the same command "
+                "again with --reason \"...\" added.")
+        # _require_approval's own checks: a token in a human lane, no (or a bad) token in a director lane
+        appr = _require_approval(ctx, st, "accept-line", token)
+        by, reason = appr["by"], reason_flag
+    else:
+        if reason_flag:
+            die("--reason is only for a director token in a director-enrolled lane. Here the reason must come from the "
+                "user's own reply in the owning chat, exactly `accept: <reason>`, as their first reply after the "
+                "question; nothing else stands in for that reply. Nothing was accepted; the question is still waiting.")
+        msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the question was asked in can answer it
+        if not msgs:
+            die("No reply has been recorded in the owning chat since this question was asked (a reply typed in another "
+                "chat, or before the question, does not count). End your turn and wait for the user's reply, exactly "
+                "`accept: <reason>`.")
+        entry = msgs[0]  # the first reply answers the question; later messages never do
+        reply = entry.get("prompt", "")
+        reason = _accept_reply_reason(reply)
+        if reason is None:
+            _spend_question(ctx, st, reply)
+            die(f"The user's first reply after the question was not the exact form `accept: <reason>`: \"{reply[:120]}\". "
+                "Nothing was accepted, and the question is closed, so a later reply in that form does not count. Run "
+                f"{again} again if they still want to accept {them}.")
+        if ctx.config().get("verify_transcripts", True):
+            good, why = _transcript_ok(entry, p.get("asked_at"))
+            if not good:
+                _spend_question(ctx, st, reply)
+                die(f"Couldn't confirm that reply came from the user ({why}). Nothing was accepted. Run {again} again "
+                    "and ask them to reply in this chat.")
+        by = "human"
+    if not _finish_pending(st):
+        _clear_pending(st)
+        ctx.save_state(st)
+        die(f"The run is no longer at the final review ({PHASE_PLAIN.get(st.get('phase'), st.get('phase'))}), so this "
+            "question no longer applies. Nothing was accepted.")
+    table = done_means_table(ctx, ctx.plan() or {"checkpoints": []}, st)
+    by_num = {e["number"]: e for e in table} if isinstance(table, list) else {}
+    stale = [i for i in ids if (by_num.get(i) or {}).get("verdict") != "unproven"]
+    if stale or not ids:
+        _clear_pending(st)
+        ctx.save_state(st)
+        what = "; ".join(f"line {i} is not unproven any more (it is "
+                         f"{(by_num.get(i) or {}).get('verdict') or 'not in the table'})" for i in stale) or "no line is named"
+        die(f"{what}, so this question no longer applies and nothing was accepted. If another line still holds the "
+            "finish, run `ratchet.py ask accept-line <n>` again for it.")
+    covered = {i: [r for r in (by_num[i].get("reasons") or []) if not str(r).startswith(HELD_AGAIN_PREFIX)]
+               for i in ids}
+    shown = p.get("covered") if isinstance(p.get("covered"), dict) else {}
+    moved = [i for i in ids if isinstance(shown.get(str(i)), list) and sorted(shown[str(i)]) != sorted(covered[i])]
+    if moved:
+        # the user accepts exactly what the question showed; what holds a line changed since, so the reply covers
+        # something they never saw (or less than they were shown): ask again with the current reasons
+        _clear_pending(st)
+        ctx.log(st, "accept_line_unclear", ids=ids, moved=moved)
+        ctx.save_state(st)
+        what = "; ".join(f"line {i} is held by: {'; '.join(covered[i]) or 'nothing'} (the question showed: "
+                         f"{'; '.join(shown[str(i)]) or 'nothing'})" for i in moved)
+        die(f"What holds {_lines_word(moved)} changed after the question was shown: {what}. The user's reply covers "
+            f"only what they were shown, so nothing was accepted and the question is closed. Run {again} again to "
+            "ask with what holds it now.")
+    at = now()
+    reason_line = " ".join(reason.split())
+    # (a) learnings first, keyed by a marker unique to this run and line: a retry after a crash never duplicates it
+    learnings = _learnings_text(ctx)
+    for i in ids:
+        e = by_num[i]
+        marker = (f"Accepted done-means line {i} of run {st['slug']} (\"{e['text']}\"; "
+                  f"{'; '.join(e.get('reasons') or []) or 'unproven'}) as unproven.")
+        if marker in learnings:
+            continue
+        _append_learning(ctx, f"{marker} Reason: {reason_line}", f"{by}, accept-line")
+        learnings += marker
+    # (b) the per-line record, then (c) the one state commit
+    acc = st.get("accepted_lines")
+    if not isinstance(acc, dict):
+        acc = {}
+    for i in ids:
+        acc[str(i)] = {"number": i, "text": by_num[i]["text"], "reason": reason, "accepted_by": by, "accepted_at": at,
+                       "covered": covered[i]}
+    st["accepted_lines"] = acc
+    ctx.log(st, "line_accepted", lines=ids, reason=reason[:200], by=by)
+    _clear_pending(st)
+    ctx.save_state(st)
+    build_viewer(ctx)
+    left = _finish_blockers(ctx, st)
+    changed = [] if left else _finish_integrity_lines(ctx, st)
+    if left:
+        tail = f"Still unproven and holding the finish: {_lines_word(e['number'] for e in left)}."
+    elif changed:
+        tail = ("No done-means line holds the finish now, but it is still held: a checkpoint or test plan changed "
+                "after the user approved the plan. Run `ratchet.py status` for what changed and settle it (undo it, "
+                "or `ratchet.py ask approve-changes`) before asking for the final approval.")
+    else:
+        tail = "The finish is no longer held: ask for the final approval (`ratchet.py ask human-approve`)."
+    ok(f"Accepted {_lines_word(ids)} as unproven, by {by}: {reason_line}. {tail}")
+
+
 def cmd_next(args):
     ctx = Ctx(find_root())
     st = ctx.state()
@@ -12655,8 +14309,11 @@ def cmd_reviewers(args):
     _expect_step(cps, ["adversarial", "complete"], args.cp)
     plan = ctx.plan()
     cp = cp_by_id(plan, args.cp)
-    obj = plan.get("objective") if isinstance(plan, dict) else None
-    obj_oneline = re.sub(r"\s*\n\s*", " ", objective_brief(plan))
+    shown = _plan_for_briefs(plan, st)  # the approved done-means lines (CP4), the same ones brief prints
+    obj = shown.get("objective") if isinstance(shown, dict) else None
+    # the same rendering brief prints and the launch guard expects (with the Proved by / Heads up notes), so a
+    # prompt that starts with this `how` objective passes the guard once the orchestrator pastes it
+    obj_oneline = re.sub(r"\s*\n\s*", " ", objective_brief(shown, _done_means_proof_notes(ctx, shown, st)))
     fp = fingerprint(ctx.root)["id"]
     g = cps["gates"]["adversarial"]
     if g["status"] != "passed" and _docs_only_review_skip(ctx, st, cfg, cp, cps, args.cp, json_out=args.json):
@@ -12690,11 +14347,14 @@ def cmd_reviewers(args):
             die(st["blocked_reason"], 2)
         provider_share(cfg)  # a bad provider_share setting stops here, before anything is opened or reserved
         # Narrow after round 1: when the round being replaced was recorded (it blocked) and was itself NOT
-        # narrowed, the next round only asks the lens(es) that still had an open blocker/major finding — a lens
-        # that approved isn't re-run. A narrowed round whose fix still left a blocker open brings back the full
-        # set for the round after it (narrow_now stays False), rather than narrowing further.
+        # narrowed, the next round only asks the lens(es) that still had an open blocker/major finding, or an
+        # open finding of any severity that names a done-means line (CP3, `names_done_means`, while
+        # `_dm_findings_block` applies to this plan) — a lens that approved isn't re-run. A narrowed round whose
+        # fix still left a blocker open brings back the full set for the round after it (narrow_now stays
+        # False), rather than narrowing further.
         was_narrowed = bool(rnd.get("narrowed")) if rnd else False
-        open_lenses = _open_blocking_lenses(ctx, cfg, args.cp, rnd, cps) if rnd and rnd.get("recorded") and not was_narrowed else set()
+        open_lenses = (_open_blocking_lenses(ctx, cfg, args.cp, rnd, cps, dm_blocks=_dm_findings_block(ctx, st, plan))
+                       if rnd and rnd.get("recorded") and not was_narrowed else set())
         narrow_now = False
         # CP3: a small fix made since the checkpoint's last FULL review opens with exactly one reviewer, told
         # (via review_rules' existing focus_files, below) to look only at what changed since that approval. That
@@ -13088,6 +14748,11 @@ def status_json(ctx: Ctx) -> dict:
             "hooks": hs, "hook_errors": hook_errors_view(ctx.root, hs.get("host", "unknown")),
             "viewer_url": viewer_link(ctx)["url"], "viewer_live": viewer_link(ctx)["live"],
             "done": sum(1 for c in cps if c["status"] == "done"), "total": len(cps),
+            "done_means_table": (done_means_table(ctx, plan, st)
+                                 if _finish_pending(st) or _has_shortcut_case(ctx, plan) else None),
+            "shortcuts": _sc_saved(ctx),
+            "finish_blockers": ([{k: e.get(k) for k in ("number", "text", "reasons")} for e in _finish_blockers(ctx, st)]
+                                if _finish_pending(st) else None),
             "small_fix_reviews": _small_fix_review_lines(st), "fix_rounds": _fix_round_lines(st),
             "docs_only_review_skips": _docs_only_skip_lines(st),
             "checkpoints": cps, "updated_at": st.get("updated_at")}
@@ -14020,9 +15685,10 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                f"`{eng} resume --claim` only if their first reply after it is one of the listed yes "
                                "replies. Otherwise leave the run alone and do what they asked.")
             if p.get("action") and p["action"] != "hooks-waive":
-                cmd = _pending_followup(p["action"], p.get("mode"))
-                what = _question_what(p["action"], p.get("mode"))
-                again = _ask_cmd(p["action"], p.get("mode"), eng=eng)
+                p_mode, p_target = _pq(p)
+                cmd = _pending_followup(p["action"], p_mode)
+                what = _question_what(p["action"], p_mode, p_target)
+                again = _ask_cmd(p["action"], p_mode, eng=eng, target=p_target)
                 asked_in = _question_session(st, p)
                 if asked_in and here and here != asked_in:
                     return False, (f"[ratchet] A Ratchet question (shall I {what}?) is waiting for a reply in another "
@@ -14058,8 +15724,28 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                    f"Only after that exact reply run `{eng} {cmd}` (pick an id for the new provider); "
                                    f"otherwise run `{eng} ask withdraw` and do what they asked. This reply does NOT "
                                    "approve the plan, a checkpoint or anything else.")
+                if p["action"] == "accept-line":
+                    # CP5: this question's own exact reply form, `accept: <reason>` (never a listed yes: the user
+                    # gives their own reason), and `accept-line` takes no argument: it reads the lines from pending
+                    reason = _accept_reply_reason(n["prompt"])
+                    verdict = ("It is in the exact form `accept: <reason>`, the one reply that accepts" if reason
+                               else "It is NOT in the exact form `accept: <reason>`, so it accepts nothing")
+                    return False, (f"[ratchet] This reply answers your waiting question: shall I {what}? {verdict}. "
+                                   f"Run `{eng} {cmd}` now to record it: it accepts the line only after that exact "
+                                   "form, and a first reply in any other form closes the question (ask again with "
+                                   f"{again} if the user still wants it). Do NOT run `ask withdraw` for a reply in "
+                                   "that form. This reply does NOT approve the finish or anything else.")
                 verdict = ("It is one of the listed yes replies" if is_listed_yes(n["prompt"])
                            else "It is NOT one of the listed yes replies, so it approves nothing")
+                if p["action"] == "human-approve" and _finish_held(ctx, st):
+                    # CP4: the question was asked before a line went unproven or a checkpoint or test plan changed;
+                    # it no longer counts and the agent is never told to run human-approve while the finish is held
+                    return False, (f"[ratchet] This reply does NOT approve the finish: a done-means line went unproven "
+                                   "or a checkpoint or test plan changed after your question, so the run cannot be "
+                                   "marked done and that question is withdrawn; do not record it as an approval. Run "
+                                   f"`{eng} status`, tell the user which lines are unproven and why (or what changed "
+                                   "after approval), and follow the ways forward it names; record change requests "
+                                   f"with `{eng} feedback`.")
                 if p["action"] in ("approve-plan", "human-approve"):
                     return False, (f"[ratchet] This reply answers your waiting question: shall I {what}? {verdict}. "
                                    f"Only if it is a listed yes, run `{eng} {cmd}`. Otherwise answer what they said or "
@@ -14080,6 +15766,16 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                             "message with the question it prints, word for word, as the only question in it, and end "
                             f"your turn; run `{eng} cancel` only if their first reply after it is one of the listed "
                             "yes replies.")
+                elif _finish_held(ctx, st):
+                    # CP4: the finish is held (an unproven done-means line, or a checkpoint or test plan changed
+                    # after approval): never a hint to ask for or run the approval
+                    hint = ("The run cannot be marked done yet, so this reply approves nothing"
+                            + (" even though it reads like a yes. " if message_intent(n["prompt"]) == "approve"
+                               else ". ")
+                            + "Do not put the approval question to them and do not record an approval. Run "
+                            f"`{eng} status`: it names the unproven done-means lines (or what changed after approval) "
+                            "and the ways forward; tell the user plainly, and record change requests with "
+                            f"`{eng} feedback`.")
                 else:
                     ask = {"awaiting_plan_approval": "approve-plan"}.get(st["phase"], "human-approve")
                     hint = ("Ratchet has not asked its approval question yet, so this reply approves nothing"
@@ -15753,11 +17449,12 @@ def _brief_guard(n: dict, root: Path) -> str | None:
     if _run_phase(root) not in ("building", "blocked"):
         return None
     ctx = Ctx(root)
-    expected = re.sub(r"\s+", " ", objective_brief(ctx.plan())).strip()
+    st, _why = _read_record(ctx.state_path())
+    plan = _plan_for_briefs(ctx.plan(), st)  # the approved done-means lines (CP4), the same ones brief prints
+    expected = re.sub(r"\s+", " ", objective_brief(plan, _done_means_proof_notes(ctx, plan, st))).strip()
     got = re.sub(r"\s+", " ", str(n["input"].get("prompt") or n["prompt"] or "")).strip()
     if expected and expected in got:
         return None
-    st, _why = _read_record(ctx.state_path())
     cp = (st or {}).get("current") or "CPn"
     return (f"RATCHET GUARD: this sub-agent's prompt is missing the plan's objective. Start its prompt with the "
             f"output of `$RATCHET brief {cp} --role {role}`, then the rest of the prompt.")
@@ -16520,8 +18217,8 @@ STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "re
                      "ui-record", "adv-record", "complete", "human-approve", "feedback", "plan-extend", "pause",
                      "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
                      "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait", "accept-finding",
-                     "raise-limit", "check-in", "triage", "merged")
-LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers", "providers", "merged")  # tests, checks, a regression
+                     "raise-limit", "check-in", "triage", "merged", "accept-line", "shortcuts")
+LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers", "providers", "merged", "shortcuts")  # tests, checks, a regression
                                                                                           # suite, provider probes (--add included)
 # The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
 OVERRIDE_CMDS = ("approve-plan", "human-approve", "approve-changes", "cancel", "set-review", "resume", "hooks-waive",
@@ -17242,10 +18939,11 @@ def main(argv=None):
     a.add_argument("--claim", action="store_true"); a.set_defaults(fn=cmd_resume)
     a = sp.add_parser("ask", help="record and print the question you're about to ask the user (needed before approve-plan, "
                                   "human-approve, cancel, set-review, approve-changes, hooks-waive, resume --claim, "
-                                  "ui-respec, accept-finding, paid-provider)")
+                                  "ui-respec, accept-finding, paid-provider, accept-line)")
     a.add_argument("action", choices=list(ASKABLE) + ["withdraw"])
     a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec/accept-finding: the checkpoint "
-                                           "id; paid-provider: the tool (preset)")
+                                           "id; paid-provider: the tool (preset); accept-line: the done-means line "
+                                           "numbers, comma-separated (e.g. 2 or 2,3)")
     a.add_argument("ids", nargs="?", help="accept-finding: the finding ids to accept, comma-separated (e.g. F1,F2); "
                                           "paid-provider: the exact model name")
     a.add_argument("--options", help="choice: the option letters, e.g. A,B,C")
@@ -17260,6 +18958,12 @@ def main(argv=None):
     a.add_argument("cp"); a.add_argument("--director-token")
     a.add_argument("--reason", help="director mode only: the director's reason (there is no chat reply to read one from)")
     a.set_defaults(fn=cmd_accept_finding)
+    a = sp.add_parser("accept-line", help="record the unproven done-means lines the user accepted (after `ask "
+                                          "accept-line <n,..>` and their 'accept: <reason>' reply, or a director "
+                                          "token with --reason)")
+    a.add_argument("--director-token")
+    a.add_argument("--reason", help="director mode only: the director's reason (there is no chat reply to read one from)")
+    a.set_defaults(fn=cmd_accept_line)
     a = sp.add_parser("raise-limit", help="raise one checkpoint's review-round limit by one round (after `ask "
                                           "raise-limit` and the owning chat's own 'raise: <reason>' reply); "
                                           "offered at most once per step, ever")
@@ -17327,6 +19031,10 @@ def main(argv=None):
     a = sp.add_parser("mark-fixed", help="record that a deferred finding was really fixed and reviewed again")
     a.add_argument("cp"); a.add_argument("decision", metavar='ref="how it was fixed"')
     a.set_defaults(fn=cmd_mark_fixed)
+    a = sp.add_parser("shortcuts", help="run the shortcut tables (tests/shortcuts/*.json) whose watched files this run "
+                      "changed against the code the run started from and the current code")
+    a.add_argument("name", nargs="?", help="only this table"); a.add_argument("--json", action="store_true")
+    a.set_defaults(fn=cmd_shortcuts)
     a = sp.add_parser("receipt", help="one proof receipt to paste into the pull request: steps, time, reviewers, "
                                       "accepted/left-for-later/fixed-later findings")
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_receipt)
@@ -17365,7 +19073,7 @@ def main(argv=None):
     a = sp.add_parser("director-sign"); a.add_argument("action", choices=["approve-plan", "human-approve", "feedback",
                                                                           "approve-changes", "cancel", "set-review",
                                                                           "hooks-waive", "ui-respec", "guardrail",
-                                                                          "accept-finding"])
+                                                                          "accept-finding", "accept-line"])
     a.add_argument("--kind", help="guardrail: the kind of finding it covers")
     a.set_defaults(fn=cmd_director_sign)
     sp.add_parser("fingerprint").set_defaults(fn=cmd_fingerprint)

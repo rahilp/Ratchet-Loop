@@ -197,7 +197,7 @@ def project_n(env, n, cmd, config=(), report=None) -> Path:
             tests["report"] = report
         cps.append({"id": f"CP{i}", "title": f"Step {i}", "summary": "s", "done_when": ["works"],
                     "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low", "tests": tests})
-        (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code"}]}))
+        (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code", "proves": [1]}]}))
     (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
                                                        "checkpoints": cps}))
     r = tt.rx(d, env, "plan-submit")

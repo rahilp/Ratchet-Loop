@@ -248,7 +248,7 @@ def _project(name, files, config=(), cps=1, extra_cp=None) -> Path:
         if extra_cp and i in extra_cp:
             cp.update(extra_cp[i])
         plan["checkpoints"].append(cp)
-        (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code"}]}))
+        (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code", "proves": [1]}]}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
     r = rx(d, "plan-submit")
     assert r.returncode == 0, _out(r)
@@ -952,7 +952,7 @@ def _two_step_docs_project(fk: Fakes):
                tests={"files": ["tests/cp2.test.js"], "command": "node --test tests/cp2.test.js"})
     plan = {"feature": "x", "objective": _tmp.OBJECTIVE_MIN, "checkpoints": [cp1, cp2]}
     for i in (1, 2):
-        (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code"}]}))
+        (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code", "proves": [1]}]}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
     r = rx(d, "plan-submit")
     assert r.returncode == 0, _out(r)

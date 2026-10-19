@@ -367,7 +367,8 @@ def build(kind="py", style="setup", two_steps=False, legacy=True):
     tests = {"files": files, "command": command, "report": "json"}
     cps = [{"id": "CP1", "title": "Step 1", "summary": "s", "done_when": ["works"],
             "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low", "tests": tests}]
-    plans = {"CP1": [{"id": "CP1-T01", "layer": "code"}, {"id": "CP1-T02", "layer": "code"}]}
+    plans = {"CP1": [{"id": "CP1-T01", "layer": "code", "proves": [1]},
+                    {"id": "CP1-T02", "layer": "code", "proves": [2]}]}
     if two_steps:
         cps.append({"id": "CP2", "title": "Step 2", "summary": "s", "done_when": ["checkout works"],
                     "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",

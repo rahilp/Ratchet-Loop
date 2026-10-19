@@ -188,7 +188,7 @@ def cp6_project(env, report, cases, checks=None, command=None, report_reason=Non
           "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low", "tests": tests}
     (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
                                                        "checkpoints": [cp]}))
-    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": cases}))
+    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [dict(cases[0], proves=[1])] + list(cases[1:])}))  # CP2: link the done_means line
     r = rx(d, env, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout
     rx(d, env, "ask", "approve-plan")
@@ -542,6 +542,8 @@ def cp6_t15_spec_status_not_proven_on_false_exit0():
     write_fixture(d, [case_id])
     cp["tests"] = {"files": [FIXTURE_REL], "command": f"python3 {FIXTURE_REL}", "report": "json"}
     plan["objective"] = _tmp.OBJECTIVE_MIN
+    cases[0]["proves"] = [1]  # CP2: link the one done_means line
+    (run / "tests" / f"{cp['id']}.json").write_text(json.dumps({"cases": cases}))
     (run / "app-scout.json").write_text("{}")
     (run / "checkpoints.json").write_text(json.dumps(plan))
     r = rx(d, env, "plan-submit")
@@ -598,7 +600,7 @@ def _x_planning_project(env):
     run = d / ".ratchet/runs/f"
     (run / "app-scout.json").write_text("{}")
     write_fixture(d, [CASE_A])
-    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": CASE_A, "layer": "code"}]}))
+    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": CASE_A, "layer": "code", "proves": [1]}]}))
     return d, run
 
 

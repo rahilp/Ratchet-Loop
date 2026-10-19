@@ -90,12 +90,17 @@ def obj_project(name, objective=OMIT, cps=1):
     plan = {"feature": "x", "checkpoints": []}
     if objective is not OMIT:
         plan["objective"] = objective
+    # CP2: every done_means line the objective has is linked to a case ("proves"), so a valid objective still
+    # submits; an objective with no usable done_means list gets no link (those cases test its own refusal).
+    dm = objective.get("done_means") if isinstance(objective, dict) else None
+    links = {"proves": list(range(1, len(dm) + 1))} if isinstance(dm, list) and dm else {}
     for i in range(1, cps + 1):
         cp = {"id": f"CP{i}", "title": f"Step {i}", "summary": "s", "done_when": ["works"],
               "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",
               "tests": {"files": [f"tests/cp{i}.test.js"], "command": f"node --test tests/cp{i}.test.js"}}
         plan["checkpoints"].append(cp)
-        (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code"}]}))
+        (run / "tests" / f"CP{i}.json").write_text(
+            json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code", **links}]}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
     r = g.rx(d, "plan-submit")
     return d, r

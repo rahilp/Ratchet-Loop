@@ -1,6 +1,6 @@
 {
   "human_review": "end",
-  "host_provider": "auto",
+  "host_provider": "anthropic",
   "ui_reviewers": {
     "visual": [
       "gemini",
@@ -29,28 +29,24 @@
       "host-both"
     ],
     "normal": [
-      "host-standards",
+      [
+        "host-alt-standards"
+      ],
       [
         "codex-correctness",
-        "gemini-correctness",
-        "claude-correctness",
-        "copilot-correctness"
+        "host-alt-correctness"
       ]
     ],
     "high": [
-      "host-standards",
-      "host-correctness",
       [
-        "codex-correctness",
-        "gemini-correctness",
-        "claude-correctness",
-        "copilot-correctness"
+        "host-standards"
       ],
       [
-        "gemini-standards",
-        "claude-standards",
-        "codex-standards",
-        "copilot-standards"
+        "codex-correctness",
+        "host-correctness"
+      ],
+      [
+        "host-alt-correctness"
       ]
     ]
   },
@@ -81,6 +77,20 @@
       "id": "opencode-kimi",
       "preset": "opencode",
       "model": "opencode-go/kimi-k3"
+    },
+    {
+      "id": "longcat-free",
+      "preset": "opencode",
+      "model": "opencode-go/longcat-2.5-preview-free",
+      "company": "meituan",
+      "cost": "flat"
+    },
+    {
+      "id": "step5-free",
+      "preset": "opencode",
+      "model": "opencode-go/step-5-preview-free",
+      "company": "stepfun",
+      "cost": "flat"
     }
   ],
   "test_timeout_sec": 3600,
@@ -91,5 +101,16 @@
     "ratchet-implementer": "standard",
     "ratchet-fixer": "standard"
   },
-  "min_review_seconds": 20
+  "min_review_seconds": 20,
+  "host_models": {
+    "anthropic": {
+      "strong": "inherit",
+      "standard": "sonnet",
+      "light": "haiku",
+      "alternates": [
+        "sonnet",
+        "opus"
+      ]
+    }
+  }
 }
