@@ -1,0 +1,56 @@
+{
+  "role": "baseline",
+  "description": "This is the fixed BASELINE snapshot of ratchet.py's visible CLI/hook behavior, captured from real invocations before any code in this run has moved. Every later checkpoint in this run (CP2..CP8) re-captures the same commands and must match this snapshot byte-identically (--help text, status --json's top-level keys/shape, the hook reply shape, and the exit codes for known failures). Later checkpoints' tests diff/compare their own fresh capture against this baseline; nothing here changes once a later checkpoint starts moving code.",
+  "path": "tests/fixtures/modularize_cp1/baseline",
+  "note": "This manifest lives at tests/fixtures/modularize_cp1/baseline/manifest.json; every 'path' field below is relative to that same tests/fixtures/modularize_cp1/baseline folder.",
+  "captured_at": "2026-10-19",
+  "captured_from": "the real, active run in this working tree (behavior-preserving-modularization-of-skills-rat), before any code change to ratchet.py/provider_health.py/spec_sources.py (see CP1-T10's git-diff-clean check)",
+  "entries": [
+    {
+      "kind": "help",
+      "cmd": ["--help"],
+      "exit_code": 0,
+      "path": "help_top.txt"
+    },
+    {
+      "kind": "help",
+      "cmd": ["status", "--help"],
+      "exit_code": 0,
+      "path": "help_status.txt"
+    },
+    {
+      "kind": "help",
+      "cmd": ["providers", "--help"],
+      "exit_code": 0,
+      "path": "help_providers.txt"
+    },
+    {
+      "kind": "status_json",
+      "cmd": ["status", "--json"],
+      "exit_code": 0,
+      "path": "status_json.json",
+      "note": "Captured from this run's own active state (the run that is implementing this very checkpoint)."
+    },
+    {
+      "kind": "hook_reply",
+      "cmd": ["hook", "guard", "--host", "copilot"],
+      "exit_code": 0,
+      "path": "hook_reply_copilot_guard.json",
+      "note": "A real PreToolUse 'guard' hook reply from a throwaway temp project (built with the real `init` command), fed a copilot-dialect payload that edits that project's own state.json directly (the same tamper attempt tests/test_hooks.py uses). Copilot's hook dialect always exits 0 and answers in JSON on stdout: {\"permissionDecision\": \"deny\", ...} for a blocked guard event. Nothing in the real repo's own .ratchet/ was touched to capture this."
+    },
+    {
+      "kind": "failure",
+      "cmd": ["no-such-command"],
+      "exit_code": 2,
+      "path": "fail_unknown_command.txt",
+      "note": "argparse's own usage-error exit code for an unrecognized subcommand."
+    },
+    {
+      "kind": "failure",
+      "cmd": ["status", "--json", "(run from a directory with no .ratchet/ at all)"],
+      "exit_code": 1,
+      "path": "fail_no_active_run.txt",
+      "note": "die()'s default exit code for an ordinary user-facing error ('No active Ratchet run.'), distinct from argparse's exit code 2 above, and paired with its own distinct command so it is never confused with the other status --json entry above."
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+usage: ratchet.py providers [-h] [--discover] [--check [CHECK]] [--add ID]
+                            [--preset PRESET] [--command COMMAND] [--stdin]
+                            [--model MODEL] [--company COMPANY]
+                            [--for-risk FOR_RISK] [--variant VARIANT]
+                            [--prefer-for PREFER_FOR] [--no-check]
+                            [--remove ID] [--json]
+
+options:
+  -h, --help            show this help message and exit
+  --discover            find installed agent CLIs, test them, add what works
+  --check [CHECK]       send a test request to one provider, a reviewer name
+                        such as codex-correctness, or all
+  --add ID
+  --preset PRESET
+  --command COMMAND
+  --stdin
+  --model MODEL
+  --company COMPANY
+  --for-risk FOR_RISK   comma list of risks it may review (default all)
+  --variant VARIANT     thinking level for an opencode provider (default low;
+                        none turns the cap off)
+  --prefer-for PREFER_FOR
+                        comma list of lenses (correctness, standards, both) it
+                        reviews before other providers of the same cost when a
+                        slot is any-<lens>
+  --no-check
+  --remove ID
+  --json
