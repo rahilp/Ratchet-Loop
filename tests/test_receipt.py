@@ -381,8 +381,8 @@ def _rich_project(name):
            "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "normal",
            "tests": {"files": ["tests/cp2.test.js"], "command": "node --test tests/cp2.test.js"}}
     plan = {"feature": "x", "objective": _tmp.OBJECTIVE_MIN, "checkpoints": [cp1, cp2]}
-    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
-    (run / "tests" / "CP2.json").write_text(json.dumps({"cases": [{"id": "CP2-T01", "layer": "code"}]}))
+    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
+    (run / "tests" / "CP2.json").write_text(json.dumps({"cases": [{"id": "CP2-T01", "layer": "code", "proves": [1]}]}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
     r = g.rx(d, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout

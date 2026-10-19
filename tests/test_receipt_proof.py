@@ -8,7 +8,12 @@ case(s) that prove it (id, title, file) and whether that step's own test report 
 browser-layer case is shown as "checked by the UI gate"; a line no case proves reads "no test linked" literally.
 A plan with no "proves" fields at all, or no objective at all (approved before either existed), still prints a
 receipt instead of crashing. `plan-submit` refuses a case whose "proves" number is not a 1-based done_means line,
-naming the case; `plan-summary` lists an unproven done_means line as a heads-up without refusing anything.
+naming the case. Since the done-means-proven run's CP2, `plan-submit` also refuses a NEW plan whose done_means
+line no case proves, naming the line (CP3-T11 below asserts that rule; it used to assert the old heads-up-only
+rule and was rewritten on purpose, not weakened). So every case here that submits through the real plan-submit
+links every done_means line (`_fill` adds a filler case for any line the case under test leaves alone), and the
+two cases about how the receipt renders an UNLINKED line (CP3-T03, CP3-T07) build an older plan, submitted before
+that rule existed, with `_legacy_submit` (the engine's own state writes, skipping only plan-submit's checks).
 
 Reuses tests/test_gates.py (`git`, `say`, `rx`, `approve_plan`, `ENGINE`, `ENV`) for the throwaway git projects,
 the same real-CLI-subprocess pattern every suite in this repo drives the engine with (see tests/test_receipt.py,
@@ -91,12 +96,65 @@ def _bare_cp1(d):
     return run
 
 
-def _proof_project(name, cases, done_means=None, submit=True):
+def _fill(cases, done_means=None, layer="code"):
+    """`cases` plus one filler case per done_means line that none of `cases` proves (ids CP1-T91, CP1-T92,
+    ...: never an id a case under test uses), so a plan built for a receipt check links every line the way
+    plan-submit requires since CP2 of the done-means-proven run. The filler never carries a test-report entry,
+    so it changes nothing under the line the case under test is about. A case that drives the step through the
+    real tests-written/red/behavior commands uses layer="browser" fillers, which those commands never look
+    for in the step's test file."""
+    dm = list(done_means) if done_means is not None else list(DONE_MEANS)
+    proved = set()
+    for c in cases:
+        p = c.get("proves")
+        for v in (p if isinstance(p, list) else [p]):
+            if isinstance(v, int) and not isinstance(v, bool):
+                proved.add(v)
+    return list(cases) + [{"id": f"CP1-T9{k}", "title": f"Done-means line {k} is covered",
+                           "file": "tests/test_login_more.py", "layer": layer, "proves": [k]}
+                          for k in range(1, len(dm) + 1) if k not in proved]
+
+
+_LEGACY_SUBMIT_HELPER = Path(_tmp.mkdtemp(prefix="ratchet-proof-legacy-submit-")) / "legacy_submit.py"
+_LEGACY_SUBMIT_HELPER.write_text(
+    "import sys, json\n"
+    "from pathlib import Path\n"
+    "sys.path.insert(0, sys.argv[2])\n"
+    "import ratchet as rt\n"
+    "root = Path(sys.argv[1])\n"
+    "ctx = rt.Ctx(root)\n"
+    "st = ctx.state()\n"
+    "plan = ctx.plan()\n"
+    "st['phase'] = 'awaiting_plan_approval'\n"
+    "st['awaiting_since'] = rt.now()\n"
+    "st.pop('pending', None)\n"
+    "st['plan_hash'] = rt._plan_hash(plan, ctx)\n"
+    "st['checkpoints'] = {cp['id']: st['checkpoints'].get(cp['id']) or rt.new_cp_state(cp)"
+    " for cp in plan['checkpoints']}\n"
+    "ctx.log(st, 'plan_submitted', hash=st['plan_hash'], count=len(plan['checkpoints']))\n"
+    "ctx.save_state(st)\n"
+    "print('ok')\n"
+)
+
+
+def _legacy_submit(d):
+    """The exact state change cmd_plan_submit makes (phase awaiting_plan_approval, plan_hash, checkpoint states,
+    the plan_submitted log entry), written with the engine's own helpers but skipping plan-submit's checks: a
+    plan submitted before CP2 of the done-means-proven run required every done_means line to have a linked
+    case. The only way such a plan (an unlinked line, or no "proves" at all) still comes to exist."""
+    r = subprocess.run([sys.executable, str(_LEGACY_SUBMIT_HELPER), str(d), str(g.ENGINE.parent)],
+                       cwd=d, capture_output=True, text=True, env=g.ENV)
+    assert r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr
+
+
+def _proof_project(name, cases, done_means=None, submit=True, legacy=False):
     """A one-checkpoint (CP1) throwaway project whose test plan carries the "proves" field this checkpoint
     adds, and whose objective.done_means is a real, specific list (not _tmp.OBJECTIVE_MIN's placeholder) so the
     receipt's done-means section has real lines to link tests against. Always returns (d, plan-submit's own
     result); when submit=True (the default) that result is also asserted to have succeeded, so every case that
-    does not itself test plan-submit's refusal can ignore the second item."""
+    does not itself test plan-submit's refusal can ignore the second item. With legacy=True the plan is
+    submitted the pre-CP2 way (_legacy_submit, never the real plan-submit, which now refuses an unlinked
+    done_means line) and the second item is None."""
     d = Path(_tmp.mkdtemp(prefix=f"ratchet-proof-{name}-"))
     run = _bare_cp1(d)
     cp1 = {"id": "CP1", "title": "Step 1", "summary": "s", "done_when": ["works"],
@@ -105,6 +163,9 @@ def _proof_project(name, cases, done_means=None, submit=True):
     plan = {"feature": "x", "objective": _objective(done_means), "checkpoints": [cp1]}
     (run / "tests" / "CP1.json").write_text(json.dumps({"cases": cases}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
+    if legacy:
+        _legacy_submit(d)
+        return d, None
     r = g.rx(d, "plan-submit")
     if submit:
         assert r.returncode == 0, r.stderr + r.stdout
@@ -195,7 +256,7 @@ TESTS = []
 def t01_line_shows_proving_test_and_pass():
     cases = [{"id": "CP1-T01", "title": "Login succeeds with the right password",
               "file": "tests/test_login.py", "layer": "code", "proves": [1]}]
-    d, _ = _proof_project("t01", cases)
+    d, _ = _proof_project("t01", _fill(cases))  # CP2: every other done_means line gets a filler link
     _write_report(d, "CP1", [{"id": "CP1-T01", "status": "passed"}])
     r = g.rx(d, "receipt")
     check("[CP3-T01] receipt exits 0", r.returncode == 0, r.stdout + r.stderr)
@@ -217,7 +278,7 @@ TESTS.append(("CP3-T01", t01_line_shows_proving_test_and_pass))
 def t02_failed_test_shown_as_failed():
     cases = [{"id": "CP1-T02", "title": "Wrong password shows an error",
               "file": "tests/test_login.py", "layer": "code", "proves": [2]}]
-    d, _ = _proof_project("t02", cases)
+    d, _ = _proof_project("t02", _fill(cases))  # CP2: every other done_means line gets a filler link
     _write_report(d, "CP1", [{"id": "CP1-T02", "status": "failed"}])
     r = g.rx(d, "receipt")
     check("[CP3-T02] receipt exits 0", r.returncode == 0, r.stdout + r.stderr)
@@ -235,7 +296,7 @@ TESTS.append(("CP3-T02", t02_failed_test_shown_as_failed))
 def t03_unlinked_line_says_no_test_linked():
     cases = [{"id": "CP1-T01", "title": "Login succeeds with the right password",
               "file": "tests/test_login.py", "layer": "code", "proves": [1]}]
-    d, _ = _proof_project("t03", cases)
+    d, _ = _proof_project("t03", cases, legacy=True)  # an older plan: a new one with an unlinked line is refused since CP2
     _write_report(d, "CP1", [{"id": "CP1-T01", "status": "passed"}])
     r = g.rx(d, "receipt")
     check("[CP3-T03] receipt exits 0 (an unlinked done-means line never crashes it)", r.returncode == 0,
@@ -258,7 +319,7 @@ def t04_two_cases_proving_same_line_both_listed():
         {"id": "CP1-T04", "title": "Login also succeeds from the mobile client",
          "file": "tests/test_login_mobile.py", "layer": "code", "proves": [1]},
     ]
-    d, _ = _proof_project("t04", cases)
+    d, _ = _proof_project("t04", _fill(cases))  # CP2: every other done_means line gets a filler link
     _write_report(d, "CP1", [{"id": "CP1-T01", "status": "passed"}, {"id": "CP1-T04", "status": "failed"}])
     r = g.rx(d, "receipt")
     check("[CP3-T04] receipt exits 0", r.returncode == 0, r.stdout + r.stderr)
@@ -280,7 +341,7 @@ TESTS.append(("CP3-T04", t04_two_cases_proving_same_line_both_listed))
 def t05_one_case_proving_two_lines_appears_under_both():
     cases = [{"id": "CP1-T05", "title": "Login works and lockout eventually applies",
               "file": "tests/test_login.py", "layer": "code", "proves": [1, 3]}]
-    d, _ = _proof_project("t05", cases)
+    d, _ = _proof_project("t05", _fill(cases))  # CP2: every other done_means line gets a filler link
     _write_report(d, "CP1", [{"id": "CP1-T05", "status": "passed"}])
     r = g.rx(d, "receipt")
     check("[CP3-T05] receipt exits 0", r.returncode == 0, r.stdout + r.stderr)
@@ -297,7 +358,7 @@ TESTS.append(("CP3-T05", t05_one_case_proving_two_lines_appears_under_both))
 def t06_browser_case_checked_by_ui_gate():
     cases = [{"id": "CP1-T06", "title": "Wrong password error shows on screen",
               "file": "tests/test_login_ui.spec.js", "layer": "browser", "proves": [2]}]
-    d, _ = _proof_project("t06", cases)
+    d, _ = _proof_project("t06", _fill(cases))  # CP2: every other done_means line gets a filler link
     # no per-case test report entry for CP1-T06: browser cases are never run by `ratchet.py behavior`
     r = g.rx(d, "receipt")
     check("[CP3-T06] receipt exits 0", r.returncode == 0, r.stdout + r.stderr)
@@ -316,7 +377,7 @@ TESTS.append(("CP3-T06", t06_browser_case_checked_by_ui_gate))
 def t07_no_proves_fields_at_all_still_prints_receipt():
     cases = [{"id": "CP1-T01", "title": "Login succeeds with the right password",
               "file": "tests/test_login.py", "layer": "code"}]  # no "proves" key anywhere: an old plan
-    d, _ = _proof_project("t07", cases)
+    d, _ = _proof_project("t07", cases, legacy=True)  # an older plan: a new one with an unlinked line is refused since CP2
     _write_report(d, "CP1", [{"id": "CP1-T01", "status": "passed"}])
     r = g.rx(d, "receipt")
     check("[CP3-T07] receipt exits 0 on a plan with no 'proves' fields at all", r.returncode == 0,
@@ -382,28 +443,47 @@ def t10_plan_submit_refuses_zero_proves():
 TESTS.append(("CP3-T10", t10_plan_submit_refuses_zero_proves))
 
 
-def t11_plan_summary_flags_unproven_line_without_refusing():
+def t11_plan_submit_refuses_unproven_line_naming_it():
+    """[CP3-T11] Rewritten for the done-means-proven run's CP2 (a deliberate rule change the user approved, not
+    a weakening): a NEW plan whose done_means line no case proves is refused at plan-submit, naming that line
+    by number and text, instead of being accepted with a plan-summary heads-up. Linking the line makes the
+    same plan submit, and plan-summary then carries no heads-up at all."""
     cases = [{"id": "CP1-T01", "title": "Login succeeds with the right password",
-              "file": "tests/test_login.py", "layer": "code", "proves": [1]}]  # nothing proves line 3
-    d, r_submit = _proof_project("t11", cases)
-    check("[CP3-T11] plan-submit exited 0", r_submit.returncode == 0, r_submit.stdout + r_submit.stderr)
-    r_approve = g.approve_plan(d)
-    check("[CP3-T11] approve-plan exited 0", r_approve.returncode == 0, r_approve.stdout + r_approve.stderr)
+              "file": "tests/test_login.py", "layer": "code", "proves": [1]},
+             {"id": "CP1-T02", "title": "Wrong password shows an error",
+              "file": "tests/test_login.py", "layer": "code", "proves": [2]}]  # nothing proves line 3
+    d, r_submit = _proof_project("t11", cases, submit=False)
+    msg = r_submit.stdout + r_submit.stderr
+    check("[CP3-T11] plan-submit exits non-zero for a plan whose done-means line 3 no case proves",
+          r_submit.returncode != 0, msg)
+    check("[CP3-T11] the refusal is a 'Plan invalid' refusal", "Plan invalid" in msg, msg)
+    check("[CP3-T11] the refusal names line 3 by number", bool(re.search(r"line 3\b", msg)), msg)
+    check("[CP3-T11] the refusal names line 3 by its own text (the lockout line)", DONE_MEANS[2] in msg, msg)
+    check("[CP3-T11] the refusal does not name lines 1 or 2 (they are proved)",
+          DONE_MEANS[0] not in msg and DONE_MEANS[1] not in msg, msg)
+    check("[CP3-T11] the refusal tells the agent to add a case whose \"proves\" names the line", "proves" in msg, msg)
+    st = json.loads((d / ".ratchet/runs/f/state.json").read_text())
+    check("[CP3-T11] the refused plan never reaches awaiting_plan_approval",
+          st.get("phase") == "planning" and not st.get("plan_hash"), (st.get("phase"), st.get("plan_hash")))
+    r_approve = g.rx(d, "ask", "approve-plan")
+    check("[CP3-T11] the refused plan cannot be put up for approval", r_approve.returncode != 0,
+          r_approve.stdout + r_approve.stderr)
+    cases[1]["proves"] = [2, 3]  # the agent links the lockout line and submits again
+    (d / ".ratchet/runs/f/tests/CP1.json").write_text(json.dumps({"cases": cases}))
+    r2 = g.rx(d, "plan-submit")
+    check("[CP3-T11] with line 3 linked the same plan submits (exit 0)", r2.returncode == 0, r2.stdout + r2.stderr)
+    st2 = json.loads((d / ".ratchet/runs/f/state.json").read_text())
+    check("[CP3-T11] the phase is then awaiting_plan_approval", st2.get("phase") == "awaiting_plan_approval",
+          st2.get("phase"))
     r = g.rx(d, "plan-summary")
-    check("[CP3-T11] plan-summary exits 0 (a heads-up never refuses the plan)", r.returncode == 0,
-          r.stdout + r.stderr)
+    check("[CP3-T11] plan-summary exits 0 on the linked plan", r.returncode == 0, r.stdout + r.stderr)
     out = r.stdout
-    m = re.search(r"no (proving )?test case|not proved by (any )?test|unproven|no test (case )?proves", out,
-                 re.I)
-    check("[CP3-T11] plan-summary's output includes a heads-up naming an unproven done-means line", bool(m),
-          out)
-    if m:
-        window = out[max(0, m.start() - 200): m.end() + 200]
-        check("[CP3-T11] the heads-up is about done-means line 3 (the lockout line)", "lock" in window.lower(),
-              window)
+    check("[CP3-T11] plan-summary carries no heads-up about an unproven done-means line",
+          not re.search(r"heads up|no (proving )?test case|not proved by (any )?test|unproven|no test (case )?proves",
+                        out, re.I), out)
 
 
-TESTS.append(("CP3-T11", t11_plan_summary_flags_unproven_line_without_refusing))
+TESTS.append(("CP3-T11", t11_plan_submit_refuses_unproven_line_naming_it))
 
 
 def t12_planner_skill_and_schema_document_proves():
@@ -434,7 +514,7 @@ def x01_scalar_proves_normalized_everywhere():
     and list the case under its matching done-means line, instead of crashing with a TypeError."""
     cases = [{"id": "CP1-T01", "title": "Login succeeds with the right password",
               "file": "tests/test_login.py", "layer": "code", "proves": 1}]  # scalar, not [1]
-    d, r_submit = _proof_project("x01", cases)
+    d, r_submit = _proof_project("x01", _fill(cases))  # CP2: every other done_means line gets a filler link
     check("[CP3-X01] plan-submit accepts a scalar proves value", r_submit.returncode == 0,
           r_submit.stdout + r_submit.stderr)
     r_approve = g.approve_plan(d)
@@ -463,7 +543,7 @@ def x02_exit_code_only_step_shows_passed_by_exit_code():
     instead of the misleading "no result recorded yet"."""
     cases = [{"id": "CP1-T01", "title": "Login succeeds with the right password",
               "file": "tests/test_login.py", "layer": "code", "proves": [1]}]
-    d, _ = _proof_project("x02", cases)
+    d, _ = _proof_project("x02", _fill(cases, layer="browser"))  # CP2: browser fillers link lines 2 and 3
     g.approve_plan(d)
     g.to_adversarial(d, "CP1")  # real tests-written/red/implemented/behavior; this plan writes no per-case report
     r = g.rx(d, "receipt")
@@ -487,7 +567,7 @@ def x03_one_failed_entry_among_several_shows_failed():
     case shows failed, not passed, because not every matching entry passed."""
     cases = [{"id": "CP1-T03", "title": "Login handles both password cases",
               "file": "tests/test_login.py", "layer": "code", "proves": [3]}]
-    d, _ = _proof_project("x03", cases)
+    d, _ = _proof_project("x03", _fill(cases))  # CP2: every other done_means line gets a filler link
     _write_report(d, "CP1", [{"id": "CP1-T03", "status": "failed"}, {"id": "CP1-T03", "status": "passed"}])
     r = g.rx(d, "receipt")
     check("[CP3-X03] receipt exits 0", r.returncode == 0, r.stdout + r.stderr)

@@ -414,7 +414,7 @@ def approved_run(d, env, slug):
     (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN,
                                                       "checkpoints": PLAN_CPS}))
     (run / "tests").mkdir(exist_ok=True)
-    (run / "tests/CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
+    (run / "tests/CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
     r = th.rx(d, env, "plan-submit")
     assert r.returncode == 0, r.stdout + r.stderr
     r = th.rx(d, env, "ask", "approve-plan")

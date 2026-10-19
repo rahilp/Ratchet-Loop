@@ -205,38 +205,85 @@ def collect_diff(root: Path, base_tree: str | None, current_tree: str | None, pr
     return "".join(parts)
 
 
-def read_doc(root: Path, rel: str) -> str:
+def scoped_diff_parts(root: Path, since_tree: str, current_tree: str) -> tuple[str, list[str], list[str]]:
+    """Lane H CP6: the diff for a SCOPED round (a fix round, or a small fix made after an approval) -- ONLY what
+    changed since `since_tree` (the last round actually reviewed), never the whole checkpoint. Returns
+    (text, shown, omitted): whole files only, in git's order, up to MAX_DIFF; a file that does not fit whole is
+    left out and named in the text, never cut mid-file, so `shown` is exactly what the reviewer could read.
+    New and deleted files are included as git's own diff format marks them."""
+    header = f"# Changes since the last round actually reviewed ({since_tree[:10]} → {current_tree[:10]})\n"
+    diff = git(root, "diff-tree", "-r", "-p", "--no-color", since_tree, current_tree)
+    if not diff:
+        return header + "(no file content differs here -- the change was likely a rename or mode-only edit)\n", [], []
+    parts, shown, omitted, total = [header], [], [], len(header)
+    for f, c in _diff_file_chunks(diff):
+        if total + len(c) > MAX_DIFF:
+            omitted.append(f)
+            continue
+        parts.append(c)
+        shown.append(f)
+        total += len(c)
+    if omitted:
+        parts.append(f"\n[diff too large: these changed files are NOT shown and were NOT reviewed by you "
+                     f"(do not approve without them; say so in a finding): {', '.join(omitted)}]")
+    return "".join(parts), shown, omitted
+
+
+def collect_scoped_diff(root: Path, since_tree: str, current_tree: str) -> str:
+    return scoped_diff_parts(root, since_tree, current_tree)[0]
+
+
+def read_doc(root: Path, rel: str, drop=None) -> str:
     p = root / rel
     if not p.exists():
         return ""
     t = p.read_text(errors="ignore")
+    if drop is not None:  # lines to leave out are removed BEFORE the size cut, so they never use up its room
+        t = "\n".join(l for l in t.split("\n") if not drop(l))
     return f"\n\n## {rel}\n" + (t[:MAX_DOC] + "\n[truncated]" if len(t) > MAX_DOC else t)
 
 
-def adversary_instructions() -> str:
+SCOPED_MARK = "<!-- scoped-round -->"  # lines in the adversary doc that apply only to a fix round's scoped diff
+
+
+def adversary_instructions(scoped: bool = False) -> str:
     for d in AGENT_DIRS:
         for name in ("ratchet-adversary.md",):
             p = d / name
             if p.exists():
-                return re.sub(r"^---\n.*?\n---\n", "", p.read_text(), count=1, flags=re.S).strip()
+                text = re.sub(r"^---\n.*?\n---\n", "", p.read_text(), count=1, flags=re.S).strip()
+                # a full round is not told about fix rounds; a scoped one keeps the line, minus its marker
+                return "\n".join(l.replace(SCOPED_MARK, "").lstrip() if scoped else l
+                                 for l in text.split("\n") if scoped or SCOPED_MARK not in l)
     return "You are an adversarial code reviewer. Assume the code is wrong and prove it."
 
 
 def build_prompt(eng, ctx, cfg, cp, rid, spec, fp, fixes_path, base_tree=None, nonce=None, rules=None,
-                 prev_round_tree=None) -> str:
+                 prev_round_tree=None, scope=None) -> str:
     root = ctx.root
     docs = "".join(read_doc(root, s) for s in cfg.get("standards", []))
-    docs += read_doc(root, ".ratchet/learnings.md")
+    # a fix round lists the findings to fix itself; learnings lines recording accepted findings are left out (the
+    # line format is ratchet.py's own: _BULLET_HEAD_RE plus _ACCEPTED_FINDING_MARKER_RE)
+    def _accepted_line(l):
+        m = eng._BULLET_HEAD_RE.match(l)
+        return bool(m and eng._ACCEPTED_FINDING_MARKER_RE.match(m.group(1)))
+    docs += read_doc(root, ".ratchet/learnings.md", _accepted_line if scope is not None else None)
     if cp.get("gates", {}).get("ui"):
         docs += read_doc(root, cfg.get("design_md", "DESIGN.md"))
     fixes = ""
     if fixes_path and Path(fixes_path).exists():
         fixes = "\n\n## Fixer rebuttals from the previous round (fixes.md)\n" + Path(fixes_path).read_text()[:MAX_DOC]
     objective = eng.objective_brief(ctx.plan())
+    # Lane H CP6: a scoped round (fix_round, or a small fix made after an approval) gets ONLY the diff since the
+    # last round actually reviewed -- never the whole checkpoint diff `collect_diff` would otherwise build. Its
+    # open findings (or the fact that there are none, for a small fix) are already in `rules` above (one line
+    # per finding from `_render_finding_line`, via review_rules).
+    code_under_review = (collect_scoped_diff(root, scope["since_tree"], fp) if scope is not None
+                         else collect_diff(root, base_tree, fp, prev_round_tree))
     return f"""## {objective}
 
 ---
-{adversary_instructions()}
+{adversary_instructions(scope is not None)}
 
 ---
 # This review (non-interactive — everything you need is below; you have no tools and must not ask questions)
@@ -255,14 +302,14 @@ Code fingerprint: {fp}
 {("## Rules for this round" + chr(10) + chr(10).join("- " + r for r in rules)) if rules else ""}
 
 ## Code under review
-{collect_diff(root, base_tree, fp, prev_round_tree)}
+{code_under_review}
 
 ---
 Reply with ONLY one JSON object, no markdown fences, exactly this shape:
 {{"reviewer":"{rid}","lens":"{spec.get('lens', 'both')}","checkpoint":"{cp['id']}","fingerprint":"{fp}",
  "verdict":"APPROVE or CHANGES_REQUESTED",
- "findings":[{{"id":"X1","severity":"blocker|major|minor","kind":"short-kebab-label-for-this-type-of-mistake","file":"path","line":0,"rule":"cited rule or failure scenario","description":"...","fix":"...","user_impact":"who is hurt and how, in normal use — required for a blocker or major finding"}}]}}
-An empty findings list means you approve. Every finding needs a cited rule or a concrete failure scenario. `kind` names the TYPE of mistake (e.g. handler-imports-db, unvalidated-input), the same label whenever that type appears again. `user_impact` names who is hurt and how, in normal use, clearing the realistic-use bar above; a blocker, major or unknown-severity finding with no `user_impact` is recorded for the final review instead of blocking.
+ "findings":[{{"id":"X1","severity":"blocker|major|minor","kind":"short-kebab-label-for-this-type-of-mistake","file":"path","line":0,"rule":"cited rule or failure scenario","description":"...","fix":"...","user_impact":"who is hurt and how, in normal use — required for a blocker or major finding"}},{{"id":"X2","severity":"minor","kind":"...","file":"path","line":0,"rule":"...","description":"...","fix":"...","done_means":[3]}}]}}
+An empty findings list means you approve. Every finding needs a cited rule or a concrete failure scenario. `kind` names the TYPE of mistake (e.g. handler-imports-db, unvalidated-input), the same label whenever that type appears again. `user_impact` names who is hurt and how, in normal use, clearing the realistic-use bar above; a blocker, major or unknown-severity finding with no `user_impact` is recorded for the final review instead of blocking. `done_means` is optional: most findings look like X1 above and have no such key. Add it, as X2 does, only when that finding shows one of the objective's "Done means" lines (numbered above) is not met in normal use, listing those line numbers; leave the field out of every other finding (a copied `done_means` makes a finding block). A finding that names a line always blocks, at any severity and any round, unless the rules for this round say the plan was approved before that rule (then the older rules apply; still name the line); one that names none follows the severity rules.
 """
 
 
@@ -388,9 +435,9 @@ def main():
     if not rnd or rnd.get("recorded") or rnd.get("fingerprint") != fp or a.reviewer not in rnd.get("reviewers", []):
         sys.exit(f"No open review round for {a.cp} that includes '{a.reviewer}' at the current code. "
                  f"Run `ratchet.py reviewers {a.cp}` first and launch exactly the reviewers it lists.")
-    _focus, rules = eng.review_rules(ctx, cfg, cp, cps["gates"]["adversarial"], rnd, fp)
+    _focus, rules, scope = eng.review_rules(ctx, cfg, cp, cps["gates"]["adversarial"], rnd, fp, cps)
     prompt = build_prompt(eng, ctx, cfg, cp, a.reviewer, spec, fp, a.fixes, cps.get("base_tree"), rnd["nonce"], rules,
-                          prev_round_tree=rnd.get("prev_round_tree"))
+                          prev_round_tree=rnd.get("prev_round_tree"), scope=scope)
 
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -401,12 +448,12 @@ def main():
         print(f"prompt written: {prompt_file} ({len(prompt)} chars)")
         return
     try:
-        _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, prompt_file, out_file)
+        _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, prompt_file, out_file, scope)
     finally:  # the prompt and the CLI's reply are not kept: the review (or its .raw.txt) is the record
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, prompt_file, out_file):
+def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, prompt_file, out_file, scope=None):
     # This round's signing secret must exist before the reviewer runs, so a paid review is never thrown away unsigned.
     if eng.review_key(ctx, a.cp, "adv", rnd["round"], st=st) is None:
         sys.exit(f"This round's review-signing secret is missing. Run `ratchet.py reviewers {a.cp}` again, then "
@@ -570,10 +617,20 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
         unavailable(f"exit {r.returncode}, no findings JSON ({tail[0][:160]})",
                     quota=quota_of(r, text), unused=r.returncode != 0 and not text.strip())
     review = eng.clean_review_text(review)  # a cut-off emoji escape in the reply must not break signing or records
-    # Stamp identity ourselves — never trust the model to echo these correctly.
+    # Stamp identity ourselves — never trust the model to echo these correctly. Lane H CP6: a scoped round's
+    # files_reviewed is stamped from ITS OWN scope (since the last round actually reviewed), never the whole
+    # checkpoint's base_tree -- the reviewer was never shown anything outside that scope.
     base = cps.get("base_tree")
-    review["files_reviewed"] = (eng.changed_files(ctx.root, {"kind": "git-tree", "id": base}, {"kind": "git-tree", "id": fp})
-                                if base else review.get("files_reviewed") or ["(whole diff)"])
+    if scope is not None:
+        _t, shown, omitted = scoped_diff_parts(ctx.root, scope["since_tree"], fp)
+        # only the files the reviewer was actually shown; a diff cut at the size limit names what it left out
+        if omitted:
+            review["files_reviewed"], review["omitted_files"] = shown, omitted
+        else:
+            review["files_reviewed"] = list(scope["changed_files"]) or ["(whole diff)"]
+    else:
+        review["files_reviewed"] = (eng.changed_files(ctx.root, {"kind": "git-tree", "id": base}, {"kind": "git-tree", "id": fp})
+                                    if base else review.get("files_reviewed") or ["(whole diff)"])
     review.update(reviewer=a.reviewer, lens=spec.get("lens"), vendor=spec.get("vendor"), round_nonce=rnd["nonce"],
                   checkpoint=a.cp, fingerprint=fp)
     review["findings"] = [f for f in review.get("findings") or [] if isinstance(f, dict)]

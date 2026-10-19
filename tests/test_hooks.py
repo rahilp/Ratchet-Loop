@@ -42,7 +42,7 @@ def setup_project() -> Path:
         "id": "CP1", "title": "A", "summary": "s", "done_when": ["a"],
         "gates": {"behavior": True, "ui": False, "adversarial": True},
         "tests": {"files": ["t.test.js"], "command": "true"}}]}))
-    (run / "tests" / "CP1.json").write_text('{"cases": []}')
+    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
     sh("plan-submit", cwd=d)
     import datetime as dt
     sh("ask", "approve-plan", cwd=d)  # CP5: an approval answers the question Ratchet printed

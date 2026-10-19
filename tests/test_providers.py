@@ -151,10 +151,13 @@ def severity_and_scope():
     check("round 2 tells reviewers where to look and what blocks",
           rnd["focus_files"] == ["src/f.js"] and any("changed since the last round" in x for x in rnd["review_rules"]),
           (rnd.get("focus_files"), rnd.get("review_rules")))
+    # CP5: round 1 blocked and the fix was made, so this round is a fix round with one reviewer, not the step's
+    # two. Every finding this fixture needs therefore comes from that one reviewer.
+    check("after the block and the fix, the next round names exactly one reviewer", len(ids(rnd)) == 1, ids(rnd))
     elsewhere = [{"id": "M2", "severity": "minor", "file": "src/a.js", "description": "old code nit"}]
     here = [{"id": "M3", "severity": "minor", "file": "./src/f.js", "description": "new code nit"}]
-    r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], elsewhere),
-           write_review(d, rnd, ids(rnd)[1], here))
+    r = rx(d, "adv-record", "CP1", "--reviews",
+           *[write_review(d, rnd, rid, (elsewhere + here) if rid == ids(rnd)[0] else []) for rid in ids(rnd)])
     check("round 2: a minor finding in the changed code still blocks", r.returncode == 2, r.stdout + r.stderr)
     open_f = json.loads(next((d / ".ratchet/runs/f/evidence/CP1/adversarial").glob("round-02/open-findings.json")).read_text())
     check("… while a minor finding in untouched code is noted, not sent to the fixer",
@@ -164,8 +167,8 @@ def severity_and_scope():
     rnd = open_round(d)
     major_elsewhere = [{"id": "B1", "severity": "major", "file": "src/a.js", "description": "real bug",
                         "user_impact": "x"}]
-    r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], major_elsewhere),
-           write_review(d, rnd, ids(rnd)[1]))
+    r = rx(d, "adv-record", "CP1", "--reviews",
+           *[write_review(d, rnd, rid, major_elsewhere if rid == ids(rnd)[0] else []) for rid in ids(rnd)])
     check("round 3: a major finding in untouched code still blocks", r.returncode == 2, r.stdout + r.stderr)
 
 
@@ -187,11 +190,16 @@ def review_holes():
     # path spellings of a changed file can't move a finding out of scope
     (d / "src/f.js").write_text("export const f = () => 1; // touched\n")
     rx(d, "behavior", "CP1")
+    # CP5: from here on each round follows a blocked round whose findings were triaged fix and whose fix was made,
+    # so it is a fix round with one reviewer; each round's finding comes from the reviewer it actually names.
+    check("after the block and the fix, every later round here names exactly one reviewer",
+          len(ids(open_round(d))) == 1, ids(open_round(d)))
     for label, path in (("absolute", str(d / "src/f.js")), ("with #L12", "src/f.js#L12"), ("(line 3)", "src/f.js (line 3)"),
                         ("bare name", "f.js"), ("no file", None)):
         rnd = open_round(d)
         f = [{"id": "M9", "severity": "minor", "description": "nit", **({"file": path} if path else {})}]
-        r = rx(d, "adv-record", "CP1", "--reviews", write_review(d, rnd, ids(rnd)[0], f), write_review(d, rnd, ids(rnd)[1]))
+        r = rx(d, "adv-record", "CP1", "--reviews",
+               *[write_review(d, rnd, rid, f if rid == ids(rnd)[0] else []) for rid in ids(rnd)])
         check(f"a minor finding in changed code given as {label} still blocks", r.returncode == 2, r.stdout + r.stderr)
 
     # a provider that runs its own command can't be slipped in after approval

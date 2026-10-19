@@ -141,8 +141,12 @@ def t03_unresolved_blocker_restores_full_set():
     r = g.rx(d, "behavior", "CP1")
     assert r.returncode == 0, r.stdout + r.stderr
     rnd3 = g.open_round(d)
-    check("[CP5-T03] a fix that leaves the blocker open brings back the full reviewer set in round 3",
-          sorted(r["lens"] for r in rnd3["reviewers"]) == ["correctness", "standards"], rnd3["reviewers"])
+    kind3 = str(rnd3.get("kind") or "")
+    check("[CP5-T03] a fix that leaves the blocker open opens a one-reviewer fix round after a block, on the lens "
+          "that still has it (standards)",
+          [rv["lens"] for rv in rnd3["reviewers"]] == ["standards"] and rnd3.get("small_fix") is True
+          and kind3 == "after a block",
+          (rnd3["reviewers"], rnd3.get("small_fix"), kind3 or "no kind field"))
 
 
 def t04_duplicate_slot_runs_once():

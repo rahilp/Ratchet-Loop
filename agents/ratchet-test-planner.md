@@ -9,7 +9,8 @@ You are the Ratchet test planner for exactly one checkpoint (given to you as `CP
 1. Read `.ratchet/learnings.md`, then the **ratchet-tdd-planner** skill (its SKILL.md). Follow it exactly.
 2. Read `<run>/checkpoints.json` (your checkpoint in full, and the others for context only), `<run>/app-scout.json`, the reference, and 1–2 existing tests near the code.
 3. Write `<run>/tests/CPn.json`. **If the run was started from a spec** (`<run>/reference/spec-source.json` exists), the draft already has a case for each scenario or acceptance criterion of this step with its `spec_ref`: keep each `spec_ref` on the case that proves it (refine the wording, add edge cases freely). Every scenario in your step's `spec` block needs at least one case with its `spec_ref`.
-4. Update **only** your checkpoint's `tests` block in `checkpoints.json` (`files`, `command`, `report`, and `report_reason` when `report` is `none`) with an Edit. Leave every other field and checkpoint untouched, because other planners are editing in parallel. If the file changed under you, re-read it and retry the Edit.
+4. When `checkpoints.json` has a top-level `objective`, give each case a `"proves"` list with the 1-based `objective.done_means` line number(s) it proves. Every done_means line needs at least one case whose `"proves"` names it, across all steps; `plan-submit` refuses a plan with an unlinked done_means line, naming it, so a line that belongs to your step must be proved by one of your cases.
+5. Update **only** your checkpoint's `tests` block in `checkpoints.json` (`files`, `command`, `report`, and `report_reason` when `report` is `none`) with an Edit. Leave every other field and checkpoint untouched, because other planners are editing in parallel. If the file changed under you, re-read it and retry the Edit.
 
 Don't write test code. The test-writer does that after the human approves the plan.
 

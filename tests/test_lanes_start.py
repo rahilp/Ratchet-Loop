@@ -165,7 +165,7 @@ def _approved_run(main, env):
           "tests": {"files": ["tests/cp1.test.js"], "command": "test -f src/f.js"}}
     (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": _tmp.OBJECTIVE_MIN, "checkpoints": [cp]}))
     (run / "tests").mkdir(exist_ok=True)
-    (run / "tests/CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
+    (run / "tests/CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
     say("please build the feature")
     r = th.rx(main, env, "plan-submit")
     assert r.returncode == 0, r.stdout + r.stderr

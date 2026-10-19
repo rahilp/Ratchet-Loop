@@ -227,6 +227,16 @@ def refine(d):
     if str(obj.get("users") or "").startswith(ss.FILL_IN_PREFIX):
         obj["users"] = "The people who use this feature"
     save_plan(d, plan)
+    # CP2: the planner also links every done_means line to a test case that proves it (spec import itself invents
+    # no links); here the very first case links every line, so a scenario that later trims a step's test plan to
+    # its first case still leaves every line linked (plan-submit refuses an unlinked line since CP2).
+    dm = obj.get("done_means") or []
+    files = {cp["id"]: json.loads((RUN(d) / "tests" / f"{cp['id']}.json").read_text()) for cp in plan["checkpoints"]}
+    flat = [c for tp in files.values() for c in tp.get("cases") or []]
+    if flat and dm:
+        flat[0]["proves"] = sorted(set(flat[0].get("proves") or []) | set(range(1, len(dm) + 1)))
+    for cid, tp in files.items():
+        (RUN(d) / "tests" / f"{cid}.json").write_text(json.dumps(tp))
     return plan
 
 

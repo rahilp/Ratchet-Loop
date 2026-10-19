@@ -122,8 +122,8 @@ def build_project(name, checkin_round=None, cp2_risk="low"):
            "tests": {"files": ["tests/cp2.test.js"], "command": "test -f src/login.js"}}
     body = {"feature": "x", "objective": OBJECTIVE, "checkpoints": [cp1, cp2]}
     (run / "checkpoints.json").write_text(json.dumps(body))
-    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code"}]}))
-    (run / "tests" / "CP2.json").write_text(json.dumps({"cases": [{"id": "CP2-T01", "layer": "code"}]}))
+    (run / "tests" / "CP1.json").write_text(json.dumps({"cases": [{"id": "CP1-T01", "layer": "code", "proves": [1]}]}))
+    (run / "tests" / "CP2.json").write_text(json.dumps({"cases": [{"id": "CP2-T01", "layer": "code", "proves": [2, 3]}]}))
     r = th.rx(d, env, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout
     th.rx(d, env, "ask", "approve-plan")

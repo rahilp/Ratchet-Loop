@@ -86,7 +86,7 @@ def _project_with_feature(name, feature, cps=1):
               "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",
               "tests": {"files": [f"tests/cp{i}.test.js"], "command": f"node --test tests/cp{i}.test.js"}}
         plan["checkpoints"].append(cp)
-        (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code"}]}))
+        (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code", "proves": [1]}]}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
     r = g.rx(d, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout

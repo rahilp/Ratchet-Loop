@@ -1,6 +1,6 @@
 {
   "human_review": "end",
-  "host_provider": "auto",
+  "host_provider": "anthropic",
   "ui_reviewers": {
     "visual": [
       "gemini",
