@@ -7367,6 +7367,224 @@ def _director_apply_ask(ctx, st, action, target, ids):
             _ask_accept_finding(ctx, st, ns)
 
 
+# ---- the developer's policy for routine approvals ------------------------------------------------------------------
+# One file per user, next to the director key (RATCHET_HOME/director-policy.json), changed only by `director-policy`
+# from the director session (the guard keeps builder sessions out of RATCHET_HOME). With no file, director-sign works
+# as it always did. With a file, each of the four routine approvals is signed only when a rule covers it.
+POLICY_FILE = "director-policy.json"
+POLICY_SEVERITIES = {"major": 1, "minor": 2}
+POLICY_NEVER = ("approve-plan", "human-approve", "feedback", "cancel", "set-review", "hooks-waive", "ui-respec",
+                "guardrail", "paid-provider")
+POLICY_MENU = ("approve-changes=test-files, raise-limit=max:<N> (N of 1 or more signed raises per run), "
+               "choice=no-unlock, accept-finding=max:<minor|major>")
+
+
+def _policy_path() -> Path:
+    return ratchet_home() / POLICY_FILE
+
+
+def _policy_rule_problem(action, rule) -> str | None:
+    """None when `rule` is a rule the menu offers for `action`; otherwise a plain reason."""
+    if action in POLICY_NEVER:
+        return (f"{action} can never be covered by a policy: it is the developer's own approval (plans, scope, final "
+                "approval, cancel, review settings, hooks waivers, paid providers). Nothing was changed.")
+    if action not in DIRECTOR_APPLY_ACTIONS:
+        return f"{action} is not a routine approval. A rule is for one of: {', '.join(DIRECTOR_APPLY_ACTIONS)}. Nothing was changed."
+    rule = rule if isinstance(rule, str) else ""
+    if action == "approve-changes" and rule != "test-files":
+        return "approve-changes takes the rule test-files (changes to test files only). Nothing was changed."
+    if action == "choice" and rule != "no-unlock":
+        return "choice takes the rule no-unlock (lettered options that unlock no locked file). Nothing was changed."
+    if action == "raise-limit" and not (re.fullmatch(r"max:[0-9]+", rule) and int(rule[4:]) >= 1):
+        return "raise-limit takes max:N with N of 1 or more (signed raises per run). Nothing was changed."
+    if action == "accept-finding" and not (rule.startswith("max:") and rule[4:] in POLICY_SEVERITIES):
+        return "accept-finding takes max:minor or max:major (never blocker). Nothing was changed."
+    return None
+
+
+def _load_policy():
+    """(policy or None when no file, problem or None). A policy is {"rules": {action: rule}, "changes": [...]};
+    one that can't be read or holds a rule the menu does not offer is a problem (routine approvals fail closed)."""
+    p = _policy_path()
+    data, why = _read_record(p, missing=None)
+    if why is None and data is not None:
+        rules, changes = data.get("rules"), data.get("changes")
+        if not isinstance(rules, dict) or not isinstance(changes, list) or any(
+                _policy_rule_problem(a, r) for a, r in rules.items()):
+            why = "it does not hold a valid policy"
+    if why:
+        return None, (f"The developer's policy file {p} (director-policy.json) is unreadable or damaged ({why}). "
+                      "Routine approvals are refused until the developer resets it: ask the developer for their rules, then "
+                      "`director-policy --set <action>=<rule>` rewrites the file from scratch (the repair is logged), or "
+                      "`director-policy --clear <action>` deletes it. Nothing was signed.")
+    return data, None
+
+
+def cmd_director_policy(args):
+    """`director-policy` (director session only): show (`--json`), `--set <action>=<rule>` or `--clear <action>` the
+    developer's policy for routine approvals. Every change is logged in the file with its time."""
+    require_director_session("director-policy")
+    pol, bad = _load_policy()
+    setting, clearing = getattr(args, "set", None), getattr(args, "clear", None)
+    if getattr(args, "remove", False):  # the one way back to no policy at all, logged in its own record
+        if pol is None and not bad:
+            die("There is no policy file to remove. Nothing was changed.")
+        try:
+            _append_record(_policy_path().with_name("director-policy-removed.jsonl"), json.dumps(
+                {"at": now(), "removed": True, "rules": (pol or {}).get("rules"), "damaged": bool(bad)}) + "\n")
+            _policy_path().unlink()
+        except OSError as e:
+            die(f"Couldn't remove {_policy_path()} ({e.strerror or e}). Nothing was changed.")
+        ok("The policy was removed (logged in director-policy-removed.jsonl): no policy is set, so director-sign works as it did before any policy.")
+        return
+    if bad and not (setting or clearing):
+        die(bad)
+    if setting or clearing:
+        pol = pol or {"rules": {}, "changes": []}
+        if bad:  # --set or --clear over a damaged file starts again from nothing, and says so in the change log
+            pol["changes"].append({"at": now(), "action": "(policy file)", "repair": "damaged file replaced"})
+            if clearing:  # a damaged file has no rule to clear: replacing it with an empty (fail-closed) policy is the repair
+                _write_record(_policy_path(), pol, pretty=True)
+                ok("The damaged policy file was replaced by a policy with no rules (logged): every routine approval asks the developer.")
+                return
+        if setting:
+            action, _, rule = setting.partition("=")
+            action, rule = action.strip(), rule.strip()
+            why = _policy_rule_problem(action, rule)
+            if why:
+                die(f"{setting}: {why} The menu: {POLICY_MENU}.")
+            pol["rules"][action] = rule
+            pol["changes"].append({"at": now(), "action": action, "rule": rule})
+        else:
+            if clearing not in pol["rules"]:
+                die(f"No rule is set for {clearing}. Nothing was changed.")
+            del pol["rules"][clearing]
+            pol["changes"].append({"at": now(), "action": clearing, "clear": True})
+        try:
+            _write_record(_policy_path(), pol, pretty=True)  # with the last rule gone it keeps only the history
+        except OSError as e:
+            die(f"Couldn't update {_policy_path()} ({e.strerror or e}). Nothing was changed.")
+    if getattr(args, "json", False):
+        print(json.dumps(pol or {"rules": {}, "changes": []}, indent=2))
+        return
+    rules = (pol or {}).get("rules") or {}
+    if pol is not None and not rules:  # a policy file with no rules covers nothing
+        print("A policy with no rules: every routine approval asks the developer. Add a rule with "
+              f"`director-policy --set <action>=<rule>` (the menu: {POLICY_MENU}), or remove the policy with "
+              "`director-policy --remove`.")
+        return
+    if not rules:
+        print("No policy is set: routine approvals are signed as the director sees fit. Set a rule with "
+              f"`director-policy --set <action>=<rule>`; the menu: {POLICY_MENU}.")
+        return
+    print(f"The developer's policy ({_policy_path()}); a routine approval no rule covers is refused:")
+    for a, r in rules.items():
+        print(f"  {a}: {r}")
+
+
+def _policy_field(args) -> dict:
+    """The log field naming the policy rule a director signature used (nothing for a chat approval or no policy)."""
+    r = getattr(args, "policy_rule", None)
+    return {"policy_rule": r} if r else {}
+
+
+def _policy_test_edit_ok(ctx, st, problem: str) -> bool:
+    """Whether an integrity problem on a test file is one the approve-changes=test-files rule covers."""
+    mm = re.match(r"test file (\S+?)(:| \()", problem)
+    if not mm or not (ctx.root / mm.group(1)).exists():
+        return False  # not a test-file problem we can read, or the file is gone
+    rel = mm.group(1)
+    if not rel.endswith(".py"):
+        # Ratchet cannot analyse other languages (an inserted `return;` or `process.exit(0)` above a planned test
+        # looks like an addition); appended tests raise no problem at all, so they need no approval. Ask the developer.
+        return False
+    # Python: covered only when the whole module is unchanged apart from comments and formatting (the freeze proves
+    # the planned tests' own defs, not helpers, imports or module-level code)
+    old_p = ctx.run_dir() / "evidence" / str(st.get("current")) / "red-tests" / rel.replace("/", "__")
+    try:
+        old = ast.dump(ast.parse(old_p.read_text(errors="replace")))
+        new = ast.dump(ast.parse((ctx.root / rel).read_text(errors="replace")))
+    except (OSError, SyntaxError, ValueError, RecursionError):
+        return False
+    return old == new
+
+
+def _policy_apply(args, ctx, st, action, target, ids=()):
+    """A lane command applying a director token re-checks the policy against the lane as it is now, under the same
+    state lock as the apply, and records the rule it finds (so a token signed apart from its apply, by the plain
+    `director-sign`, still logs `policy_rule`, and a token the policy no longer covers is refused). `director-sign
+    --apply` has checked already (policy_checked)."""
+    if getattr(args, "policy_checked", False) or not getattr(args, "director_token", None):
+        return
+    args.policy_rule = _policy_rule_for(ctx, st, action, target, list(ids))
+
+
+def _policy_refuse(what, ask=True):
+    die(f"{what}" + (" Ask the developer; nothing was signed or changed." if ask else ""))
+
+
+def _policy_rule_for(ctx, st, action, target, ids) -> str | None:
+    """The rule text that covers this routine signature, or None when there is no policy file; dies (before anything
+    is signed, asked or written) when a policy exists and no rule covers it, or the file is damaged."""
+    pol, bad = _load_policy()
+    if bad:
+        die(bad)
+    if pol is None:  # no file at all: director-sign works as it always did
+        return None
+    rule = (pol.get("rules") or {}).get(action)
+    if not rule:
+        _policy_refuse(f"The developer's policy has no {action} rule, so the director may not sign {action}.")
+    if action == "approve-changes":
+        errs = validate_plan(ctx.plan())
+        if errs:
+            die("Plan invalid:\n  - " + "\n  - ".join(errs))
+        probs = integrity_problems(ctx, st)
+        # covered: a test file that still exists and keeps every line it had at the red run (only lines added; a
+        # non-Python file is compared line by line, so a skip, a deletion, an emptied body or a swapped assertion is
+        # a replace or delete and is not covered); Python keeps the structural freeze's own refusals (a skipped,
+        # ended-early, removed or re-declared planned test is not covered)
+        frozen = [pr for pr in probs if pr.startswith("test file ") and not _policy_test_edit_ok(ctx, st, pr)]
+        if frozen:
+            _policy_refuse(f"The approve-changes rule covers edits that keep every planned test, but a planned test "
+                           f"was skipped, removed, weakened or its file deleted: {'; '.join(frozen)[:300]}.")
+        other = [pr for pr in probs if not pr.startswith("test file ")]
+        if other:
+            _policy_refuse(f"The approve-changes rule covers test files only, but these changed too: "
+                           f"{_problems_for_director(other)}.")
+    elif action == "raise-limit":
+        n = int(rule[4:])
+        used = sum(1 for e in st.get("history") or [] if e.get("event") == "round_limit_raised" and e.get("by") == "director")
+        if used >= n:
+            _policy_refuse(f"The raise-limit rule ({rule}) is used up: {used} of {n} raises are already signed in this run.")
+        return f"raise-limit: {rule} ({used + 1} of {n})"
+    elif action == "choice":
+        p = st.get("pending") or {}
+        letter = target.upper()
+        files = (p.get("locked") or {}).get(letter) or []
+        kind = (p.get("guardrail") or {}).get(letter)
+        if files or kind:
+            _policy_refuse(f"The choice rule ({rule}) covers options that unlock nothing, but option {letter} "
+                           + (f"unlocks {', '.join(files)}" if files else f"adds a guardrail step for '{kind}'") + ".")
+    elif action == "accept-finding":
+        p = st.get("pending") or {}
+        cp = target or p.get("mode") or ""
+        ids = ids or p.get("ids") or []
+        cps = (st.get("checkpoints") or {}).get(cp) or {}
+        rnd = cps.get("adv_round")
+        opened = _adv_open_findings(ctx, cp, rnd, cps) if rnd else []
+        top = POLICY_SEVERITIES[rule[4:]]
+        over = []  # (id as named, finding) for every named finding above the rule's severity
+        for i in ids:
+            f, _err = _resolve_finding_ref(i, opened)  # a bare id or 'reviewer/id'; unknown ids fail later, as today
+            r = _SEVERITY_RANK.get(str((f or {}).get("severity", "")).strip().lower()) if f else top
+            if r is None or r < top:
+                over.append((i, f))
+        if over:
+            sev = ", ".join(f"{i} ({f.get('severity')})" for i, f in over)
+            _policy_refuse(f"The accept-finding rule ({rule}) does not cover {sev}.")
+    return f"{action}: {rule}"
+
+
 def cmd_director_sign(args):
     """Sign the lane's current pause for `action` and print the token (stdout's last line) that the lane applies
     with `--director-token`. With `--apply`, for a routine approval (DIRECTOR_APPLY_ACTIONS) only: the question step
@@ -7375,7 +7593,11 @@ def cmd_director_sign(args):
     and applied at once, all under one hold of the lane's state lock (see _changes_state), so the token cannot go
     stale between the ask and the apply; a refusal (a missing --reason, an unknown id, a letter not offered, the
     wrong phase, a lane that is not enrolled) comes before anything is asked or written. The old separate steps
-    (the lane's ask, this command without --apply, the lane's command with the token) still work unchanged."""
+    (the lane's ask, this command without --apply, the lane's command with the token) still work unchanged. When the
+    developer has a policy file (`director-policy`), the four routine actions are policy-checked first, on both paths:
+    one no rule covers (or a damaged policy file) is refused before anything is signed. A covered plain signature
+    prints a token; the lane's command that applies it checks the policy again under its own lock and records the
+    rule as `policy_rule`, the same as `--apply` does."""
     require_director_session("director-sign")
     action = args.action
     apply = bool(getattr(args, "apply", False))
@@ -7503,6 +7725,7 @@ def cmd_director_sign(args):
             does.append("is the pick at a blocked run; resuming it still needs director-sign human-approve")
         print(f"Signing option {letter} of {', '.join(opts)}: it " + ("; ".join(does) if does else
               "unlocks nothing (it only records the letter)") + ".", file=sys.stderr)
+    rule = _policy_rule_for(ctx, st, action, target, ids) if action in DIRECTOR_APPLY_ACTIONS else None
     if not apply:
         print(_sign(_director_key(), _approval_payload(ctx, st, action, bind)))
         return
@@ -7521,7 +7744,8 @@ def cmd_director_sign(args):
             _director_apply_ask(ctx, st, action, target, ",".join(ids))
             st = ctx.state()  # the ask moved awaiting_since: the token is signed for the pause as it now stands
         token = _sign(key, _approval_payload(ctx, st, action, bind))
-        ns = argparse.Namespace(director_token=token, cp=target, reason=reason, letter=target.upper() or None)
+        ns = argparse.Namespace(director_token=token, cp=target, reason=reason, letter=target.upper() or None,
+                                 policy_rule=rule, policy_checked=True)
         {"approve-changes": cmd_approve_changes, "accept-finding": cmd_accept_finding, "raise-limit": cmd_raise_limit,
          "choice": cmd_choice}[action](ns)
     finally:
@@ -11230,11 +11454,19 @@ def cmd_receipt(args):
                       "reviewers": _step_reviewer_entries(cfg, cps)})
     accepted, left, fixed = _receipt_accepted(st), _receipt_left_for_later(st), _receipt_fixed_later(st)
     dm = _done_means_proof(ctx, plan, cps_map)
+    labels = {"changes_approved": lambda e: "approve-changes",
+              "round_limit_raised": lambda e: f"raise-limit {e.get('cp')}",
+              "choice_made": lambda e: f"choice {e.get('letter')}",
+              "finding_accepted": lambda e: f"accept-finding {e.get('cp')} ({', '.join(e.get('ids') or [])})"}
+    policy_signed = [{"approval": labels.get(e["event"], lambda x: e["event"])(e), "policy_rule": e["policy_rule"]}
+                     for e in st.get("history") or [] if e.get("policy_rule")]
     if getattr(args, "json", False):
         data = {"run": {"elapsed_seconds": run_seconds, "finished": run_status == "finished"},
                 "steps": [{k: s[k] for k in ("id", "title", "commit", "finished", "elapsed_seconds", "reviewers")}
                          for s in steps],
                 "accepted": accepted, "left_for_later": left, "fixed_later": fixed, "done_means": dm}
+        if policy_signed:
+            data["policy_approvals"] = policy_signed
         print(json.dumps(data, indent=2))
         return
     print(f"# Proof receipt: {plan.get('feature') or st.get('feature') or st.get('slug')}")
@@ -11267,6 +11499,11 @@ def cmd_receipt(args):
         if not dm["any_proves"]:
             print("Note: this plan's tests were never linked to done_means lines (an older test plan, "
                   "approved before the \"proves\" field existed).")
+    if policy_signed:
+        print("")
+        print("Approvals the director signed under the developer's policy:")
+        for pa in policy_signed:
+            print(f"- {pa['approval']}: {pa['policy_rule']}")
     acc_lines = _accepted_findings_lines(st)
     if acc_lines:
         print("")
@@ -12596,6 +12833,7 @@ def cmd_choice(args):
         # token for another letter, lane, question or pause is refused): dies here when this lane is
         # director-enrolled and no (or a bad) director token was given; a chat letter is never enough in that lane.
         by = _require_approval(ctx, st, "choice", token, bind=(given,))["by"]
+        _policy_apply(args, ctx, st, "choice", given)
         letter, reply = given, f"director-signed choice {given}"
     else:
         msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the options were put to can pick one
@@ -12625,7 +12863,7 @@ def cmd_choice(args):
         st["choice_allow"] = {"letter": letter, "files": files, "cp": st.get("current"), "at": now(),
                               "reply": reply, "unblock": unblock, "guardrail": guard, "by": by}
     _clear_pending(st)
-    ctx.log(st, "choice_made", letter=letter, approves=files, by=by)
+    ctx.log(st, "choice_made", letter=letter, approves=files, by=by, **_policy_field(args))
     ctx.save_state(st)
     msg = f"The {'director' if by == 'director' else 'user'} picked option {letter}."
     if files:
@@ -12750,6 +12988,8 @@ def cmd_approve_changes(args):
                 "(`ratchet.py ask approve-changes`).")
         _require_pending(st, "approve-changes", ctx=ctx)
         msg = _require_human(ctx, st, "approve-changes", getattr(args, "director_token", None))
+        if msg["by"] == "director":
+            _policy_apply(args, ctx, st, "approve-changes", "")
     plan = ctx.plan()
     new_ids = [c["id"] for c in plan["checkpoints"] if c["id"] not in st["checkpoints"]]
     if new_ids:
@@ -12761,7 +13001,7 @@ def cmd_approve_changes(args):
         st["checkpoints"][cur]["red_tests"] = _snapshot_tests(ctx, cp_by_id(ctx.plan(), cur))
     st["approved"] = approval_snapshot(ctx, st)  # after the red baseline moved, so the snapshot records it
     _clear_pending(st)
-    ctx.log(st, "changes_approved", by=msg["by"], changed="; ".join(probs)[:400])
+    ctx.log(st, "changes_approved", by=msg["by"], changed="; ".join(probs)[:400], **_policy_field(args))
     ctx.save_state(st)
     build_viewer(ctx)
     ok("Accepted as the new baseline: " + "; ".join(probs))
@@ -12961,6 +13201,7 @@ def cmd_accept_finding(args):
         # no (or a bad) director token was given; a chat "accept: ..." reply is never enough in that lane.
         appr = _require_approval(ctx, st, "accept-finding", token)
         by = appr["by"]
+        _policy_apply(args, ctx, st, "accept-finding", cp, ids)
     else:
         msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the question was asked in can answer it
         if not msgs:
@@ -13020,7 +13261,7 @@ def cmd_accept_finding(args):
         die(f"{', '.join(missing)} is not an open finding of {cp}'s current round. Nothing was accepted.")
     at = now()
     accepted_entries = [dict(open_by_key[i], accepted=True, reason=reason, accepted_at=at, accepted_by=by,
-                            round=rnd["round"]) for i in ids]
+                            round=rnd["round"], **_policy_field(args)) for i in ids]
     remaining_open = [f for f in open_findings if _finding_key(f) not in ids]
     dest = _adv_round_dir(ctx, cp, rnd["round"])
 
@@ -13067,7 +13308,7 @@ def cmd_accept_finding(args):
     if round_rec is not None:
         round_rec.setdefault("accepted", []).extend(
             [{"id": i, "reason": reason, "at": at, "by": by} for i in ids])
-    ctx.log(st, "finding_accepted", cp=cp, ids=ids, reason=reason[:200], by=by)
+    ctx.log(st, "finding_accepted", cp=cp, ids=ids, reason=reason[:200], by=by, **_policy_field(args))
     unblocked_to = None
     if not remaining_open:
         g["status"] = "passed"
@@ -13201,6 +13442,7 @@ def cmd_raise_limit(args):
         # the token, so a token for another step, reason, lane or pause is refused): dies here when this lane is
         # director-enrolled and no (or a bad) director token was given; a chat `raise:` reply is never enough there.
         by = _require_approval(ctx, st, "raise-limit", token, bind=(cp, reason))["by"]
+        _policy_apply(args, ctx, st, "raise-limit", cp)
     else:
         msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the question was asked in can answer it
         if not msgs:
@@ -13230,7 +13472,7 @@ def cmd_raise_limit(args):
     # grant happen in, instead of compounding on top of each other (see _adv_base_cap/_adv_round_cap).
     g["cap_raised_to"] = cap
     _clear_pending(st)
-    ctx.log(st, "round_limit_raised", cp=cp, cap=cap, reason=reason[:300], by=by)
+    ctx.log(st, "round_limit_raised", cp=cp, cap=cap, reason=reason[:300], by=by, **_policy_field(args))
     _append_learning(ctx, f"{cp}'s review-round limit was raised to {cap} rounds: {reason}", source="raise-limit")
     unblocked_to = None
     if _adv_block_kind(st, cp) == "own":  # raise-limit only ever lifts CP's own step cap, so it only ever
@@ -14845,7 +15087,7 @@ def _expand(cmd: str) -> str:
             continue
         cmd = re.sub(r"\$\{" + name + r"\}|\$" + name + r"(?![A-Za-z0-9_])", lambda _m: val, cmd)
     return cmd
-DIRECTOR_CALL_RE = re.compile(r"""ratchet\.py["']?\s+(?:--root\s+\S+\s+)?(?:director-(?:sign|key|enroll)|integrate)\b""")
+DIRECTOR_CALL_RE = re.compile(r"""ratchet\.py["']?\s+(?:--root\s+\S+\s+)?(?:director-(?:sign|key|enroll|policy)|integrate)\b""")
 # Variables a builder session may read but never set. Each is matched however it is set: VAR=, export/declare/
 # typeset/local/readonly/setenv/fish `set -x`, a dict or kwargs entry (python3 -c os.environ / env=...), putenv-style
 # calls, or indirectly (the name stored in another variable, or built from pieces, then used by eval, env -S,
@@ -17976,6 +18218,11 @@ def main(argv=None):
     a.add_argument("lane", help="the lane's folder (a git worktree) or its branch name")
     a.add_argument("--dry-run", action="store_true", help="say what integrate would do; change nothing")
     a.set_defaults(fn=cmd_integrate)
+    a = sp.add_parser("director-policy", help="director only: show, set or clear the developer's rules for routine approvals")
+    g_ = a.add_mutually_exclusive_group()
+    g_.add_argument("--set", metavar="ACTION=RULE"); g_.add_argument("--clear", metavar="ACTION")
+    g_.add_argument("--remove", action="store_true", help="delete the policy file (logged): back to no policy at all")
+    a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_director_policy)
     a = sp.add_parser("director-sign"); a.add_argument("action", choices=["approve-plan", "human-approve", "feedback",
                                                                           "approve-changes", "cancel", "set-review",
                                                                           "hooks-waive", "ui-respec", "guardrail",
