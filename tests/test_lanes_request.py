@@ -106,7 +106,7 @@ def write_plan(lane, slug, n):
     run = Path(lane) / ".ratchet/runs" / slug
     cps = [{"id": f"CP{i}", "title": f"Step {i}", "summary": "s", "done_when": ["works"],
             "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",
-            "tests": {"files": [f"tests/cp{i}.test.js"], "command": "true"}} for i in range(1, n + 1)]
+            "tests": {"files": [f"tests/cp{i}.test.js"], "command": "true"}, "proves": [1]} for i in range(1, n + 1)]
     (run / "checkpoints.json").write_text(json.dumps({"feature": "x", "objective": {}, "checkpoints": cps}))
     rebaseline(lane, run / "checkpoints.json")
 
