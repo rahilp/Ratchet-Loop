@@ -447,6 +447,8 @@ It is safe to run twice: skill folders are replaced, hooks are not duplicated, a
 | `ratchet.py config --set key=value` | settings in `.ratchet/config.json` (reviewer roster, retry caps, `regression_command`, `ui_globs`, app URL) |
 | `ratchet.py ci-export [--stdout]` | write (or update) `.github/workflows/ratchet.yml`, the GitHub Actions workflow that keeps the run's mechanical checks running on every push and pull request; refuses to replace a hand-written file at that path; `--stdout` prints the workflow instead of writing it |
 
+Ratchet's own guard has a shortcut table, `tests/shortcuts/guard.json` (run by `tests/shortcuts/guard_runner.py`, checked by `tests/test_shortcuts_guard.py`): a fixed list of shortcut commands the guard should refuse, next to everyday read-only commands it should allow. A run that changes the engine (`ratchet.py`) shows the table's result at the final review. The table watches `ratchet.py` plus `spec_sources.py` and `provider_health.py` (the engine imports both, so the comparison copy cannot load without them). It covers only the shell check (`_guard_shell`): refusals of commands that set Ratchet's reserved variables come from the hook layer (`decide_guard`), which this table does not run, so a clean result does not show those hold. Rows are only ever added; a row is never removed, reworded or flipped, and a row the guard still gets wrong stays listed as still open.
+
 The viewer server only serves the viewer, its live data and the prototype, never the rest of `.ratchet/`. Its URL is saved in `.ratchet/viewer.json`.
 
 Director-signed approvals: the director's session runs in the director role (see the orchestrator's SKILL.md), creates a key once with `ratchet.py director-key`, then enrolls each lane with `ratchet.py --root <lane> director-enroll`. In an enrolled lane chat messages stop counting as approvals; approvals need `ratchet.py --root <lane> director-sign <action>` and `--director-token <t>`. Builder sessions cannot read the key or sign. The director's per-user folder (`RATCHET_HOME`) and key file must be the same ones the lane's hooks use: Ratchet refuses to run when they differ. `RATCHET_ROLE=director` alone is not enough either: the director commands run only where Ratchet's guard hook recorded a director session, so run the director's agent CLI with Ratchet's hooks, in its own folder (not a lane's), and reach lanes with `--root <lane>`. A builder that sets the variable, even inside a script, is refused. A missing record is refused too, whenever Ratchet's hooks are installed or have run there (restart the director's agent CLI so its hooks record the role). Only when no Ratchet hooks are in use at all is the variable taken at its word, and the command says so, because nothing else is enforced then either. The record of the director's session is written by Ratchet's hook command, so a script deliberately written to cheat, running as your own user, can still forge it by calling that command directly with made-up input; this check stops easy shortcuts, not a deliberate forgery.
@@ -535,6 +537,7 @@ python3 tests/test_run_all_dedupe.py
 python3 tests/test_runner.py
 python3 tests/test_shortcuts.py
 python3 tests/test_shortcuts_extra.py
+python3 tests/test_shortcuts_guard.py
 python3 tests/test_signing.py
 python3 tests/test_specs.py
 python3 tests/test_split_check.py
