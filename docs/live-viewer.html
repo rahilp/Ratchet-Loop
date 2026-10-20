@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Live viewer · Ratchet Loop</title>
-<meta name="description" content="Every run gets its own page: the plan, every planned test, each review round and each commit, updated as the agent works.">
+<meta name="description" content="A web page for each run. It shows the plan, the tests, each review round and each commit.">
 <link rel="canonical" href="https://ratchetloop.github.io/live-viewer.html">
 <meta name="theme-color" content="#FBFAF7">
 <meta name="color-scheme" content="light">
@@ -32,8 +32,8 @@
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="preload" as="style" data-fonts href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Newsreader:ital,wght@0,400;0,600;1,400&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'">
-<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Newsreader:ital,wght@0,400;0,600;1,400&amp;display=swap"></noscript>
+<link rel="preload" as="style" data-fonts href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300..700&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300..700&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap"></noscript>
 
 <link rel="stylesheet" href="styles.min.css">
 
@@ -68,16 +68,16 @@
   <div class="phead__bg" aria-hidden="true"><div class="hero__grid" data-depth="0.25"></div><img class="hero__draw" src="assets/blueprint.svg" alt="" width="1200" height="1200" decoding="async" data-depth="0.55"></div>
   <div class="wrap phead__inner">
     <p class="crumb"><a href="index.html#features">Features</a><span aria-hidden="true">/</span>Feature 04</p>
-    <h1 id="page-title" class="phead__title">The live viewer. <em>Watch every run, step by step.</em></h1>
-    <p class="lede">Everything Ratchet does shows up in your chat. The viewer puts the whole run on one page, so you can see where it is at a glance.</p>
+    <h1 id="page-title" class="phead__title">The live viewer. <em>Watch the run as it happens.</em></h1>
+    <p class="lede">Your chat shows each step as it happens. The viewer shows the whole run at once.</p>
     <nav class="phead__jump" aria-label="On this page"><a href="#viewer">The viewer</a></nav>
   </div>
 </section>
 <section class="band" id="viewer" aria-labelledby="viewer-title">
   <div class="wrap">
     <p class="kicker"><span>01</span>The viewer</p>
-    <h2 id="viewer-title" class="h2">Every run gets its own page. <em>Watch it happen, step by step.</em></h2>
-    <p class="lede">Each run writes a viewer: one web page with the plan, every planned test, every review round and every commit, kept up to date as the agent works. You don't need it, because everything also shows up in your chat. It's there when you want the whole picture at once.</p>
+    <h2 id="viewer-title" class="h2">One page per run. <em>Updated as it works.</em></h2>
+    <p class="lede">Every run writes a viewer. It is a single web page with the plan, the tests, each review round and each commit. Everything also shows up in your chat. The viewer is for when you want to see the whole run at once.</p>
 
     <div class="shot reveal" data-shot>
       <div class="shot__bar">
@@ -102,13 +102,13 @@
     </div>
 
     <div class="facts facts--3">
-      <div class="fact reveal"><h3>What's on it</h3><p>A progress bar with one segment per step. Each step's four gates as chips: Tests, Look and feel, Second opinion, Your OK. What "done" means, the planned tests by ID, who reviewed each round, and the evidence and commit for every finished step.</p></div>
-      <div class="fact reveal"><h3>How to open it</h3><p>Say <q>Give me the viewer link, and open it if you can.</q> It's a single file in your project at <code>.ratchet/runs/&lt;run&gt;/viewer.html</code>. When Ratchet's small server is running, it refreshes on its own every few seconds and shows "live".</p></div>
-      <div class="fact reveal"><h3>More than one tab</h3><p>Activity is a time-stamped feed of the run. Learnings shows your saved lessons. New screens link to the clickable prototype, and spec-driven runs show which scenarios are proven so far.</p></div>
+      <div class="fact reveal"><h3>What's on it</h3><p>A progress bar with one segment per step. The four gates for each step: Tests, Look and feel, Second opinion and Your OK. What "done" means, the planned tests, who reviewed each round, and the proof and commit for each finished step.</p></div>
+      <div class="fact reveal"><h3>How to open it</h3><p>Ask the agent for the viewer link. The file is at <code>.ratchet/runs/&lt;run&gt;/viewer.html</code> in your project. If Ratchet's local server is on, the page refreshes every 3 seconds.</p></div>
+      <div class="fact reveal"><h3>Other tabs</h3><p>Activity is a timeline of the run. Learnings lists lessons saved from past runs. New screens link to a clickable prototype. Runs built from a spec show which scenarios pass so far.</p></div>
     </div>
     <details class="expand">
       <summary>Can I share it with my team?</summary>
-      <p>Yes, on your own network. Ask the agent to serve the viewer for others to see. It gives you a link with a private token in it, and requests without that token are refused. The page follows light or dark mode, and has its own theme switch.</p>
+      <p>Yes, on your own network. Ask the agent to share the viewer. You get a link with a private token. Anyone without the token is turned away.</p>
     </details>
   </div>
 </section>
@@ -117,8 +117,8 @@
 <section class="cta" aria-labelledby="cta-title">
   <div class="wrap cta__card">
     <svg class="cta__mark" viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke-linejoin="round" stroke-linecap="round" stroke-width="2.0"><path stroke="#3E6FC4" stroke-opacity=".55" stroke-width="1.20" stroke-dasharray="5 2 1 2" d="M1.5,37 H55.5 M28.5,10 V64"/><circle stroke="#3E6FC4" stroke-opacity=".6" stroke-width="1.20" cx="28.5" cy="37" r="14.8"/><path stroke="#3E6FC4" d="M40.54,23.62 L35.06,14.43 L33.34,14.24 L32.24,19.39 L22.89,14.18 L21.31,14.87 L22.94,19.88 L12.23,20.04 L11.21,21.43 L15.12,24.96 L5.93,30.44 L5.74,32.16 L10.89,33.26 L5.68,42.61 L6.37,44.19 L11.38,42.56 L11.54,53.27 L12.93,54.29 L16.46,50.38 L21.94,59.57 L23.66,59.76 L24.76,54.61 L34.11,59.82 L35.69,59.13 L34.06,54.12 L44.77,53.96 L45.79,52.57 L41.88,49.04 L51.07,43.56 L51.26,41.84 L46.11,40.74 L51.32,31.39 L50.63,29.81 L45.62,31.44 L45.46,20.73 L44.07,19.71Z"/><circle stroke="#3E6FC4" cx="28.5" cy="37" r="4.2"/><path stroke="#E8572A" d="M33.91,7.11 L38.05,20.29 L40.95,23.18 L42.13,21.15 L40.55,5.64Z"/><circle stroke="#E8572A" fill="#FBFAF7" cx="37.23" cy="6.38" r="3.6"/><circle fill="#E8572A" stroke="none" cx="37.23" cy="6.38" r="1.2"/></g></svg>
-    <h2 id="cta-title" class="cta__title">Stop taking <em>done</em> on faith.</h2>
-    <p class="lede">One message to install. One sentence to build. Proof at every step.</p>
+    <h2 id="cta-title" class="cta__title">Know it works <em>before you merge.</em></h2>
+    <p class="lede">Paste one prompt to install. Describe a feature to build it.</p>
     <div class="hero__ctas">
       <button class="btn btn--primary" type="button" data-copy="Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI."><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" d="M8 8h11v11H8zM5 16V5h11"/></svg><span data-copy-label>Copy the install prompt</span></button>
       <a class="btn btn--ghost" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>Read the docs on GitHub</a>

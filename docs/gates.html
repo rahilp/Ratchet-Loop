@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Four gates and safeguards · Ratchet Loop</title>
-<meta name="description" content="Tests, looks right, review and your OK, in order. Hooks make sure the agent can&#x27;t skip, weaken or argue past any of them.">
+<meta name="description" content="Tests, a design check, a code review and your OK. Hooks stop the agent from skipping any of them.">
 <link rel="canonical" href="https://ratchetloop.github.io/gates.html">
 <meta name="theme-color" content="#FBFAF7">
 <meta name="color-scheme" content="light">
@@ -32,8 +32,8 @@
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="preload" as="style" data-fonts href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Newsreader:ital,wght@0,400;0,600;1,400&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'">
-<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Newsreader:ital,wght@0,400;0,600;1,400&amp;display=swap"></noscript>
+<link rel="preload" as="style" data-fonts href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300..700&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300..700&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap"></noscript>
 
 <link rel="stylesheet" href="styles.min.css">
 
@@ -68,8 +68,8 @@
   <div class="phead__bg" aria-hidden="true"><div class="hero__grid" data-depth="0.25"></div><img class="hero__draw" src="assets/blueprint.svg" alt="" width="1200" height="1200" decoding="async" data-depth="0.55"></div>
   <div class="wrap phead__inner">
     <p class="crumb"><a href="index.html#features">Features</a><span aria-hidden="true">/</span>Feature 02</p>
-    <h1 id="page-title" class="phead__title">Four gates. <em>And nothing the agent can do to skip them.</em></h1>
-    <p class="lede">Every step has to pass the same gates in the same order. Hooks in your CLI enforce the rules, so they hold even when the agent would rather move on.</p>
+    <h1 id="page-title" class="phead__title">Four gates. <em>The agent can't skip one.</em></h1>
+    <p class="lede">Every step passes the same gates in the same order. Hooks in your CLI enforce them.</p>
     <nav class="phead__jump" aria-label="On this page"><a href="#gates">The four gates</a><a href="#safeguards">Safeguards</a></nav>
   </div>
 </section>
@@ -116,40 +116,40 @@
           </g>
         </svg>
         <div class="gates__count"><span data-count>0</span> of 4 gates passed</div>
-        <p class="gates__hint">Scroll back up. It won't turn back. That's the point.</p>
+        <p class="gates__hint">Scroll back up. A ratchet doesn't turn backwards.</p>
       </div>
     </div>
     <div class="gates__list">
       <p class="kicker"><span>01</span>The four gates</p>
-      <h2 id="gates-title" class="h2">Four gates. <em>In order. No skipping.</em></h2>
-      <p class="lede">The first three run on every step. The last one is you, at the end. Work with nothing to look at, like an API change or a refactor, skips gate 2.</p>
+      <h2 id="gates-title" class="h2">Four gates. <em>Always in this order.</em></h2>
+      <p class="lede">Gates 1 to 3 run on every checkpoint. Gate 4 is you, once the feature is finished. A checkpoint with no visible change, such as an API change, skips gate 2.</p>
       <article class="gate" data-gate="1">
         <header><span class="gate__n">Gate 1</span><span class="gate__state" data-state>Waiting</span></header>
         <h3>Tests</h3>
         <dl class="gate__rule"><div><dt>Has to be true</dt><dd>Tests are written before the code. At least one fails on an assertion. Then all of them pass.</dd></div>
-        <div><dt>How it's enforced</dt><dd>Ratchet runs the tests itself and reads each planned test's own result. A test that crashed, was skipped or never ran doesn't count. None may be deleted.</dd></div></dl>
-        <ul><li>Planned tests are frozen after their first failing run. Changing one needs your OK.</li><li>A test that already passes before the code exists isn't testing anything.</li></ul>
+        <div><dt>How it's enforced</dt><dd>Ratchet runs the tests and reads each planned test's result. A test that crashed, was skipped or didn't run counts as missing. Deleting a test is refused.</dd></div></dl>
+        <ul><li>Planned tests are frozen after their first failing run. Changing one needs your OK.</li><li>A test that passes before the code exists is rejected.</li></ul>
       </article>
       <article class="gate" data-gate="2">
         <header><span class="gate__n">Gate 2</span><span class="gate__state" data-state>Waiting</span></header>
         <h3>Looks right</h3>
-        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>The screen matches the design, or the old screen if you're rebuilding one, in the same state.</dd></div>
-        <div><dt>How it's enforced</dt><dd>Both are opened in a browser, put in the same state, clicked through the same actions and screenshotted. Two reviewers list every difference. Any difference that can be fixed in code blocks the step.</dd></div></dl>
-        <ul><li>One reviewer checks how it looks. The other checks how it behaves: clicks, typing, errors.</li><li>They only see screenshots and the design file, never the code or the chat.</li><li>If the two screenshots aren't showing the same thing, the comparison is thrown out and redone.</li></ul>
+        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>The screen matches the prototype, or the old screen when rebuilding one, in the same state.</dd></div>
+        <div><dt>How it's enforced</dt><dd>Both are opened in a browser, put in the same state and screenshotted after the same actions. Two reviewers list every difference. Any difference that can be fixed in code blocks the checkpoint.</dd></div></dl>
+        <ul><li>One reviewer checks the look. The other checks behaviour: clicks, typing and errors.</li><li>Reviewers see only the screenshots and the design file. They never see the code or the chat.</li><li>If the two screenshots show different states, the comparison is redone.</li></ul>
       </article>
       <article class="gate" data-gate="3">
         <header><span class="gate__n">Gate 3</span><span class="gate__state" data-state>Waiting</span></header>
         <h3>Review</h3>
-        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>Reviewers try to break the code and find nothing serious.</dd></div>
-        <div><dt>How it's enforced</dt><dd>Rounds keep going until no reviewer has a blocking finding on the current code. A review only counts if it was signed for that exact round, or written by the agent's own reviewer.</dd></div></dl>
-        <ul><li>Every finding must say who is harmed and how, judged against the plan's objective.</li><li>Small nitpicks stop blocking after two rounds and are listed for you at the end.</li></ul>
+        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>No reviewer has a blocking finding on the current code.</dd></div>
+        <div><dt>How it's enforced</dt><dd>Review rounds repeat until that is true. A review counts only if Ratchet's review script signed it for that round, or the agent's own reviewer wrote it.</dd></div></dl>
+        <ul><li>Each finding must say which users are harmed, and how.</li><li>From round 3, minor findings stop blocking. They are listed for you at the end.</li></ul>
       </article>
       <article class="gate" data-gate="4">
         <header><span class="gate__n">Gate 4</span><span class="gate__state" data-state>Waiting</span></header>
         <h3>You</h3>
-        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>You try it and say yes.</dd></div>
-        <div><dt>How it's enforced</dt><dd>Only a real message from you counts. Messages your CLI sends on its own, like a background task finishing, are never taken as your reply.</dd></div></dl>
-        <ul><li>A thumbs-up, an "ok" or a yes with a "but" on the end doesn't count. <a href="control.html#talk">Try it yourself</a>.</li></ul>
+        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>You try the feature and approve it.</dd></div>
+        <div><dt>How it's enforced</dt><dd>Only a message you typed counts. Messages your CLI sends by itself, such as a background task finishing, are ignored.</dd></div></dl>
+        <ul><li>"ok", 👍 or "yes, but…" are not approvals. <a href="control.html#talk">Test a reply</a>.</li></ul>
       </article>
     </div>
   </div>
@@ -158,21 +158,21 @@
 <section class="band band--alt" id="safeguards" aria-labelledby="safe-title">
   <div class="wrap">
     <p class="kicker"><span>02</span>Safeguards</p>
-    <h2 id="safe-title" class="h2">Why the agent can't cheat. <em>It can only fix the problem.</em></h2>
-    <p class="lede">Ratchet installs hooks into your CLI. Hooks run on every action the agent takes, so the rules hold even when the agent would rather skip them.</p>
+    <h2 id="safe-title" class="h2">Eight safeguards. <em>Enforced by hooks.</em></h2>
+    <p class="lede">A hook is a small program your CLI runs before and after the agent acts. Ratchet's hooks check each action against these rules, so the agent can't skip a gate or lower one.</p>
     <div class="rules">
-      <div class="rule reveal"><span>R1</span><h3>Ratchet checks, it doesn't take anyone's word</h3><p>The agent doesn't get to say "tests pass". Ratchet runs them. Reviewers don't get to say "approved". Ratchet works out the verdict from what they found.</p></div>
-      <div class="rule reveal"><span>R2</span><h3>Tests come first</h3><p>A test that passes before the feature exists is rejected, because it isn't testing anything.</p></div>
-      <div class="rule reveal"><span>R3</span><h3>Tests can't disappear</h3><p>Every planned test has to still be there each time the tests run.</p></div>
-      <div class="rule reveal"><span>R4</span><h3>Any change resets the gates</h3><p>Every gate result is tied to the exact code it checked. Change the code afterwards and the gates run again.</p></div>
-      <div class="rule reveal"><span>R5</span><h3>Same state, or it doesn't count</h3><p>If two screenshots being compared aren't showing the same thing, the comparison is thrown out and redone.</p></div>
-      <div class="rule reveal"><span>R6</span><h3>Screen reviewers are kept apart</h3><p>They work in a folder that holds only the screenshots and the design file. They never see your code, your agent's instructions or the chat.</p></div>
-      <div class="rule reveal"><span>R7</span><h3>Records are protected</h3><p>A hook blocks anyone from editing Ratchet's records by hand. In Claude Code, only the right reviewer can write each review.</p></div>
-      <div class="rule reveal"><span>R8</span><h3>No quitting early</h3><p>Another hook stops the agent from ending its turn until a gate is passed, unless it's waiting for you, stuck, or paused.</p></div>
+      <div class="rule reveal"><span>R1</span><h3>Results come from Ratchet</h3><p>The agent can't report that tests pass. Ratchet runs them. Reviewers can't report approval. Ratchet decides the verdict from their findings.</p></div>
+      <div class="rule reveal"><span>R2</span><h3>Tests come first</h3><p>A test that passes before the feature exists is rejected.</p></div>
+      <div class="rule reveal"><span>R3</span><h3>Tests can't be removed</h3><p>Every planned test must still exist each time the tests run.</p></div>
+      <div class="rule reveal"><span>R4</span><h3>Changes reset the gates</h3><p>Each gate result is tied to the code it checked. If the code changes, the gates run again.</p></div>
+      <div class="rule reveal"><span>R5</span><h3>Same state or no result</h3><p>Two screenshots are only compared if they show the same state. Otherwise the comparison is redone.</p></div>
+      <div class="rule reveal"><span>R6</span><h3>Screen reviewers are isolated</h3><p>They work in a folder with only the screenshots and the design file. They never see the code, the chat or your agent's instructions.</p></div>
+      <div class="rule reveal"><span>R7</span><h3>Records are protected</h3><p>Ratchet's records can't be edited by hand. In Claude Code, each review can only be written by its assigned reviewer.</p></div>
+      <div class="rule reveal"><span>R8</span><h3>No stopping early</h3><p>The agent can't end its turn while a gate is open, unless it is waiting for you, stuck or paused.</p></div>
     </div>
 
-    <h3 class="sub">What each CLI enforces today</h3>
-    <p class="sub-lede">The four CLIs don't all give hooks the same view. Ratchet is honest about the gaps.</p>
+    <h3 class="sub">What each CLI enforces</h3>
+    <p class="sub-lede">Hooks see different things in each CLI, so some checks only run in Claude Code.</p>
     <div class="matrix reveal" role="table" aria-label="What each CLI enforces">
       <div class="matrix__row matrix__row--head" role="row"><span role="columnheader">Check</span><span role="columnheader">Claude Code</span><span role="columnheader">Codex</span><span role="columnheader">Gemini CLI</span><span role="columnheader">Copilot CLI</span></div>
       <div class="matrix__row" role="row"><b role="rowheader">Records protected from hand-edits</b><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i></div>
@@ -181,7 +181,7 @@
       <div class="matrix__row" role="row"><b role="rowheader">Confirms which reviewer wrote a review</b><i class="y" role="cell">Yes</i><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="n" role="cell">No</i></div>
       <div class="matrix__row" role="row"><b role="rowheader">Refuses sub-agents launched without the plan's objective</b><i class="y" role="cell">Yes</i><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="n" role="cell">No</i></div>
     </div>
-    <p class="fine">On every CLI, a review from another AI tool counts only when Ratchet's own review script signed it for that round. A review that was typed, copied or edited by hand is refused.</p>
+    <p class="fine">In every CLI, a review from another AI tool counts only if Ratchet's review script signed it for that round. Reviews typed, copied or edited by hand are refused.</p>
   </div>
 </section>
 <nav class="pnext wrap" aria-label="More features"><a class="pnext__link " href="how-it-works.html"><span>Previous feature</span><b>How it works</b></a><a class="pnext__link pnext__link--next" href="reviewers.html"><span>Next feature</span><b>A second opinion</b></a></nav>
@@ -189,8 +189,8 @@
 <section class="cta" aria-labelledby="cta-title">
   <div class="wrap cta__card">
     <svg class="cta__mark" viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke-linejoin="round" stroke-linecap="round" stroke-width="2.0"><path stroke="#3E6FC4" stroke-opacity=".55" stroke-width="1.20" stroke-dasharray="5 2 1 2" d="M1.5,37 H55.5 M28.5,10 V64"/><circle stroke="#3E6FC4" stroke-opacity=".6" stroke-width="1.20" cx="28.5" cy="37" r="14.8"/><path stroke="#3E6FC4" d="M40.54,23.62 L35.06,14.43 L33.34,14.24 L32.24,19.39 L22.89,14.18 L21.31,14.87 L22.94,19.88 L12.23,20.04 L11.21,21.43 L15.12,24.96 L5.93,30.44 L5.74,32.16 L10.89,33.26 L5.68,42.61 L6.37,44.19 L11.38,42.56 L11.54,53.27 L12.93,54.29 L16.46,50.38 L21.94,59.57 L23.66,59.76 L24.76,54.61 L34.11,59.82 L35.69,59.13 L34.06,54.12 L44.77,53.96 L45.79,52.57 L41.88,49.04 L51.07,43.56 L51.26,41.84 L46.11,40.74 L51.32,31.39 L50.63,29.81 L45.62,31.44 L45.46,20.73 L44.07,19.71Z"/><circle stroke="#3E6FC4" cx="28.5" cy="37" r="4.2"/><path stroke="#E8572A" d="M33.91,7.11 L38.05,20.29 L40.95,23.18 L42.13,21.15 L40.55,5.64Z"/><circle stroke="#E8572A" fill="#FBFAF7" cx="37.23" cy="6.38" r="3.6"/><circle fill="#E8572A" stroke="none" cx="37.23" cy="6.38" r="1.2"/></g></svg>
-    <h2 id="cta-title" class="cta__title">Stop taking <em>done</em> on faith.</h2>
-    <p class="lede">One message to install. One sentence to build. Proof at every step.</p>
+    <h2 id="cta-title" class="cta__title">Know it works <em>before you merge.</em></h2>
+    <p class="lede">Paste one prompt to install. Describe a feature to build it.</p>
     <div class="hero__ctas">
       <button class="btn btn--primary" type="button" data-copy="Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI."><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" d="M8 8h11v11H8zM5 16V5h11"/></svg><span data-copy-label>Copy the install prompt</span></button>
       <a class="btn btn--ghost" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>Read the docs on GitHub</a>

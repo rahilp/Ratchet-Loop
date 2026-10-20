@@ -5,10 +5,10 @@
   const reduce = matchMedia('(prefers-reduced-motion: reduce)');
   const saveData = navigator.connection && navigator.connection.saveData;
 
-  // reveal the hero once the display face is in, so the serif headline never reflows in view
+  // reveal the hero once the display face is in, so the headline never reflows in view
   const fontsIn = new Promise(res => {
     const link = document.querySelector('link[data-fonts]');
-    const go = () => Promise.all([document.fonts.load('400 64px Newsreader'), document.fonts.load('italic 400 64px Newsreader'), document.fonts.load('400 17px Inter')]).then(res, res);
+    const go = () => Promise.all([document.fonts.load('600 64px Inter'), document.fonts.load('400 17px Inter')]).then(res, res);
     if (!link || !document.fonts) return res();
     if (link.rel === 'stylesheet' && link.sheet) go(); else link.addEventListener('load', () => setTimeout(go, 0), { once: true });
   });
@@ -175,14 +175,14 @@
     const STAGE_MS = 2800;
     const NAMES = ['Plan tests', 'Write tests', 'Red', 'Build', 'Green', 'Looks right', 'Review', 'Lock'];
     const TEXT = [
-      'The test planner writes test cases before any code exists: the normal path, edge cases, permissions and what should happen when things go wrong.',
-      'The test writer turns those cases into real tests you can run, each tagged with its case number. There is still no code for the feature.',
-      'Ratchet runs the tests itself. At least one has to fail for the right reason, because there is no code yet. A test that crashed or was skipped doesn’t count. From here the planned tests are frozen.',
-      'The implementer writes the code for exactly this step, until the tests pass. It is never allowed to change the tests.',
-      'Every planned test has to pass. Ratchet reads each result one by one and checks that none were deleted.',
-      'This step changes a screen, so two reviewers compare screenshots of the real app and the prototype in the same state. One checks the look, one checks the behaviour. Any fixable difference blocks.',
-      'Reviewers, from another company when one is installed, try to break the code. The fixer answers every finding, and rounds repeat until nobody has anything serious left.',
-      'The step becomes its own git commit. The ratchet clicks forward one tooth and the next step starts. You sign off on the whole feature at the end.'
+      'The test planner writes test cases before any code exists. They cover the normal path, edge cases, permissions and errors.',
+      'The test writer turns each case into a runnable test, tagged with its case ID. There is no feature code yet.',
+      'Ratchet runs the tests. At least one must fail on an assertion. A test that crashes or is skipped does not count. From here on, the planned tests are frozen.',
+      'The implementer writes code for this checkpoint only, until the tests pass. It cannot edit the tests.',
+      'All planned tests must pass. Ratchet reads each result and checks that no test was deleted.',
+      'Two reviewers compare screenshots of the app and the prototype, in the same state. One checks the look, the other checks the behaviour. Any fixable difference blocks.',
+      'Reviewers try to break the code. The fixer answers each finding, then the next round starts. Rounds repeat until no blocking findings remain.',
+      'The checkpoint becomes one git commit, and the next checkpoint starts. You approve the whole feature at the end.'
     ];
     const boxes = [...sim.querySelectorAll('[data-stage]')];
     const text = sim.querySelector('[data-sim-text]');
@@ -265,8 +265,8 @@
       out.classList.add('is-no');
       const starts = ACCEPT.find(a => core.startsWith(a));
       out.textContent = starts
-        ? '✕ Not a yes. Something is attached after it, so nothing is approved. The agent answers what you said and asks again.'
-        : '✕ Not a yes. Nothing is approved. The agent answers what you said, or makes the change you asked for, then asks again.';
+        ? '✕ Not a yes. There is more after it, so nothing is approved. The agent replies and asks again.'
+        : '✕ Not a yes. Nothing is approved. The agent replies or makes your change, then asks again.';
     };
     input.addEventListener('input', judge);
     yes.querySelectorAll('[data-yes-try]').forEach(b => b.addEventListener('click', () => { input.value = b.dataset.yesTry; judge(); input.focus(); }));

@@ -1,8 +1,8 @@
 <section class="band" id="cost" aria-labelledby="cost-title">
   <div class="wrap">
     <p class="kicker"><span>09</span>Cost and budgets</p>
-    <h2 id="cost-title" class="h2">Checking costs more than not checking. <em>Ratchet keeps the bill in your hands.</em></h2>
-    <p class="lede">Proving every step uses more AI time than letting an agent write code unchecked. So Ratchet puts hard limits on how much review can happen, spends it where the risk is, and never spends your money on a pay-per-use tool without your exact OK.</p>
+    <h2 id="cost-title" class="h2">Checking costs more. <em>You set the limit.</em></h2>
+    <p class="lede">Reviewing every step uses more AI time than letting the agent run unchecked. Ratchet caps the number of review rounds, spends more on risky steps and less on safe ones, and never uses a pay-per-use tool unless you say so.</p>
 
     <div class="budget reveal">
       <div class="budget__head">
@@ -16,7 +16,7 @@
         <li><span class="budget__cp">CP3</span><span class="budget__bar" role="img" aria-label="2 of 6 rounds"><i style="--w:33.3%"></i></span><span class="budget__n">2 / 6</span><span class="budget__note">round 2 asked back only the reviewer with an open finding</span></li>
         <li class="is-hot"><span class="budget__cp">CP4</span><span class="budget__bar" role="img" aria-label="4 of 6 rounds so far"><i style="--w:66.7%"></i></span><span class="budget__n">4 / 6</span><span class="budget__note">high risk · 4 reviewers · still going</span></li>
       </ol>
-      <p class="budget__foot">When a step reaches its limit, or the run reaches 30, the run stops and asks you. Raising a step's limit is offered last, once per step, and only with your own reason. The run-wide limit is only ever raised by you.</p>
+      <p class="budget__foot">When a step hits its limit, or the run hits 30, Ratchet stops and asks you what to do. Only you can raise the limit for the whole run.</p>
     </div>
 
     <div class="caps">
@@ -28,15 +28,15 @@
     <p class="fine">Default limits. You can change any of them in <code>.ratchet/config.json</code>.</p>
 
     <div class="rules rules--cost">
-      <div class="rule reveal"><span>C1</span><h3>Reviewers match the risk</h3><p>Low-risk steps get one reviewer, and only serious findings block. Normal steps get two, high-risk steps four. You see each step's risk in the plan before you approve it.</p></div>
-      <div class="rule reveal"><span>C2</span><h3>The right model for each job</h3><p>Planning, coding, fixing and reviewing use a strong model. Lighter jobs like planning tests use a cheaper one, and running tests the cheapest. Ask the agent to list them, or change them in the config.</p></div>
-      <div class="rule reveal"><span>C3</span><h3>Subscriptions first</h3><p>Tools you already pay a flat rate for are tried first. A tool that charges per use isn't sent even a test request until you reply <code>pay per use: &lt;model&gt;</code> for that exact model.</p></div>
-      <div class="rule reveal"><span>C4</span><h3>Later rounds cost less</h3><p>Round 1 asks every reviewer. After that, only reviewers with an open serious finding are asked back. A small fix after approval, 20 changed lines or fewer, gets one reviewer unless the step is high risk.</p></div>
-      <div class="rule reveal"><span>C5</span><h3>Nitpicks don't buy rounds</h3><p>From round 3, minor findings stop blocking. They're saved and listed for you at the end, where you decide which to fix.</p></div>
-      <div class="rule reveal"><span>C6</span><h3>No paying twice</h3><p>Two slots that would reach the same company, model and kind of review run once. A round replaced before anyone reviewed it is free, and one flaky test failure costs no attempt.</p></div>
-      <div class="rule reveal"><span>C7</span><h3>No paying for tools that are down</h3><p>A signed-out tool is skipped for six hours. One that says it's out of credits waits for the reset time it gave. What Ratchet learns is shared by every project on your machine.</p></div>
-      <div class="rule reveal"><span>C8</span><h3>Repeat mistakes get cheap</h3><p>When reviewers flag the same kind of mistake twice, the agent offers an automatic check like a lint rule. From then on it's caught in seconds, before any reviewer is paid to find it.</p></div>
+      <div class="rule reveal"><span>C1</span><h3>Reviewers match the risk</h3><p>Low-risk steps get one reviewer. Normal steps get two. High-risk steps get four. The plan shows each step's risk before you approve it.</p></div>
+      <div class="rule reveal"><span>C2</span><h3>The right model for each job</h3><p>Planning, coding and reviewing use a strong model. Writing test plans uses a cheaper one. Running tests uses the cheapest. You can change any of them in the config.</p></div>
+      <div class="rule reveal"><span>C3</span><h3>Subscriptions first</h3><p>Tools you already pay a flat monthly rate for are used first. A pay-per-use tool gets nothing, not even a test call, until you reply <code>pay per use: &lt;model&gt;</code>.</p></div>
+      <div class="rule reveal"><span>C4</span><h3>Later rounds cost less</h3><p>Round 1 asks every reviewer. After that, only reviewers with an open problem are asked back. A small fix of 20 lines or fewer gets one reviewer.</p></div>
+      <div class="rule reveal"><span>C5</span><h3>Small notes don't block</h3><p>From round 3, minor findings no longer hold up a step. They are listed at the end and you decide which to fix.</p></div>
+      <div class="rule reveal"><span>C6</span><h3>No paying twice</h3><p>If two reviewers would be the same model doing the same review, it runs once. A single flaky test failure does not use up an attempt.</p></div>
+      <div class="rule reveal"><span>C7</span><h3>No paying for tools that are down</h3><p>A signed-out tool is skipped for six hours. A tool that is out of credits is skipped until its reset time. Every project on your machine shares this list.</p></div>
+      <div class="rule reveal"><span>C8</span><h3>Repeat mistakes get a rule</h3><p>If reviewers flag the same mistake twice, the agent offers to add a check, like a lint rule. After that it is caught in seconds, before a reviewer is paid to find it.</p></div>
     </div>
-    <p class="fine">Ratchet counts rounds and attempts, not dollars. The proof receipt reports time per step, never cost or tokens, so check your providers' dashboards for spend.</p>
+    <p class="fine">Ratchet counts rounds and attempts, not dollars. For what you spent, check your AI provider's dashboard.</p>
   </div>
 </section>

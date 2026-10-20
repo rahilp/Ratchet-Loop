@@ -1,8 +1,8 @@
 <section class="band band--alt" id="viewer" aria-labelledby="viewer-title">
   <div class="wrap">
     <p class="kicker"><span>04</span>The viewer</p>
-    <h2 id="viewer-title" class="h2">Every run gets its own page. <em>Watch it happen, step by step.</em></h2>
-    <p class="lede">Each run writes a viewer: one web page with the plan, every planned test, every review round and every commit, kept up to date as the agent works. You don't need it, because everything also shows up in your chat. It's there when you want the whole picture at once.</p>
+    <h2 id="viewer-title" class="h2">One page per run. <em>Updated as it works.</em></h2>
+    <p class="lede">Every run writes a viewer. It is a single web page with the plan, the tests, each review round and each commit. Everything also shows up in your chat. The viewer is for when you want to see the whole run at once.</p>
 
     <div class="shot reveal" data-shot>
       <div class="shot__bar">
@@ -27,13 +27,13 @@
     </div>
 
     <div class="facts facts--3">
-      <div class="fact reveal"><h3>What's on it</h3><p>A progress bar with one segment per step. Each step's four gates as chips: Tests, Look and feel, Second opinion, Your OK. What "done" means, the planned tests by ID, who reviewed each round, and the evidence and commit for every finished step.</p></div>
-      <div class="fact reveal"><h3>How to open it</h3><p>Say <q>Give me the viewer link, and open it if you can.</q> It's a single file in your project at <code>.ratchet/runs/&lt;run&gt;/viewer.html</code>. When Ratchet's small server is running, it refreshes on its own every few seconds and shows "live".</p></div>
-      <div class="fact reveal"><h3>More than one tab</h3><p>Activity is a time-stamped feed of the run. Learnings shows your saved lessons. New screens link to the clickable prototype, and spec-driven runs show which scenarios are proven so far.</p></div>
+      <div class="fact reveal"><h3>What's on it</h3><p>A progress bar with one segment per step. The four gates for each step: Tests, Look and feel, Second opinion and Your OK. What "done" means, the planned tests, who reviewed each round, and the proof and commit for each finished step.</p></div>
+      <div class="fact reveal"><h3>How to open it</h3><p>Ask the agent for the viewer link. The file is at <code>.ratchet/runs/&lt;run&gt;/viewer.html</code> in your project. If Ratchet's local server is on, the page refreshes every 3 seconds.</p></div>
+      <div class="fact reveal"><h3>Other tabs</h3><p>Activity is a timeline of the run. Learnings lists lessons saved from past runs. New screens link to a clickable prototype. Runs built from a spec show which scenarios pass so far.</p></div>
     </div>
     <details class="expand">
       <summary>Can I share it with my team?</summary>
-      <p>Yes, on your own network. Ask the agent to serve the viewer for others to see. It gives you a link with a private token in it, and requests without that token are refused. The page follows light or dark mode, and has its own theme switch.</p>
+      <p>Yes, on your own network. Ask the agent to share the viewer. You get a link with a private token. Anyone without the token is turned away.</p>
     </details>
   </div>
 </section>

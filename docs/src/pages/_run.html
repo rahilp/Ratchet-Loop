@@ -1,8 +1,8 @@
 <section class="band" id="run" aria-labelledby="run-title">
   <div class="wrap">
     <p class="kicker"><span>03</span>A whole run</p>
-    <h2 id="run-title" class="h2">From one sentence <em>to a finished feature.</em></h2>
-    <p class="lede">Here is everything that happens, in order. You're needed twice: once to OK the plan, and once at the end. Step through it, or let it play.</p>
+    <h2 id="run-title" class="h2">One run. <em>Six stages.</em></h2>
+    <p class="lede">A run is one feature, from your request to your sign-off. You take part in two stages: the plan and the sign-off.</p>
 
     <div class="player reveal" data-player="run" data-ms="5200">
       <div class="player__head">
@@ -32,9 +32,9 @@
             </div>
           </div>
           <div class="scene__text">
-            <h3>You ask, in your own words</h3>
-            <p>That's all you type. Keep it to one feature. Something you can explain in a few sentences usually becomes three to eight steps. If it's bigger, split it.</p>
-            <p class="scene__note">The agent may ask a few quick questions first, instead of guessing.</p>
+            <h3>You ask</h3>
+            <p>Describe one feature in a sentence or two. That usually becomes three to eight checkpoints. If it would need more, split it into two features.</p>
+            <p class="scene__note">If something is unclear, the agent asks instead of guessing.</p>
           </div>
         </div>
         <!-- 02 -->
@@ -49,8 +49,8 @@
             </ul>
           </div>
           <div class="scene__text">
-            <h3>It checks a few things on its own</h3>
-            <p>Are the hooks working? Which other AI tools are installed that could review? Has your team already written a spec for this? If something would get in the way, like the app not starting, no way to run tests, or unsaved changes, it tells you in one message and offers to fix each one.</p>
+            <h3>Quick checks</h3>
+            <p>Before planning, the agent checks that Ratchet's hooks work, which other AI tools can review, whether a spec already exists, and whether the app starts and the tests run. Anything in the way is listed in one message, with an offer to fix it.</p>
           </div>
         </div>
         <!-- 03 -->
@@ -74,9 +74,9 @@
             </div>
           </div>
           <div class="scene__text">
-            <h3>You read the plan and say yes</h3>
-            <p>It opens with the objective: who it's for, what they want, what done means, and what's out of scope. Every step, reviewer and finding points back to it. Each step says what "done" means, whether its look is checked, how risky it is and who reviews it.</p>
-            <p>New screens come with a clickable prototype, so you see the result before anything is built. Once you say yes, the plan, the design file and the prototype are locked.</p>
+            <h3>The plan</h3>
+            <p>The plan starts with the objective: who the feature is for, what they need, what done means and what is out of scope. Then it lists the checkpoints. Each one has a done-when list, a risk level and its reviewers.</p>
+            <p>New screens come with a clickable prototype. When you approve, the plan, the design file and the prototype are locked.</p>
           </div>
         </div>
         <!-- 04 -->
@@ -90,9 +90,9 @@
             </ol>
           </div>
           <div class="scene__text">
-            <h3>Now you can walk away</h3>
-            <p>For each step, the agent writes the tests first and makes sure they fail. Then it writes the code until they pass. Then reviewers go looking for problems, and anything they find gets fixed and checked again.</p>
-            <p>Every finished step becomes its own git commit, and you get a one-line update as each one lands.</p>
+            <h3>Building</h3>
+            <p>Checkpoints are built one at a time. Tests come first and must fail. Then the code is written until they pass. Then reviewers look for problems, and each one is fixed and checked again.</p>
+            <p>Each finished checkpoint is its own git commit. You get a one-line update for each.</p>
           </div>
         </div>
         <!-- 05 -->
@@ -105,9 +105,9 @@
             </div>
           </div>
           <div class="scene__text">
-            <h3>If a step gets stuck, it asks you</h3>
-            <p>Each gate gets a limited number of tries. When they run out, the run stops. The agent quotes the problem and gives you two or three options, labelled A, B and C, with the one it recommends. Just reply with the letter.</p>
-            <p>Nothing gets lowered or skipped unless you pick it.</p>
+            <h3>If it gets stuck</h3>
+            <p>Each gate has a limited number of tries. When they run out, the run stops. The agent quotes the problem and offers two or three options, labelled A, B and C, and marks the one it recommends. You reply with a letter.</p>
+            <p>A check is only lowered or skipped if you choose that option.</p>
           </div>
         </div>
         <!-- 06 -->
@@ -120,18 +120,18 @@
             </div>
           </div>
           <div class="scene__text">
-            <h3>You try it and sign off</h3>
-            <p>When everything is built, the agent tells you what to try. It also lists any small issues the reviewers noted but didn't hold things up for, and asks if you want any fixed.</p>
-            <p>Say "approved" if you're happy. If not, say what's wrong in your own words. Your changes become new steps, through the same gates.</p>
+            <h3>Sign-off</h3>
+            <p>When every checkpoint is done, the agent tells you what to try. It also lists minor issues the reviewers noted, and asks whether you want any of them fixed.</p>
+            <p>Reply "approved" to finish. Otherwise, describe what's wrong. Your changes become new checkpoints and go through the same gates.</p>
           </div>
         </div>
       </div>
-      <p class="player__status"><span class="dot" aria-hidden="true"></span><span data-status></span><span class="player__fine">Example run. Real runs show the same steps in your chat.</span></p>
+      <p class="player__status"><span class="dot" aria-hidden="true"></span><span data-status></span><span class="player__fine">Illustrative example</span></p>
     </div>
 
     <details class="expand">
-      <summary>Prefer to check every step yourself, or not be asked at all?</summary>
-      <p>Just say so. By default you're asked twice: the plan and the end. You can ask to approve every step, or to only check in at the end after the plan. You can also say "pause" at any time and "carry on" later, even from a new chat.</p>
+      <summary>Can I approve every checkpoint instead?</summary>
+      <p>Yes. By default you approve the plan and the finished feature. You can ask to approve every checkpoint instead. You can also say "pause" at any time and "carry on" later, even from a new chat.</p>
     </details>
   </div>
 </section>

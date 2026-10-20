@@ -10,8 +10,8 @@ All asset paths are relative, so the same files also work from this repository's
 
 ## Edit
 
-- Copy and layout: `src/index.template.html`, then run `python3 docs/src/build.py` to regenerate `index.html`. The build script also draws the ratchet wheel, pawl, logo, favicon and gear art, writes the FAQ and its structured data, and builds the "What it sets up" and agents grids (each agent panel quotes the real definition from `agents/*.md`). Re-run it after changing an agent's frontmatter.
-- Styles: `styles.css`. Colours and fonts are tokens at the top.
+- Copy and layout: the page parts in `src/pages/` (`home.html`, `_hero.html` and one `_<section>.html` per section). The feature list, FAQ, agents and setup files are data in `src/build.py`. Run `python3 docs/src/build.py` to regenerate the home page, the eight feature pages, `install.html`, the sitemap and `styles.min.css`. The build also draws the ratchet wheel, logo and favicon, and quotes each agent's real definition from `agents/*.md`, so re-run it after changing an agent's frontmatter.
+- Styles: `styles.css`. Colours, fonts and the type scale (`--fs-*`) are tokens at the top. Headings and body use Inter; JetBrains Mono is only for code, file names and IDs.
 - Behaviour: `main.js` (parallax, the one-way scroll ratchet, the equation replay, the run walkthrough, the checkpoint simulator, the card grids, the yes checker, mobile menu, video source choice, copy buttons).
 
 ## Files
