@@ -32,8 +32,8 @@
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="preload" as="style" data-fonts href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,300..900&family=JetBrains+Mono:wght@400;600&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,300..900&family=JetBrains+Mono:wght@400;600&display=swap"></noscript>
+<link rel="preload" as="style" data-fonts href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,300..900&family=JetBrains+Mono:wght@400;600&family=Newsreader:ital,opsz,wght@0,6..72,400..600;1,6..72,400..600&display=swap" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,300..900&family=JetBrains+Mono:wght@400;600&family=Newsreader:ital,opsz,wght@0,6..72,400..600;1,6..72,400..600&display=swap"></noscript>
 <link rel="preload" as="image" href="assets/hero-poster.avif" type="image/avif" fetchpriority="high">
 <link rel="stylesheet" href="styles.min.css">
 
@@ -52,16 +52,21 @@
     <svg class="brand__mark" viewBox="0 0 64 64" aria-hidden="true">{{MARK}}</svg>
     <span class="brand__word">Ratchet<span>Loop</span></span>
   </a>
-  <nav class="nav__links" aria-label="Primary">
-    <a href="#loop">How it works</a>
-    <a href="#gates">The gates</a>
-    <a href="#reviewers">Reviewers</a>
-    <a href="#install">Install</a>
+  <nav class="nav__links" id="menu" aria-label="Primary" data-menu>
+    <a href="#idea"><span>01</span>The idea</a>
+    <a href="#checkpoint"><span>02</span>One checkpoint</a>
+    <a href="#gates"><span>03</span>Gates</a>
+    <a href="#team"><span>04</span>Agents</a>
+    <a href="#install"><span>07</span>Install</a>
   </nav>
-  <a class="btn btn--ghost btn--sm" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener">
-    <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-    <span>GitHub</span>
-  </a>
+  <div class="nav__end">
+    <a class="icon-btn" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener" aria-label="Code on GitHub" title="Code on GitHub">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>
+    </a>
+    <button class="icon-btn nav__toggle" type="button" aria-controls="menu" aria-expanded="false" aria-label="Open menu" data-menu-toggle>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+  </div>
 </header>
 
 <main id="main">
@@ -83,20 +88,23 @@
   <div class="hero__scrim" aria-hidden="true"></div>
 
   <div class="hero__content wrap" data-depth="-0.12">
-    <p class="eyebrow"><span class="dot" aria-hidden="true"></span>For Claude Code · Codex · Gemini CLI · Copilot CLI</p>
+    <p class="eyebrow"><svg viewBox="0 0 64 64" aria-hidden="true">{{MARK}}</svg>Checkpoint-and-gate build loop</p>
     <h1 id="hero-title" class="hero__title">
-      <span class="hero__line hero__line--dim">Your agent says it works.</span>
-      <span class="hero__line">Ratchet makes it prove&nbsp;it<span class="tick">.</span></span>
+      <span class="hero__line"><b>Ratchet Loop:</b> building with AI agents</span>
+      <em class="hero__line">one proven step at a time</em>
     </h1>
-    <p class="hero__lede">You describe a feature. Your agent splits it into small checkpoints and builds them one at a time. Each one has to get through four gates before the next starts. If a gate fails, the agent fixes it and tries again. It can't argue its way past.</p>
+    <p class="hero__tag"><span>Your agent says it works.</span> <strong>Ratchet makes it prove&nbsp;it<i>.</i></strong></p>
     <div class="hero__ctas">
-      <button class="btn btn--hot" type="button" data-copy="Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI.">
+      <a class="btn btn--hot" href="#idea">Explore the loop
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M5 12h14M13 6l6 6-6 6"/></svg></a>
+      <a class="btn btn--ghost" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>Code</a>
+      <button class="btn btn--ghost" type="button" data-copy="Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI.">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" d="M8 8h11v11H8zM5 16V5h11"/></svg>
-        <span data-copy-label>Copy the install prompt</span>
+        <span data-copy-label>Copy install prompt</span>
       </button>
-      <a class="btn btn--ghost" href="#loop">See how it works</a>
     </div>
-    <p class="hero__note">Paste it into your agent. No commands to learn.</p>
+    <p class="hero__meta">Claude Code <i>·</i> Codex <i>·</i> Gemini CLI <i>·</i> GitHub Copilot CLI</p>
   </div>
 
   <div class="hero__ticker" aria-hidden="true">
@@ -111,87 +119,158 @@
   </div>
 </section>
 
-<!-- ============ THESIS ============ -->
-<section class="thesis wrap" aria-labelledby="thesis-title">
+<!-- two levels, like a paper's two contributions -->
+<div class="levels wrap">
+  <div class="levels__item reveal">
+    <span class="levels__n">01</span>
+    <div><p class="mono-k">Checkpoint level</p><p>Each step has to prove itself before the next one starts</p></div>
+  </div>
+  <div class="levels__item reveal">
+    <span class="levels__n">02</span>
+    <div><p class="mono-k">Run level</p><p>Every lesson you give is carried into the next run</p></div>
+  </div>
+</div>
+
+<!-- ============ 01 THE IDEA ============ -->
+<section class="band" id="idea" aria-labelledby="idea-title">
   <img class="float float--a" src="assets/gear-outline.svg" alt="" width="400" height="400" data-depth="0.5" aria-hidden="true" loading="lazy">
-  <p class="kicker">The problem</p>
-  <h2 id="thesis-title" class="h2">Fast was never the problem. <em>Unproven</em> is.</h2>
-  <div class="thesis__grid">
-    <div class="thesis__item reveal">
-      <span class="num">01</span>
-      <h3>It says done</h3>
-      <p>AI coding agents are quick. They'll also tell you something works when it doesn't, and sound sure about it.</p>
-    </div>
-    <div class="thesis__item reveal">
-      <span class="num">02</span>
-      <h3>You find out late</h3>
-      <p>The bug turns up at the end, under three more features built on top of it. Now it's expensive.</p>
-    </div>
-    <div class="thesis__item reveal">
-      <span class="num">03</span>
-      <h3>Ratchet moves one way</h3>
-      <p>Each step locks before the next begins. Progress only clicks forward. Nothing slips back.</p>
-    </div>
-  </div>
-</section>
-
-<!-- ============ THE LOOP ============ -->
-<section class="loop" id="loop" aria-labelledby="loop-title">
   <div class="wrap">
-    <p class="kicker">How it works</p>
-    <h2 id="loop-title" class="h2">You talk to your agent like normal. <em>It runs Ratchet for you.</em></h2>
+    <p class="kicker"><span>01</span>The idea</p>
+    <h2 id="idea-title" class="h2">The agent writes the code. <em>Ratchet makes it earn the commit.</em></h2>
+    <p class="lede">AI coding agents are fast, and they'll tell you something works when it doesn't. Ratchet splits your feature into small checkpoints and puts four gates in front of each one. The agent can only move on once Ratchet itself has checked the proof. Its word doesn't count.</p>
+
+    <figure class="eq reveal" data-eq aria-label="Done equals code plus proof">
+      <div class="eq__head">
+        <p class="eq__title">Done = Code + Proof. <em>A checkpoint locks only when both are there.</em></p>
+        <button class="pill" type="button" data-eq-replay><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 12a8 8 0 1 0 2.4-5.7M4 4v4h4"/></svg>Replay</button>
+      </div>
+      <div class="eq__row">
+        <div class="eq__card" data-eq-step="1">
+          <span class="eq__icon eq__icon--code" aria-hidden="true"><svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5"/></svg></span>
+          <div><h3>Code</h3><p>Written by your agent · fast</p></div>
+        </div>
+        <span class="eq__op" data-eq-step="2" aria-hidden="true">+</span>
+        <div class="eq__card" data-eq-step="2">
+          <span class="eq__icon eq__icon--gates" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <div><h3>Proof</h3><p>Four gates · checked by Ratchet</p></div>
+        </div>
+      </div>
+      <span class="eq__op eq__op--eq" data-eq-step="3" aria-hidden="true">=</span>
+      <div class="eq__result" data-eq-step="3">
+        <span class="eq__orbit" aria-hidden="true"><svg viewBox="0 0 64 64">{{MARK}}</svg></span>
+        <div><h3>Locked checkpoint</h3><p>One commit · it can't slip back</p></div>
+      </div>
+      <div class="eq__inner" data-eq-step="4">
+        <p class="mono-k">Ratchet Loop <span>· around every checkpoint</span></p>
+        <div class="eq__flow">
+          <p><b>01</b> A gate fails <span aria-hidden="true">→</span> the agent fixes it and tries again</p>
+          <p><b>02</b> Every gate passes <span aria-hidden="true">→</span> lock it and start the next</p>
+          <p><b>03</b> Tries run out <span aria-hidden="true">→</span> stop and ask you, with options</p>
+        </div>
+        <p class="eq__becomes" aria-hidden="true">Becomes ↓</p>
+        <p class="eq__final"><em>A feature you can trust</em><span>small steps · proof at every one</span></p>
+      </div>
+    </figure>
+
+    <h3 class="sub">What you do</h3>
+    <ol class="loop__track">
+      <li class="loop__step reveal"><span class="loop__n">1</span><h3>Describe it</h3><p>One sentence or two. <q>Use Ratchet to build this feature: managers can approve or reject leave requests, with a reason.</q></p></li>
+      <li class="loop__step reveal"><span class="loop__n">2</span><h3>Approve the plan</h3><p>The objective, the steps, what done means, the risk and who reviews. New screens come with a clickable prototype. Say yes and it locks.</p></li>
+      <li class="loop__step reveal"><span class="loop__n">3</span><h3>Walk away</h3><p>Every finished step becomes its own commit, and you get a one-line update as each one lands.</p></li>
+      <li class="loop__step reveal"><span class="loop__n">4</span><h3>Try it, sign off</h3><p>Say <q>approved</q> if you're happy. If not, say what's wrong. Your feedback becomes new steps through the same gates.</p></li>
+    </ol>
+    <p class="loop__twice reveal"><strong>You're needed twice.</strong> Once to OK the plan, once at the end.</p>
   </div>
-  <ol class="loop__track wrap">
-    <li class="loop__step reveal">
-      <span class="loop__n">1</span>
-      <h3>Describe it</h3>
-      <p>One sentence or two. <q>Use Ratchet to build this feature: managers can approve or reject leave requests, with a reason.</q></p>
-    </li>
-    <li class="loop__step reveal">
-      <span class="loop__n">2</span>
-      <h3>Approve the plan</h3>
-      <p>The objective, the steps, what done means, the risk and who reviews. New screens come with a clickable prototype. Say yes and it locks.</p>
-    </li>
-    <li class="loop__step reveal">
-      <span class="loop__n">3</span>
-      <h3>Walk away</h3>
-      <p>Tests first, and they must fail. Then code until they pass. Then reviewers go looking for problems. Every finished step is its own commit.</p>
-    </li>
-    <li class="loop__step reveal">
-      <span class="loop__n">4</span>
-      <h3>Try it, sign off</h3>
-      <p>Say <q>approved</q> if you're happy. If not, say what's wrong in your own words. Your feedback becomes new steps through the same gates.</p>
-    </li>
-  </ol>
-  <p class="loop__twice wrap reveal"><strong>You're needed twice.</strong> Once to OK the plan, once at the end.</p>
 </section>
 
-<!-- ============ GATES (sticky ratchet) ============ -->
-<section class="gates" id="gates" aria-labelledby="gates-title">
+<!-- ============ 02 ONE CHECKPOINT ============ -->
+<section class="band band--alt" id="checkpoint" aria-labelledby="cp-title">
+  <div class="wrap">
+    <p class="kicker"><span>02</span>One checkpoint</p>
+    <h2 id="cp-title" class="h2">Tests first. <em>Then the code has to catch up.</em></h2>
+    <p class="lede">Every checkpoint goes through the same eight stages. Let it play, or step through it yourself.</p>
+
+    <div class="sim reveal" data-sim>
+      <div class="sim__head">
+        <p class="mono-k"><span class="sim__badge" aria-hidden="true">✳</span>The checkpoint loop</p>
+        <h3 class="sim__title">One checkpoint, from first test to lock.</h3>
+        <div class="sim__ctrls">
+          <button class="ctrl" type="button" data-sim-play aria-pressed="true"><span data-sim-play-label>Pause</span></button>
+          <button class="ctrl" type="button" data-sim-step>→ Step</button>
+          <button class="ctrl" type="button" data-sim-replay>↻ Replay</button>
+        </div>
+      </div>
+
+      <div class="sim__stream">
+        <div class="sim__streamhead"><p class="mono-k">Run · leave-approvals</p><span class="tag">Illustrative</span></div>
+        <ol class="stream" aria-label="Checkpoints in this run">
+          <li class="is-done"><b>CP1</b><span>Locked</span></li>
+          <li class="is-done"><b>CP2</b><span>Locked</span></li>
+          <li class="is-now" data-sim-cp="3"><b>CP3</b><span data-sim-cp-state>Current</span></li>
+          <li data-sim-cp="4"><b>CP4</b><span data-sim-cp-state>Up next</span></li>
+        </ol>
+      </div>
+
+      <div class="sim__body">
+        <div class="sim__task">
+          <p class="mono-k">CP3 <span>· risk normal · 2 reviewers · has a screen</span></p>
+          <p class="sim__taskname">Reject a leave request, with a reason</p>
+          <p class="sim__done">Done when: a manager can reject a request, a reason is required, and the employee sees it.</p>
+        </div>
+        <ol class="flow" aria-label="Stages">
+          <li class="flow__box" data-stage="0"><p class="flow__k">Test planner</p><p class="flow__t">Plan tests</p><p class="flow__s">6 cases, before any code</p></li>
+          <li class="flow__box" data-stage="1"><p class="flow__k">Test writer</p><p class="flow__t">Write tests</p><p class="flow__s">tagged CP3-T1 … T6</p></li>
+          <li class="flow__box flow__box--gate" data-stage="2"><p class="flow__k">Gate 1</p><p class="flow__t">Red</p><p class="flow__s">at least one fails on an assertion</p></li>
+          <li class="flow__box" data-stage="3"><p class="flow__k">Implementer</p><p class="flow__t">Build</p><p class="flow__s">code for this checkpoint only</p></li>
+          <li class="flow__box flow__box--gate" data-stage="4"><p class="flow__k">Gate 1</p><p class="flow__t">Green</p><p class="flow__s">6 of 6 pass, none deleted</p></li>
+          <li class="flow__box flow__box--gate" data-stage="5"><p class="flow__k">Gate 2</p><p class="flow__t">Looks right</p><p class="flow__s">screenshots vs the prototype</p></li>
+          <li class="flow__box flow__box--gate flow__box--loop" data-stage="6"><p class="flow__k">Gate 3 <span>⇄ fixer</span></p><p class="flow__t">Review</p><p class="flow__s">until nobody has a blocking finding</p></li>
+          <li class="flow__box flow__box--lock" data-stage="7"><p class="flow__k">Commit</p><p class="flow__t">Lock</p><p class="flow__s">the ratchet clicks forward</p></li>
+        </ol>
+      </div>
+
+      <div class="sim__tabs" role="tablist" aria-label="Stages">
+        <button role="tab" type="button" data-sim-tab="0"><span>01</span>Plan tests</button>
+        <button role="tab" type="button" data-sim-tab="1"><span>02</span>Write tests</button>
+        <button role="tab" type="button" data-sim-tab="2"><span>03</span>Red</button>
+        <button role="tab" type="button" data-sim-tab="3"><span>04</span>Build</button>
+        <button role="tab" type="button" data-sim-tab="4"><span>05</span>Green</button>
+        <button role="tab" type="button" data-sim-tab="5"><span>06</span>Looks right</button>
+        <button role="tab" type="button" data-sim-tab="6"><span>07</span>Review</button>
+        <button role="tab" type="button" data-sim-tab="7"><span>08</span>Lock</button>
+      </div>
+      <div class="sim__detail" aria-live="polite">
+        <p class="sim__detailk">▸ Stage details</p>
+        <p data-sim-text>The test planner writes ID-tagged test cases before any code exists: the happy path, edge cases, permissions and failure modes.</p>
+      </div>
+      <p class="sim__status"><span class="dot" aria-hidden="true"></span><span data-sim-status>Auto-loop · checkpoint 3 / 4 · Plan tests</span><span class="sim__fine">Simplified example. Real runs report each stage in your chat.</span></p>
+    </div>
+
+    <details class="expand">
+      <summary>What happens when a stage keeps failing</summary>
+      <p>Each gate gets a limited number of tries. When they run out, the run stops and the agent comes back to you. It quotes the problem and gives you two or three options, labelled A, B and C, with the one it recommends. Just reply with the letter. Nothing gets lowered or skipped unless you pick it.</p>
+    </details>
+  </div>
+</section>
+
+<!-- ============ 03 GATES (sticky ratchet) ============ -->
+<section class="band gates" id="gates" aria-labelledby="gates-title">
   <div class="gates__inner wrap">
     <div class="gates__stage" aria-hidden="true">
       <div class="gates__sticky">
         <svg class="wheel" viewBox="0 0 400 400" data-wheel>
-          <defs>
-            <radialGradient id="wg" cx="50%" cy="50%" r="50%">
-              <stop offset="0" stop-color="#6A7078"/><stop offset=".55" stop-color="#9AA0A8"/><stop offset=".8" stop-color="#C9CED4"/><stop offset="1" stop-color="#8A9098"/>
-            </radialGradient>
-            <linearGradient id="wl" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0" stop-color="#fff" stop-opacity=".55"/><stop offset=".45" stop-color="#fff" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity=".45"/>
-            </linearGradient>
-          </defs>
           <g class="wheel__rotor" data-rotor>
-            <path d="{{WHEEL}}" fill="url(#wg)" fill-rule="evenodd"/>
-            <circle cx="200" cy="200" r="132" fill="none" stroke="#2A2E35" stroke-width="2"/>
+            <path class="wheel__teeth" d="{{WHEEL}}" fill-rule="evenodd"/>
+            <circle class="wheel__ring" cx="200" cy="200" r="132"/>
+            <path class="wheel__cl" d="M200,40 V360 M40,200 H360"/>
             {{STUDS}}
-            <circle cx="200" cy="200" r="44" fill="#1A1D23"/>
-            <circle cx="200" cy="200" r="18" fill="#9AA0A8"/>
+            <circle class="wheel__hub" cx="200" cy="200" r="44"/>
+            <circle class="wheel__hub" cx="200" cy="200" r="18"/>
           </g>
-          <circle cx="200" cy="200" r="150" fill="url(#wl)" style="mix-blend-mode:overlay" pointer-events="none"/>
           <g class="pawl" data-pawl>
-            <path d="{{PAWL}}" fill="#FF5A1F"/>
-            <circle cx="{{PX}}" cy="{{PY}}" r="13" fill="#FF5A1F"/>
-            <circle cx="{{PX}}" cy="{{PY}}" r="5" fill="#0A0B0D"/>
+            <path class="pawl__arm" d="{{PAWL}}"/>
+            <circle class="pawl__pin" cx="{{PX}}" cy="{{PY}}" r="13"/>
+            <circle cx="{{PX}}" cy="{{PY}}" r="4" fill="#FF5A1F"/>
           </g>
         </svg>
         <div class="gates__count"><span data-count>0</span>/4 gates locked</div>
@@ -199,8 +278,8 @@
       </div>
     </div>
     <div class="gates__list">
-      <p class="kicker">The four gates</p>
-      <h2 id="gates-title" class="h2">Every checkpoint clicks through four gates. <em>In order. No skipping.</em></h2>
+      <p class="kicker"><span>03</span>The four gates</p>
+      <h2 id="gates-title" class="h2">Four gates per checkpoint. <em>In order. No skipping.</em></h2>
       <article class="gate" data-gate="1">
         <header><span class="gate__n">Gate 1</span><span class="gate__state" data-state>Open</span></header>
         <h3>Tests</h3>
@@ -245,116 +324,174 @@
   </div>
 </section>
 
-<!-- ============ CAN'T CHEAT ============ -->
-<section class="cheat" aria-labelledby="cheat-title">
+
+<!-- ============ 04 THE TEAM ============ -->
+<section class="band band--alt" id="team" aria-labelledby="team-title">
+  <div class="wrap">
+    <p class="kicker"><span>04</span>The agents</p>
+    <h2 id="team-title" class="h2">Thirteen agents. <em>Nobody marks their own homework.</em></h2>
+    <p class="lede">Ratchet splits the work so that the agent writing the code is never the one judging it. Planners plan, writers write, and reviewers only review. Pick one to read its actual definition.</p>
+    <div class="team" data-team>
+      <div class="team__grid" role="tablist" aria-label="Agents">
+{{TEAM_GRID}}
+      </div>
+{{TEAM_PANELS}}
+    </div>
+    <details class="expand">
+      <summary>See how they hand off</summary>
+      <ol class="handoff">
+        <li><b>Before the plan.</b> The app scout checks the app runs and finds the test command while the checkpoint planner splits the feature. For new screens, the design system agent writes DESIGN.md and the prototyper builds a clickable prototype.</li>
+        <li><b>Each checkpoint.</b> The test planner and test writer go first. The implementer writes code until the test runner reports green.</li>
+        <li><b>Review.</b> Visual and behaviour reviewers compare screens. Adversaries try to break the code. The fixer answers every finding, and the round repeats.</li>
+        <li><b>Repeated mistakes.</b> When you agree to turn one into an automatic check, the variant writer tries to sneak disguised versions past it, so the check is proven on cases its author didn't pick.</li>
+      </ol>
+    </details>
+  </div>
+</section>
+
+<!-- ============ 05 REVIEWERS ============ -->
+<section class="band reviewers" id="reviewers" aria-labelledby="rev-title">
+  <img class="float float--b" src="assets/blueprint.svg" alt="" width="1200" height="1200" data-depth="0.45" aria-hidden="true" loading="lazy">
+  <div class="wrap">
+    <p class="kicker"><span>05</span>Who reviews</p>
+    <h2 id="rev-title" class="h2">A second opinion <em>from somebody else.</em></h2>
+    <p class="lede">The model running your agent could be Claude, GPT, Gemini or a Copilot model. Ratchet doesn't care which. What matters is that the reviewer is someone different. A second company tends to catch what the first one misses.</p>
+    <ol class="ladder">
+      <li class="reveal"><span>1</span><div><h3>Another company</h3><p>Any AI tool installed and signed in on your machine that works.</p></div></li>
+      <li class="reveal"><span>2</span><div><h3>Another model</h3><p>Same company, different model. Sonnet reviewing work done by Opus.</p></div></li>
+      <li class="reveal"><span>3</span><div><h3>Same model</h3><p>Only if nothing else is available.</p></div></li>
+    </ol>
+    <ul class="chips" aria-label="Supported reviewer tools">
+      <li>Claude Code</li><li>Codex</li><li>Gemini CLI</li><li>Copilot CLI</li><li>Cursor</li><li>OpenCode</li><li>Oh My Pi</li><li>Pi</li><li>Your own command</li>
+    </ul>
+    <p class="fine">Risk decides how many look: one reviewer for low, two for normal, four for high. Signed-out tools are skipped for six hours, and out-of-credit tools wait for the reset time they gave.</p>
+  </div>
+</section>
+
+<!-- ============ 06 A CLOSER LOOK ============ -->
+<section class="band band--alt closer" id="closer" aria-labelledby="closer-title">
   <div class="cheat__bg" data-depth="0.3" aria-hidden="true">
     <picture>
       <source srcset="assets/macro.avif" type="image/avif">
       <img src="assets/macro.jpg" alt="" width="1600" height="900" loading="lazy" decoding="async">
     </picture>
   </div>
-  <div class="cheat__inner wrap">
-    <div class="cheat__copy">
-      <p class="kicker">Why the gates hold</p>
-      <h2 id="cheat-title" class="h2">The agent can't argue its way past. <em>It can only fix the problem.</em></h2>
-      <p>Hooks sit between your agent and the exit. They stop it skipping a gate, quitting early, or quietly lowering the bar. When a gate runs out of tries, the run stops and the agent comes back to you with options. Nothing gets lowered unless you pick it.</p>
-      <ul class="checks">
-        <li>Tests can't be deleted to make the suite pass.</li>
-        <li>The approved plan, design file and prototype are locked.</li>
-        <li>Screenshots that don't match the same state are thrown out and redone.</li>
-        <li>Accepting a finding takes your own words and your own reason, written down.</li>
-      </ul>
+  <div class="wrap">
+    <p class="kicker"><span>06</span>A closer look</p>
+    <h2 id="closer-title" class="h2">From <q>it works</q> <em>to a checked change.</em></h2>
+    <p class="lede">The same checkpoint, two endings. On its own, the agent reports success. With Ratchet, a reviewer finds the gap before you ever see it.</p>
+
+    <div class="case reveal">
+      <div class="case__head"><p class="mono-k">Case · leave-approvals · CP3 reject with a reason</p><span class="tag">Illustrative</span></div>
+      <div class="case__cols">
+        <div class="case__col case__col--bad">
+          <p class="case__label">Agent alone</p>
+          <ul>
+            <li><i>✓</i>Reject button added</li>
+            <li><i>✓</i>Tests written after the code, all pass</li>
+            <li><i>✓</i><q>Done. Rejecting works.</q></li>
+          </ul>
+          <p class="case__out"><b>Ships:</b> a rejection with an empty reason goes through.</p>
+        </div>
+        <div class="case__col case__col--good">
+          <p class="case__label">With Ratchet</p>
+          <ul>
+            <li><i>✓</i>Gate 1 · 6 tests written first, 1 failed, then 6 pass</li>
+            <li><i>✓</i>Gate 2 · 0 fixable differences from the prototype</li>
+            <li><i class="hot">✕</i>Gate 3 · <code>codex-correctness/A1</code> empty reason accepted</li>
+            <li><i>✓</i>Fixer · reason required, with a test that proves it</li>
+            <li><i>✓</i>Gate 3 · round 2 · no blocking findings</li>
+          </ul>
+          <p class="case__out"><b>Locks:</b> CP3 as its own commit. CP4 starts.</p>
+        </div>
+      </div>
     </div>
-    <figure class="term reveal" aria-label="Example of Ratchet stopping a run and offering choices">
-      <div class="term__bar"><i></i><i></i><i></i><span>ratchet · leave-approvals · CP3</span></div>
-      <pre class="term__body" data-type><span class="t-dim">▸ CP3  Reject with a reason</span>
-<span class="t-ok">✓ gate 1  tests       6 planned · 6 pass · 1 failed first</span>
+
+    <div class="cheat__inner">
+      <div class="cheat__copy">
+        <h3 class="sub">Why the gates hold</h3>
+        <p>Hooks sit between your agent and the exit. They stop it skipping a gate, quitting early, or quietly lowering the bar.</p>
+        <ul class="checks">
+          <li>Tests can't be deleted to make the suite pass.</li>
+          <li>The approved plan, design file and prototype are locked.</li>
+          <li>Screenshots that don't match the same state are thrown out and redone.</li>
+          <li>Accepting a finding takes your own words and your own reason, written down.</li>
+        </ul>
+      </div>
+      <figure class="term reveal" aria-label="Example of Ratchet stopping a run and offering choices">
+        <div class="term__bar"><i></i><i></i><i></i><span>ratchet · leave-approvals · CP4</span><em>illustrative</em></div>
+        <pre class="term__body" data-type><span class="t-dim">▸ CP4  Tell the employee</span>
+<span class="t-ok">✓ gate 1  tests       5 planned · 5 pass · 2 failed first</span>
 <span class="t-ok">✓ gate 2  looks right  2 reviewers · 0 fixable diffs</span>
 <span class="t-hot">✕ gate 3  review       round 3 of 3 · 1 blocking</span>
-<span class="t-dim">  codex-correctness/A1  reason accepted when empty string</span>
+<span class="t-dim">  codex-correctness/A1  email sent before the rejection is saved</span>
 
 <span>Review limit reached. Pick one:</span>
-<span><b>A</b>  Require a non-empty reason and re-review  <span class="t-ok">(recommended)</span></span>
-<span><b>B</b>  Simplify the step: reject without a reason field</span>
-<span><b>C</b>  Stop here and keep CP1 and CP2</span>
+<span><b>A</b>  Send the email only after the save succeeds  <span class="t-ok">(recommended)</span></span>
+<span><b>B</b>  Simplify the step: in-app notice only, no email</span>
+<span><b>C</b>  Stop here and keep CP1 to CP3</span>
 
 <span class="t-dim">you ›</span> <span class="caret">A</span></pre>
-    </figure>
+        <figcaption class="term__foot"><span class="dot" aria-hidden="true"></span>When tries run out, you choose<b>ready</b></figcaption>
+      </figure>
+    </div>
   </div>
 </section>
 
-<!-- ============ REVIEWERS ============ -->
-<section class="reviewers wrap" id="reviewers" aria-labelledby="rev-title">
-  <img class="float float--b" src="assets/blueprint.svg" alt="" width="1200" height="1200" data-depth="0.45" aria-hidden="true" loading="lazy">
-  <p class="kicker">Who reviews the work</p>
-  <h2 id="rev-title" class="h2">A second opinion from <em>somebody else.</em></h2>
-  <p class="lede">The model running your agent could be Claude, GPT, Gemini or a Copilot model. Ratchet doesn't care which. What matters is that the reviewer is someone different. A second company tends to catch what the first one misses.</p>
-  <ol class="ladder">
-    <li class="reveal"><span>1</span><div><h3>Another company</h3><p>Any AI tool installed and signed in on your machine that works.</p></div></li>
-    <li class="reveal"><span>2</span><div><h3>Another model</h3><p>Same company, different model. Sonnet reviewing work done by Opus.</p></div></li>
-    <li class="reveal"><span>3</span><div><h3>Same model</h3><p>Only if nothing else is available.</p></div></li>
-  </ol>
-  <ul class="chips" aria-label="Supported reviewer tools">
-    <li>Claude Code</li><li>Codex</li><li>Gemini CLI</li><li>Copilot CLI</li><li>Cursor</li><li>OpenCode</li><li>Oh My Pi</li><li>Pi</li><li>Your own command</li>
-  </ul>
-  <p class="fine">Signed-out tools are skipped for six hours. Out-of-credit tools wait for the reset time they gave. A failed slot goes to another working provider.</p>
-</section>
-
-<!-- ============ INSTALL ============ -->
-<section class="install" id="install" aria-labelledby="install-title">
+<!-- ============ 07 INSTALL ============ -->
+<section class="band install" id="install" aria-labelledby="install-title">
   <img class="float float--c" src="assets/gear-outline.svg" alt="" width="400" height="400" data-depth="0.55" aria-hidden="true" loading="lazy">
   <div class="wrap">
-    <p class="kicker">Install once per computer</p>
-    <h2 id="install-title" class="h2">Three messages. <em>That's the whole setup.</em></h2>
-    <ol class="steps">
-      <li class="step reveal">
-        <span class="step__n">01</span>
-        <h3>Ask your agent to install it</h3>
-        <div class="prompt">
-          <p>Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI.</p>
-          <button class="copy" type="button" data-copy="Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI." aria-label="Copy install prompt"><span data-copy-label>Copy</span></button>
-        </div>
-        <p class="step__note">It asks before it changes anything. Part of setup is adding hooks. Hooks are what stop the agent skipping a gate.</p>
-      </li>
-      <li class="step reveal">
-        <span class="step__n">02</span>
-        <h3>Restart your CLI, then say</h3>
-        <div class="prompt">
-          <p>Set up Ratchet and continue</p>
-          <button class="copy" type="button" data-copy="Set up Ratchet and continue" aria-label="Copy setup prompt"><span data-copy-label>Copy</span></button>
-        </div>
-        <p class="step__note">Hooks only load when the CLI starts. The agent checks they work and tells you Ratchet is ready.</p>
-      </li>
-      <li class="step reveal">
-        <span class="step__n">03</span>
-        <h3>Build something</h3>
-        <div class="prompt">
-          <p>Use Ratchet to build this feature: <span class="ph">describe it in a sentence or two</span>.</p>
-          <button class="copy" type="button" data-copy="Use Ratchet to build this feature: " aria-label="Copy build prompt"><span data-copy-label>Copy</span></button>
-        </div>
-        <p class="step__note">Keep it to one feature. A few sentences usually becomes three to eight steps.</p>
-      </li>
-    </ol>
+    <p class="kicker"><span>07</span>Install</p>
+    <h2 id="install-title" class="h2">Install once. <em>Then just ask.</em></h2>
+    <p class="lede">Ratchet is installed once per computer, not once per project. You don't type any commands. You paste three messages into your agent.</p>
+    <div class="cite reveal">
+      <ol class="steps">
+        <li class="step">
+          <div class="prompt">
+            <div class="prompt__bar"><p class="mono-k"><b>01</b> Ask your agent to install it</p>
+              <button class="copy" type="button" data-copy="Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI." aria-label="Copy prompt 1"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" d="M8 8h11v11H8zM5 16V5h11"/></svg><span data-copy-label>Copy prompt</span></button></div>
+            <p class="prompt__text">Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI.</p>
+          </div>
+          <p class="step__note">It asks before it changes anything. Part of setup is adding hooks, which are what stop the agent skipping a gate.</p>
+        </li>
+        <li class="step">
+          <div class="prompt">
+            <div class="prompt__bar"><p class="mono-k"><b>02</b> Restart your CLI, then say</p>
+              <button class="copy" type="button" data-copy="Set up Ratchet and continue" aria-label="Copy prompt 2"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" d="M8 8h11v11H8zM5 16V5h11"/></svg><span data-copy-label>Copy prompt</span></button></div>
+            <p class="prompt__text">Set up Ratchet and continue</p>
+          </div>
+          <p class="step__note">Hooks only load when the CLI starts. The agent checks they work and tells you Ratchet is ready.</p>
+        </li>
+        <li class="step">
+          <div class="prompt">
+            <div class="prompt__bar"><p class="mono-k"><b>03</b> Build something</p>
+              <button class="copy" type="button" data-copy="Use Ratchet to build this feature: " aria-label="Copy prompt 3"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" d="M8 8h11v11H8zM5 16V5h11"/></svg><span data-copy-label>Copy prompt</span></button></div>
+            <p class="prompt__text">Use Ratchet to build this feature: <span class="ph">describe it in a sentence or two</span>.</p>
+          </div>
+          <p class="step__note">Keep it to one feature. A few sentences usually becomes three to eight steps.</p>
+        </li>
+      </ol>
+    </div>
     <p class="needs">You need a git repository and Python 3. Building screens? Ratchet also uses Node and Playwright for screenshots, and offers to set them up.</p>
+
+    <div class="specs__card reveal">
+      <p class="mono-k">If your team writes specs</p>
+      <h3 class="h3">OpenSpec, Spec Kit, BMAD. <em>The spec says what to build. Ratchet makes sure it was built.</em></h3>
+      <p>Every scenario gets a test that has to pass. Every task is assigned to a step. If anything is left out, the plan tells you why. As steps pass, Ratchet ticks off the matching tasks in your spec files.</p>
+      <div class="specs__eg"><code>Use Ratchet to build the add-dark-mode change.</code><code>Use Ratchet to build story 1.3.</code></div>
+    </div>
   </div>
 </section>
 
-<!-- ============ SPECS ============ -->
-<section class="specs wrap" aria-labelledby="specs-title">
-  <div class="specs__card reveal">
-    <p class="kicker">If your team writes specs</p>
-    <h2 id="specs-title" class="h3">OpenSpec, Spec Kit, BMAD. <em>The spec says what to build. Ratchet makes sure it was built.</em></h2>
-    <p>Every scenario gets a test that has to pass. Every task is assigned to a step. If anything is left out, the plan tells you why. As steps pass, Ratchet ticks off the matching tasks in your spec files.</p>
-    <div class="specs__eg"><code>Use Ratchet to build the add-dark-mode change.</code><code>Use Ratchet to build story 1.3.</code></div>
-  </div>
-</section>
-
-<!-- ============ FAQ ============ -->
-<section class="faq wrap" id="faq" aria-labelledby="faq-title">
-  <p class="kicker">Common questions</p>
-  <h2 id="faq-title" class="h2">Before you ask.</h2>
-  <div class="faq__list">
+<!-- ============ 08 FAQ ============ -->
+<section class="band band--alt faq" id="faq" aria-labelledby="faq-title">
+  <div class="wrap">
+    <p class="kicker"><span>08</span>Questions</p>
+    <h2 id="faq-title" class="h2">Before you ask.</h2>
+    <div class="faq__list">
 {{FAQ_HTML}}
+    </div>
   </div>
 </section>
 
@@ -374,12 +511,14 @@
 </main>
 
 <footer class="foot wrap">
-  <a class="brand" href="#top">
-    <svg class="brand__mark" viewBox="0 0 64 64" aria-hidden="true">{{MARK}}</svg>
-    <span class="brand__word">Ratchet<span>Loop</span></span>
-  </a>
-  <p>Built by <a href="https://github.com/rahilp" rel="noopener">Rahil Pirani</a>.</p>
-  <p class="foot__links"><a href="https://github.com/rahilp/Ratchet-Loop">GitHub</a><a href="https://github.com/rahilp/Ratchet-Loop#how-it-works">How it works</a><a href="https://github.com/rahilp/Ratchet-Loop#reference-commands-the-agent-runs">Reference</a></p>
+  <div class="foot__row">
+    <a class="brand" href="#top">
+      <svg class="brand__mark" viewBox="0 0 64 64" aria-hidden="true">{{MARK}}</svg>
+      <span class="brand__word">Ratchet<span>Loop</span></span>
+    </a>
+    <a class="foot__top" href="#top">Back to top ↑</a>
+  </div>
+  <p class="foot__tag">Checkpoint-and-gate building for AI coding agents · by <a href="https://github.com/rahilp" rel="noopener">Rahil Pirani</a></p>
 </footer>
 
 <div class="toast" role="status" aria-live="polite" data-toast></div>

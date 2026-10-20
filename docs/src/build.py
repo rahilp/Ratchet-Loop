@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Builds docs/index.html from src/index.template.html.
 
-Generates the ratchet geometry (wheel, pawl, studs), the FAQ markup and its
-JSON-LD, and the gear outline art. Run from anywhere: python3 docs/src/build.py
+Generates the ratchet geometry (wheel, pawl, studs), the agent grid from
+agents/*.md, the FAQ markup and its JSON-LD, and the gear outline art. Run from anywhere: python3 docs/src/build.py
 """
 import html
 import json
@@ -32,6 +32,85 @@ FAQ = [
     ("The agent says the hooks aren't working.",
      "Close the CLI, open it again in the same folder, and say: Set up Ratchet and continue. Still not working? Ask it to check that Ratchet's hooks are installed for this CLI and install them if not."),
 ]
+
+
+# Ratchet's agents in hand-off order. The detail panel quotes each agent's real definition file.
+AGENTS = [
+    ("app-scout", "App scout", "Plan", "Checks the app runs, finds the test runner and start command, and drafts coding standards if you have none."),
+    ("checkpoint-planner", "Checkpoint planner", "Plan", "Splits the feature into small, ordered checkpoints, each with plain “done when” criteria and the gates that apply."),
+    ("design-system", "Design system", "Plan", "Writes DESIGN.md: exact colours, type, spacing and every state of every component."),
+    ("prototyper", "Prototyper", "Plan", "Builds a clickable prototype from DESIGN.md for you to approve before anything is built."),
+    ("test-planner", "Test planner", "Plan", "Plans each checkpoint’s test cases before any code exists."),
+    ("test-writer", "Test writer", "Build", "Turns the planned cases into real tests, written before the code, so at least one fails first."),
+    ("implementer", "Implementer", "Build", "Writes the code for exactly one checkpoint. Never edits tests."),
+    ("test-runner", "Test runner", "Build", "Runs Gate 1 and, when it fails, returns a short diagnosis instead of a wall of logs."),
+    ("fixer", "Fixer", "Build", "Fixes every open review finding, or rebuts a wrong one with evidence. Never weakens a test."),
+    ("adversary", "Adversary", "Review", "Assumes the code is wrong and tries to prove it. Approves only by finding nothing."),
+    ("visual-reviewer", "Visual reviewer", "Review", "Compares screenshots against the reference and lists every visual difference, with where it is."),
+    ("behavior-reviewer", "Behaviour reviewer", "Review", "Clicks through the same journey on both and lists every difference in how they respond."),
+    ("variant-writer", "Variant writer", "Review", "Writes disguised bad code to prove a new automatic check really catches the mistake."),
+]
+
+
+def frontmatter(path):
+    block = path.read_text().split("---", 2)[1]
+    fields = {}
+    for line in block.strip().splitlines():
+        if ":" in line and not line.startswith(" "):
+            k, v = line.split(":", 1)
+            fields[k.strip()] = v.strip()
+    return fields
+
+
+def wrap_words(text, width):
+    lines, cur = [], ""
+    for w in text.split():
+        if cur and len(cur) + 1 + len(w) > width:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = f"{cur} {w}" if cur else w
+    return lines + ([cur] if cur else [])
+
+
+CODE_ICON = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" '
+             'stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>')
+
+
+def team_markup():
+    grid, panels, row = [], [], None
+    for i, (slug, title, group, role) in enumerate(AGENTS, 1):
+        if group != row:
+            if row:
+                grid.append('        </div>')
+            row = group
+            grid.append(f'        <div class="team__row" role="presentation"><p class="team__rowk" role="presentation">{group}</p>')
+        fname = f"ratchet-{slug}.md"
+        fm = frontmatter(ROOT.parent / "agents" / fname)
+        on = i == 1
+        grid.append(
+            f'        <button class="team__card" role="tab" type="button" id="agent-tab-{i}" aria-controls="agent-{i}" '
+            f'aria-selected="{"true" if on else "false"}" tabindex="{0 if on else -1}" data-team-tab>'
+            f'<span class="team__code">A{i}</span><span class="team__name">{html.escape(title)}</span></button>')
+        desc = wrap_words(fm.get("description", ""), 64)
+        code = ["---", f"name: {fm.get('name', '')}"]
+        code += [("description: " if j == 0 else "  ") + ln for j, ln in enumerate(desc)]
+        code += [f"tools: {fm.get('tools', '')}", "---"]
+        rows = "".join(f'<span><i>{n:02d}</i>{html.escape(ln)}</span>' for n, ln in enumerate(code, 1))
+        panels.append(
+            f'      <div class="team__panel" role="tabpanel" id="agent-{i}" aria-labelledby="agent-tab-{i}"{"" if on else " hidden"}>\n'
+            f'        <div class="team__top"><span class="team__big">A{i}</span><span class="pill pill--static">{group} stage</span></div>\n'
+            f'        <h3>{html.escape(title)}</h3>\n'
+            f'        <p class="team__role">{html.escape(role)}</p>\n'
+            f'        <p class="team__file">{CODE_ICON}agents/{fname}</p>\n'
+            f'        <figure class="code">\n'
+            f'          <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>{fname}</span><em>markdown</em></div>\n'
+            f'          <pre class="code__body">{rows}</pre>\n'
+            f'          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repo<b>ready</b></figcaption>\n'
+            f'        </figure>\n'
+            f'      </div>')
+    grid.append('        </div>')
+    return "\n".join(grid), "\n".join(panels)
 
 
 def pts_path(pts):
@@ -99,7 +178,7 @@ def big_wheel():
     studs = []
     for i in range(n):
         a = A + (i + 0.5) * p
-        studs.append(f'<circle class="stud" cx="{cx + math.cos(a) * 141:.2f}" cy="{cy - math.sin(a) * 141:.2f}" r="4"/>')
+        studs.append(f'<circle class="stud" cx="{cx + math.cos(a) * 141:.2f}" cy="{cy - math.sin(a) * 141:.2f}" r="4.5"/>')
     pawl, piv, tip = pawl_geom(cx, cy, rr, A, 96, 52, 11, scale=6)
     # which way does a positive CSS rotation (clockwise on screen) move the tip? we want it to lift outward
     rel = (tip[0] - piv[0], tip[1] - piv[1])
@@ -136,7 +215,10 @@ def main():
         f'    <details>\n      <summary>{html.escape(q)}</summary>\n      <p>{html.escape(a)}</p>\n    </details>'
         for q, a in FAQ)
     faq_ld = ",".join(json.dumps({"@type": "Question", "name": q, "acceptedAnswer": {"@type": "Answer", "text": a}}) for q, a in FAQ)
+    team_grid, team_panels = team_markup()
     out = (tpl.replace("{{SITE}}", SITE)
+              .replace("{{TEAM_GRID}}", team_grid)
+              .replace("{{TEAM_PANELS}}", team_panels)
               .replace("{{MARK}}", mark_wire())
               .replace("{{WHEEL}}", wheel)
               .replace("{{STUDS}}", studs)

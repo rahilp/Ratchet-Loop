@@ -8,9 +8,9 @@ In the repository settings, open **Pages**, set **Source** to *Deploy from a bra
 
 ## Edit
 
-- Copy and layout: `src/index.template.html`, then run `python3 docs/src/build.py` to regenerate `index.html`. The build script also draws the ratchet wheel, pawl, logo, favicon and gear art, and writes the FAQ and its structured data.
+- Copy and layout: `src/index.template.html`, then run `python3 docs/src/build.py` to regenerate `index.html`. The build script also draws the ratchet wheel, pawl, logo, favicon and gear art, writes the FAQ and its structured data, and builds the agents grid from `agents/*.md` (so each panel quotes the real agent definition). Re-run it after changing an agent's frontmatter.
 - Styles: `styles.css`. Colours and fonts are tokens at the top.
-- Behaviour: `main.js` (parallax, the one-way scroll ratchet, video source choice, copy buttons).
+- Behaviour: `main.js` (parallax, the one-way scroll ratchet, the equation replay, the checkpoint simulator, agent tabs, mobile menu, video source choice, copy buttons).
 
 ## Files
 
