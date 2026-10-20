@@ -1,0 +1,29 @@
+<section class="band" id="safeguards" aria-labelledby="safe-title">
+  <div class="wrap">
+    <p class="kicker"><span>07</span>Safeguards</p>
+    <h2 id="safe-title" class="h2">Why the agent can't cheat. <em>It can only fix the problem.</em></h2>
+    <p class="lede">Ratchet installs hooks into your CLI. Hooks run on every action the agent takes, so the rules hold even when the agent would rather skip them.</p>
+    <div class="rules">
+      <div class="rule reveal"><span>R1</span><h3>Ratchet checks, it doesn't take anyone's word</h3><p>The agent doesn't get to say "tests pass". Ratchet runs them. Reviewers don't get to say "approved". Ratchet works out the verdict from what they found.</p></div>
+      <div class="rule reveal"><span>R2</span><h3>Tests come first</h3><p>A test that passes before the feature exists is rejected, because it isn't testing anything.</p></div>
+      <div class="rule reveal"><span>R3</span><h3>Tests can't disappear</h3><p>Every planned test has to still be there each time the tests run.</p></div>
+      <div class="rule reveal"><span>R4</span><h3>Any change resets the gates</h3><p>Every gate result is tied to the exact code it checked. Change the code afterwards and the gates run again.</p></div>
+      <div class="rule reveal"><span>R5</span><h3>Same state, or it doesn't count</h3><p>If two screenshots being compared aren't showing the same thing, the comparison is thrown out and redone.</p></div>
+      <div class="rule reveal"><span>R6</span><h3>Screen reviewers are kept apart</h3><p>They work in a folder that holds only the screenshots and the design file. They never see your code, your agent's instructions or the chat.</p></div>
+      <div class="rule reveal"><span>R7</span><h3>Records are protected</h3><p>A hook blocks anyone from editing Ratchet's records by hand. In Claude Code, only the right reviewer can write each review.</p></div>
+      <div class="rule reveal"><span>R8</span><h3>No quitting early</h3><p>Another hook stops the agent from ending its turn until a gate is passed, unless it's waiting for you, stuck, or paused.</p></div>
+    </div>
+
+    <h3 class="sub">What each CLI enforces today</h3>
+    <p class="sub-lede">The four CLIs don't all give hooks the same view. Ratchet is honest about the gaps.</p>
+    <div class="matrix reveal" role="table" aria-label="What each CLI enforces">
+      <div class="matrix__row matrix__row--head" role="row"><span role="columnheader">Check</span><span role="columnheader">Claude Code</span><span role="columnheader">Codex</span><span role="columnheader">Gemini CLI</span><span role="columnheader">Copilot CLI</span></div>
+      <div class="matrix__row" role="row"><b role="rowheader">Records protected from hand-edits</b><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i></div>
+      <div class="matrix__row" role="row"><b role="rowheader">Stops the agent ending its turn early</b><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i></div>
+      <div class="matrix__row" role="row"><b role="rowheader">Records your replies</b><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="p" role="cell">Recorded, but the agent doesn't see Ratchet's guidance</i></div>
+      <div class="matrix__row" role="row"><b role="rowheader">Confirms which reviewer wrote a review</b><i class="y" role="cell">Yes</i><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="n" role="cell">No</i></div>
+      <div class="matrix__row" role="row"><b role="rowheader">Refuses sub-agents launched without the plan's objective</b><i class="y" role="cell">Yes</i><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="n" role="cell">No</i></div>
+    </div>
+    <p class="fine">On every CLI, a review from another AI tool counts only when Ratchet's own review script signed it for that round. A review that was typed, copied or edited by hand is refused.</p>
+  </div>
+</section>

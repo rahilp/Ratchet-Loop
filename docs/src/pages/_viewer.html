@@ -1,0 +1,39 @@
+<section class="band band--alt" id="viewer" aria-labelledby="viewer-title">
+  <div class="wrap">
+    <p class="kicker"><span>04</span>The viewer</p>
+    <h2 id="viewer-title" class="h2">Every run gets its own page. <em>Watch it happen, step by step.</em></h2>
+    <p class="lede">Each run writes a viewer: one web page with the plan, every planned test, every review round and every commit, kept up to date as the agent works. You don't need it, because everything also shows up in your chat. It's there when you want the whole picture at once.</p>
+
+    <div class="shot reveal" data-shot>
+      <div class="shot__bar">
+        <span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="shot__url">.ratchet/runs/leave-approvals/viewer.html</span>
+        <div class="shot__tabs" role="tablist" aria-label="Viewer screens">
+          <button role="tab" type="button" id="shot-tab-plan" aria-controls="shot-plan" aria-selected="true" data-shot-tab>Checkpoints</button>
+          <button role="tab" type="button" id="shot-tab-act" aria-controls="shot-act" aria-selected="false" tabindex="-1" data-shot-tab>Activity</button>
+        </div>
+      </div>
+      <div class="shot__frame">
+        <picture id="shot-plan" role="tabpanel" aria-labelledby="shot-tab-plan">
+          <source srcset="assets/viewer-plan.avif" type="image/avif">
+          <img src="assets/viewer-plan.jpg" width="1600" height="1328" loading="lazy" decoding="async" alt="The Ratchet viewer for a run called Leave approvals. A blue Building banner says CP3 is in its second review round. Below, CP1 and CP2 show green chips for Tests, Look and feel and Second opinion. CP3 is open, showing its done-when list, what the design reviewer checks, six planned tests tagged code, edge or browser, and its first review round: one thing to fix, one minor note for later.">
+        </picture>
+        <picture id="shot-act" role="tabpanel" aria-labelledby="shot-tab-act" hidden>
+          <source srcset="assets/viewer-act.avif" type="image/avif">
+          <img src="assets/viewer-act.jpg" width="1600" height="1220" loading="lazy" decoding="async" alt="The viewer's Activity tab: a time-stamped feed of the run, from plan approved, through tests going red then green for each checkpoint, to review round 2 starting on CP3.">
+        </picture>
+      </div>
+      <p class="shot__cap"><span class="tag">Example run</span> The real viewer, showing the leave approvals example used on this page.</p>
+    </div>
+
+    <div class="facts facts--3">
+      <div class="fact reveal"><h3>What's on it</h3><p>A progress bar with one segment per step. Each step's four gates as chips: Tests, Look and feel, Second opinion, Your OK. What "done" means, the planned tests by ID, who reviewed each round, and the evidence and commit for every finished step.</p></div>
+      <div class="fact reveal"><h3>How to open it</h3><p>Say <q>Give me the viewer link, and open it if you can.</q> It's a single file in your project at <code>.ratchet/runs/&lt;run&gt;/viewer.html</code>. When Ratchet's small server is running, it refreshes on its own every few seconds and shows "live".</p></div>
+      <div class="fact reveal"><h3>More than one tab</h3><p>Activity is a time-stamped feed of the run. Learnings shows your saved lessons. New screens link to the clickable prototype, and spec-driven runs show which scenarios are proven so far.</p></div>
+    </div>
+    <details class="expand">
+      <summary>Can I share it with my team?</summary>
+      <p>Yes, on your own network. Ask the agent to serve the viewer for others to see. It gives you a link with a private token in it, and requests without that token are refused. The page follows light or dark mode, and has its own theme switch.</p>
+    </details>
+  </div>
+</section>

@@ -1,0 +1,37 @@
+<section class="band" id="install" aria-labelledby="install-title">
+  <div class="wrap">
+    <p class="kicker"><span>15</span>Install</p>
+    <h2 id="install-title" class="h2">Install once. <em>Then just ask.</em></h2>
+    <p class="lede">You install Ratchet once per computer, not once per project. After that it's there in every project you open. The hooks do nothing in projects where you're not using Ratchet.</p>
+    <div class="cite reveal">
+      <ol class="steps">
+        <li class="step">
+          <div class="prompt">
+            <div class="prompt__bar"><p class="mono-k"><b>01</b>Ask your agent to install it</p><button class="copy" type="button" data-copy="{{INSTALL_PROMPT}}" aria-label="Copy prompt 1">{{ICON_COPY}}<span data-copy-label>Copy prompt</span></button></div>
+            <p class="prompt__text">{{INSTALL_PROMPT}}</p>
+          </div>
+          <p class="step__note">Open your agent in any folder and paste this. It asks before it changes anything. Part of setup is adding hooks to your CLI, which is what stops the agent skipping a gate.</p>
+        </li>
+        <li class="step">
+          <div class="prompt">
+            <div class="prompt__bar"><p class="mono-k"><b>02</b>Restart your CLI, then say</p><button class="copy" type="button" data-copy="Set up Ratchet and continue" aria-label="Copy prompt 2">{{ICON_COPY}}<span data-copy-label>Copy prompt</span></button></div>
+            <p class="prompt__text">Set up Ratchet and continue</p>
+          </div>
+          <p class="step__note">Hooks only load when the CLI starts. The agent checks they work, tells you Ratchet is ready, and asks what you'd like to build.</p>
+        </li>
+        <li class="step">
+          <div class="prompt">
+            <div class="prompt__bar"><p class="mono-k"><b>03</b>Build something</p><button class="copy" type="button" data-copy="Use Ratchet to build this feature: " aria-label="Copy prompt 3">{{ICON_COPY}}<span data-copy-label>Copy prompt</span></button></div>
+            <p class="prompt__text">Use Ratchet to build this feature: <span class="ph">describe it in a sentence or two</span>.</p>
+          </div>
+          <p class="step__note">Open your agent in your project folder. A real one: "managers can approve or reject their team's leave requests, with a reason."</p>
+        </li>
+      </ol>
+    </div>
+    <div class="facts facts--3">
+      <div class="fact"><h3>What you need</h3><p>Your project in a git repository, and Python 3.8 or newer. If you're building screens, Ratchet also uses Node 18+ and Playwright for screenshots, and offers to set them up.</p></div>
+      <div class="fact"><h3>Only for one project?</h3><p>Ask your agent to "install Ratchet Loop for this project only". If you use more than one CLI, ask each one to install Ratchet for itself.</p></div>
+      <div class="fact"><h3>Codex, Gemini or Copilot</h3><p>Claude Code finds Ratchet's skills on its own. For the others, the installer keeps one shared copy, and the agent can link it into your CLI's skills folder for you.</p></div>
+    </div>
+  </div>
+</section>

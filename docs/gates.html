@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Four gates and safeguards · Ratchet Loop</title>
+<meta name="description" content="Tests, looks right, review and your OK, in order. Hooks make sure the agent can&#x27;t skip, weaken or argue past any of them.">
+<link rel="canonical" href="https://ratchetloop.github.io/gates.html">
+<meta name="theme-color" content="#FBFAF7">
+<meta name="color-scheme" content="light">
+<meta name="author" content="Rahil Pirani">
+<meta name="robots" content="index, follow, max-image-preview:large">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Ratchet Loop">
+<meta property="og:title" content="Four gates and safeguards · Ratchet Loop">
+<meta property="og:description" content="Small checkpoints. Four gates each. Tests first, a different AI as reviewer, and your sign-off. Your agent can't argue its way past.">
+<meta property="og:url" content="https://ratchetloop.github.io/gates.html">
+<meta property="og:image" content="https://ratchetloop.github.io/assets/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="A blueprint drawing of a ratchet wheel with three gate checks lit, beside the words: Ratchet Loop, make your agent prove it.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Four gates and safeguards · Ratchet Loop">
+<meta name="twitter:description" content="Small checkpoints. Four gates each. Your agent can't argue its way past.">
+<meta name="twitter:image" content="https://ratchetloop.github.io/assets/og.jpg">
+
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="assets/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<link rel="manifest" href="site.webmanifest">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preload" as="style" data-fonts href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Newsreader:ital,wght@0,400;0,600;1,400&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Newsreader:ital,wght@0,400;0,600;1,400&amp;display=swap"></noscript>
+
+<link rel="stylesheet" href="styles.min.css">
+
+
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav" data-nav>
+  <a class="brand" href="index.html">
+    <svg class="brand__mark" viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke-linejoin="round" stroke-linecap="round" stroke-width="2.0"><path stroke="#3E6FC4" stroke-opacity=".55" stroke-width="1.20" stroke-dasharray="5 2 1 2" d="M1.5,37 H55.5 M28.5,10 V64"/><circle stroke="#3E6FC4" stroke-opacity=".6" stroke-width="1.20" cx="28.5" cy="37" r="14.8"/><path stroke="#3E6FC4" d="M40.54,23.62 L35.06,14.43 L33.34,14.24 L32.24,19.39 L22.89,14.18 L21.31,14.87 L22.94,19.88 L12.23,20.04 L11.21,21.43 L15.12,24.96 L5.93,30.44 L5.74,32.16 L10.89,33.26 L5.68,42.61 L6.37,44.19 L11.38,42.56 L11.54,53.27 L12.93,54.29 L16.46,50.38 L21.94,59.57 L23.66,59.76 L24.76,54.61 L34.11,59.82 L35.69,59.13 L34.06,54.12 L44.77,53.96 L45.79,52.57 L41.88,49.04 L51.07,43.56 L51.26,41.84 L46.11,40.74 L51.32,31.39 L50.63,29.81 L45.62,31.44 L45.46,20.73 L44.07,19.71Z"/><circle stroke="#3E6FC4" cx="28.5" cy="37" r="4.2"/><path stroke="#E8572A" d="M33.91,7.11 L38.05,20.29 L40.95,23.18 L42.13,21.15 L40.55,5.64Z"/><circle stroke="#E8572A" fill="#FBFAF7" cx="37.23" cy="6.38" r="3.6"/><circle fill="#E8572A" stroke="none" cx="37.23" cy="6.38" r="1.2"/></g></svg>
+    <span class="brand__word">Ratchet Loop</span>
+  </a>
+  <nav class="nav__links" id="menu" aria-label="Primary" data-menu>
+    <a href="index.html#features">Features</a>
+    <a href="how-it-works.html">How it works</a>
+    <a href="gates.html" aria-current="page">Gates</a>
+    <a href="cost.html">Cost</a>
+    <a href="live-viewer.html">Viewer</a>
+    <a href="install.html">Install</a>
+  </nav>
+  <div class="nav__end">
+    <a class="icon-btn" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener" aria-label="Code on GitHub" title="Code on GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg></a>
+    <button class="icon-btn nav__toggle" type="button" aria-controls="menu" aria-expanded="false" aria-label="Open menu" data-menu-toggle>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+<section class="phead" id="top" aria-labelledby="page-title">
+  <div class="phead__bg" aria-hidden="true"><div class="hero__grid" data-depth="0.25"></div><img class="hero__draw" src="assets/blueprint.svg" alt="" width="1200" height="1200" decoding="async" data-depth="0.55"></div>
+  <div class="wrap phead__inner">
+    <p class="crumb"><a href="index.html#features">Features</a><span aria-hidden="true">/</span>Feature 02</p>
+    <h1 id="page-title" class="phead__title">Four gates. <em>And nothing the agent can do to skip them.</em></h1>
+    <p class="lede">Every step has to pass the same gates in the same order. Hooks in your CLI enforce the rules, so they hold even when the agent would rather move on.</p>
+    <nav class="phead__jump" aria-label="On this page"><a href="#gates">The four gates</a><a href="#safeguards">Safeguards</a></nav>
+  </div>
+</section>
+<section class="band gates" id="gates" aria-labelledby="gates-title">
+  <div class="gates__inner wrap">
+    <div class="gates__stage" aria-hidden="true">
+      <div class="gates__sticky">
+        <svg class="wheel" viewBox="0 0 400 400" data-wheel>
+          <g class="wheel__rotor" data-rotor>
+            <path class="wheel__teeth" d="M279.49,72.79 L259.30,25.82 L253.26,25.80 L243.86,56.55 L212.19,16.40 L206.36,17.95 L205.23,50.09 L164.26,19.50 L159.02,22.51 L166.26,53.84 L118.76,34.90 L114.48,39.16 L129.58,67.56 L78.80,61.56 L75.77,66.78 L97.70,90.30 L47.10,97.64 L45.52,103.47 L72.79,120.51 L25.82,140.70 L25.80,146.74 L56.55,156.14 L16.40,187.81 L17.95,193.64 L50.09,194.77 L19.50,235.74 L22.51,240.98 L53.84,233.74 L34.90,281.24 L39.16,285.52 L67.56,270.42 L61.56,321.20 L66.78,324.23 L90.30,302.30 L97.64,352.90 L103.47,354.48 L120.51,327.21 L140.70,374.18 L146.74,374.20 L156.14,343.45 L187.81,383.60 L193.64,382.05 L194.77,349.91 L235.74,380.50 L240.98,377.49 L233.74,346.16 L281.24,365.10 L285.52,360.84 L270.42,332.44 L321.20,338.44 L324.23,333.22 L302.30,309.70 L352.90,302.36 L354.48,296.53 L327.21,279.49 L374.18,259.30 L374.20,253.26 L343.45,243.86 L383.60,212.19 L382.05,206.36 L349.91,205.23 L380.50,164.26 L377.49,159.02 L346.16,166.26 L365.10,118.76 L360.84,114.48 L332.44,129.58 L338.44,78.80 L333.22,75.77 L309.70,97.70 L302.36,47.10 L296.53,45.52Z M308.07,173.99 a24,24 0 1,0 -48,0 a24,24 0 1,0 48,0Z M243.51,114.19 a24,24 0 1,0 -48,0 a24,24 0 1,0 48,0Z M159.44,140.20 a24,24 0 1,0 -48,0 a24,24 0 1,0 48,0Z M139.93,226.01 a24,24 0 1,0 -48,0 a24,24 0 1,0 48,0Z M204.49,285.81 a24,24 0 1,0 -48,0 a24,24 0 1,0 48,0Z M288.56,259.80 a24,24 0 1,0 -48,0 a24,24 0 1,0 48,0Z" fill-rule="evenodd"/>
+            <circle class="wheel__ring" cx="200" cy="200" r="132"/>
+            <path class="wheel__cl" d="M200,40 V360 M40,200 H360"/>
+            <circle class="stud" cx="258.47" cy="71.70" r="4.5"/>
+            <circle class="stud" cx="223.27" cy="60.93" r="4.5"/>
+            <circle class="stud" cx="186.49" cy="59.65" r="4.5"/>
+            <circle class="stud" cx="150.62" cy="67.93" r="4.5"/>
+            <circle class="stud" cx="118.12" cy="85.21" r="4.5"/>
+            <circle class="stud" cx="91.20" cy="110.31" r="4.5"/>
+            <circle class="stud" cx="71.70" cy="141.53" r="4.5"/>
+            <circle class="stud" cx="60.93" cy="176.73" r="4.5"/>
+            <circle class="stud" cx="59.65" cy="213.51" r="4.5"/>
+            <circle class="stud" cx="67.93" cy="249.38" r="4.5"/>
+            <circle class="stud" cx="85.21" cy="281.88" r="4.5"/>
+            <circle class="stud" cx="110.31" cy="308.80" r="4.5"/>
+            <circle class="stud" cx="141.53" cy="328.30" r="4.5"/>
+            <circle class="stud" cx="176.73" cy="339.07" r="4.5"/>
+            <circle class="stud" cx="213.51" cy="340.35" r="4.5"/>
+            <circle class="stud" cx="249.38" cy="332.07" r="4.5"/>
+            <circle class="stud" cx="281.88" cy="314.79" r="4.5"/>
+            <circle class="stud" cx="308.80" cy="289.69" r="4.5"/>
+            <circle class="stud" cx="328.30" cy="258.47" r="4.5"/>
+            <circle class="stud" cx="339.07" cy="223.27" r="4.5"/>
+            <circle class="stud" cx="340.35" cy="186.49" r="4.5"/>
+            <circle class="stud" cx="332.07" cy="150.62" r="4.5"/>
+            <circle class="stud" cx="314.79" cy="118.12" r="4.5"/>
+            <circle class="stud" cx="289.69" cy="91.20" r="4.5"/>
+            <circle class="wheel__hub" cx="200" cy="200" r="44"/>
+            <circle class="wheel__hub" cx="200" cy="200" r="18"/>
+          </g>
+          <g class="pawl" data-pawl style="transform-origin:227.54px -25.23px;--lift:-7deg">
+            <path class="pawl__arm" d="M217.97,-19.80 L264.40,54.27 L281.40,69.74 L280.51,57.69 L237.11,-30.66Z"/>
+            <circle class="pawl__pin" cx="227.54" cy="-25.23" r="13"/>
+            <circle cx="227.54" cy="-25.23" r="4" fill="#E8572A"/>
+          </g>
+        </svg>
+        <div class="gates__count"><span data-count>0</span> of 4 gates passed</div>
+        <p class="gates__hint">Scroll back up. It won't turn back. That's the point.</p>
+      </div>
+    </div>
+    <div class="gates__list">
+      <p class="kicker"><span>01</span>The four gates</p>
+      <h2 id="gates-title" class="h2">Four gates. <em>In order. No skipping.</em></h2>
+      <p class="lede">The first three run on every step. The last one is you, at the end. Work with nothing to look at, like an API change or a refactor, skips gate 2.</p>
+      <article class="gate" data-gate="1">
+        <header><span class="gate__n">Gate 1</span><span class="gate__state" data-state>Waiting</span></header>
+        <h3>Tests</h3>
+        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>Tests are written before the code. At least one fails on an assertion. Then all of them pass.</dd></div>
+        <div><dt>How it's enforced</dt><dd>Ratchet runs the tests itself and reads each planned test's own result. A test that crashed, was skipped or never ran doesn't count. None may be deleted.</dd></div></dl>
+        <ul><li>Planned tests are frozen after their first failing run. Changing one needs your OK.</li><li>A test that already passes before the code exists isn't testing anything.</li></ul>
+      </article>
+      <article class="gate" data-gate="2">
+        <header><span class="gate__n">Gate 2</span><span class="gate__state" data-state>Waiting</span></header>
+        <h3>Looks right</h3>
+        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>The screen matches the design, or the old screen if you're rebuilding one, in the same state.</dd></div>
+        <div><dt>How it's enforced</dt><dd>Both are opened in a browser, put in the same state, clicked through the same actions and screenshotted. Two reviewers list every difference. Any difference that can be fixed in code blocks the step.</dd></div></dl>
+        <ul><li>One reviewer checks how it looks. The other checks how it behaves: clicks, typing, errors.</li><li>They only see screenshots and the design file, never the code or the chat.</li><li>If the two screenshots aren't showing the same thing, the comparison is thrown out and redone.</li></ul>
+      </article>
+      <article class="gate" data-gate="3">
+        <header><span class="gate__n">Gate 3</span><span class="gate__state" data-state>Waiting</span></header>
+        <h3>Review</h3>
+        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>Reviewers try to break the code and find nothing serious.</dd></div>
+        <div><dt>How it's enforced</dt><dd>Rounds keep going until no reviewer has a blocking finding on the current code. A review only counts if it was signed for that exact round, or written by the agent's own reviewer.</dd></div></dl>
+        <ul><li>Every finding must say who is harmed and how, judged against the plan's objective.</li><li>Small nitpicks stop blocking after two rounds and are listed for you at the end.</li></ul>
+      </article>
+      <article class="gate" data-gate="4">
+        <header><span class="gate__n">Gate 4</span><span class="gate__state" data-state>Waiting</span></header>
+        <h3>You</h3>
+        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>You try it and say yes.</dd></div>
+        <div><dt>How it's enforced</dt><dd>Only a real message from you counts. Messages your CLI sends on its own, like a background task finishing, are never taken as your reply.</dd></div></dl>
+        <ul><li>A thumbs-up, an "ok" or a yes with a "but" on the end doesn't count. <a href="control.html#talk">Try it yourself</a>.</li></ul>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="band band--alt" id="safeguards" aria-labelledby="safe-title">
+  <div class="wrap">
+    <p class="kicker"><span>02</span>Safeguards</p>
+    <h2 id="safe-title" class="h2">Why the agent can't cheat. <em>It can only fix the problem.</em></h2>
+    <p class="lede">Ratchet installs hooks into your CLI. Hooks run on every action the agent takes, so the rules hold even when the agent would rather skip them.</p>
+    <div class="rules">
+      <div class="rule reveal"><span>R1</span><h3>Ratchet checks, it doesn't take anyone's word</h3><p>The agent doesn't get to say "tests pass". Ratchet runs them. Reviewers don't get to say "approved". Ratchet works out the verdict from what they found.</p></div>
+      <div class="rule reveal"><span>R2</span><h3>Tests come first</h3><p>A test that passes before the feature exists is rejected, because it isn't testing anything.</p></div>
+      <div class="rule reveal"><span>R3</span><h3>Tests can't disappear</h3><p>Every planned test has to still be there each time the tests run.</p></div>
+      <div class="rule reveal"><span>R4</span><h3>Any change resets the gates</h3><p>Every gate result is tied to the exact code it checked. Change the code afterwards and the gates run again.</p></div>
+      <div class="rule reveal"><span>R5</span><h3>Same state, or it doesn't count</h3><p>If two screenshots being compared aren't showing the same thing, the comparison is thrown out and redone.</p></div>
+      <div class="rule reveal"><span>R6</span><h3>Screen reviewers are kept apart</h3><p>They work in a folder that holds only the screenshots and the design file. They never see your code, your agent's instructions or the chat.</p></div>
+      <div class="rule reveal"><span>R7</span><h3>Records are protected</h3><p>A hook blocks anyone from editing Ratchet's records by hand. In Claude Code, only the right reviewer can write each review.</p></div>
+      <div class="rule reveal"><span>R8</span><h3>No quitting early</h3><p>Another hook stops the agent from ending its turn until a gate is passed, unless it's waiting for you, stuck, or paused.</p></div>
+    </div>
+
+    <h3 class="sub">What each CLI enforces today</h3>
+    <p class="sub-lede">The four CLIs don't all give hooks the same view. Ratchet is honest about the gaps.</p>
+    <div class="matrix reveal" role="table" aria-label="What each CLI enforces">
+      <div class="matrix__row matrix__row--head" role="row"><span role="columnheader">Check</span><span role="columnheader">Claude Code</span><span role="columnheader">Codex</span><span role="columnheader">Gemini CLI</span><span role="columnheader">Copilot CLI</span></div>
+      <div class="matrix__row" role="row"><b role="rowheader">Records protected from hand-edits</b><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i></div>
+      <div class="matrix__row" role="row"><b role="rowheader">Stops the agent ending its turn early</b><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i></div>
+      <div class="matrix__row" role="row"><b role="rowheader">Records your replies</b><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes</i><i class="p" role="cell">Recorded, but the agent doesn't see Ratchet's guidance</i></div>
+      <div class="matrix__row" role="row"><b role="rowheader">Confirms which reviewer wrote a review</b><i class="y" role="cell">Yes</i><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="n" role="cell">No</i></div>
+      <div class="matrix__row" role="row"><b role="rowheader">Refuses sub-agents launched without the plan's objective</b><i class="y" role="cell">Yes</i><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="n" role="cell">No</i></div>
+    </div>
+    <p class="fine">On every CLI, a review from another AI tool counts only when Ratchet's own review script signed it for that round. A review that was typed, copied or edited by hand is refused.</p>
+  </div>
+</section>
+<nav class="pnext wrap" aria-label="More features"><a class="pnext__link " href="how-it-works.html"><span>Previous feature</span><b>How it works</b></a><a class="pnext__link pnext__link--next" href="reviewers.html"><span>Next feature</span><b>A second opinion</b></a></nav>
+<!-- ============ CTA ============ -->
+<section class="cta" aria-labelledby="cta-title">
+  <div class="wrap cta__card">
+    <svg class="cta__mark" viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke-linejoin="round" stroke-linecap="round" stroke-width="2.0"><path stroke="#3E6FC4" stroke-opacity=".55" stroke-width="1.20" stroke-dasharray="5 2 1 2" d="M1.5,37 H55.5 M28.5,10 V64"/><circle stroke="#3E6FC4" stroke-opacity=".6" stroke-width="1.20" cx="28.5" cy="37" r="14.8"/><path stroke="#3E6FC4" d="M40.54,23.62 L35.06,14.43 L33.34,14.24 L32.24,19.39 L22.89,14.18 L21.31,14.87 L22.94,19.88 L12.23,20.04 L11.21,21.43 L15.12,24.96 L5.93,30.44 L5.74,32.16 L10.89,33.26 L5.68,42.61 L6.37,44.19 L11.38,42.56 L11.54,53.27 L12.93,54.29 L16.46,50.38 L21.94,59.57 L23.66,59.76 L24.76,54.61 L34.11,59.82 L35.69,59.13 L34.06,54.12 L44.77,53.96 L45.79,52.57 L41.88,49.04 L51.07,43.56 L51.26,41.84 L46.11,40.74 L51.32,31.39 L50.63,29.81 L45.62,31.44 L45.46,20.73 L44.07,19.71Z"/><circle stroke="#3E6FC4" cx="28.5" cy="37" r="4.2"/><path stroke="#E8572A" d="M33.91,7.11 L38.05,20.29 L40.95,23.18 L42.13,21.15 L40.55,5.64Z"/><circle stroke="#E8572A" fill="#FBFAF7" cx="37.23" cy="6.38" r="3.6"/><circle fill="#E8572A" stroke="none" cx="37.23" cy="6.38" r="1.2"/></g></svg>
+    <h2 id="cta-title" class="cta__title">Stop taking <em>done</em> on faith.</h2>
+    <p class="lede">One message to install. One sentence to build. Proof at every step.</p>
+    <div class="hero__ctas">
+      <button class="btn btn--primary" type="button" data-copy="Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI."><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" d="M8 8h11v11H8zM5 16V5h11"/></svg><span data-copy-label>Copy the install prompt</span></button>
+      <a class="btn btn--ghost" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>Read the docs on GitHub</a>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer class="foot wrap">
+  <div class="foot__row">
+    <a class="brand" href="index.html">
+      <svg class="brand__mark" viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke-linejoin="round" stroke-linecap="round" stroke-width="2.0"><path stroke="#3E6FC4" stroke-opacity=".55" stroke-width="1.20" stroke-dasharray="5 2 1 2" d="M1.5,37 H55.5 M28.5,10 V64"/><circle stroke="#3E6FC4" stroke-opacity=".6" stroke-width="1.20" cx="28.5" cy="37" r="14.8"/><path stroke="#3E6FC4" d="M40.54,23.62 L35.06,14.43 L33.34,14.24 L32.24,19.39 L22.89,14.18 L21.31,14.87 L22.94,19.88 L12.23,20.04 L11.21,21.43 L15.12,24.96 L5.93,30.44 L5.74,32.16 L10.89,33.26 L5.68,42.61 L6.37,44.19 L11.38,42.56 L11.54,53.27 L12.93,54.29 L16.46,50.38 L21.94,59.57 L23.66,59.76 L24.76,54.61 L34.11,59.82 L35.69,59.13 L34.06,54.12 L44.77,53.96 L45.79,52.57 L41.88,49.04 L51.07,43.56 L51.26,41.84 L46.11,40.74 L51.32,31.39 L50.63,29.81 L45.62,31.44 L45.46,20.73 L44.07,19.71Z"/><circle stroke="#3E6FC4" cx="28.5" cy="37" r="4.2"/><path stroke="#E8572A" d="M33.91,7.11 L38.05,20.29 L40.95,23.18 L42.13,21.15 L40.55,5.64Z"/><circle stroke="#E8572A" fill="#FBFAF7" cx="37.23" cy="6.38" r="3.6"/><circle fill="#E8572A" stroke="none" cx="37.23" cy="6.38" r="1.2"/></g></svg>
+      <span class="brand__word">Ratchet Loop</span>
+    </a>
+    <a class="foot__top" href="#top">Back to top ↑</a>
+  </div>
+  <nav class="foot__map" aria-label="All pages">
+    <a href="how-it-works.html">How it works</a><a href="gates.html">Gates and safeguards</a><a href="reviewers.html">Second opinion</a><a href="live-viewer.html">Live viewer</a><a href="cost.html">Cost control</a><a href="control.html">You stay in control</a><a href="setup.html">Learns your project</a><a href="specs.html">Specs and CI</a><a href="install.html">Install</a>
+  </nav>
+  <p class="foot__tag">Checkpoint-and-gate building for AI coding agents · by <a href="https://github.com/rahilp" rel="noopener">Rahil Pirani</a></p>
+</footer>
+
+<div class="toast" role="status" aria-live="polite" data-toast></div>
+<script src="main.js" defer></script>
+</body>
+</html>

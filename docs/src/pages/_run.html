@@ -1,0 +1,137 @@
+<section class="band" id="run" aria-labelledby="run-title">
+  <div class="wrap">
+    <p class="kicker"><span>03</span>A whole run</p>
+    <h2 id="run-title" class="h2">From one sentence <em>to a finished feature.</em></h2>
+    <p class="lede">Here is everything that happens, in order. You're needed twice: once to OK the plan, and once at the end. Step through it, or let it play.</p>
+
+    <div class="player reveal" data-player="run" data-ms="5200">
+      <div class="player__head">
+        <p class="mono-k"><span class="badge" aria-hidden="true">{{ICON_PLAY}}</span>The run, start to finish</p>
+        <div class="player__ctrls">
+          <button class="ctrl" type="button" data-play aria-pressed="true"><span data-play-label>Pause</span></button>
+          <button class="ctrl" type="button" data-step>→ Step</button>
+          <button class="ctrl" type="button" data-replay>↻ Replay</button>
+        </div>
+      </div>
+      <div class="player__tabs" role="tablist" aria-label="Stages of a run">
+        <button role="tab" type="button" data-tab><span>01</span>You ask</button>
+        <button role="tab" type="button" data-tab><span>02</span>Quick checks</button>
+        <button role="tab" type="button" data-tab><span>03</span>The plan</button>
+        <button role="tab" type="button" data-tab><span>04</span>Building</button>
+        <button role="tab" type="button" data-tab><span>05</span>If it's stuck</button>
+        <button role="tab" type="button" data-tab><span>06</span>Your sign-off</button>
+      </div>
+
+      <div class="player__stage">
+        <!-- 01 -->
+        <div class="scene" role="tabpanel" data-scene>
+          <div class="scene__vis">
+            <div class="chat">
+              <p class="chat__you"><b>You</b>Use Ratchet to build this feature: managers can approve or reject their team's leave requests, with a reason.</p>
+              <p class="chat__agent"><b>Agent</b>Got it. A couple of quick checks first, then I'll show you the plan.</p>
+            </div>
+          </div>
+          <div class="scene__text">
+            <h3>You ask, in your own words</h3>
+            <p>That's all you type. Keep it to one feature. Something you can explain in a few sentences usually becomes three to eight steps. If it's bigger, split it.</p>
+            <p class="scene__note">The agent may ask a few quick questions first, instead of guessing.</p>
+          </div>
+        </div>
+        <!-- 02 -->
+        <div class="scene" role="tabpanel" data-scene hidden>
+          <div class="scene__vis">
+            <ul class="checklist">
+              <li class="ok">Ratchet's hooks are working in this CLI</li>
+              <li class="ok">Another AI can review: Codex, signed in</li>
+              <li class="ok">No spec written yet, so the plan will be the spec</li>
+              <li class="ok">The app starts and the tests run</li>
+              <li class="warn">You're on your main branch. Start a new one?</li>
+            </ul>
+          </div>
+          <div class="scene__text">
+            <h3>It checks a few things on its own</h3>
+            <p>Are the hooks working? Which other AI tools are installed that could review? Has your team already written a spec for this? If something would get in the way, like the app not starting, no way to run tests, or unsaved changes, it tells you in one message and offers to fix each one.</p>
+          </div>
+        </div>
+        <!-- 03 -->
+        <div class="scene" role="tabpanel" data-scene hidden>
+          <div class="scene__vis">
+            <div class="plan">
+              <p class="mono-k">Objective</p>
+              <dl class="plan__obj">
+                <div><dt>Users</dt><dd>Managers who approve leave requests</dd></div>
+                <div><dt>Goal</dt><dd>Clear a team's requests without leaving the app</dd></div>
+                <div><dt>Done means</dt><dd>A manager can approve or reject a request, with a reason</dd></div>
+                <div><dt>Out of scope</dt><dd>Approving another team's requests</dd></div>
+              </dl>
+              <div class="plan__steps" role="table" aria-label="Planned steps">
+                <div role="row" class="plan__row plan__row--head"><span role="columnheader">Step</span><span role="columnheader">Look check</span><span role="columnheader">Risk</span><span role="columnheader">Reviewers</span></div>
+                <div role="row" class="plan__row"><span role="cell">CP1 Show pending requests</span><span role="cell">Yes</span><span role="cell">normal</span><span role="cell">2</span></div>
+                <div role="row" class="plan__row"><span role="cell">CP2 Approve a request</span><span role="cell">Yes</span><span role="cell">normal</span><span role="cell">2</span></div>
+                <div role="row" class="plan__row"><span role="cell">CP3 Reject, with a reason</span><span role="cell">Yes</span><span role="cell">normal</span><span role="cell">2</span></div>
+                <div role="row" class="plan__row"><span role="cell">CP4 Tell the employee</span><span role="cell">No</span><span role="cell">high</span><span role="cell">4</span></div>
+              </div>
+            </div>
+          </div>
+          <div class="scene__text">
+            <h3>You read the plan and say yes</h3>
+            <p>It opens with the objective: who it's for, what they want, what done means, and what's out of scope. Every step, reviewer and finding points back to it. Each step says what "done" means, whether its look is checked, how risky it is and who reviews it.</p>
+            <p>New screens come with a clickable prototype, so you see the result before anything is built. Once you say yes, the plan, the design file and the prototype are locked.</p>
+          </div>
+        </div>
+        <!-- 04 -->
+        <div class="scene" role="tabpanel" data-scene hidden>
+          <div class="scene__vis">
+            <ol class="feed">
+              <li class="ok"><b>CP1</b> Show pending requests <span>locked · commit 3f9a1c2</span></li>
+              <li class="ok"><b>CP2</b> Approve a request <span>locked · commit 81be04d</span></li>
+              <li class="now"><b>CP3</b> Reject, with a reason <span>review, round 2</span></li>
+              <li><b>CP4</b> Tell the employee <span>queued</span></li>
+            </ol>
+          </div>
+          <div class="scene__text">
+            <h3>Now you can walk away</h3>
+            <p>For each step, the agent writes the tests first and makes sure they fail. Then it writes the code until they pass. Then reviewers go looking for problems, and anything they find gets fixed and checked again.</p>
+            <p>Every finished step becomes its own git commit, and you get a one-line update as each one lands.</p>
+          </div>
+        </div>
+        <!-- 05 -->
+        <div class="scene" role="tabpanel" data-scene hidden>
+          <div class="scene__vis">
+            <div class="chat">
+              <p class="chat__agent"><b>Agent</b>CP4 ran out of review rounds. One problem is left: the email goes out before the rejection is saved. Pick one:</p>
+              <p class="chat__opts"><span><b>A</b> Send the email only after the save works <i>(recommended)</i></span><span><b>B</b> Make the step simpler: an in-app notice, no email</span><span><b>C</b> Stop here and keep CP1 to CP3</span></p>
+              <p class="chat__you"><b>You</b>A</p>
+            </div>
+          </div>
+          <div class="scene__text">
+            <h3>If a step gets stuck, it asks you</h3>
+            <p>Each gate gets a limited number of tries. When they run out, the run stops. The agent quotes the problem and gives you two or three options, labelled A, B and C, with the one it recommends. Just reply with the letter.</p>
+            <p>Nothing gets lowered or skipped unless you pick it.</p>
+          </div>
+        </div>
+        <!-- 06 -->
+        <div class="scene" role="tabpanel" data-scene hidden>
+          <div class="scene__vis">
+            <div class="chat">
+              <p class="chat__agent"><b>Agent</b>All 4 steps are locked. To try it: open Team leave, reject a request, and leave the reason empty. You should see "A reason is required". Reviewers also noted 2 small things that didn't block. Want either fixed?</p>
+              <p class="chat__you"><b>You</b>approved</p>
+              <p class="chat__agent"><b>Agent</b>Done. Here's the proof receipt for your pull request.</p>
+            </div>
+          </div>
+          <div class="scene__text">
+            <h3>You try it and sign off</h3>
+            <p>When everything is built, the agent tells you what to try. It also lists any small issues the reviewers noted but didn't hold things up for, and asks if you want any fixed.</p>
+            <p>Say "approved" if you're happy. If not, say what's wrong in your own words. Your changes become new steps, through the same gates.</p>
+          </div>
+        </div>
+      </div>
+      <p class="player__status"><span class="dot" aria-hidden="true"></span><span data-status></span><span class="player__fine">Example run. Real runs show the same steps in your chat.</span></p>
+    </div>
+
+    <details class="expand">
+      <summary>Prefer to check every step yourself, or not be asked at all?</summary>
+      <p>Just say so. By default you're asked twice: the plan and the end. You can ask to approve every step, or to only check in at the end after the plan. You can also say "pause" at any time and "carry on" later, even from a new chat.</p>
+    </details>
+  </div>
+</section>

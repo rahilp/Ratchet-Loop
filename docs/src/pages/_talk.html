@@ -1,0 +1,50 @@
+<section class="band band--alt" id="talk" aria-labelledby="talk-title">
+  <div class="wrap">
+    <p class="kicker"><span>12</span>Talking to it</p>
+    <h2 id="talk-title" class="h2">No commands to learn. <em>Just say what you want.</em></h2>
+    <p class="lede">You can say any of these at any time, in your own words.</p>
+    <ul class="says">
+      <li class="reveal"><q>Where are we?</q><span>A short status of the run.</span></li>
+      <li class="reveal"><q>Pause the build, and resume it when I say so.</q><span>Nothing is lost. Say "carry on" later, even in a new chat.</span></li>
+      <li class="reveal"><q>Cancel this run.</q><span>The agent double-checks before it cancels anything.</span></li>
+      <li class="reveal"><q>Only check in with me at the end.</q><span>Instead of after every step.</span></li>
+      <li class="reveal"><q>Give me the viewer link.</q><span>A web page showing the plan, every test and every review as it happens.</span></li>
+      <li class="reveal"><q>Which reviewers are available on this machine?</q><span>Lists the AI tools Ratchet found and whether they work.</span></li>
+      <li class="reveal"><q>Check that Ratchet's hooks are installed for this CLI.</q><span>And installs them if they aren't.</span></li>
+      <li class="reveal"><q>Create a DESIGN.md for this app.</q><span>Writes the design file from your existing screens, without building anything.</span></li>
+    </ul>
+
+    <div class="yes reveal" data-yes>
+      <div class="yes__copy">
+        <p class="mono-k"><span class="badge" aria-hidden="true">{{ICON_ASK}}</span>Try it</p>
+        <h3 class="yes__title">Does this count as a yes?</h3>
+        <p>When Ratchet needs your approval, only a clear yes moves it forward. Type a reply and see what Ratchet would make of it.</p>
+        <ul class="yes__rules">
+          <li>Counts: <code>yes</code> <code>yes, go ahead</code> <code>go ahead</code> <code>approved</code></li>
+          <li>Capitals and a full stop or exclamation mark at the end don't matter.</li>
+          <li>Nothing else can be attached. "ok", "sure", 👍 or "yes but…" don't count.</li>
+          <li>Only your first reply after the question counts, and a yes only answers that one question.</li>
+        </ul>
+      </div>
+      <div class="yes__box">
+        <label class="yes__label" for="yes-input">Your reply</label>
+        <input class="yes__input" id="yes-input" type="text" autocomplete="off" spellcheck="false" value="Yes, go ahead!" data-yes-input>
+        <div class="yes__try"><button type="button" class="pill" data-yes-try="ok">ok</button><button type="button" class="pill" data-yes-try="Approved.">Approved.</button><button type="button" class="pill" data-yes-try="yes but change the colour">yes but change the colour</button><button type="button" class="pill" data-yes-try="👍">👍</button></div>
+        <p class="yes__out" data-yes-out aria-live="polite"></p>
+      </div>
+    </div>
+
+    <div class="pair">
+      <div class="pair__card reveal">
+        <p class="mono-k">Accept a finding yourself</p>
+        <p class="pair__cmd"><code>accept: <i>your reason</i></code></p>
+        <p>If a review blocks on something you've decided isn't worth another round, you can accept it once, with your own reason. It's written down in the step's record and in <code>.ratchet/learnings.md</code>. If the code changes later, normal review rules apply again.</p>
+      </div>
+      <div class="pair__card reveal">
+        <p class="mono-k">Give a step one more round</p>
+        <p class="pair__cmd"><code>raise: <i>your reason</i></code></p>
+        <p>When a step hits its review limit, raising it is always the last option offered, and only once per step. Your reason is written down so later rounds and agents see it too.</p>
+      </div>
+    </div>
+  </div>
+</section>

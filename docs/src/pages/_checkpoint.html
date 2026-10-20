@@ -1,0 +1,60 @@
+<section class="band" id="checkpoint" aria-labelledby="cp-title">
+  <div class="wrap">
+    <p class="kicker"><span>05</span>Inside one step</p>
+    <h2 id="cp-title" class="h2">Tests first. <em>Then the code has to catch up.</em></h2>
+    <p class="lede">Every step, which Ratchet calls a checkpoint, goes through the same eight stages. A different agent handles each job, so the one writing the code is never the one judging it.</p>
+
+    <div class="sim reveal" data-sim>
+      <div class="sim__head">
+        <p class="mono-k"><span class="badge" aria-hidden="true">{{ICON_PLAY}}</span>One checkpoint</p>
+        <h3 class="sim__title">From the first test to the commit.</h3>
+        <div class="player__ctrls">
+          <button class="ctrl" type="button" data-sim-play aria-pressed="true"><span data-sim-play-label>Pause</span></button>
+          <button class="ctrl" type="button" data-sim-step>→ Step</button>
+          <button class="ctrl" type="button" data-sim-replay>↻ Replay</button>
+        </div>
+      </div>
+      <div class="sim__stream">
+        <div class="sim__streamhead"><p class="mono-k">Run · leave approvals</p><span class="tag">Example</span></div>
+        <ol class="stream" aria-label="Checkpoints in this run">
+          <li class="is-done"><b>CP1</b><span>Locked</span></li>
+          <li class="is-done"><b>CP2</b><span>Locked</span></li>
+          <li class="is-now" data-sim-cp="3"><b>CP3</b><span data-sim-cp-state>Current</span></li>
+          <li data-sim-cp="4"><b>CP4</b><span data-sim-cp-state>Up next</span></li>
+        </ol>
+      </div>
+      <div class="sim__body">
+        <div class="sim__task">
+          <p class="mono-k">CP3 <span>· risk normal · 2 reviewers · has a screen</span></p>
+          <p class="sim__taskname">Reject a leave request, with a reason</p>
+          <p class="sim__done"><b>Done when:</b> a manager can reject a request, a reason is required, and the employee can see it.</p>
+        </div>
+        <ol class="flow" aria-label="Stages">
+          <li class="flow__box" data-stage="0"><p class="flow__k">Test planner</p><p class="flow__t">Plan tests</p><p class="flow__s">6 cases, before any code</p></li>
+          <li class="flow__box" data-stage="1"><p class="flow__k">Test writer</p><p class="flow__t">Write tests</p><p class="flow__s">tagged CP3-T1 to T6</p></li>
+          <li class="flow__box flow__box--gate" data-stage="2"><p class="flow__k">Gate 1</p><p class="flow__t">Red</p><p class="flow__s">at least one must fail</p></li>
+          <li class="flow__box" data-stage="3"><p class="flow__k">Implementer</p><p class="flow__t">Build</p><p class="flow__s">code for this step only</p></li>
+          <li class="flow__box flow__box--gate" data-stage="4"><p class="flow__k">Gate 1</p><p class="flow__t">Green</p><p class="flow__s">6 of 6 pass, none deleted</p></li>
+          <li class="flow__box flow__box--gate" data-stage="5"><p class="flow__k">Gate 2</p><p class="flow__t">Looks right</p><p class="flow__s">screens vs the prototype</p></li>
+          <li class="flow__box flow__box--gate" data-stage="6"><p class="flow__k">Gate 3 <span>⇄ fixer</span></p><p class="flow__t">Review</p><p class="flow__s">until nothing serious is left</p></li>
+          <li class="flow__box flow__box--lock" data-stage="7"><p class="flow__k">Commit</p><p class="flow__t">Lock</p><p class="flow__s">the ratchet clicks forward</p></li>
+        </ol>
+      </div>
+      <div class="sim__tabs" role="tablist" aria-label="Stages">
+        <button role="tab" type="button" data-sim-tab="0"><span>01</span>Plan tests</button>
+        <button role="tab" type="button" data-sim-tab="1"><span>02</span>Write tests</button>
+        <button role="tab" type="button" data-sim-tab="2"><span>03</span>Red</button>
+        <button role="tab" type="button" data-sim-tab="3"><span>04</span>Build</button>
+        <button role="tab" type="button" data-sim-tab="4"><span>05</span>Green</button>
+        <button role="tab" type="button" data-sim-tab="5"><span>06</span>Looks right</button>
+        <button role="tab" type="button" data-sim-tab="6"><span>07</span>Review</button>
+        <button role="tab" type="button" data-sim-tab="7"><span>08</span>Lock</button>
+      </div>
+      <div class="sim__detail" aria-live="polite">
+        <p class="sim__detailk">▸ What happens</p>
+        <p data-sim-text>The test planner writes test cases before any code exists: the normal path, edge cases, permissions and what should happen when things go wrong.</p>
+      </div>
+      <p class="player__status"><span class="dot" aria-hidden="true"></span><span data-sim-status>Auto-play · checkpoint 3 of 4 · Plan tests</span><span class="player__fine">Example. Your chat shows each stage as it happens.</span></p>
+    </div>
+  </div>
+</section>

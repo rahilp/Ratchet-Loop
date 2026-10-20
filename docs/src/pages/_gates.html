@@ -1,0 +1,58 @@
+<section class="band band--alt gates" id="gates" aria-labelledby="gates-title">
+  <div class="gates__inner wrap">
+    <div class="gates__stage" aria-hidden="true">
+      <div class="gates__sticky">
+        <svg class="wheel" viewBox="0 0 400 400" data-wheel>
+          <g class="wheel__rotor" data-rotor>
+            <path class="wheel__teeth" d="{{WHEEL}}" fill-rule="evenodd"/>
+            <circle class="wheel__ring" cx="200" cy="200" r="132"/>
+            <path class="wheel__cl" d="M200,40 V360 M40,200 H360"/>
+            {{STUDS}}
+            <circle class="wheel__hub" cx="200" cy="200" r="44"/>
+            <circle class="wheel__hub" cx="200" cy="200" r="18"/>
+          </g>
+          <g class="pawl" data-pawl>
+            <path class="pawl__arm" d="{{PAWL}}"/>
+            <circle class="pawl__pin" cx="{{PX}}" cy="{{PY}}" r="13"/>
+            <circle cx="{{PX}}" cy="{{PY}}" r="4" fill="#E8572A"/>
+          </g>
+        </svg>
+        <div class="gates__count"><span data-count>0</span> of 4 gates passed</div>
+        <p class="gates__hint">Scroll back up. It won't turn back. That's the point.</p>
+      </div>
+    </div>
+    <div class="gates__list">
+      <p class="kicker"><span>06</span>The four gates</p>
+      <h2 id="gates-title" class="h2">Four gates. <em>In order. No skipping.</em></h2>
+      <p class="lede">The first three run on every step. The last one is you, at the end. Work with nothing to look at, like an API change or a refactor, skips gate 2.</p>
+      <article class="gate" data-gate="1">
+        <header><span class="gate__n">Gate 1</span><span class="gate__state" data-state>Waiting</span></header>
+        <h3>Tests</h3>
+        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>Tests are written before the code. At least one fails on an assertion. Then all of them pass.</dd></div>
+        <div><dt>How it's enforced</dt><dd>Ratchet runs the tests itself and reads each planned test's own result. A test that crashed, was skipped or never ran doesn't count. None may be deleted.</dd></div></dl>
+        <ul><li>Planned tests are frozen after their first failing run. Changing one needs your OK.</li><li>A test that already passes before the code exists isn't testing anything.</li></ul>
+      </article>
+      <article class="gate" data-gate="2">
+        <header><span class="gate__n">Gate 2</span><span class="gate__state" data-state>Waiting</span></header>
+        <h3>Looks right</h3>
+        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>The screen matches the design, or the old screen if you're rebuilding one, in the same state.</dd></div>
+        <div><dt>How it's enforced</dt><dd>Both are opened in a browser, put in the same state, clicked through the same actions and screenshotted. Two reviewers list every difference. Any difference that can be fixed in code blocks the step.</dd></div></dl>
+        <ul><li>One reviewer checks how it looks. The other checks how it behaves: clicks, typing, errors.</li><li>They only see screenshots and the design file, never the code or the chat.</li><li>If the two screenshots aren't showing the same thing, the comparison is thrown out and redone.</li></ul>
+      </article>
+      <article class="gate" data-gate="3">
+        <header><span class="gate__n">Gate 3</span><span class="gate__state" data-state>Waiting</span></header>
+        <h3>Review</h3>
+        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>Reviewers try to break the code and find nothing serious.</dd></div>
+        <div><dt>How it's enforced</dt><dd>Rounds keep going until no reviewer has a blocking finding on the current code. A review only counts if it was signed for that exact round, or written by the agent's own reviewer.</dd></div></dl>
+        <ul><li>Every finding must say who is harmed and how, judged against the plan's objective.</li><li>Small nitpicks stop blocking after two rounds and are listed for you at the end.</li></ul>
+      </article>
+      <article class="gate" data-gate="4">
+        <header><span class="gate__n">Gate 4</span><span class="gate__state" data-state>Waiting</span></header>
+        <h3>You</h3>
+        <dl class="gate__rule"><div><dt>Has to be true</dt><dd>You try it and say yes.</dd></div>
+        <div><dt>How it's enforced</dt><dd>Only a real message from you counts. Messages your CLI sends on its own, like a background task finishing, are never taken as your reply.</dd></div></dl>
+        <ul><li>A thumbs-up, an "ok" or a yes with a "but" on the end doesn't count. <a href="control.html#talk">Try it yourself</a>.</li></ul>
+      </article>
+    </div>
+  </div>
+</section>

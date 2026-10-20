@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Builds docs/index.html from src/index.template.html.
+"""Builds the site (index.html and one page per feature) from the parts in src/pages/.
 
 Generates the ratchet geometry (wheel, pawl, studs), the agent grid from
 agents/*.md, the setup panels, and the FAQ markup and its JSON-LD. Run from anywhere: python3 docs/src/build.py
@@ -273,8 +273,105 @@ def minify_css(css):
     return css.replace(";}", "}").strip() + "\n"
 
 
+FEATURES = [
+    # slug, card title, card text, page h1, h1 accent, page lede, sections on the page, icon path
+    ("how-it-works", "How it works", "From one sentence to a finished feature: the plan you approve, the build, and the eight stages every step goes through.",
+     "How it works.", "From one sentence to a finished feature.",
+     "You describe a feature. Your agent plans it as small steps, you say yes, and each step is built test-first and checked before the next one starts.",
+     ["idea", "run", "checkpoint"], "M4 6h16M4 12h10M4 18h6"),
+    ("gates", "Four gates and safeguards", "Tests, looks right, review and your OK, in order. Hooks make sure the agent can't skip, weaken or argue past any of them.",
+     "Four gates.", "And nothing the agent can do to skip them.",
+     "Every step has to pass the same gates in the same order. Hooks in your CLI enforce the rules, so they hold even when the agent would rather move on.",
+     ["gates", "safeguards"], "M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"),
+    ("reviewers", "A second opinion", "A different AI, from another company when you have one, tries to break every step. Thirteen agents each do one job.",
+     "A second opinion.", "From somebody other than the author.",
+     "The agent that writes the code never judges it. Reviews come from a different model, ideally a different company, and every job has its own agent.",
+     ["reviewers", "agents"], "M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM16 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM3 20c0-3 2.5-5 5-5s5 2 5 5M11 20c0-3 2.5-5 5-5s5 2 5 5"),
+    ("live-viewer", "Live viewer", "Every run gets its own page: the plan, every planned test, each review round and each commit, updated as the agent works.",
+     "The live viewer.", "Watch every run, step by step.",
+     "Everything Ratchet does shows up in your chat. The viewer puts the whole run on one page, so you can see where it is at a glance.",
+     ["viewer"], "M3 5h18v14H3zM3 9h18M7 7h.01"),
+    ("cost", "Cost control", "Hard limits on review rounds, reviewers sized to risk, cheaper models for lighter jobs, and no pay-per-use tool without your OK.",
+     "Cost control.", "Checking costs more. Ratchet keeps it bounded.",
+     "Proving every step takes more AI time than not checking. Ratchet limits how much review can happen and spends it where the risk is.",
+     ["cost"], "M4 18h16M7 18V9M12 18V5M17 18v-6"),
+    ("control", "You stay in control", "Approve the plan, pause at any time, accept a finding with your own reason, and get a proof receipt at the end.",
+     "You stay in control.", "No commands. Just say what you want.",
+     "You talk to your agent in your own words. Ratchet only moves on with a clear yes from you, and it writes down every decision you make.",
+     ["talk", "receipt"], "M12 8v4l3 2M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z"),
+    ("setup", "Learns your project", "A design file, coding standards, a clickable prototype, your lessons and automatic checks, written for you and reused every run.",
+     "Learns your project.", "Say it once, not every time.",
+     "You don't prepare anything before your first run. Ratchet writes down how your app looks, how your code is written and what you've told it, and every agent reads it.",
+     ["setup"], "M6 3h9l3 3v15H6zM9 9h6M9 13h6M9 17h4"),
+    ("specs", "Specs and CI", "Builds from OpenSpec, Spec Kit or BMAD and ticks off their tasks. Keeps the same checks running in GitHub Actions.",
+     "Specs and CI.", "Fits the way your team already works.",
+     "If your team writes specs, Ratchet builds from them and proves each scenario. If you use CI, it keeps the mechanical checks running there too.",
+     ["specs"], "M8 4l-5 8 5 8M16 4l5 8-5 8"),
+]
+PAGE_SUFFIX = " · Ratchet Loop"
+
+
+def sections_html(ids):
+    """Pull sections out of their files, number their kickers 01, 02... and alternate the band shading."""
+    out = []
+    for i, sid in enumerate(ids):
+        s = (ROOT / "src" / "pages" / f"_{sid}.html").read_text()
+        s = re.sub(r'<p class="kicker"><span>\d\d</span>', f'<p class="kicker"><span>{i + 1:02d}</span>', s)
+        def shade(m, alt=i % 2 == 1):
+            cls = [c for c in m.group(1).split() if c not in ("band", "band--alt")]
+            return '<section class="' + " ".join(["band"] + (["band--alt"] if alt else []) + cls) + '"'
+        s = re.sub(r'<section class="(band[^"]*)"', shade, s, count=1)
+        out.append(s)
+    return "\n".join(out)
+
+
+def page_header(n, title, accent, lede, ids, slug):
+    names = {"idea": "The idea", "run": "A whole run", "checkpoint": "Inside one step", "gates": "The four gates",
+             "safeguards": "Safeguards", "reviewers": "Who reviews", "agents": "The agents", "viewer": "The viewer",
+             "cost": "Budgets and limits", "talk": "Talking to it", "receipt": "The proof receipt", "setup": "What it sets up",
+             "specs": "Specs and CI", "install": "Install", "faq": "Questions"}
+    jump = "".join(f'<a href="#{i}">{names[i]}</a>' for i in ids)
+    label = f"Feature {n:02d}" if n else "Get started"
+    return f'''<section class="phead" id="top" aria-labelledby="page-title">
+  <div class="phead__bg" aria-hidden="true"><div class="hero__grid" data-depth="0.25"></div><img class="hero__draw" src="assets/blueprint.svg" alt="" width="1200" height="1200" decoding="async" data-depth="0.55"></div>
+  <div class="wrap phead__inner">
+    <p class="crumb"><a href="index.html#features">Features</a><span aria-hidden="true">/</span>{label}</p>
+    <h1 id="page-title" class="phead__title">{title} <em>{accent}</em></h1>
+    <p class="lede">{lede}</p>
+    <nav class="phead__jump" aria-label="On this page">{jump}</nav>
+  </div>
+</section>
+'''
+
+
+def next_nav(k):
+    prev = FEATURES[k - 1] if k > 0 else None
+    nxt = FEATURES[k + 1] if k + 1 < len(FEATURES) else None
+    cell = lambda f, cls, tag: (f'<a class="pnext__link {cls}" href="{f[0]}.html"><span>{tag}</span><b>{f[1]}</b></a>' if f else "<span></span>")
+    nxt_cell = cell(nxt, "pnext__link--next", "Next feature") if nxt else \
+        '<a class="pnext__link pnext__link--next" href="install.html"><span>Ready?</span><b>Install Ratchet Loop</b></a>'
+    return (f'<nav class="pnext wrap" aria-label="More features">{cell(prev, "", "Previous feature")}{nxt_cell}</nav>\n')
+
+
+def feature_cards():
+    out = []
+    for n, f in enumerate(FEATURES, 1):
+        slug, card_title, card_text, *_rest, icon = f
+        out.append(f'      <a class="feat reveal" href="{slug}.html"><span class="feat__n">{n:02d}</span>'
+                   f'<span class="feat__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="{icon}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
+                   f'<h3>{html.escape(card_title)}</h3><p>{html.escape(card_text)}</p><span class="feat__more">Learn more {ICONS["{{ICON_ARROW}}"]}</span></a>')
+    return "\n".join(out)
+
+
+def fill(s, reps):
+    for k, v in reps.items():
+        s = s.replace(k, v)
+    return s
+
+
 def main():
-    tpl = (ROOT / "src" / "index.template.html").read_text()
+    P = ROOT / "src" / "pages"
+    part = lambda n: (P / n).read_text()
     wheel, studs, pawl, piv, sign = big_wheel()
     faq_html = "\n".join(
         f'    <details>\n      <summary>{html.escape(q)}</summary>\n      <p>{html.escape(a)}</p>\n    </details>'
@@ -282,33 +379,52 @@ def main():
     faq_ld = ",".join(json.dumps({"@type": "Question", "name": q, "acceptedAnswer": {"@type": "Answer", "text": a}}) for q, a in FAQ)
     team_grid, team_panels = team_markup()
     setup_grid, setup_panels = setup_markup()
-    for k, v in ICONS.items():
-        tpl = tpl.replace(k, v)
-    out = (tpl.replace("{{SITE}}", SITE)
-              .replace("{{FONTS}}", html.escape(FONTS))
-              .replace("{{INSTALL_PROMPT}}", INSTALL_PROMPT)
-              .replace("{{SETUP_GRID}}", setup_grid)
-              .replace("{{SETUP_PANELS}}", setup_panels)
-              .replace("{{TEAM_GRID}}", team_grid)
-              .replace("{{TEAM_PANELS}}", team_panels)
-              .replace("{{MARK}}", mark_wire())
-              .replace("{{WHEEL}}", wheel)
-              .replace("{{STUDS}}", studs)
-              .replace("{{PAWL}}", pawl)
-              .replace("{{PX}}", f"{piv[0]:.2f}").replace("{{PY}}", f"{piv[1]:.2f}")
-              .replace("{{FAQ_HTML}}", faq_html)
-              .replace("{{FAQ_LD}}", faq_ld))
-    out = out.replace('<g class="pawl" data-pawl>',
-                      f'<g class="pawl" data-pawl style="transform-origin:{piv[0]:.2f}px {piv[1]:.2f}px;--lift:{sign * 7}deg">')
-    assert "{{" not in out, "unfilled placeholder"
-    (ROOT / "index.html").write_text(out)
+    common = dict(ICONS)
+    common.update({"{{FONTS}}": html.escape(FONTS), "{{INSTALL_PROMPT}}": INSTALL_PROMPT,
+                   "{{SETUP_GRID}}": setup_grid, "{{SETUP_PANELS}}": setup_panels,
+                   "{{TEAM_GRID}}": team_grid, "{{TEAM_PANELS}}": team_panels,
+                   "{{WHEEL}}": wheel, "{{STUDS}}": studs, "{{PAWL}}": pawl,
+                   "{{PX}}": f"{piv[0]:.2f}", "{{PY}}": f"{piv[1]:.2f}", "{{FAQ_HTML}}": faq_html})
+    faq_section = re.sub(r'<p class="kicker"><span>\d\d</span>', '<p class="kicker">', part("_faq.html"))
+    sw_ld = ('{"@type":"SoftwareApplication","name":"Ratchet Loop","applicationCategory":"DeveloperApplication",'
+             '"operatingSystem":"macOS, Linux, Windows","softwareVersion":"1.14.0","url":"' + SITE + '",'
+             '"downloadUrl":"https://github.com/rahilp/Ratchet-Loop","image":"' + SITE + 'assets/og.jpg",'
+             '"description":"A checkpoint-and-gate build loop for AI coding agents. Every checkpoint must pass behavior tests, UI review, adversarial code review and human review before the next one starts.",'
+             '"author":{"@type":"Person","name":"Rahil Pirani"},"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}')
+    pages = [("index.html", "Ratchet Loop · Make your AI coding agent prove its work",
+              "Ratchet Loop plugs into Claude Code, Codex, Gemini CLI and Copilot CLI. Your agent builds in small steps, and each one must pass its tests, match the design and survive a review by a different AI before the next starts.",
+              part("_hero.html") + part("home.html").replace("{{FEATURE_CARDS}}", feature_cards())
+              .replace("{{CASE}}", part("_case.html")).replace("{{FAQ_SECTION}}", faq_section),
+              '<script type="application/ld+json">{"@context":"https://schema.org","@graph":[' + sw_ld +
+              ',{"@type":"FAQPage","mainEntity":[' + faq_ld + ']}]}</script>',
+              '<link rel="preload" as="image" href="assets/hero-poster.avif" type="image/avif" fetchpriority="high">', "home")]
+    for k, (slug, card_title, card_text, h1, accent, lede, ids, _icon) in enumerate(FEATURES):
+        body = page_header(k + 1, h1, accent, lede, ids, slug) + sections_html(ids) + next_nav(k)
+        pages.append((f"{slug}.html", card_title + PAGE_SUFFIX, card_text, body, "", "", slug))
+    body = page_header(0, "Install once.", "Then just ask.", "You install Ratchet once per computer, then use it in any project by talking to your agent.",
+                       ["install", "faq"], "install") + sections_html(["install", "faq"])
+    pages.append(("install.html", "Install" + PAGE_SUFFIX, "Install Ratchet Loop in Claude Code, Codex, Gemini CLI or Copilot CLI with three messages to your agent.", body, "", "", "install"))
+
+    head, nav, cta, foot = part("_head.html"), part("_nav.html"), part("_cta.html"), part("_foot.html")
+    for fname, title, desc, body, ld, preload, cur in pages:
+        navc = re.sub(r"\{\{CUR_([a-z-]+)\}\}", lambda m: ' aria-current="page"' if m.group(1) == cur else "", nav)
+        out = head + navc + body + cta + "</main>\n\n" + foot
+        out = fill(out, {"{{TITLE}}": html.escape(title), "{{DESC}}": html.escape(desc), "{{LD}}": ld, "{{PRELOAD}}": preload,
+                         "{{PATH}}": "" if fname == "index.html" else fname})
+        out = fill(out, common).replace("{{SITE}}", SITE).replace("{{MARK}}", mark_wire())
+        out = out.replace('<g class="pawl" data-pawl>',
+                          f'<g class="pawl" data-pawl style="transform-origin:{piv[0]:.2f}px {piv[1]:.2f}px;--lift:{sign * 7}deg">')
+        assert "{{" not in out, (fname, re.findall(r"\{\{[A-Z_a-z-]+\}\}", out)[:5])
+        (ROOT / fname).write_text(out)
+    urls = "\n".join(f"  <url><loc>{SITE}{'' if p[0] == 'index.html' else p[0]}</loc></url>" for p in pages)
+    (ROOT / "sitemap.xml").write_text('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' + urls + "\n</urlset>\n")
     (ROOT / "assets" / "logo-mark.svg").write_text(
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Ratchet Loop">{mark_wire()}</svg>')
     (ROOT / "assets" / "favicon.svg").write_text(
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect x="1" y="1" width="62" height="62" rx="14" fill="#FFFFFF" stroke="#DCD9E6" stroke-width="2"/>'
         f'<g transform="translate(4.5 4.5) scale(0.86)">{mark_wire(sw=3.6, detail=False, bg="#FFFFFF")}</g></svg>')
     (ROOT / "styles.min.css").write_text(minify_css((ROOT / "styles.css").read_text()))
-    print("built", ROOT / "index.html")
+    print("built", ", ".join(p[0] for p in pages))
 
 
 if __name__ == "__main__":

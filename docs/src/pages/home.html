@@ -1,0 +1,99 @@
+<!-- ============ WHAT IT MEANS FOR YOU ============ -->
+<section class="band" id="why" aria-labelledby="why-title">
+  <div class="wrap">
+    <p class="kicker">What it means for you</p>
+    <h2 id="why-title" class="h2">Hand off the feature. <em>Get back something you can ship.</em></h2>
+    <p class="lede">AI agents write code fast, then tell you it works when it doesn't. So you stay at the keyboard, re-checking every claim. Ratchet Loop does that checking for you, the same way every time.</p>
+    <div class="why">
+      <article class="why__card reveal">
+        <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h10M11 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 5v14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+        <h3>Walk away while it builds</h3>
+        <p>You're needed twice: to OK the plan, and to try the result. In between you don't have to watch, re-prompt or ask "are you sure it works?". You get a one-line update as each step lands.</p>
+      </article>
+      <article class="why__card reveal">
+        <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M8.5 12.2l2.4 2.4 4.6-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <h3>Trust what it calls done</h3>
+        <p>Done means Ratchet ran the tests itself, compared the screen with the design, and had a different AI try to break the code. The agent's own word never counts, and hooks stop it skipping a check.</p>
+      </article>
+      <article class="why__card reveal">
+        <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16 16l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+        <h3>Catch problems where they start</h3>
+        <p>Each small step is checked and committed before the next begins. A bug shows up at the step that caused it, not three features later, and every step can be rolled back on its own.</p>
+      </article>
+      <article class="why__card reveal">
+        <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 18h16M7 18V9M12 18V5M17 18v-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+        <h3>Keep cost and control</h3>
+        <p>Review has hard limits per step and per run, reviewers are sized to risk, and no pay-per-use tool is touched without your OK. When it's stuck it stops and asks you. Nothing is lowered unless you choose it.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============ MORE THAN TDD ============ -->
+<section class="band band--alt" id="tdd" aria-labelledby="tdd-title">
+  <div class="wrap">
+    <p class="kicker">More than test-driven development</p>
+    <h2 id="tdd-title" class="h2">Tests first is one gate. <em>Ratchet adds the other three, and enforces all four.</em></h2>
+    <p class="lede">Asking an agent to do TDD helps, but the agent still writes the tests, runs them, reports the result and decides when it's finished. Ratchet takes those calls away from it.</p>
+    <div class="vs reveal" role="table" aria-label="Prompting an agent, agent with TDD, and Ratchet Loop compared">
+      <div class="vs__row vs__row--head" role="row"><span role="columnheader"></span><span role="columnheader">Prompting an agent</span><span role="columnheader">Agent doing TDD</span><span role="columnheader">Ratchet Loop</span></div>
+      <div class="vs__row" role="row"><b role="rowheader">Tests written before the code</b><i class="n" role="cell">No</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes, and one must fail first</i></div>
+      <div class="vs__row" role="row"><b role="rowheader">Someone other than the agent runs them</b><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="y" role="cell">Ratchet reads every result</i></div>
+      <div class="vs__row" role="row"><b role="rowheader">Tests can't be deleted or weakened</b><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="y" role="cell">Frozen after the first run</i></div>
+      <div class="vs__row" role="row"><b role="rowheader">Screens checked against the design</b><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="y" role="cell">Two screenshot reviewers</i></div>
+      <div class="vs__row" role="row"><b role="rowheader">Code reviewed by a different AI</b><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="y" role="cell">Another company when available</i></div>
+      <div class="vs__row" role="row"><b role="rowheader">Agent can't skip a check or quit early</b><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="y" role="cell">Hooks block it</i></div>
+      <div class="vs__row" role="row"><b role="rowheader">Small steps, one commit each</b><i class="n" role="cell">No</i><i class="p" role="cell">Sometimes</i><i class="y" role="cell">Always</i></div>
+      <div class="vs__row" role="row"><b role="rowheader">Stops and asks you when stuck</b><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="y" role="cell">With A, B, C options</i></div>
+      <div class="vs__row" role="row"><b role="rowheader">Limits on review cost</b><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="y" role="cell">Per step and per run</i></div>
+      <div class="vs__row" role="row"><b role="rowheader">Remembers your feedback next time</b><i class="n" role="cell">No</i><i class="n" role="cell">No</i><i class="y" role="cell">Written to a lessons file</i></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FEATURES ============ -->
+<section class="band" id="features" aria-labelledby="features-title">
+  <div class="wrap">
+    <p class="kicker">Features</p>
+    <h2 id="features-title" class="h2">Everything around your agent <em>that makes its work trustworthy.</em></h2>
+    <p class="lede">Each feature has its own page with the details, diagrams and examples.</p>
+    <div class="feats">
+{{FEATURE_CARDS}}
+    </div>
+  </div>
+</section>
+
+<!-- ============ PROOF ============ -->
+<section class="band band--alt" id="example" aria-labelledby="example-title">
+  <div class="wrap">
+    <p class="kicker">What it catches</p>
+    <h2 id="example-title" class="h2">From "it works" <em>to a checked change.</em></h2>
+    <p class="lede">The same step, two endings. On its own, the agent reports success. With Ratchet, a reviewer finds the gap before you ever see it.</p>
+{{CASE}}
+  </div>
+</section>
+
+<!-- ============ WORKS WHERE YOU WORK ============ -->
+<section class="band" id="start" aria-labelledby="start-title">
+  <div class="wrap">
+    <p class="kicker">Get started</p>
+    <h2 id="start-title" class="h2">Works in the CLI you already use. <em>Three messages to set up.</em></h2>
+    <ul class="clis" aria-label="Supported coding agents">
+      <li><b>Claude Code</b><span>Full protection, including checking which reviewer wrote each review</span></li>
+      <li><b>Codex</b><span>Hooks, gates and records</span></li>
+      <li><b>Gemini CLI</b><span>Hooks, gates and records</span></li>
+      <li><b>GitHub Copilot CLI</b><span>Hooks, gates and records</span></li>
+    </ul>
+    <ol class="mini-steps">
+      <li><span>01</span><p><b>Ask your agent to install it.</b> Paste one message. It asks before changing anything.</p></li>
+      <li><span>02</span><p><b>Restart your CLI</b> and say "Set up Ratchet and continue".</p></li>
+      <li><span>03</span><p><b>Build something.</b> "Use Ratchet to build this feature: …"</p></li>
+    </ol>
+    <div class="hero__ctas hero__ctas--left">
+      <a class="btn btn--primary" href="install.html">Install guide {{ICON_ARROW}}</a>
+      <button class="btn btn--ghost" type="button" data-copy="{{INSTALL_PROMPT}}">{{ICON_COPY}}<span data-copy-label>Copy install prompt</span></button>
+    </div>
+  </div>
+</section>
+
+{{FAQ_SECTION}}

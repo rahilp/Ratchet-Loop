@@ -1,4 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>https://ratchetloop.github.io/</loc><lastmod>2026-10-20</lastmod><changefreq>monthly</changefreq><priority>1.0</priority></url>
+  <url><loc>https://ratchetloop.github.io/</loc></url>
+  <url><loc>https://ratchetloop.github.io/how-it-works.html</loc></url>
+  <url><loc>https://ratchetloop.github.io/gates.html</loc></url>
+  <url><loc>https://ratchetloop.github.io/reviewers.html</loc></url>
+  <url><loc>https://ratchetloop.github.io/live-viewer.html</loc></url>
+  <url><loc>https://ratchetloop.github.io/cost.html</loc></url>
+  <url><loc>https://ratchetloop.github.io/control.html</loc></url>
+  <url><loc>https://ratchetloop.github.io/setup.html</loc></url>
+  <url><loc>https://ratchetloop.github.io/specs.html</loc></url>
+  <url><loc>https://ratchetloop.github.io/install.html</loc></url>
 </urlset>

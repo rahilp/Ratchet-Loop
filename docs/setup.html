@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Learns your project · Ratchet Loop</title>
+<meta name="description" content="A design file, coding standards, a clickable prototype, your lessons and automatic checks, written for you and reused every run.">
+<link rel="canonical" href="https://ratchetloop.github.io/setup.html">
+<meta name="theme-color" content="#FBFAF7">
+<meta name="color-scheme" content="light">
+<meta name="author" content="Rahil Pirani">
+<meta name="robots" content="index, follow, max-image-preview:large">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Ratchet Loop">
+<meta property="og:title" content="Learns your project · Ratchet Loop">
+<meta property="og:description" content="Small checkpoints. Four gates each. Tests first, a different AI as reviewer, and your sign-off. Your agent can't argue its way past.">
+<meta property="og:url" content="https://ratchetloop.github.io/setup.html">
+<meta property="og:image" content="https://ratchetloop.github.io/assets/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="A blueprint drawing of a ratchet wheel with three gate checks lit, beside the words: Ratchet Loop, make your agent prove it.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Learns your project · Ratchet Loop">
+<meta name="twitter:description" content="Small checkpoints. Four gates each. Your agent can't argue its way past.">
+<meta name="twitter:image" content="https://ratchetloop.github.io/assets/og.jpg">
+
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="assets/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<link rel="manifest" href="site.webmanifest">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preload" as="style" data-fonts href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Newsreader:ital,wght@0,400;0,600;1,400&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Newsreader:ital,wght@0,400;0,600;1,400&amp;display=swap"></noscript>
+
+<link rel="stylesheet" href="styles.min.css">
+
+
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav" data-nav>
+  <a class="brand" href="index.html">
+    <svg class="brand__mark" viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke-linejoin="round" stroke-linecap="round" stroke-width="2.0"><path stroke="#3E6FC4" stroke-opacity=".55" stroke-width="1.20" stroke-dasharray="5 2 1 2" d="M1.5,37 H55.5 M28.5,10 V64"/><circle stroke="#3E6FC4" stroke-opacity=".6" stroke-width="1.20" cx="28.5" cy="37" r="14.8"/><path stroke="#3E6FC4" d="M40.54,23.62 L35.06,14.43 L33.34,14.24 L32.24,19.39 L22.89,14.18 L21.31,14.87 L22.94,19.88 L12.23,20.04 L11.21,21.43 L15.12,24.96 L5.93,30.44 L5.74,32.16 L10.89,33.26 L5.68,42.61 L6.37,44.19 L11.38,42.56 L11.54,53.27 L12.93,54.29 L16.46,50.38 L21.94,59.57 L23.66,59.76 L24.76,54.61 L34.11,59.82 L35.69,59.13 L34.06,54.12 L44.77,53.96 L45.79,52.57 L41.88,49.04 L51.07,43.56 L51.26,41.84 L46.11,40.74 L51.32,31.39 L50.63,29.81 L45.62,31.44 L45.46,20.73 L44.07,19.71Z"/><circle stroke="#3E6FC4" cx="28.5" cy="37" r="4.2"/><path stroke="#E8572A" d="M33.91,7.11 L38.05,20.29 L40.95,23.18 L42.13,21.15 L40.55,5.64Z"/><circle stroke="#E8572A" fill="#FBFAF7" cx="37.23" cy="6.38" r="3.6"/><circle fill="#E8572A" stroke="none" cx="37.23" cy="6.38" r="1.2"/></g></svg>
+    <span class="brand__word">Ratchet Loop</span>
+  </a>
+  <nav class="nav__links" id="menu" aria-label="Primary" data-menu>
+    <a href="index.html#features">Features</a>
+    <a href="how-it-works.html">How it works</a>
+    <a href="gates.html">Gates</a>
+    <a href="cost.html">Cost</a>
+    <a href="live-viewer.html">Viewer</a>
+    <a href="install.html">Install</a>
+  </nav>
+  <div class="nav__end">
+    <a class="icon-btn" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener" aria-label="Code on GitHub" title="Code on GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg></a>
+    <button class="icon-btn nav__toggle" type="button" aria-controls="menu" aria-expanded="false" aria-label="Open menu" data-menu-toggle>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+<section class="phead" id="top" aria-labelledby="page-title">
+  <div class="phead__bg" aria-hidden="true"><div class="hero__grid" data-depth="0.25"></div><img class="hero__draw" src="assets/blueprint.svg" alt="" width="1200" height="1200" decoding="async" data-depth="0.55"></div>
+  <div class="wrap phead__inner">
+    <p class="crumb"><a href="index.html#features">Features</a><span aria-hidden="true">/</span>Feature 07</p>
+    <h1 id="page-title" class="phead__title">Learns your project. <em>Say it once, not every time.</em></h1>
+    <p class="lede">You don't prepare anything before your first run. Ratchet writes down how your app looks, how your code is written and what you've told it, and every agent reads it.</p>
+    <nav class="phead__jump" aria-label="On this page"><a href="#setup">What it sets up</a></nav>
+  </div>
+</section>
+<section class="band" id="setup" aria-labelledby="setup-title">
+  <div class="wrap">
+    <p class="kicker"><span>01</span>What it sets up</p>
+    <h2 id="setup-title" class="h2">Six files that make the next run better. <em>All of them yours to read and edit.</em></h2>
+    <p class="lede">You don't have to prepare anything before your first run. If your project is missing something Ratchet needs, the agent makes it. Pick one to see what it is.</p>
+    <div class="tabsgrid" data-tabs>
+      <div class="tabsgrid__grid" role="tablist" aria-label="What Ratchet sets up">
+        <button class="tcard" role="tab" type="button" id="setup-tab-1" aria-controls="setup-1" aria-selected="true" tabindex="0" data-tab-card><span class="tcard__code">S1</span><span class="tcard__name">Design file</span><span class="tcard__sub">DESIGN.md</span></button>
+        <button class="tcard" role="tab" type="button" id="setup-tab-2" aria-controls="setup-2" aria-selected="false" tabindex="-1" data-tab-card><span class="tcard__code">S2</span><span class="tcard__name">Coding standards</span><span class="tcard__sub">.ratchet/standards.md</span></button>
+        <button class="tcard" role="tab" type="button" id="setup-tab-3" aria-controls="setup-3" aria-selected="false" tabindex="-1" data-tab-card><span class="tcard__code">S3</span><span class="tcard__name">Clickable prototype</span><span class="tcard__sub">prototype.html</span></button>
+        <button class="tcard" role="tab" type="button" id="setup-tab-4" aria-controls="setup-4" aria-selected="false" tabindex="-1" data-tab-card><span class="tcard__code">S4</span><span class="tcard__name">Lessons</span><span class="tcard__sub">.ratchet/learnings.md</span></button>
+        <button class="tcard" role="tab" type="button" id="setup-tab-5" aria-controls="setup-5" aria-selected="false" tabindex="-1" data-tab-card><span class="tcard__code">S5</span><span class="tcard__name">Automatic checks</span><span class="tcard__sub">checks/</span></button>
+        <button class="tcard" role="tab" type="button" id="setup-tab-6" aria-controls="setup-6" aria-selected="false" tabindex="-1" data-tab-card><span class="tcard__code">S6</span><span class="tcard__name">Record of what&#x27;s built</span><span class="tcard__sub">specs/</span></button>
+      </div>
+      <div class="tpanel" role="tabpanel" id="setup-1" aria-labelledby="setup-tab-1">
+        <div class="tpanel__top"><span class="tpanel__big">S1</span><span class="pill pill--static">DESIGN.md</span></div>
+        <h3>Design file</h3>
+        <p class="tpanel__lead">Your app&#x27;s look, written down exactly</p>
+        <p class="tpanel__body">Colours, fonts, sizes, spacing, corner radius, and how each component looks in each state: normal, hover, disabled, error. The prototype, the code and the screen reviewers all work from it, so a button comes out the same every time.</p>
+        <ul class="ticks"><li>For an existing app, it reads your real styles and writes down what you actually use, including where your app isn&#x27;t consistent with itself.</li><li>For a new app, it asks who it&#x27;s for, the feel and any brand colour, then picks exact values with readable contrast.</li></ul>
+        <figure class="code">
+          <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>DESIGN.md</span><em>example</em></div>
+          <pre class="code__body"><span><i>01</i>## Colours</span><span><i>02</i>--primary   #2F5FB3   buttons, links</span><span><i>03</i>--danger    #C2410C   destructive actions</span><span><i>04</i></span><span><i>05</i>## Button · primary</span><span><i>06</i>default    bg --primary · text #FFFFFF · radius 8px</span><span><i>07</i>hover      bg #284F96</span><span><i>08</i>disabled   bg #C9D3E6 · text #6B7280</span></pre>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Short example of this file<b>ready</b></figcaption>
+        </figure>
+      </div>
+      <div class="tpanel" role="tabpanel" id="setup-2" aria-labelledby="setup-tab-2" hidden>
+        <div class="tpanel__top"><span class="tpanel__big">S2</span><span class="pill pill--static">.ratchet/standards.md</span></div>
+        <h3>Coding standards</h3>
+        <p class="tpanel__lead">The rules reviewers check the code against</p>
+        <p class="tpanel__body">Where business logic lives, how errors are handled, naming, what may import what, and security checks. If you don&#x27;t have written standards, the agent drafts 15 to 40 of them from how your code already works, each with a real file as the example.</p>
+        <ul class="ticks"><li>It&#x27;s marked as a draft. Read it and change anything you disagree with.</li></ul>
+        <figure class="code">
+          <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>standards.md</span><em>example</em></div>
+          <pre class="code__body"><span><i>01</i>## S-07  Business logic lives in services/</span><span><i>02</i>Route handlers check the input and call a service.</span><span><i>03</i>They never talk to the database directly.</span><span><i>04</i>Example: src/services/leave.ts</span><span><i>05</i></span><span><i>06</i>Status: draft · edit anything you disagree with</span></pre>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Short example of this file<b>ready</b></figcaption>
+        </figure>
+      </div>
+      <div class="tpanel" role="tabpanel" id="setup-3" aria-labelledby="setup-tab-3" hidden>
+        <div class="tpanel__top"><span class="tpanel__big">S3</span><span class="pill pill--static">prototype.html</span></div>
+        <h3>Clickable prototype</h3>
+        <p class="tpanel__lead">See it before anything is built</p>
+        <p class="tpanel__body">For features with new screens and nothing to copy, the agent makes a single clickable web page in your app&#x27;s style. You click through it when you review the plan.</p>
+        <ul class="ticks"><li>Every state of every step can be opened directly, so the screen gate can compare like with like.</li><li>The prototype is never changed to match the app. If you decide the app looks better, that&#x27;s your call.</li></ul>
+        <figure class="code">
+          <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>prototype.html</span><em>example</em></div>
+          <pre class="code__body"><span><i>01</i>prototype.html?state=pending-list</span><span><i>02</i>prototype.html?state=reject-dialog</span><span><i>03</i>prototype.html?state=reject-dialog-empty-reason</span><span><i>04</i>prototype.html?state=rejected-toast</span></pre>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Short example of this file<b>ready</b></figcaption>
+        </figure>
+      </div>
+      <div class="tpanel" role="tabpanel" id="setup-4" aria-labelledby="setup-tab-4" hidden>
+        <div class="tpanel__top"><span class="tpanel__big">S4</span><span class="pill pill--static">.ratchet/learnings.md</span></div>
+        <h3>Lessons</h3>
+        <p class="tpanel__lead">Say it once, not every time</p>
+        <p class="tpanel__body">Whenever you give feedback that applies beyond this one feature, it&#x27;s written here, and every agent reads it before starting work. Findings you accept, and the reason you gave, are recorded here too.</p>
+        <ul class="ticks"><li>You shouldn&#x27;t have to say the same thing twice.</li></ul>
+        <figure class="code">
+          <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>learnings.md</span><em>example</em></div>
+          <pre class="code__body"><span><i>01</i>- Always use the shared date picker (src/ui/DatePicker).</span><span><i>02</i>  From your feedback on leave approvals, CP2.</span><span><i>03</i></span><span><i>04</i>- Accepted: long names may wrap to two lines in the table.</span><span><i>05</i>  Your reason: it only affects a rare case.</span></pre>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Short example of this file<b>ready</b></figcaption>
+        </figure>
+      </div>
+      <div class="tpanel" role="tabpanel" id="setup-5" aria-labelledby="setup-tab-5" hidden>
+        <div class="tpanel__top"><span class="tpanel__big">S5</span><span class="pill pill--static">checks/</span></div>
+        <h3>Automatic checks</h3>
+        <p class="tpanel__lead">Mistakes that keep coming back get caught in seconds</p>
+        <p class="tpanel__body">Reviewers label every finding with the kind of mistake it is. When the same kind shows up a second time, the agent offers to turn it into an automatic check, like a lint rule. It&#x27;s built as its own small step, through every gate.</p>
+        <ul class="ticks"><li>Before it counts, it must catch a deliberately bad example and the real code where the mistake was found, and pass on today&#x27;s code.</li><li>For security, data or money mistakes, a separate writer who never sees the check tries to sneak disguised versions past it.</li></ul>
+        <figure class="code">
+          <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>no-db-in-routes.check</span><em>example</em></div>
+          <pre class="code__body"><span><i>01</i>rule:    routes may not import the database client</span><span><i>02</i>why:     found twice in review (CP2, CP4)</span><span><i>03</i>proven:  catches bad-example.ts and the CP4 code</span><span><i>04</i>         passes on the current code</span><span><i>05</i>runs:    with your tests, and in CI</span></pre>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Short example of this file<b>ready</b></figcaption>
+        </figure>
+      </div>
+      <div class="tpanel" role="tabpanel" id="setup-6" aria-labelledby="setup-tab-6" hidden>
+        <div class="tpanel__top"><span class="tpanel__big">S6</span><span class="pill pill--static">specs/</span></div>
+        <h3>Record of what&#x27;s built</h3>
+        <p class="tpanel__lead">Every rule, linked to the test that proves it</p>
+        <p class="tpanel__body">If you say yes after your first feature, Ratchet keeps one file per feature. Each rule in it points to the test that proves it, so later work can see what must keep holding.</p>
+        <ul class="ticks"><li>Yes or no, it remembers your answer.</li></ul>
+        <figure class="code">
+          <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>leave-approvals.md</span><em>example</em></div>
+          <pre class="code__body"><span><i>01</i># Leave approvals</span><span><i>02</i></span><span><i>03</i>- A manager sees their team&#x27;s pending requests</span><span><i>04</i>  proved by: tests/leave.test.ts › CP1-T1</span><span><i>05</i>- A rejection needs a reason</span><span><i>06</i>  proved by: tests/leave.test.ts › CP3-T2</span></pre>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Short example of this file<b>ready</b></figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
+</section>
+<nav class="pnext wrap" aria-label="More features"><a class="pnext__link " href="control.html"><span>Previous feature</span><b>You stay in control</b></a><a class="pnext__link pnext__link--next" href="specs.html"><span>Next feature</span><b>Specs and CI</b></a></nav>
+<!-- ============ CTA ============ -->
+<section class="cta" aria-labelledby="cta-title">
+  <div class="wrap cta__card">
+    <svg class="cta__mark" viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke-linejoin="round" stroke-linecap="round" stroke-width="2.0"><path stroke="#3E6FC4" stroke-opacity=".55" stroke-width="1.20" stroke-dasharray="5 2 1 2" d="M1.5,37 H55.5 M28.5,10 V64"/><circle stroke="#3E6FC4" stroke-opacity=".6" stroke-width="1.20" cx="28.5" cy="37" r="14.8"/><path stroke="#3E6FC4" d="M40.54,23.62 L35.06,14.43 L33.34,14.24 L32.24,19.39 L22.89,14.18 L21.31,14.87 L22.94,19.88 L12.23,20.04 L11.21,21.43 L15.12,24.96 L5.93,30.44 L5.74,32.16 L10.89,33.26 L5.68,42.61 L6.37,44.19 L11.38,42.56 L11.54,53.27 L12.93,54.29 L16.46,50.38 L21.94,59.57 L23.66,59.76 L24.76,54.61 L34.11,59.82 L35.69,59.13 L34.06,54.12 L44.77,53.96 L45.79,52.57 L41.88,49.04 L51.07,43.56 L51.26,41.84 L46.11,40.74 L51.32,31.39 L50.63,29.81 L45.62,31.44 L45.46,20.73 L44.07,19.71Z"/><circle stroke="#3E6FC4" cx="28.5" cy="37" r="4.2"/><path stroke="#E8572A" d="M33.91,7.11 L38.05,20.29 L40.95,23.18 L42.13,21.15 L40.55,5.64Z"/><circle stroke="#E8572A" fill="#FBFAF7" cx="37.23" cy="6.38" r="3.6"/><circle fill="#E8572A" stroke="none" cx="37.23" cy="6.38" r="1.2"/></g></svg>
+    <h2 id="cta-title" class="cta__title">Stop taking <em>done</em> on faith.</h2>
+    <p class="lede">One message to install. One sentence to build. Proof at every step.</p>
+    <div class="hero__ctas">
+      <button class="btn btn--primary" type="button" data-copy="Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI."><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" d="M8 8h11v11H8zM5 16V5h11"/></svg><span data-copy-label>Copy the install prompt</span></button>
+      <a class="btn btn--ghost" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>Read the docs on GitHub</a>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer class="foot wrap">
+  <div class="foot__row">
+    <a class="brand" href="index.html">
+      <svg class="brand__mark" viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke-linejoin="round" stroke-linecap="round" stroke-width="2.0"><path stroke="#3E6FC4" stroke-opacity=".55" stroke-width="1.20" stroke-dasharray="5 2 1 2" d="M1.5,37 H55.5 M28.5,10 V64"/><circle stroke="#3E6FC4" stroke-opacity=".6" stroke-width="1.20" cx="28.5" cy="37" r="14.8"/><path stroke="#3E6FC4" d="M40.54,23.62 L35.06,14.43 L33.34,14.24 L32.24,19.39 L22.89,14.18 L21.31,14.87 L22.94,19.88 L12.23,20.04 L11.21,21.43 L15.12,24.96 L5.93,30.44 L5.74,32.16 L10.89,33.26 L5.68,42.61 L6.37,44.19 L11.38,42.56 L11.54,53.27 L12.93,54.29 L16.46,50.38 L21.94,59.57 L23.66,59.76 L24.76,54.61 L34.11,59.82 L35.69,59.13 L34.06,54.12 L44.77,53.96 L45.79,52.57 L41.88,49.04 L51.07,43.56 L51.26,41.84 L46.11,40.74 L51.32,31.39 L50.63,29.81 L45.62,31.44 L45.46,20.73 L44.07,19.71Z"/><circle stroke="#3E6FC4" cx="28.5" cy="37" r="4.2"/><path stroke="#E8572A" d="M33.91,7.11 L38.05,20.29 L40.95,23.18 L42.13,21.15 L40.55,5.64Z"/><circle stroke="#E8572A" fill="#FBFAF7" cx="37.23" cy="6.38" r="3.6"/><circle fill="#E8572A" stroke="none" cx="37.23" cy="6.38" r="1.2"/></g></svg>
+      <span class="brand__word">Ratchet Loop</span>
+    </a>
+    <a class="foot__top" href="#top">Back to top ↑</a>
+  </div>
+  <nav class="foot__map" aria-label="All pages">
+    <a href="how-it-works.html">How it works</a><a href="gates.html">Gates and safeguards</a><a href="reviewers.html">Second opinion</a><a href="live-viewer.html">Live viewer</a><a href="cost.html">Cost control</a><a href="control.html">You stay in control</a><a href="setup.html">Learns your project</a><a href="specs.html">Specs and CI</a><a href="install.html">Install</a>
+  </nav>
+  <p class="foot__tag">Checkpoint-and-gate building for AI coding agents · by <a href="https://github.com/rahilp" rel="noopener">Rahil Pirani</a></p>
+</footer>
+
+<div class="toast" role="status" aria-live="polite" data-toast></div>
+<script src="main.js" defer></script>
+</body>
+</html>

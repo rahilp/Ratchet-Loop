@@ -1,0 +1,40 @@
+<section class="band band--alt" id="idea" aria-labelledby="idea-title">
+  <div class="wrap">
+    <p class="kicker"><span>02</span>The idea</p>
+    <h2 id="idea-title" class="h2">Done means code <em>plus proof.</em></h2>
+    <p class="lede">A step only counts once both are there. The proof comes from four gates, and the agent doesn't get to mark its own gates.</p>
+
+    <figure class="eq reveal" data-eq aria-label="Done equals code plus proof">
+      <div class="eq__head">
+        <p class="eq__title">Done = Code + Proof. <em>A step locks only when both are there.</em></p>
+        <button class="pill" type="button" data-eq-replay>{{ICON_REPLAY}}Replay</button>
+      </div>
+      <div class="eq__row">
+        <div class="eq__card" data-eq-step="1">
+          <span class="eq__icon">{{ICON_CODE}}</span>
+          <div><h3>Code</h3><p>Written by your agent · fast</p></div>
+        </div>
+        <span class="eq__op" data-eq-step="2" aria-hidden="true">+</span>
+        <div class="eq__card" data-eq-step="2">
+          <span class="eq__icon eq__icon--gates" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <div><h3>Proof</h3><p>Four gates · checked by Ratchet, not the agent</p></div>
+        </div>
+      </div>
+      <span class="eq__op eq__op--eq" data-eq-step="3" aria-hidden="true">=</span>
+      <div class="eq__result" data-eq-step="3">
+        <span class="eq__orbit" aria-hidden="true"><svg viewBox="0 0 64 64">{{MARK}}</svg></span>
+        <div><h3>A locked step</h3><p>Its own git commit · it can't slip back</p></div>
+      </div>
+      <div class="eq__inner" data-eq-step="4">
+        <p class="mono-k">Around every step</p>
+        <div class="eq__flow">
+          <p><b>01</b>A gate fails <span aria-hidden="true">→</span> the agent fixes the problem and tries again</p>
+          <p><b>02</b>Every gate passes <span aria-hidden="true">→</span> the step locks and the next one starts</p>
+          <p><b>03</b>The tries run out <span aria-hidden="true">→</span> the run stops and asks you what to do</p>
+        </div>
+        <p class="eq__becomes" aria-hidden="true">Adds up to ↓</p>
+        <p class="eq__final"><em>A feature you can trust</em><span>small steps · evidence at every one · your sign-off at the end</span></p>
+      </div>
+    </figure>
+  </div>
+</section>
