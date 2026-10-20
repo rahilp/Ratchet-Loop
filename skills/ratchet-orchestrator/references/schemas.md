@@ -17,6 +17,7 @@ Contents
 12. `ratchet.py receipt`
 13. CI export
 14. Shortcut tables (`ratchet.py shortcuts`)
+15. `evidence/baseline_timings.json` — written by `tests/measure_suite_baseline.py`
 
 ---
 
@@ -656,3 +657,18 @@ A guard-like part of the code can have a fixed table of shortcut commands that s
 **Output.** `ratchet.py shortcuts [<name>] [--json]` prints, per table, `Shortcut table <name>: N worse, N still open, N fixed, N held, N errored` (plus `unknown` when there are any), its notes, and under the headings `got worse`, `still open`, `fixed`, `errored`, `unknown` each row with its command. `--json` is `{"tables": [{"name", "ran", "failed", "stale", "note", "notes", "counts": {"worse", "still_open", "fixed", "held", "errored", "unknown"}, "rows": [{"id", "command", "expect", "old", "new", "verdict", "new_row", "note"?}], "watches", "fingerprint"}]}`; a table whose watched files did not change has `ran: false` and a note. The top level may also carry `"notes": [..]` (for example, a project that is not a git repository has no tables run and one note). With no tables the plain output says there are no shortcut tables in this project. Results are saved as `evidence/shortcuts/<name>.json` (the table object plus `saved_at`) with the code fingerprint they ran on; `stale` is true when the code has changed since. `complete` of the last step runs and saves the tables, and plain `status` (part of the final review), `status --json` (key `shortcuts`: `{"tables": [...]}` from the saved results, with `stale`) and the receipt (markdown block, and the `shortcut_tables` list in `--json`) show them. A worse row never blocks `complete` or the finish: this only shows the result.
 
 **Linking a table to done-means lines.** A test-plan case with `"layer": "shortcuts"` and `"table": "<name>"` (no `"file"`, never run by `behavior`; `tests-written` and `red` do not look for its id in a test file) can carry `"proves"`. `plan-submit` refuses a shortcuts case that names no table or a table whose file does not exist, naming the case. That line is proven only when a saved result made on the current code has every row right on the current code (`new` equals `expect`, no row `errored`); the starting side does not matter. With no saved result it reads `no result recorded yet`; a saved result made on older code reads out of date; otherwise it names the wrong rows by id.
+
+## 15. `evidence/baseline_timings.json` — written by `tests/measure_suite_baseline.py`
+
+```json
+{
+  "command": "python3 -I tests/measure_suite_baseline.py --suites tests/test_trust_cp5_d.py,tests/test_trust_cp5_e.py,tests/test_quota_shared.py",
+  "suites": {
+    "test_trust_cp5_d.py": {"elapsed_sec": 402.1, "passed": true},
+    "test_trust_cp5_e.py": {"elapsed_sec": 95.3, "passed": true},
+    "test_quota_shared.py": {"elapsed_sec": 310.7, "passed": true}
+  }
+}
+```
+
+One-time evidence recorded by the CP1 timing harness (`tests/measure_suite_baseline.py`, run through its own `--suites`/`--out` CLI entry point), never by `ratchet.py` itself. `command` is a reproducible command line that re-measures the same suites and prints to stdout; it deliberately omits `--out`, so replaying it as recorded never overwrites whatever evidence file it originally produced. `suites` holds one entry per suite named on the command line, keyed by the suite's file basename (not its full path), each `{"elapsed_sec": <float, real wall-clock seconds spent in that suite's own subprocess>, "passed": <bool, that suite's subprocess exited 0>}`. The whole file is overwritten (never merged) on every run of the harness whose `--out` points at it, so re-running the harness by hand against this same path loses whatever the file held before.

@@ -26,27 +26,28 @@
   },
   "review_depth": {
     "low": [
-      "host-both"
+      "any-both"
     ],
     "normal": [
       [
-        "host-alt-standards"
+        "any-standards"
       ],
       [
-        "codex-correctness",
-        "host-alt-correctness"
+        "any-correctness"
       ]
     ],
     "high": [
       [
-        "host-standards"
+        "any-standards"
       ],
       [
-        "codex-correctness",
-        "host-correctness"
+        "any-correctness"
       ],
       [
-        "host-alt-correctness"
+        "any-correctness"
+      ],
+      [
+        "any-standards"
       ]
     ]
   },
@@ -60,23 +61,9 @@
       "preset": "claude"
     },
     {
-      "id": "codex",
-      "preset": "codex"
-    },
-    {
       "id": "copilot",
       "preset": "copilot",
       "model": "grok-4.7"
-    },
-    {
-      "id": "opencode-glm",
-      "preset": "opencode",
-      "model": "opencode-go/glm-5.3"
-    },
-    {
-      "id": "opencode-kimi",
-      "preset": "opencode",
-      "model": "opencode-go/kimi-k3"
     },
     {
       "id": "longcat-free",
@@ -91,6 +78,40 @@
       "model": "opencode-go/step-5-preview-free",
       "company": "stepfun",
       "cost": "flat"
+    },
+    {
+      "id": "codex",
+      "preset": "codex",
+      "prefer_for": [
+        "both"
+      ]
+    },
+    {
+      "id": "opencode-glm",
+      "preset": "opencode",
+      "model": "opencode-go/glm-5.3",
+      "prefer_for": [
+        "both"
+      ],
+      "cost": "flat"
+    },
+    {
+      "id": "opencode-kimi",
+      "preset": "opencode",
+      "model": "opencode-go/kimi-k3",
+      "prefer_for": [
+        "both"
+      ],
+      "cost": "flat"
+    },
+    {
+      "id": "omp-glm",
+      "preset": "omp",
+      "model": "opencode-go/glm-5.3",
+      "prefer_for": [
+        "both"
+      ],
+      "cost": "flat"
     }
   ],
   "test_timeout_sec": 3600,
@@ -98,8 +119,8 @@
   "spec_keep": true,
   "max_adversarial_rounds": 6,
   "role_models": {
-    "ratchet-implementer": "strong",
-    "ratchet-fixer": "strong"
+    "ratchet-implementer": "standard",
+    "ratchet-fixer": "standard"
   },
   "min_review_seconds": 20,
   "host_models": {
