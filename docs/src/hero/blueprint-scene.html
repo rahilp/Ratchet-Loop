@@ -1,0 +1,137 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  html,body{margin:0;width:1920px;height:1080px;overflow:hidden;background:#FBFAF7}
+  svg{display:block}
+  text{font-family:"JetBrains Mono",ui-monospace,monospace}
+  text.serif{font-family:"Newsreader",Georgia,serif;font-style:italic}
+</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Newsreader:ital,opsz,wght@1,6..72,400&display=block">
+</head><body>
+<svg id="s" width="1920" height="1080" viewBox="0 0 1920 1080" xmlns="http://www.w3.org/2000/svg"></svg>
+<script>
+// A calm blueprint loop: three gate lamps light, the pawl lifts, the wheel clicks one tooth forward.
+// 12 s, 4 clicks. The wheel and its studs are rotationally symmetric, so frame 360 equals frame 0.
+const FPS = 30, LOOP = 12, FRAMES = FPS * LOOP, CLICKS = 4, CYCLE = LOOP / CLICKS;
+const TEETH = 24, PITCH = 360 / TEETH, TAU = Math.PI * 2;
+const BLUE = '#3E6FC4', BLUE_L = '#9DB7E6', GRID = '#ECEAF2', INK = '#1F2A44', MUTED = '#8A90A6', HOT = '#E8572A', PASS = '#2E9E6A';
+const CX = 1220, CY = 590, RR = 262, RT = 322, A = 58 * Math.PI / 180;
+const svg = document.getElementById('s');
+const NS = 'http://www.w3.org/2000/svg';
+const el = (tag, attrs, parent = svg) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent.appendChild(e); return e; };
+
+// drafting paper
+for (let x = 0; x <= 1920; x += 40) el('line', { x1: x, y1: 0, x2: x, y2: 1080, stroke: GRID, 'stroke-width': x % 200 === 0 ? 1.4 : .7 });
+for (let y = 0; y <= 1080; y += 40) el('line', { x1: 0, y1: y, x2: 1920, y2: y, stroke: GRID, 'stroke-width': y % 200 === 0 ? 1.4 : .7 });
+
+// sawtooth outline (ramp counter-clockwise, radial cliff)
+const pt = (a, r) => [CX + Math.cos(a) * r, CY - Math.sin(a) * r];
+let d = '';
+for (let k = 0; k < TEETH; k++) {
+  const a0 = A + k * TAU / TEETH, a1 = a0 + TAU / TEETH * .88, a2 = a0 + TAU / TEETH;
+  const p = [pt(a0, RR), pt(a1, RT), pt(a2, RT * .99)];
+  d += (k ? 'L' : 'M') + p.map(q => q.map(v => v.toFixed(2)).join(',')).join(' L');
+}
+d += 'Z';
+
+// static drafting marks
+el('path', { d: `M${CX - 420},${CY} H${CX + 420} M${CX},${CY - 420} V${CY + 420}`, stroke: BLUE_L, 'stroke-width': 1.4, 'stroke-dasharray': '26 8 5 8', fill: 'none' });
+el('circle', { cx: CX, cy: CY, r: 372, fill: 'none', stroke: BLUE_L, 'stroke-width': 1, 'stroke-dasharray': '3 9' });
+for (let k = 0; k < 72; k++) { const a = k * TAU / 72, r1 = 382, r2 = k % 3 ? 390 : 400; const [x1, y1] = pt(a, r1), [x2, y2] = pt(a, r2); el('line', { x1, y1, x2, y2, stroke: BLUE_L, 'stroke-width': 1 }); }
+// dimension line
+el('path', { d: `M${CX - RT},${CY + 432} H${CX + RT} M${CX - RT},${CY + 417} v30 M${CX + RT},${CY + 417} v30`, stroke: HOT, 'stroke-width': 1.4, fill: 'none', opacity: .7 });
+el('text', { x: CX, y: CY + 422, 'text-anchor': 'middle', fill: MUTED, 'font-size': 17, 'letter-spacing': 2 }).textContent = 'Ø 104.0 · 24 T · ONE WAY';
+
+// the wheel (rotates)
+const rotor = el('g', {});
+el('path', { d, fill: 'rgba(62,111,196,.045)', stroke: BLUE, 'stroke-width': 3, 'stroke-linejoin': 'round' }, rotor);
+el('circle', { cx: CX, cy: CY, r: 230, fill: 'none', stroke: BLUE_L, 'stroke-width': 1.6 }, rotor);
+for (let k = 0; k < 6; k++) { const [x, y] = pt(k * TAU / 6 + .3, 152); el('circle', { cx: x, cy: y, r: 42, fill: '#FBFAF7', stroke: BLUE, 'stroke-width': 2.4 }, rotor); }
+el('circle', { cx: CX, cy: CY, r: 76, fill: '#FBFAF7', stroke: BLUE, 'stroke-width': 3 }, rotor);
+el('circle', { cx: CX, cy: CY, r: 34, fill: 'none', stroke: BLUE, 'stroke-width': 2.4 }, rotor);
+for (let k = 0; k < 6; k++) { const [x, y] = pt(k * TAU / 6, 60); el('circle', { cx: x, cy: y, r: 6, fill: 'none', stroke: BLUE, 'stroke-width': 1.8 }, rotor); }
+const studs = [];
+for (let k = 0; k < TEETH; k++) { const a = A + (k + .5) * TAU / TEETH; const [x, y] = pt(a, 246); studs.push({ a, e: el('circle', { cx: x, cy: y, r: 8, fill: '#FBFAF7', stroke: BLUE, 'stroke-width': 2 }, rotor) }); }
+
+// pawl
+const tip = pt(A, RR + 4);
+const tg = [-Math.sin(A), -Math.cos(A)], ou = [Math.cos(A), -Math.sin(A)];
+const piv = [tip[0] + tg[0] * 170 + ou[0] * 92, tip[1] + tg[1] * 170 + ou[1] * 92];
+const dv = [tip[0] - piv[0], tip[1] - piv[1]], L = Math.hypot(...dv), u = [dv[0] / L, dv[1] / L], n = [-u[1], u[0]];
+const q = (s, t) => [piv[0] + n[0] * s + u[0] * t, piv[1] + n[1] * s + u[1] * t];
+const pawl = el('g', {});
+const poly = [q(26, 0), q(17, L * .8), tip, q(-12, L * .9), q(-26, 0)];
+el('path', { d: 'M' + poly.map(p => p.map(v => v.toFixed(1)).join(',')).join(' L') + 'Z', fill: 'rgba(232,87,42,.07)', stroke: HOT, 'stroke-width': 3.2, 'stroke-linejoin': 'round' }, pawl);
+el('circle', { cx: piv[0], cy: piv[1], r: 26, fill: '#FBFAF7', stroke: HOT, 'stroke-width': 3.2 }, pawl);
+el('circle', { cx: piv[0], cy: piv[1], r: 8, fill: HOT }, pawl);
+// spring up to a fixed mount
+const MY = piv[1] - 120;
+el('rect', { x: piv[0] - 50, y: MY - 22, width: 100, height: 22, fill: '#FFFFFF', stroke: BLUE_L, 'stroke-width': 1.6 });
+for (let k = 0; k < 6; k++) el('line', { x1: piv[0] - 44 + k * 18, y1: MY - 22, x2: piv[0] - 56 + k * 18, y2: MY - 34, stroke: BLUE_L, 'stroke-width': 1.2 });
+let sp = `M${piv[0]},${MY}`;
+for (let k = 0; k < 10; k++) sp += ` l${k % 2 ? -14 : 14},${(piv[1] - 26 - MY) / 10}`;
+el('path', { d: sp, fill: 'none', stroke: HOT, 'stroke-width': 2.2, opacity: .6, 'stroke-linejoin': 'round' });
+// click ripple
+const ripple = el('circle', { cx: tip[0], cy: tip[1], r: 10, fill: 'none', stroke: HOT, 'stroke-width': 2.5, opacity: 0 });
+
+// gate lamps (left)
+const LX = 170, LY = 330;
+el('text', { x: LX, y: LY - 70, fill: MUTED, 'font-size': 18, 'letter-spacing': 4 }).textContent = 'CHECKPOINT GATES';
+const lamps = ['Tests', 'Looks right', 'Review'].map((label, k) => {
+  const y = LY + k * 110;
+  el('line', { x1: LX + 22, y1: y + 26, x2: LX + 22, y2: y + 84, stroke: GRID, 'stroke-width': 3 });
+  const ring = el('circle', { cx: LX + 22, cy: y, r: 22, fill: '#FFFFFF', stroke: BLUE_L, 'stroke-width': 2.4 });
+  const check = el('path', { d: `M${LX + 12},${y + 1} l7,8 l14,-16`, fill: 'none', stroke: '#fff', 'stroke-width': 4, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', opacity: 0 });
+  const t = el('text', { x: LX + 66, y: y + 9, fill: INK, 'font-size': 28 }); t.textContent = label;
+  t.setAttribute('class', 'serif');
+  return { ring, check, t };
+});
+const lockY = LY + 3 * 110;
+const lockRing = el('rect', { x: LX, y: lockY - 22, width: 44, height: 44, rx: 10, fill: '#FFFFFF', stroke: BLUE_L, 'stroke-width': 2.4 });
+const lockT = el('text', { x: LX + 66, y: lockY + 9, fill: INK, 'font-size': 28 }); lockT.textContent = 'Lock & commit';
+lockT.setAttribute('class', 'serif');
+
+// title block (bottom right)
+el('rect', { x: 1580, y: 960, width: 300, height: 84, fill: '#FFFFFF', stroke: BLUE_L, 'stroke-width': 1.4 });
+el('line', { x1: 1580, y1: 1002, x2: 1880, y2: 1002, stroke: BLUE_L, 'stroke-width': 1 });
+el('text', { x: 1598, y: 988, fill: INK, 'font-size': 17, 'letter-spacing': 2 }).textContent = 'RATCHET LOOP · DWG-001';
+el('text', { x: 1598, y: 1030, fill: MUTED, 'font-size': 15, 'letter-spacing': 2 }).textContent = 'ONE TOOTH PER CHECKPOINT';
+
+const ease = x => x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+// timing inside each 3 s cycle: lamps at .10/.28/.46, lock lamp .62, turn .64-.86, settle
+window.renderFrame = i => {
+  const t = (i % FRAMES) / FPS, c = Math.floor(t / CYCLE), f = (t % CYCLE) / CYCLE;
+  const p = ease(clamp((f - .64) / .22));
+  const rot = (c + p) * PITCH;                         // degrees, clockwise on screen
+  rotor.setAttribute('transform', `rotate(${rot.toFixed(3)} ${CX} ${CY})`);
+  // pawl rides up the ramp then drops on the click
+  const lift = f < .64 ? 0 : f < .86 ? Math.sin(clamp((f - .64) / .22) * Math.PI * .5) * 7 : Math.max(0, 7 * (1 - (f - .86) / .03));
+  pawl.setAttribute('transform', `rotate(${(-lift).toFixed(3)} ${piv[0]} ${piv[1]})`);
+  // ripple right after the click
+  const rp = clamp((f - .86) / .14);
+  ripple.setAttribute('r', (10 + rp * 70).toFixed(1)); ripple.setAttribute('opacity', (f >= .86 ? (1 - rp) * .8 : 0).toFixed(3));
+  // studs: filled once they have passed the pawl (world angle), hot just after the click
+  for (const s of studs) {
+    const world = s.a - rot * Math.PI / 180;               // clockwise rotation lowers the angle
+    let past = ((A - world) % TAU + TAU) % TAU;           // how far clockwise past the pawl
+    const passed = past > 0 && past < Math.PI * 1.15;
+    const fresh = passed && past < TAU / TEETH * 1.05;
+    s.e.setAttribute('fill', fresh && f > .86 ? HOT : passed ? BLUE : '#FBFAF7');
+  }
+  // lamps
+  [0.10, 0.28, 0.46].forEach((on, k) => {
+    const lit = f >= on && f < .97;
+    lamps[k].ring.setAttribute('fill', lit ? PASS : '#FFFFFF');
+    lamps[k].ring.setAttribute('stroke', lit ? PASS : BLUE_L);
+    lamps[k].check.setAttribute('opacity', lit ? 1 : 0);
+    lamps[k].t.setAttribute('fill', lit ? INK : MUTED);
+  });
+  const locked = f >= .62 && f < .97;
+  lockRing.setAttribute('fill', locked ? HOT : '#FFFFFF'); lockRing.setAttribute('stroke', locked ? HOT : BLUE_L);
+  lockT.setAttribute('fill', locked ? INK : MUTED);
+};
+window.FRAMES = FRAMES;
+document.fonts.ready.then(() => { window.renderFrame(0); window.ready = true; });
+</script>
+</body></html>

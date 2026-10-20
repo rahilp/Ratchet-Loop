@@ -1,22 +1,15 @@
 # Hero video source
 
-The hero loop is a real-time Three.js scene rendered frame by frame in headless Chromium, then encoded with ffmpeg.
+The hero loop is a vector drawing (`blueprint-scene.html`) rendered frame by frame in headless Chromium, then encoded with ffmpeg. It is 12 seconds: three gate lamps light, then the ratchet clicks forward one tooth, four times. The wheel is symmetric under a one-tooth turn, so the last frame leads straight back into the first.
 
 ```sh
-npm i three@0.170.0 playwright@1.48.2
-# 270 frames at 1080p: 240 for the 8 s loop plus 30 past it for the seam cross-fade
-node render.mjs frames 1920 1080 0 270
-python3 xfade.py                      # writes final/ (240 frames, seamless)
-Q=cam=macro node render.mjs macro 1920 1080 49 50   # close-up still
-```
-
-Encode (from this folder, `A=../../assets`):
-
-```sh
-VF="vignette=PI/5"
-ffmpeg -framerate 30 -i final/f%04d.png -vf "$VF,format=yuv420p" -c:v libx264 -preset slow -crf 22 -movflags +faststart -an $A/hero-1080.mp4
-ffmpeg -framerate 30 -i final/f%04d.png -vf "$VF,format=yuv420p" -c:v libvpx-vp9 -crf 33 -b:v 0 -row-mt 1 -an $A/hero-1080.webm
-ffmpeg -framerate 30 -i final/f%04d.png -vf "$VF,scale=1280:720:flags=lanczos,format=yuv420p" -c:v libx264 -preset slow -crf 24 -movflags +faststart -an $A/hero-720.mp4
+npm i playwright@1.48.2
+node render.mjs blueprint-scene.html frames        # 360 frames at 1920x1080
+A=../../assets
+ffmpeg -framerate 30 -i frames/f%04d.png -vf format=yuv420p -c:v libx264 -preset slow -crf 20 -tune animation -movflags +faststart -an $A/hero-1080.mp4
+ffmpeg -framerate 30 -i frames/f%04d.png -vf format=yuv420p -c:v libvpx-vp9 -crf 32 -b:v 0 -row-mt 1 -an $A/hero-1080.webm
+ffmpeg -framerate 30 -i frames/f%04d.png -vf "scale=1280:720:flags=lanczos,format=yuv420p" -c:v libx264 -preset slow -crf 22 -tune animation -movflags +faststart -an $A/hero-720.mp4
+ffmpeg -i frames/f0000.png -q:v 3 $A/hero-poster.jpg
 ```
 
 `render.mjs` expects Playwright's headless shell; set its `executablePath` for your machine. `og.html` is the social card template (screenshot at 1200×630).

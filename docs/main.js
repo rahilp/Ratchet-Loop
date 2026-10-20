@@ -5,10 +5,10 @@
   const reduce = matchMedia('(prefers-reduced-motion: reduce)');
   const saveData = navigator.connection && navigator.connection.saveData;
 
-  // reveal the hero once the display face is in, so the expanded headline never reflows in view
+  // reveal the hero once the display face is in, so the serif headline never reflows in view
   const fontsIn = new Promise(res => {
     const link = document.querySelector('link[data-fonts]');
-    const go = () => Promise.all([document.fonts.load('400 64px Newsreader'), document.fonts.load('italic 400 64px Newsreader'), document.fonts.load('800 17px Archivo')]).then(res, res);
+    const go = () => Promise.all([document.fonts.load('400 64px Newsreader'), document.fonts.load('italic 400 64px Newsreader'), document.fonts.load('400 17px Inter')]).then(res, res);
     if (!link || !document.fonts) return res();
     if (link.rel === 'stylesheet' && link.sheet) go(); else link.addEventListener('load', () => setTimeout(go, 0), { once: true });
   });
@@ -17,7 +17,7 @@
 
   /* ---------- nav ---------- */
   const nav = document.querySelector('[data-nav]');
-  const onNav = () => nav.classList.toggle('is-solid', scrollY > 40);
+  const onNav = () => nav.classList.toggle('is-solid', scrollY > 30);
   addEventListener('scroll', onNav, { passive: true }); onNav();
   const toggle = document.querySelector('[data-menu-toggle]');
   const setMenu = open => {
@@ -29,22 +29,22 @@
   document.querySelectorAll('[data-menu] a').forEach(a => a.addEventListener('click', () => setMenu(false)));
   addEventListener('keydown', e => { if (e.key === 'Escape' && nav.classList.contains('is-open')) { setMenu(false); toggle.focus(); } });
 
-  /* ---------- hero video: pick a source that suits the screen ---------- */
-  const hero = document.querySelector('.hero');
-  const video = document.querySelector('.hero__video');
+  /* ---------- hero film: pick a source that suits the screen ---------- */
+  const film = document.querySelector('.film');
+  const video = document.querySelector('.film__video');
   if (video && !reduce.matches && !saveData) {
-    const small = Math.max(screen.width, screen.height) * Math.min(devicePixelRatio || 1, 2) < 1600 || innerWidth < 760;
+    const small = innerWidth < 760 || Math.max(screen.width, screen.height) * Math.min(devicePixelRatio || 1, 2) < 1600;
     const add = (src, type) => { const s = document.createElement('source'); s.src = src; s.type = type; video.appendChild(s); };
     if (small) add(video.dataset.srcSm, 'video/mp4');
     else { add(video.dataset.srcLgWebm, 'video/webm'); add(video.dataset.srcLg, 'video/mp4'); }
     // poster frame: reuse whichever format the <picture> already fetched
-    const still = document.querySelector('.hero__poster img');
+    const still = document.querySelector('.film__poster img');
     if (still) video.poster = still.currentSrc || still.src;
     video.load();
-    video.addEventListener('playing', () => hero.classList.add('is-playing'), { once: true });
+    video.addEventListener('playing', () => film.classList.add('is-playing'), { once: true });
     const p = video.play(); if (p && p.catch) p.catch(() => {});
     // pause off-screen to save battery
-    new IntersectionObserver(([e]) => { e.isIntersecting ? video.play().catch(() => {}) : video.pause(); }).observe(hero);
+    new IntersectionObserver(([e]) => { e.isIntersecting ? video.play().catch(() => {}) : video.pause(); }).observe(film);
   } else if (video) {
     video.remove();
   }
@@ -59,33 +59,32 @@
     ticking = false;
     for (const l of layers) {
       if (!l.on) continue;
-      const host = l.el.parentElement.getBoundingClientRect();
-      const off = (host.top + host.height / 2 - vh / 2);   // 0 when the section is centred
-      l.el.style.transform = `translate3d(0, ${(off * l.d * -0.35 * mobileScale).toFixed(1)}px, 0)`;
+      const host = l.el.closest('section').getBoundingClientRect();
+      const off = Math.min(0, host.top);   // layers drift only once their section starts to scroll away
+      l.el.style.transform = `translate3d(0, ${(off * l.d * -0.45 * mobileScale).toFixed(1)}px, 0)`;
     }
   };
   const req = () => { if (!ticking) { ticking = true; requestAnimationFrame(paint); } };
   const startParallax = () => {
     layers.forEach(l => io.observe(l.el));
     addEventListener('scroll', req, { passive: true });
-    addEventListener('resize', () => { vh = innerHeight; mobileScale = innerWidth < 760 ? 0.55 : 1; req(); }, { passive: true });
     req();
   };
   const stopParallax = () => {
     removeEventListener('scroll', req);
     layers.forEach(l => { io.unobserve(l.el); l.el.style.transform = ''; });
   };
+  addEventListener('resize', () => { vh = innerHeight; mobileScale = innerWidth < 760 ? 0.55 : 1; req(); }, { passive: true });
   if (!reduce.matches) startParallax();
   reduce.addEventListener && reduce.addEventListener('change', e => e.matches ? stopParallax() : startParallax());
 
   /* ---------- reveal ---------- */
   const rev = new IntersectionObserver(es => es.forEach(e => {
     if (e.isIntersecting) { e.target.classList.add('is-in'); rev.unobserve(e.target); }
-  }), { rootMargin: '0px 0px -10% 0px' });
-  document.querySelectorAll('.reveal, .term').forEach(el => rev.observe(el));
-  document.querySelectorAll('.term__body[data-type] > span').forEach((s, i) => s.style.setProperty('--i', i));
+  }), { rootMargin: '0px 0px -8% 0px' });
+  document.querySelectorAll('.reveal').forEach(el => rev.observe(el));
 
-  /* ---------- the one-way ratchet ---------- */
+  /* ---------- 05: the one-way ratchet ---------- */
   const rotor = document.querySelector('[data-rotor]');
   const pawl = document.querySelector('[data-pawl]');
   const count = document.querySelector('[data-count]');
@@ -102,7 +101,7 @@
     count.textContent = locked;
     gates.forEach((g, i) => {
       const on = i < locked; g.classList.toggle('is-locked', on);
-      g.querySelector('[data-state]').textContent = on ? 'Locked' : 'Open';
+      g.querySelector('[data-state]').textContent = on ? 'Passed' : 'Waiting';
     });
     studs.forEach((s, i) => s.classList.toggle('is-hot', i < locked * TEETH_PER_GATE));
     if (locked === gates.length) hint.classList.add('is-on');
@@ -113,7 +112,7 @@
   }), { rootMargin: '-45% 0px -45% 0px' });
   gates.forEach(g => gio.observe(g));
 
-  /* ---------- 01: equation diagram, plays once in view, Replay restarts it ---------- */
+  /* ---------- 02: equation diagram, plays once in view, Replay restarts it ---------- */
   const eq = document.querySelector('[data-eq]');
   if (eq) {
     new IntersectionObserver(([e], o) => { if (e.isIntersecting) { eq.classList.add('is-in'); o.disconnect(); } }, { threshold: .3 }).observe(eq);
@@ -122,68 +121,95 @@
     });
   }
 
-  /* ---------- 02: one checkpoint, stage by stage ---------- */
-  const sim = document.querySelector('[data-sim]');
-  if (sim) {
-    const STAGE_MS = 2600;
-    const NAMES = ['Plan tests', 'Write tests', 'Red', 'Build', 'Green', 'Looks right', 'Review', 'Lock'];
-    const TEXT = [
-      'The test planner writes ID-tagged test cases before any code exists: the happy path, edge cases, permissions and failure modes.',
-      'The test writer turns those cases into real, runnable tests, tagged with their IDs. There is still no production code.',
-      'Ratchet runs the tests itself. At least one has to fail on an assertion, and a test that crashed or was skipped doesn\u2019t count. From here the planned tests are frozen.',
-      'The implementer writes the code for exactly this checkpoint. It never edits tests.',
-      'Every planned test has to pass. Ratchet reads each result one by one and checks that none were deleted.',
-      'This step changes a screen, so two reviewers compare screenshots against the prototype in the same state. One checks the look, one the behaviour. Any fixable difference blocks.',
-      'Reviewers, from another company when one is installed, try to break the code. The fixer answers every finding, and rounds repeat until nobody has a blocking one.',
-      'The checkpoint becomes its own git commit. The ratchet clicks forward and the next checkpoint starts. You sign off on the whole feature at the end.'
-    ];
-    const boxes = [...sim.querySelectorAll('[data-stage]')];
-    const tabs = [...sim.querySelectorAll('[data-sim-tab]')];
-    const text = sim.querySelector('[data-sim-text]');
-    const status = sim.querySelector('[data-sim-status]');
-    const playBtn = sim.querySelector('[data-sim-play]');
-    const playLabel = sim.querySelector('[data-sim-play-label]');
-    const cp3 = sim.querySelector('[data-sim-cp="3"]'), cp4 = sim.querySelector('[data-sim-cp="4"]');
+  /* ---------- a stepper: play / pause / step / replay, tabs, autoplay only while on screen ---------- */
+  const stepper = ({ root, count, ms, onRender, tablist, playBtn, playLabel, stepBtn, replayBtn, lastHold = 1 }) => {
     let i = 0, playing = !reduce.matches, inView = false, timer = 0;
-    sim.style.setProperty('--stage-ms', STAGE_MS + 'ms');
-
+    const tabs = [...tablist.querySelectorAll('[role="tab"]')];
     const render = () => {
-      boxes.forEach((b, k) => { b.classList.toggle('is-done', k < i); b.classList.toggle('is-now', k === i); });
       tabs.forEach((t, k) => { t.setAttribute('aria-selected', String(k === i)); t.classList.toggle('is-past', k < i); t.tabIndex = k === i ? 0 : -1; });
-      text.textContent = TEXT[i];
-      const locked = i === boxes.length - 1;
-      cp3.classList.toggle('is-done', locked); cp3.classList.toggle('is-now', !locked);
-      cp3.querySelector('[data-sim-cp-state]').textContent = locked ? 'Locked' : 'Current';
-      cp4.querySelector('[data-sim-cp-state]').textContent = locked ? 'Starting' : 'Up next';
-      status.textContent = `${playing ? 'Auto-loop' : 'Paused'} \u00b7 checkpoint 3 / 4 \u00b7 ${NAMES[i]}`;
-      // restart the progress bar on the current box
-      const now = boxes[i].querySelector('.flow__s'); now.style.animation = 'none'; void now.offsetWidth; now.style.animation = '';
+      onRender(i, playing);
     };
     const schedule = () => {
       clearTimeout(timer);
-      if (playing && inView) timer = setTimeout(() => { i = (i + 1) % boxes.length; render(); schedule(); }, i === boxes.length - 1 ? STAGE_MS * 1.6 : STAGE_MS);
+      if (playing && inView) timer = setTimeout(() => { i = (i + 1) % count; render(); schedule(); }, i === count - 1 ? ms * lastHold : ms);
     };
     const setPlaying = on => {
-      playing = on; sim.classList.toggle('is-paused', !on);
+      playing = on; root.classList.toggle('is-paused', !on);
       playBtn.setAttribute('aria-pressed', String(on)); playLabel.textContent = on ? 'Pause' : 'Play';
       render(); schedule();
     };
     playBtn.addEventListener('click', () => setPlaying(!playing));
-    sim.querySelector('[data-sim-step]').addEventListener('click', () => { i = (i + 1) % boxes.length; setPlaying(false); });
-    sim.querySelector('[data-sim-replay]').addEventListener('click', () => { i = 0; setPlaying(true); });
+    stepBtn.addEventListener('click', () => { i = (i + 1) % count; setPlaying(false); });
+    replayBtn.addEventListener('click', () => { i = 0; setPlaying(true); });
     tabs.forEach((t, k) => t.addEventListener('click', () => { i = k; setPlaying(false); }));
-    sim.querySelector('.sim__tabs').addEventListener('keydown', e => {
+    tablist.addEventListener('keydown', e => {
       const d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0; if (!d) return;
-      e.preventDefault(); i = (i + d + boxes.length) % boxes.length; setPlaying(false); tabs[i].focus();
+      e.preventDefault(); i = (i + d + count) % count; setPlaying(false); tabs[i].focus();
     });
-    new IntersectionObserver(([e]) => { inView = e.isIntersecting; schedule(); }, { threshold: .25 }).observe(sim);
+    new IntersectionObserver(([e]) => { inView = e.isIntersecting; schedule(); }, { threshold: .25 }).observe(root);
     setPlaying(playing);
+  };
+
+  /* ---------- 03: a whole run ---------- */
+  const run = document.querySelector('[data-player="run"]');
+  if (run) {
+    const scenes = [...run.querySelectorAll('[data-scene]')];
+    const tablist = run.querySelector('.player__tabs');
+    const tabs = [...tablist.querySelectorAll('[role="tab"]')];
+    const status = run.querySelector('[data-status]');
+    tabs.forEach((t, k) => { t.id = `run-tab-${k}`; scenes[k].id = `run-scene-${k}`; t.setAttribute('aria-controls', scenes[k].id); scenes[k].setAttribute('aria-labelledby', t.id); });
+    stepper({
+      root: run, count: scenes.length, ms: +run.dataset.ms || 5200, tablist, lastHold: 1.4,
+      playBtn: run.querySelector('[data-play]'), playLabel: run.querySelector('[data-play-label]'),
+      stepBtn: run.querySelector('[data-step]'), replayBtn: run.querySelector('[data-replay]'),
+      onRender: (i, playing) => {
+        scenes.forEach((s, k) => { s.hidden = k !== i; });
+        status.textContent = `${playing ? 'Auto-play' : 'Paused'} · stage ${i + 1} of ${scenes.length} · ${tabs[i].textContent.replace(/^\d+/, '').trim()}`;
+      }
+    });
   }
 
-  /* ---------- 04: agents, as tabs ---------- */
-  const team = document.querySelector('[data-team]');
-  if (team) {
-    const cards = [...team.querySelectorAll('[data-team-tab]')];
+  /* ---------- 04: one checkpoint, stage by stage ---------- */
+  const sim = document.querySelector('[data-sim]');
+  if (sim) {
+    const STAGE_MS = 2800;
+    const NAMES = ['Plan tests', 'Write tests', 'Red', 'Build', 'Green', 'Looks right', 'Review', 'Lock'];
+    const TEXT = [
+      'The test planner writes test cases before any code exists: the normal path, edge cases, permissions and what should happen when things go wrong.',
+      'The test writer turns those cases into real tests you can run, each tagged with its case number. There is still no code for the feature.',
+      'Ratchet runs the tests itself. At least one has to fail for the right reason, because there is no code yet. A test that crashed or was skipped doesn’t count. From here the planned tests are frozen.',
+      'The implementer writes the code for exactly this step, until the tests pass. It is never allowed to change the tests.',
+      'Every planned test has to pass. Ratchet reads each result one by one and checks that none were deleted.',
+      'This step changes a screen, so two reviewers compare screenshots of the real app and the prototype in the same state. One checks the look, one checks the behaviour. Any fixable difference blocks.',
+      'Reviewers, from another company when one is installed, try to break the code. The fixer answers every finding, and rounds repeat until nobody has anything serious left.',
+      'The step becomes its own git commit. The ratchet clicks forward one tooth and the next step starts. You sign off on the whole feature at the end.'
+    ];
+    const boxes = [...sim.querySelectorAll('[data-stage]')];
+    const text = sim.querySelector('[data-sim-text]');
+    const status = sim.querySelector('[data-sim-status]');
+    const cp3 = sim.querySelector('[data-sim-cp="3"]'), cp4 = sim.querySelector('[data-sim-cp="4"]');
+    sim.style.setProperty('--stage-ms', STAGE_MS + 'ms');
+    stepper({
+      root: sim, count: boxes.length, ms: STAGE_MS, tablist: sim.querySelector('.sim__tabs'), lastHold: 1.6,
+      playBtn: sim.querySelector('[data-sim-play]'), playLabel: sim.querySelector('[data-sim-play-label]'),
+      stepBtn: sim.querySelector('[data-sim-step]'), replayBtn: sim.querySelector('[data-sim-replay]'),
+      onRender: (i, playing) => {
+        boxes.forEach((b, k) => { b.classList.toggle('is-done', k < i); b.classList.toggle('is-now', k === i); });
+        text.textContent = TEXT[i];
+        const done = i === boxes.length - 1;
+        cp3.classList.toggle('is-done', done); cp3.classList.toggle('is-now', !done);
+        cp3.querySelector('[data-sim-cp-state]').textContent = done ? 'Locked' : 'Current';
+        cp4.querySelector('[data-sim-cp-state]').textContent = done ? 'Starting' : 'Up next';
+        status.textContent = `${playing ? 'Auto-play' : 'Paused'} · checkpoint 3 of 4 · ${NAMES[i]}`;
+        // restart the progress bar on the current box
+        const now = boxes[i].querySelector('.flow__s'); now.style.animation = 'none'; requestAnimationFrame(() => { now.style.animation = ''; });
+      }
+    });
+  }
+
+  /* ---------- 08/09: card grids that open a detail panel ---------- */
+  document.querySelectorAll('[data-tabs]').forEach(group => {
+    const cards = [...group.querySelectorAll('[data-tab-card]')];
     const select = (c, focus) => {
       cards.forEach(x => {
         const on = x === c; x.setAttribute('aria-selected', String(on)); x.tabIndex = on ? 0 : -1;
@@ -197,13 +223,36 @@
       const panel = document.getElementById(c.getAttribute('aria-controls'));
       if (innerWidth < 760 && panel.getBoundingClientRect().top > innerHeight * .6) panel.scrollIntoView({ behavior: reduce.matches ? 'auto' : 'smooth', block: 'start' });
     }));
-    team.querySelector('.team__grid').addEventListener('keydown', e => {
+    group.querySelector('[role="tablist"]').addEventListener('keydown', e => {
       const k = cards.indexOf(document.activeElement); if (k < 0) return;
       const d = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[e.key];
       if (d) { e.preventDefault(); select(cards[(k + d + cards.length) % cards.length], true); }
       else if (e.key === 'Home') { e.preventDefault(); select(cards[0], true); }
       else if (e.key === 'End') { e.preventDefault(); select(cards[cards.length - 1], true); }
     });
+  });
+
+  /* ---------- 10: does this count as a yes? (same rule Ratchet's prompt hook applies) ---------- */
+  const yes = document.querySelector('[data-yes]');
+  if (yes) {
+    const input = yes.querySelector('[data-yes-input]');
+    const out = yes.querySelector('[data-yes-out]');
+    const ACCEPT = ['yes', 'yes, go ahead', 'go ahead', 'approved'];
+    const judge = () => {
+      const raw = input.value.trim();
+      const core = raw.replace(/[.!]$/, '').toLowerCase();
+      out.classList.remove('is-yes', 'is-no');
+      if (!raw) { out.textContent = 'Type a reply to see how Ratchet reads it.'; return; }
+      if (ACCEPT.includes(core)) { out.classList.add('is-yes'); out.textContent = `✓ Counts as a yes. Ratchet moves on.`; return; }
+      out.classList.add('is-no');
+      const starts = ACCEPT.find(a => core.startsWith(a));
+      out.textContent = starts
+        ? '✕ Not a yes. Something is attached after it, so nothing is approved. The agent answers what you said and asks again.'
+        : '✕ Not a yes. Nothing is approved. The agent answers what you said, or makes the change you asked for, then asks again.';
+    };
+    input.addEventListener('input', judge);
+    yes.querySelectorAll('[data-yes-try]').forEach(b => b.addEventListener('click', () => { input.value = b.dataset.yesTry; judge(); input.focus(); }));
+    judge();
   }
 
   /* ---------- copy buttons ---------- */
