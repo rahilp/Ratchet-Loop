@@ -20,7 +20,7 @@ FAQ = [
     ("How long does it take?",
      "A small feature usually takes tens of minutes, with the agent working by itself. Bigger ones take longer. You don't have to watch."),
     ("Is it expensive?",
-     "It uses more AI time than letting the agent just write code, because it checks the work. Ratchet keeps that down: low-risk steps get one reviewer, and small nitpicks are noted for you at the end instead of starting another round of review."),
+     "It uses more AI time than letting the agent just write code, because it checks the work. Ratchet keeps that down: hard limits on review rounds per step and per run, one reviewer for low-risk steps, cheaper models for lighter jobs, and small nitpicks noted for you at the end instead of starting another round. Pay-per-use tools are never used without your exact OK."),
     ("Do I need other AI tools installed?",
      "No. Without them, reviews come from your own agent's company, using a different model when it can. With another company's tool installed and signed in, such as Codex, Gemini, Copilot, Cursor or OpenCode, that tool reviews first. A second company tends to catch things the first one misses."),
     ("Where does my code go?",

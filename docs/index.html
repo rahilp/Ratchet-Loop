@@ -40,7 +40,7 @@
 <script type="application/ld+json">
 {"@context":"https://schema.org","@graph":[
  {"@type":"SoftwareApplication","name":"Ratchet Loop","applicationCategory":"DeveloperApplication","operatingSystem":"macOS, Linux, Windows","softwareVersion":"1.14.0","url":"https://ratchetloop.github.io/","downloadUrl":"https://github.com/rahilp/Ratchet-Loop","image":"https://ratchetloop.github.io/assets/og.jpg","description":"A checkpoint-and-gate build loop for AI coding agents. Every checkpoint must pass behavior tests, UI review, adversarial code review and human review before the next one starts.","author":{"@type":"Person","name":"Rahil Pirani"},"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}},
- {"@type":"FAQPage","mainEntity":[{"@type": "Question", "name": "Which coding agents does it work with?", "acceptedAnswer": {"@type": "Answer", "text": "Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. You install it once per computer for each CLI you use. Claude Code gets the most protection, because its hooks can see which sub-agent is acting. The safeguards section shows exactly what each CLI enforces."}},{"@type": "Question", "name": "How long does it take?", "acceptedAnswer": {"@type": "Answer", "text": "A small feature usually takes tens of minutes, with the agent working by itself. Bigger ones take longer. You don't have to watch."}},{"@type": "Question", "name": "Is it expensive?", "acceptedAnswer": {"@type": "Answer", "text": "It uses more AI time than letting the agent just write code, because it checks the work. Ratchet keeps that down: low-risk steps get one reviewer, and small nitpicks are noted for you at the end instead of starting another round of review."}},{"@type": "Question", "name": "Do I need other AI tools installed?", "acceptedAnswer": {"@type": "Answer", "text": "No. Without them, reviews come from your own agent's company, using a different model when it can. With another company's tool installed and signed in, such as Codex, Gemini, Copilot, Cursor or OpenCode, that tool reviews first. A second company tends to catch things the first one misses."}},{"@type": "Question", "name": "Where does my code go?", "acceptedAnswer": {"@type": "Answer", "text": "Into your project, like any other change, with one git commit per finished step. If you're on your main branch or have unsaved changes, the agent offers to start a new branch first. Ratchet keeps its own notes in a .ratchet/ folder."}},{"@type": "Question", "name": "Can I stop halfway?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Say pause. When you're ready, say carry on. You can even pick it up in a new chat. The agent checks with you before moving the run over. Nothing is lost."}},{"@type": "Question", "name": "What if I don't like the result?", "acceptedAnswer": {"@type": "Answer", "text": "Say so at the end, the same way you'd tell a colleague. Your feedback turns into new steps, and the agent remembers the lesson for next time."}},{"@type": "Question", "name": "What if the reviewers keep finding the same mistake?", "acceptedAnswer": {"@type": "Answer", "text": "The agent offers to add an automatic check for it, like a lint rule, so it gets caught in seconds from then on. You decide."}},{"@type": "Question", "name": "The agent says the hooks aren't working.", "acceptedAnswer": {"@type": "Answer", "text": "Close the CLI, open it again in the same folder, and say: Set up Ratchet and continue. Still not working? Ask it to check that Ratchet's hooks are installed for this CLI and install them if not."}}]}
+ {"@type":"FAQPage","mainEntity":[{"@type": "Question", "name": "Which coding agents does it work with?", "acceptedAnswer": {"@type": "Answer", "text": "Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. You install it once per computer for each CLI you use. Claude Code gets the most protection, because its hooks can see which sub-agent is acting. The safeguards section shows exactly what each CLI enforces."}},{"@type": "Question", "name": "How long does it take?", "acceptedAnswer": {"@type": "Answer", "text": "A small feature usually takes tens of minutes, with the agent working by itself. Bigger ones take longer. You don't have to watch."}},{"@type": "Question", "name": "Is it expensive?", "acceptedAnswer": {"@type": "Answer", "text": "It uses more AI time than letting the agent just write code, because it checks the work. Ratchet keeps that down: hard limits on review rounds per step and per run, one reviewer for low-risk steps, cheaper models for lighter jobs, and small nitpicks noted for you at the end instead of starting another round. Pay-per-use tools are never used without your exact OK."}},{"@type": "Question", "name": "Do I need other AI tools installed?", "acceptedAnswer": {"@type": "Answer", "text": "No. Without them, reviews come from your own agent's company, using a different model when it can. With another company's tool installed and signed in, such as Codex, Gemini, Copilot, Cursor or OpenCode, that tool reviews first. A second company tends to catch things the first one misses."}},{"@type": "Question", "name": "Where does my code go?", "acceptedAnswer": {"@type": "Answer", "text": "Into your project, like any other change, with one git commit per finished step. If you're on your main branch or have unsaved changes, the agent offers to start a new branch first. Ratchet keeps its own notes in a .ratchet/ folder."}},{"@type": "Question", "name": "Can I stop halfway?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Say pause. When you're ready, say carry on. You can even pick it up in a new chat. The agent checks with you before moving the run over. Nothing is lost."}},{"@type": "Question", "name": "What if I don't like the result?", "acceptedAnswer": {"@type": "Answer", "text": "Say so at the end, the same way you'd tell a colleague. Your feedback turns into new steps, and the agent remembers the lesson for next time."}},{"@type": "Question", "name": "What if the reviewers keep finding the same mistake?", "acceptedAnswer": {"@type": "Answer", "text": "The agent offers to add an automatic check for it, like a lint rule, so it gets caught in seconds from then on. You decide."}},{"@type": "Question", "name": "The agent says the hooks aren't working.", "acceptedAnswer": {"@type": "Answer", "text": "Close the CLI, open it again in the same folder, and say: Set up Ratchet and continue. Still not working? Ask it to check that Ratchet's hooks are installed for this CLI and install them if not."}}]}
 ]}
 </script>
 </head>
@@ -55,8 +55,9 @@
   <nav class="nav__links" id="menu" aria-label="Primary" data-menu>
     <a href="#run">How it works</a>
     <a href="#gates">The gates</a>
+    <a href="#viewer">Viewer</a>
+    <a href="#cost">Cost</a>
     <a href="#safeguards">Safeguards</a>
-    <a href="#setup">What it sets up</a>
     <a href="#install">Install</a>
   </nav>
   <div class="nav__end">
@@ -311,10 +312,51 @@
   </div>
 </section>
 
-<!-- ============ 04 ONE STEP ============ -->
-<section class="band band--alt" id="checkpoint" aria-labelledby="cp-title">
+<!-- ============ THE VIEWER ============ -->
+<section class="band band--alt" id="viewer" aria-labelledby="viewer-title">
   <div class="wrap">
-    <p class="kicker"><span>04</span>Inside one step</p>
+    <p class="kicker"><span>04</span>The viewer</p>
+    <h2 id="viewer-title" class="h2">Every run gets its own page. <em>Watch it happen, step by step.</em></h2>
+    <p class="lede">Each run writes a viewer: one web page with the plan, every planned test, every review round and every commit, kept up to date as the agent works. You don't need it, because everything also shows up in your chat. It's there when you want the whole picture at once.</p>
+
+    <div class="shot reveal" data-shot>
+      <div class="shot__bar">
+        <span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="shot__url">.ratchet/runs/leave-approvals/viewer.html</span>
+        <div class="shot__tabs" role="tablist" aria-label="Viewer screens">
+          <button role="tab" type="button" id="shot-tab-plan" aria-controls="shot-plan" aria-selected="true" data-shot-tab>Checkpoints</button>
+          <button role="tab" type="button" id="shot-tab-act" aria-controls="shot-act" aria-selected="false" tabindex="-1" data-shot-tab>Activity</button>
+        </div>
+      </div>
+      <div class="shot__frame">
+        <picture id="shot-plan" role="tabpanel" aria-labelledby="shot-tab-plan">
+          <source srcset="assets/viewer-plan.avif" type="image/avif">
+          <img src="assets/viewer-plan.jpg" width="1600" height="1328" loading="lazy" decoding="async" alt="The Ratchet viewer for a run called Leave approvals. A blue Building banner says CP3 is in its second review round. Below, CP1 and CP2 show green chips for Tests, Look and feel and Second opinion. CP3 is open, showing its done-when list, what the design reviewer checks, six planned tests tagged code, edge or browser, and its first review round: one thing to fix, one minor note for later.">
+        </picture>
+        <picture id="shot-act" role="tabpanel" aria-labelledby="shot-tab-act" hidden>
+          <source srcset="assets/viewer-act.avif" type="image/avif">
+          <img src="assets/viewer-act.jpg" width="1600" height="1220" loading="lazy" decoding="async" alt="The viewer's Activity tab: a time-stamped feed of the run, from plan approved, through tests going red then green for each checkpoint, to review round 2 starting on CP3.">
+        </picture>
+      </div>
+      <p class="shot__cap"><span class="tag">Example run</span> The real viewer, showing the leave approvals example used on this page.</p>
+    </div>
+
+    <div class="facts facts--3">
+      <div class="fact reveal"><h3>What's on it</h3><p>A progress bar with one segment per step. Each step's four gates as chips: Tests, Look and feel, Second opinion, Your OK. What "done" means, the planned tests by ID, who reviewed each round, and the evidence and commit for every finished step.</p></div>
+      <div class="fact reveal"><h3>How to open it</h3><p>Say <q>Give me the viewer link, and open it if you can.</q> It's a single file in your project at <code>.ratchet/runs/&lt;run&gt;/viewer.html</code>. When Ratchet's small server is running, it refreshes on its own every few seconds and shows "live".</p></div>
+      <div class="fact reveal"><h3>More than one tab</h3><p>Activity is a time-stamped feed of the run. Learnings shows your saved lessons. New screens link to the clickable prototype, and spec-driven runs show which scenarios are proven so far.</p></div>
+    </div>
+    <details class="expand">
+      <summary>Can I share it with my team?</summary>
+      <p>Yes, on your own network. Ask the agent to serve the viewer for others to see. It gives you a link with a private token in it, and requests without that token are refused. The page follows light or dark mode, and has its own theme switch.</p>
+    </details>
+  </div>
+</section>
+
+<!-- ============ 04 ONE STEP ============ -->
+<section class="band" id="checkpoint" aria-labelledby="cp-title">
+  <div class="wrap">
+    <p class="kicker"><span>05</span>Inside one step</p>
     <h2 id="cp-title" class="h2">Tests first. <em>Then the code has to catch up.</em></h2>
     <p class="lede">Every step, which Ratchet calls a checkpoint, goes through the same eight stages. A different agent handles each job, so the one writing the code is never the one judging it.</p>
 
@@ -374,7 +416,7 @@
 </section>
 
 <!-- ============ 05 THE FOUR GATES ============ -->
-<section class="band gates" id="gates" aria-labelledby="gates-title">
+<section class="band band--alt gates" id="gates" aria-labelledby="gates-title">
   <div class="gates__inner wrap">
     <div class="gates__stage" aria-hidden="true">
       <div class="gates__sticky">
@@ -421,7 +463,7 @@
       </div>
     </div>
     <div class="gates__list">
-      <p class="kicker"><span>05</span>The four gates</p>
+      <p class="kicker"><span>06</span>The four gates</p>
       <h2 id="gates-title" class="h2">Four gates. <em>In order. No skipping.</em></h2>
       <p class="lede">The first three run on every step. The last one is you, at the end. Work with nothing to look at, like an API change or a refactor, skips gate 2.</p>
       <article class="gate" data-gate="1">
@@ -450,16 +492,16 @@
         <h3>You</h3>
         <dl class="gate__rule"><div><dt>Has to be true</dt><dd>You try it and say yes.</dd></div>
         <div><dt>How it's enforced</dt><dd>Only a real message from you counts. Messages your CLI sends on its own, like a background task finishing, are never taken as your reply.</dd></div></dl>
-        <ul><li>A thumbs-up, an "ok" or a yes with a "but" on the end doesn't count. Try it in section 10.</li></ul>
+        <ul><li>A thumbs-up, an "ok" or a yes with a "but" on the end doesn't count. Try it further down this page.</li></ul>
       </article>
     </div>
   </div>
 </section>
 
 <!-- ============ 06 SAFEGUARDS ============ -->
-<section class="band band--alt" id="safeguards" aria-labelledby="safe-title">
+<section class="band" id="safeguards" aria-labelledby="safe-title">
   <div class="wrap">
-    <p class="kicker"><span>06</span>Safeguards</p>
+    <p class="kicker"><span>07</span>Safeguards</p>
     <h2 id="safe-title" class="h2">Why the agent can't cheat. <em>It can only fix the problem.</em></h2>
     <p class="lede">Ratchet installs hooks into your CLI. Hooks run on every action the agent takes, so the rules hold even when the agent would rather skip them.</p>
     <div class="rules">
@@ -488,9 +530,9 @@
 </section>
 
 <!-- ============ 07 WHO REVIEWS ============ -->
-<section class="band" id="reviewers" aria-labelledby="rev-title">
+<section class="band band--alt" id="reviewers" aria-labelledby="rev-title">
   <div class="wrap">
-    <p class="kicker"><span>07</span>Who reviews</p>
+    <p class="kicker"><span>08</span>Who reviews</p>
     <h2 id="rev-title" class="h2">A second opinion <em>from somebody else.</em></h2>
     <p class="lede">The model running your agent could be Claude, GPT, Gemini or a Copilot model. Ratchet doesn't mind which. What matters is that the reviewer is someone different, because a second company tends to catch what the first one misses.</p>
     <div class="split">
@@ -515,18 +557,62 @@
       <li>Claude Code</li><li>Codex</li><li>Gemini CLI</li><li>Copilot CLI</li><li>Cursor</li><li>OpenCode</li><li>Oh My Pi</li><li>Pi</li><li>A command you add</li>
     </ul>
     <div class="facts">
-      <div class="fact reveal"><h3>Later rounds cost less</h3><p>Round 1 asks every reviewer. After that, only the reviewers with an open serious finding are asked back. A small fix after approval gets one reviewer, unless the step is high risk.</p></div>
-      <div class="fact reveal"><h3>One flaky failure is free</h3><p>If the tests fail once and pass on an immediate re-run, the step is marked flaky and no attempt is spent. A second time counts as a real failure.</p></div>
-      <div class="fact reveal"><h3>Tools that are down are skipped</h3><p>A tool that's signed out is skipped for six hours. One that's out of credits waits for the reset time it gave. Its slot goes to another working tool.</p></div>
+      <div class="fact reveal"><h3>Aimed at your users</h3><p>Every reviewer's instructions open with the plan's objective. A finding has to say who is harmed and how, and its severity follows real harm in normal use.</p></div>
+      <div class="fact reveal"><h3>A failed reviewer is replaced</h3><p>When one tool fails, only that tool is set aside, and its slot goes to another working tool from a different company.</p></div>
+      <div class="fact reveal"><h3>Cut-off replies get one retry</h3><p>If a reviewer's answer is cut off mid-reply, it's asked once more before anything is held against it.</p></div>
       <div class="fact reveal"><h3>Long reviews get a check-in</h3><p>If a step blocks twice in a row, a fresh reviewer looks at the goal and the history and suggests simplifying the step, or asking you.</p></div>
     </div>
+  </div>
+</section>
+
+<!-- ============ COST ============ -->
+<section class="band" id="cost" aria-labelledby="cost-title">
+  <div class="wrap">
+    <p class="kicker"><span>09</span>Cost and budgets</p>
+    <h2 id="cost-title" class="h2">Checking costs more than not checking. <em>Ratchet keeps the bill in your hands.</em></h2>
+    <p class="lede">Proving every step uses more AI time than letting an agent write code unchecked. So Ratchet puts hard limits on how much review can happen, spends it where the risk is, and never spends your money on a pay-per-use tool without your exact OK.</p>
+
+    <div class="budget reveal">
+      <div class="budget__head">
+        <div><p class="mono-k">Review budget <span>· example run</span></p><h3 class="budget__title">Leave approvals, after CP3 is locked</h3></div>
+        <p class="budget__total"><b>8</b> of 30 review rounds used for the whole run</p>
+      </div>
+      <div class="budget__run" role="img" aria-label="8 of 30 review rounds used across the run"><i style="--w:26.7%"></i></div>
+      <ol class="budget__steps">
+        <li><span class="budget__cp">CP1</span><span class="budget__bar" role="img" aria-label="1 of 6 rounds"><i style="--w:16.7%"></i></span><span class="budget__n">1 / 6</span><span class="budget__note">normal risk · 2 reviewers</span></li>
+        <li><span class="budget__cp">CP2</span><span class="budget__bar" role="img" aria-label="1 of 6 rounds"><i style="--w:16.7%"></i></span><span class="budget__n">1 / 6</span><span class="budget__note">normal risk · 2 reviewers</span></li>
+        <li><span class="budget__cp">CP3</span><span class="budget__bar" role="img" aria-label="2 of 6 rounds"><i style="--w:33.3%"></i></span><span class="budget__n">2 / 6</span><span class="budget__note">round 2 asked back only the reviewer with an open finding</span></li>
+        <li class="is-hot"><span class="budget__cp">CP4</span><span class="budget__bar" role="img" aria-label="4 of 6 rounds so far"><i style="--w:66.7%"></i></span><span class="budget__n">4 / 6</span><span class="budget__note">high risk · 4 reviewers · still going</span></li>
+      </ol>
+      <p class="budget__foot">When a step reaches its limit, or the run reaches 30, the run stops and asks you. Raising a step's limit is offered last, once per step, and only with your own reason. The run-wide limit is only ever raised by you.</p>
+    </div>
+
+    <div class="caps">
+      <div class="cap"><b>6</b><span>review rounds per step</span></div>
+      <div class="cap"><b>30</b><span>review rounds per run</span></div>
+      <div class="cap"><b>6</b><span>screen comparisons per step</span></div>
+      <div class="cap"><b>8</b><span>test attempts per step</span></div>
+    </div>
+    <p class="fine">Default limits. You can change any of them in <code>.ratchet/config.json</code>.</p>
+
+    <div class="rules rules--cost">
+      <div class="rule reveal"><span>C1</span><h3>Reviewers match the risk</h3><p>Low-risk steps get one reviewer, and only serious findings block. Normal steps get two, high-risk steps four. You see each step's risk in the plan before you approve it.</p></div>
+      <div class="rule reveal"><span>C2</span><h3>The right model for each job</h3><p>Planning, coding, fixing and reviewing use a strong model. Lighter jobs like planning tests use a cheaper one, and running tests the cheapest. Ask the agent to list them, or change them in the config.</p></div>
+      <div class="rule reveal"><span>C3</span><h3>Subscriptions first</h3><p>Tools you already pay a flat rate for are tried first. A tool that charges per use isn't sent even a test request until you reply <code>pay per use: &lt;model&gt;</code> for that exact model.</p></div>
+      <div class="rule reveal"><span>C4</span><h3>Later rounds cost less</h3><p>Round 1 asks every reviewer. After that, only reviewers with an open serious finding are asked back. A small fix after approval, 20 changed lines or fewer, gets one reviewer unless the step is high risk.</p></div>
+      <div class="rule reveal"><span>C5</span><h3>Nitpicks don't buy rounds</h3><p>From round 3, minor findings stop blocking. They're saved and listed for you at the end, where you decide which to fix.</p></div>
+      <div class="rule reveal"><span>C6</span><h3>No paying twice</h3><p>Two slots that would reach the same company, model and kind of review run once. A round replaced before anyone reviewed it is free, and one flaky test failure costs no attempt.</p></div>
+      <div class="rule reveal"><span>C7</span><h3>No paying for tools that are down</h3><p>A signed-out tool is skipped for six hours. One that says it's out of credits waits for the reset time it gave. What Ratchet learns is shared by every project on your machine.</p></div>
+      <div class="rule reveal"><span>C8</span><h3>Repeat mistakes get cheap</h3><p>When reviewers flag the same kind of mistake twice, the agent offers an automatic check like a lint rule. From then on it's caught in seconds, before any reviewer is paid to find it.</p></div>
+    </div>
+    <p class="fine">Ratchet counts rounds and attempts, not dollars. The proof receipt reports time per step, never cost or tokens, so check your providers' dashboards for spend.</p>
   </div>
 </section>
 
 <!-- ============ 08 WHAT IT SETS UP ============ -->
 <section class="band band--alt" id="setup" aria-labelledby="setup-title">
   <div class="wrap">
-    <p class="kicker"><span>08</span>What it sets up</p>
+    <p class="kicker"><span>10</span>What it sets up</p>
     <h2 id="setup-title" class="h2">Six files that make the next run better. <em>All of them yours to read and edit.</em></h2>
     <p class="lede">You don't have to prepare anything before your first run. If your project is missing something Ratchet needs, the agent makes it. Pick one to see what it is.</p>
     <div class="tabsgrid" data-tabs>
@@ -617,7 +703,7 @@
 <!-- ============ 09 THE AGENTS ============ -->
 <section class="band" id="agents" aria-labelledby="team-title">
   <div class="wrap">
-    <p class="kicker"><span>09</span>The agents</p>
+    <p class="kicker"><span>11</span>The agents</p>
     <h2 id="team-title" class="h2">Thirteen agents. <em>Nobody marks their own homework.</em></h2>
     <p class="lede">Each job goes to its own agent with its own instructions. Planners plan, writers write, and reviewers only review. Pick one to read its actual definition from the repository.</p>
     <div class="tabsgrid" data-tabs>
@@ -792,7 +878,7 @@
 <!-- ============ 10 TALKING TO IT ============ -->
 <section class="band band--alt" id="talk" aria-labelledby="talk-title">
   <div class="wrap">
-    <p class="kicker"><span>10</span>Talking to it</p>
+    <p class="kicker"><span>12</span>Talking to it</p>
     <h2 id="talk-title" class="h2">No commands to learn. <em>Just say what you want.</em></h2>
     <p class="lede">You can say any of these at any time, in your own words.</p>
     <ul class="says">
@@ -844,7 +930,7 @@
 <!-- ============ 11 A CLOSER LOOK ============ -->
 <section class="band" id="closer" aria-labelledby="closer-title">
   <div class="wrap">
-    <p class="kicker"><span>11</span>A closer look</p>
+    <p class="kicker"><span>13</span>A closer look</p>
     <h2 id="closer-title" class="h2">From "it works" <em>to a checked change.</em></h2>
     <p class="lede">The same step, two endings. On its own, the agent reports success. With Ratchet, a reviewer finds the gap before you ever see it.</p>
     <div class="case reveal">
@@ -897,7 +983,7 @@
 <!-- ============ 12 SPECS AND CI ============ -->
 <section class="band band--alt" id="specs" aria-labelledby="specs-title">
   <div class="wrap">
-    <p class="kicker"><span>12</span>Specs and CI</p>
+    <p class="kicker"><span>14</span>Specs and CI</p>
     <h2 id="specs-title" class="h2">Fits the way <em>your team already works.</em></h2>
     <div class="pair">
       <div class="pair__card reveal">
@@ -920,7 +1006,7 @@
 <!-- ============ 13 INSTALL ============ -->
 <section class="band" id="install" aria-labelledby="install-title">
   <div class="wrap">
-    <p class="kicker"><span>13</span>Install</p>
+    <p class="kicker"><span>15</span>Install</p>
     <h2 id="install-title" class="h2">Install once. <em>Then just ask.</em></h2>
     <p class="lede">You install Ratchet once per computer, not once per project. After that it's there in every project you open. The hooks do nothing in projects where you're not using Ratchet.</p>
     <div class="cite reveal">
@@ -959,7 +1045,7 @@
 <!-- ============ 14 FAQ ============ -->
 <section class="band band--alt faq" id="faq" aria-labelledby="faq-title">
   <div class="wrap">
-    <p class="kicker"><span>14</span>Questions</p>
+    <p class="kicker"><span>16</span>Questions</p>
     <h2 id="faq-title" class="h2">Before you ask.</h2>
     <div class="faq__list">
     <details>
@@ -972,7 +1058,7 @@
     </details>
     <details>
       <summary>Is it expensive?</summary>
-      <p>It uses more AI time than letting the agent just write code, because it checks the work. Ratchet keeps that down: low-risk steps get one reviewer, and small nitpicks are noted for you at the end instead of starting another round of review.</p>
+      <p>It uses more AI time than letting the agent just write code, because it checks the work. Ratchet keeps that down: hard limits on review rounds per step and per run, one reviewer for low-risk steps, cheaper models for lighter jobs, and small nitpicks noted for you at the end instead of starting another round. Pay-per-use tools are never used without your exact OK.</p>
     </details>
     <details>
       <summary>Do I need other AI tools installed?</summary>

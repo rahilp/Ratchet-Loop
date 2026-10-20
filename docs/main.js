@@ -232,6 +232,24 @@
     });
   });
 
+  /* ---------- the viewer screenshot: Checkpoints / Activity ---------- */
+  document.querySelectorAll('[data-shot]').forEach(shot => {
+    const tabs = [...shot.querySelectorAll('[data-shot-tab]')];
+    const pick = (t, focus) => {
+      tabs.forEach(x => {
+        const on = x === t; x.setAttribute('aria-selected', String(on)); x.tabIndex = on ? 0 : -1;
+        document.getElementById(x.getAttribute('aria-controls')).hidden = !on;
+      });
+      shot.querySelector('.shot__frame').scrollTop = 0;
+      if (focus) t.focus();
+    };
+    tabs.forEach(t => t.addEventListener('click', () => pick(t)));
+    shot.querySelector('.shot__tabs').addEventListener('keydown', e => {
+      const d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0; if (!d) return;
+      e.preventDefault(); pick(tabs[(tabs.indexOf(document.activeElement) + d + tabs.length) % tabs.length], true);
+    });
+  });
+
   /* ---------- 10: does this count as a yes? (same rule Ratchet's prompt hook applies) ---------- */
   const yes = document.querySelector('[data-yes]');
   if (yes) {

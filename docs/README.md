@@ -21,6 +21,7 @@ All asset paths are relative, so the same files also work from this repository's
 | `assets/hero-1080.webm`, `assets/hero-1080.mp4` | Hero loop: a blueprint ratchet, 1920×1080, 12 s, seamless |
 | `assets/hero-720.mp4` | Lighter hero loop for phones |
 | `assets/hero-poster.avif`, `assets/hero-poster.jpg` | First frame of the loop, shown before the video plays and for reduced motion |
+| `assets/viewer-plan.*`, `assets/viewer-act.*` | Screenshots of the real run viewer (`skills/ratchet-orchestrator/assets/viewer.html`) with the leave approvals example data |
 | `assets/og.jpg` | 1200×630 social preview |
 | `src/hero/` | Source for the hero video and the social card |
 | `assets/blueprint.svg` | Line art for the hero's parallax layer |
