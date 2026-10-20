@@ -85,8 +85,7 @@ ICONS = {
     "{{ICON_ASK}}": '<svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" d="M9 9.2a3 3 0 1 1 4.2 2.8c-.8.4-1.2 1-1.2 1.8v.4M12 17.6v.2"/></svg>',
     "{{ICON_REPLAY}}": '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 12a8 8 0 1 0 2.4-5.7M4 4v4h4"/></svg>',
 }
-FONTS = ("https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300..700"
-         "&family=JetBrains+Mono:wght@400;500&display=swap")
+FONTS = "https://fonts.googleapis.com/css2?family=Geist:wght@300..700&family=Geist+Mono:wght@400;500&display=swap"
 INSTALL_PROMPT = "Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI."
 
 # What Ratchet creates in a project. The excerpts are short examples of each file, labelled as examples on the page.

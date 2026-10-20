@@ -8,7 +8,7 @@
   // reveal the hero once the display face is in, so the headline never reflows in view
   const fontsIn = new Promise(res => {
     const link = document.querySelector('link[data-fonts]');
-    const go = () => Promise.all([document.fonts.load('600 64px Inter'), document.fonts.load('400 17px Inter')]).then(res, res);
+    const go = () => Promise.all([document.fonts.load('600 64px Geist'), document.fonts.load('400 17px Geist')]).then(res, res);
     if (!link || !document.fonts) return res();
     if (link.rel === 'stylesheet' && link.sheet) go(); else link.addEventListener('load', () => setTimeout(go, 0), { once: true });
   });
@@ -124,9 +124,13 @@
   /* ---------- a stepper: play / pause / step / replay, tabs, autoplay only while on screen ---------- */
   const stepper = ({ root, count, ms, onRender, tablist, playBtn, playLabel, stepBtn, replayBtn, lastHold = 1 }) => {
     let i = 0, playing = !reduce.matches, inView = false, timer = 0;
+    root.style.setProperty('--dur', ms + 'ms');
     const tabs = [...tablist.querySelectorAll('[role="tab"]')];
     const render = () => {
       tabs.forEach((t, k) => { t.setAttribute('aria-selected', String(k === i)); t.classList.toggle('is-past', k < i); t.tabIndex = k === i ? 0 : -1; });
+      tabs[i].classList.remove('is-run'); void tabs[i].offsetWidth; tabs[i].classList.add('is-run');   // restart the stage's progress bar
+      root.style.setProperty('--dur', (i === count - 1 ? ms * lastHold : ms) + 'ms');
+      root.classList.toggle('is-waiting', !inView);
       onRender(i, playing);
     };
     const schedule = () => {
@@ -135,7 +139,7 @@
     };
     const setPlaying = on => {
       playing = on; root.classList.toggle('is-paused', !on);
-      playBtn.setAttribute('aria-pressed', String(on)); playLabel.textContent = on ? 'Pause' : 'Play';
+      const word = on ? 'Pause' : 'Play'; playBtn.setAttribute('aria-label', word); playBtn.title = word; playLabel.textContent = word;
       render(); schedule();
     };
     playBtn.addEventListener('click', () => setPlaying(!playing));
@@ -146,7 +150,7 @@
       const d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0; if (!d) return;
       e.preventDefault(); i = (i + d + count) % count; setPlaying(false); tabs[i].focus();
     });
-    new IntersectionObserver(([e]) => { inView = e.isIntersecting; schedule(); }, { threshold: .25 }).observe(root);
+    new IntersectionObserver(([e]) => { inView = e.isIntersecting; root.classList.toggle('is-waiting', !inView); schedule(); }, { threshold: .25 }).observe(root);
     setPlaying(playing);
   };
 
@@ -164,7 +168,7 @@
       stepBtn: run.querySelector('[data-step]'), replayBtn: run.querySelector('[data-replay]'),
       onRender: (i, playing) => {
         scenes.forEach((s, k) => { s.hidden = k !== i; });
-        status.textContent = `${playing ? 'Auto-play' : 'Paused'} · stage ${i + 1} of ${scenes.length} · ${tabs[i].textContent.replace(/^\d+/, '').trim()}`;
+        status.textContent = `${playing ? 'Playing' : 'Paused'} · stage ${i + 1} of ${scenes.length}`;
       }
     });
   }
@@ -200,7 +204,7 @@
         cp3.classList.toggle('is-done', done); cp3.classList.toggle('is-now', !done);
         cp3.querySelector('[data-sim-cp-state]').textContent = done ? 'Locked' : 'Current';
         cp4.querySelector('[data-sim-cp-state]').textContent = done ? 'Starting' : 'Up next';
-        status.textContent = `${playing ? 'Auto-play' : 'Paused'} · checkpoint 3 of 4 · ${NAMES[i]}`;
+        status.textContent = `${playing ? 'Playing' : 'Paused'} · ${NAMES[i]}`;
         // restart the progress bar on the current box
         const now = boxes[i].querySelector('.flow__s'); now.style.animation = 'none'; requestAnimationFrame(() => { now.style.animation = ''; });
       }
@@ -271,6 +275,16 @@
     input.addEventListener('input', judge);
     yes.querySelectorAll('[data-yes-try]').forEach(b => b.addEventListener('click', () => { input.value = b.dataset.yesTry; judge(); input.focus(); }));
     judge();
+  }
+
+  /* ---------- cards: a soft light that follows the pointer ---------- */
+  if (matchMedia('(hover: hover) and (pointer: fine)').matches) {
+    document.querySelectorAll('.feat, .why__card, .rule, .fact, .tcard, .pnext__link').forEach(c => {
+      c.addEventListener('pointermove', e => {
+        const r = c.getBoundingClientRect();
+        c.style.setProperty('--mx', `${e.clientX - r.left}px`); c.style.setProperty('--my', `${e.clientY - r.top}px`);
+      }, { passive: true });
+    });
   }
 
   /* ---------- copy buttons ---------- */

@@ -6,12 +6,12 @@
 
     <div class="sim reveal" data-sim>
       <div class="sim__head">
-        <p class="mono-k"><span class="badge" aria-hidden="true">{{ICON_PLAY}}</span>One checkpoint</p>
-        <h3 class="sim__title">From the first test to the commit</h3>
-        <div class="player__ctrls">
-          <button class="ctrl" type="button" data-sim-play aria-pressed="true"><span data-sim-play-label>Pause</span></button>
-          <button class="ctrl" type="button" data-sim-step>→ Step</button>
-          <button class="ctrl" type="button" data-sim-replay>↻ Replay</button>
+        <div><p class="mono-k">One checkpoint</p>
+        <h3 class="sim__title">From the first test to the commit</h3></div>
+        <div class="ctrls" role="group" aria-label="Playback">
+          <button class="ctrl ctrl--play" type="button" data-sim-play aria-label="Pause" title="Pause"><svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="5.5" width="3.4" height="13" rx="1.2" fill="currentColor"/><rect x="13.6" y="5.5" width="3.4" height="13" rx="1.2" fill="currentColor"/></svg><svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 6.2v11.6a1 1 0 0 0 1.5.86l9.3-5.8a1 1 0 0 0 0-1.72L10 5.34a1 1 0 0 0-1.5.86z" fill="currentColor"/></svg><span class="sr" data-sim-play-label>Pause</span></button>
+          <button class="ctrl" type="button" data-sim-step aria-label="Next stage" title="Next stage"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6.5v11l8-5.5z" fill="currentColor"/><rect x="15.5" y="6" width="2.6" height="12" rx="1" fill="currentColor"/></svg></button>
+          <button class="ctrl" type="button" data-sim-replay aria-label="Replay from the start" title="Replay"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3M4.5 4.5v4h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
         </div>
       </div>
       <div class="sim__stream">
