@@ -66,15 +66,24 @@ def pawl_geom(cx, cy, rr, A, along, out, w0, scale=1.0):
     return pts_path(poly), piv, tip
 
 
-def mark_svg():
+def mark_wire(sw=2.0, detail=True, bg="#0A0B0D"):
+    """Blueprint version of the mark: drafting linework, dashed centre lines, orange pawl."""
     cx, cy, rr, rt, A = 28.5, 37, 18, 23.5, math.radians(48)
-    wheel = pts_path(saw(cx, cy, rr, rt, 12, rot=A)) + circle_sub(cx, cy, 7.5)
+    wheel = pts_path(saw(cx, cy, rr, rt, 12, rot=A))
     pawl, piv, _ = pawl_geom(cx, cy, rr, A, 14, 10, 3.4)
-    return (f'<path fill="#D7DBE0" fill-rule="evenodd" d="{wheel}"/>'
-            f'<circle cx="{cx}" cy="{cy}" r="3" fill="#D7DBE0"/>'
-            f'<path fill="#FF5A1F" d="{pawl}"/>'
-            f'<circle cx="{piv[0]:.2f}" cy="{piv[1]:.2f}" r="3.8" fill="#FF5A1F"/>'
-            f'<circle cx="{piv[0]:.2f}" cy="{piv[1]:.2f}" r="1.4" fill="#0A0B0D"/>')
+    blue, hot = "#6FA8FF", "#FF5A1F"
+    g = [f'<g fill="none" stroke-linejoin="round" stroke-linecap="round" stroke-width="{sw}">']
+    if detail:
+        g.append(f'<path stroke="{blue}" stroke-opacity=".55" stroke-width="{sw * .6:.2f}" stroke-dasharray="5 2 1 2" '
+                 f'd="M{cx - 27},{cy} H{cx + 27} M{cx},{cy - 27} V{cy + 27}"/>')
+        g.append(f'<circle stroke="{blue}" stroke-opacity=".6" stroke-width="{sw * .6:.2f}" cx="{cx}" cy="{cy}" r="{rr - 3.2}"/>')
+    g.append(f'<path stroke="{blue}" d="{wheel}"/>')
+    g.append(f'<circle stroke="{blue}" cx="{cx}" cy="{cy}" r="{4.2 if detail else 5.5}"/>')
+    g.append(f'<path stroke="{hot}" d="{pawl}"/>')
+    g.append(f'<circle stroke="{hot}" fill="{bg}" cx="{piv[0]:.2f}" cy="{piv[1]:.2f}" r="3.6"/>')
+    g.append(f'<circle fill="{hot}" stroke="none" cx="{piv[0]:.2f}" cy="{piv[1]:.2f}" r="1.2"/>')
+    g.append('</g>')
+    return "".join(g)
 
 
 def big_wheel():
@@ -128,7 +137,7 @@ def main():
         for q, a in FAQ)
     faq_ld = ",".join(json.dumps({"@type": "Question", "name": q, "acceptedAnswer": {"@type": "Answer", "text": a}}) for q, a in FAQ)
     out = (tpl.replace("{{SITE}}", SITE)
-              .replace("{{MARK}}", mark_svg())
+              .replace("{{MARK}}", mark_wire())
               .replace("{{WHEEL}}", wheel)
               .replace("{{STUDS}}", studs)
               .replace("{{PAWL}}", pawl)
@@ -141,10 +150,10 @@ def main():
     (ROOT / "index.html").write_text(out)
     (ROOT / "assets" / "gear-outline.svg").write_text(gear_outline())
     (ROOT / "assets" / "logo-mark.svg").write_text(
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Ratchet Loop">{mark_svg()}</svg>')
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Ratchet Loop">{mark_wire()}</svg>')
     (ROOT / "assets" / "favicon.svg").write_text(
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#0A0B0D"/>'
-        f'<g transform="translate(4.5 4.5) scale(0.86)">{mark_svg()}</g></svg>')
+        f'<g transform="translate(4.5 4.5) scale(0.86)">{mark_wire(sw=3.6, detail=False)}</g></svg>')
     (ROOT / "styles.min.css").write_text(minify_css((ROOT / "styles.css").read_text()))
     print("built", ROOT / "index.html")
 
