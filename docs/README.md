@@ -4,7 +4,9 @@ The GitHub Pages site for Ratchet Loop. It is plain static HTML, CSS and JS with
 
 ## Publish
 
-In the repository settings, open **Pages**, set **Source** to *Deploy from a branch*, then pick the branch and the `/docs` folder. The site appears at `https://rahilp.github.io/Ratchet-Loop/`.
+The site is meant to live at `https://ratchetloop.github.io/`. That address needs a GitHub organization (or user) named `ratchetloop` with a public repository named `ratchetloop.github.io`. Copy the contents of this `docs/` folder to the root of that repository's `main` branch, then in its **Settings → Pages** choose *Deploy from a branch*, `main`, `/ (root)`.
+
+All asset paths are relative, so the same files also work from this repository's `/docs` folder at `https://rahilp.github.io/Ratchet-Loop/` (the canonical URL and sitemap still point at ratchetloop.github.io).
 
 ## Edit
 

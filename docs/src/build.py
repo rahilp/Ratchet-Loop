@@ -11,7 +11,7 @@ import pathlib
 import re
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SITE = "https://rahilp.github.io/Ratchet-Loop/"
+SITE = "https://ratchetloop.github.io/"
 TAU = math.tau
 
 FAQ = [

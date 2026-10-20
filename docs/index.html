@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Ratchet Loop · Make your AI coding agent prove it works</title>
 <meta name="description" content="Ratchet Loop splits a feature into small checkpoints and won't let your AI coding agent move on until each one passes four gates: tests written first, a design check, a review by a different AI, and you. Works with Claude Code, Codex, Gemini CLI and GitHub Copilot CLI.">
-<link rel="canonical" href="https://rahilp.github.io/Ratchet-Loop/">
+<link rel="canonical" href="https://ratchetloop.github.io/">
 <meta name="theme-color" content="#FBFAF7">
 <meta name="color-scheme" content="light">
 <meta name="author" content="Rahil Pirani">
@@ -15,15 +15,15 @@
 <meta property="og:site_name" content="Ratchet Loop">
 <meta property="og:title" content="Ratchet Loop · Make your AI coding agent prove it works">
 <meta property="og:description" content="Small checkpoints. Four gates each. Tests first, a different AI as reviewer, and your sign-off. Your agent can't argue its way past.">
-<meta property="og:url" content="https://rahilp.github.io/Ratchet-Loop/">
-<meta property="og:image" content="https://rahilp.github.io/Ratchet-Loop/assets/og.jpg">
+<meta property="og:url" content="https://ratchetloop.github.io/">
+<meta property="og:image" content="https://ratchetloop.github.io/assets/og.jpg">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="A blueprint drawing of a ratchet wheel with three gate checks lit, beside the words: Ratchet Loop, make your agent prove it.">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Ratchet Loop · Make your AI coding agent prove it works">
 <meta name="twitter:description" content="Small checkpoints. Four gates each. Your agent can't argue its way past.">
-<meta name="twitter:image" content="https://rahilp.github.io/Ratchet-Loop/assets/og.jpg">
+<meta name="twitter:image" content="https://ratchetloop.github.io/assets/og.jpg">
 
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="assets/favicon-32.png" sizes="32x32" type="image/png">
@@ -39,7 +39,7 @@
 
 <script type="application/ld+json">
 {"@context":"https://schema.org","@graph":[
- {"@type":"SoftwareApplication","name":"Ratchet Loop","applicationCategory":"DeveloperApplication","operatingSystem":"macOS, Linux, Windows","softwareVersion":"1.14.0","url":"https://rahilp.github.io/Ratchet-Loop/","downloadUrl":"https://github.com/rahilp/Ratchet-Loop","image":"https://rahilp.github.io/Ratchet-Loop/assets/og.jpg","description":"A checkpoint-and-gate build loop for AI coding agents. Every checkpoint must pass behavior tests, UI review, adversarial code review and human review before the next one starts.","author":{"@type":"Person","name":"Rahil Pirani"},"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}},
+ {"@type":"SoftwareApplication","name":"Ratchet Loop","applicationCategory":"DeveloperApplication","operatingSystem":"macOS, Linux, Windows","softwareVersion":"1.14.0","url":"https://ratchetloop.github.io/","downloadUrl":"https://github.com/rahilp/Ratchet-Loop","image":"https://ratchetloop.github.io/assets/og.jpg","description":"A checkpoint-and-gate build loop for AI coding agents. Every checkpoint must pass behavior tests, UI review, adversarial code review and human review before the next one starts.","author":{"@type":"Person","name":"Rahil Pirani"},"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}},
  {"@type":"FAQPage","mainEntity":[{"@type": "Question", "name": "Which coding agents does it work with?", "acceptedAnswer": {"@type": "Answer", "text": "Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. You install it once per computer for each CLI you use. Claude Code gets the most protection, because its hooks can see which sub-agent is acting. The safeguards section shows exactly what each CLI enforces."}},{"@type": "Question", "name": "How long does it take?", "acceptedAnswer": {"@type": "Answer", "text": "A small feature usually takes tens of minutes, with the agent working by itself. Bigger ones take longer. You don't have to watch."}},{"@type": "Question", "name": "Is it expensive?", "acceptedAnswer": {"@type": "Answer", "text": "It uses more AI time than letting the agent just write code, because it checks the work. Ratchet keeps that down: low-risk steps get one reviewer, and small nitpicks are noted for you at the end instead of starting another round of review."}},{"@type": "Question", "name": "Do I need other AI tools installed?", "acceptedAnswer": {"@type": "Answer", "text": "No. Without them, reviews come from your own agent's company, using a different model when it can. With another company's tool installed and signed in, such as Codex, Gemini, Copilot, Cursor or OpenCode, that tool reviews first. A second company tends to catch things the first one misses."}},{"@type": "Question", "name": "Where does my code go?", "acceptedAnswer": {"@type": "Answer", "text": "Into your project, like any other change, with one git commit per finished step. If you're on your main branch or have unsaved changes, the agent offers to start a new branch first. Ratchet keeps its own notes in a .ratchet/ folder."}},{"@type": "Question", "name": "Can I stop halfway?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Say pause. When you're ready, say carry on. You can even pick it up in a new chat. The agent checks with you before moving the run over. Nothing is lost."}},{"@type": "Question", "name": "What if I don't like the result?", "acceptedAnswer": {"@type": "Answer", "text": "Say so at the end, the same way you'd tell a colleague. Your feedback turns into new steps, and the agent remembers the lesson for next time."}},{"@type": "Question", "name": "What if the reviewers keep finding the same mistake?", "acceptedAnswer": {"@type": "Answer", "text": "The agent offers to add an automatic check for it, like a lint rule, so it gets caught in seconds from then on. You decide."}},{"@type": "Question", "name": "The agent says the hooks aren't working.", "acceptedAnswer": {"@type": "Answer", "text": "Close the CLI, open it again in the same folder, and say: Set up Ratchet and continue. Still not working? Ask it to check that Ratchet's hooks are installed for this CLI and install them if not."}}]}
 ]}
 </script>
