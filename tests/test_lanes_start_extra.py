@@ -143,6 +143,7 @@ def write_fails():
     """Structural: whichever record write fails (the Nth _write_record call), the run is rolled back completely."""
     eng = t.th.cp5y_load_engine()
     real = eng._write_record
+    real_require_director_session = eng.require_director_session
     n = 0
     while True:
         n += 1
@@ -172,6 +173,7 @@ def write_fails():
                     failed = True
         finally:
             eng._write_record = real
+            eng.require_director_session = real_require_director_session
             os.chdir(old_cwd)
             os.environ.clear()
             os.environ.update(old_env)

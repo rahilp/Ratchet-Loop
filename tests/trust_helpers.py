@@ -10,6 +10,7 @@ resolved from the real PATH by name - never claude/codex/gemini/cursor-agent/ope
 this machine has all of those installed.
 """
 import datetime as dt
+import functools
 import importlib.util
 import json
 import os
@@ -44,10 +45,16 @@ _SAFE_TOOLS = ("git", "python3", "sh", "env", "cat", "mkdir", "rm", "ls", "dirna
                "readlink", "printf", "echo")
 
 
+# The two glyphs check() prints a result line with. [CP2] A second copy of this format (CP2's own cp2_check() in
+# test_trust_cp5_e.py, and the regex it uses to tally bracket ids out of a captured run's stdout) reads these same
+# two constants instead of hand-copying the glyphs, so a future change here can't silently desync that parsing.
+MARK_PASS, MARK_FAIL = "✓", "✗"
+
+
 def check(name, cond, detail=""):
     global PASS, FAIL
     PASS, FAIL = (PASS + 1, FAIL) if cond else (PASS, FAIL + 1)
-    print(f"  {'✓' if cond else '✗'} {name}" + ("" if cond else f"   {str(detail)[:400]}"))
+    print(f"  {MARK_PASS if cond else MARK_FAIL} {name}" + ("" if cond else f"   {str(detail)[:400]}"))
 
 
 def _safe_path():
@@ -201,6 +208,14 @@ def project(env, approved=True):
 
 
 def engine():
+    """A freshly loaded engine module, one new module object per call. [CP2] Deliberately NOT memoized: unlike
+    cp5y_load_engine() below, this loader is called by test_trust_cp3.py's CP3-X03/X04 cases, which monkeypatch
+    a module-level function (e.g. m._read_round_review) mid-section and rely on the NEXT engine() call starting
+    from a pristine module to undo it -- caching this one reintroduces the patched function into later sections
+    (confirmed: with lru_cache here, test_trust_cp3.py crashes with RecursionError from the stacked monkeypatches).
+    cp5y_load_engine()'s callers were all audited and every one restores any monkeypatch itself (try/finally,
+    including test_lanes_start_extra.py's write_fails(), which restores both _write_record and
+    require_director_session), so only that loader is safe to memoize."""
     spec = importlib.util.spec_from_file_location("ratchet_engine_trust", str(ENGINE))
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
@@ -650,7 +665,11 @@ def cp5x_frozen_ui_project(env):
     return d
 
 
+@functools.lru_cache(maxsize=None)
 def cp5y_load_engine():
+    """The engine module, loaded once per test process (memoized) -- see engine()'s docstring: the real cost is
+    recompiling ratchet.py's ~21k lines, so every call after the first, from any caller, gets back the identical
+    module object (`is`, not just `==`), letting a converted in-process call reuse it instead of re-importing."""
     spec = importlib.util.spec_from_file_location("ratchet_cp5_round2", ENGINE)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
