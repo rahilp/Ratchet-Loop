@@ -12,6 +12,7 @@ this machine has all of those installed.
 import datetime as dt
 import functools
 import importlib.util
+import io
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import _tmp
 import time
+import traceback
 from pathlib import Path
 
 try:  # pty / os.forkpty give a test a REAL controlling terminal; absent on Windows
@@ -674,6 +676,97 @@ def cp5y_load_engine():
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
+
+
+class InProcessCall:
+    """`with InProcessCall(m, d, env, reset_globals, lock_wait_cap) as r: m.main([...])` -- the in-process
+    stand-in for one rx(...) subprocess call that test_trust_cp5_e.py's `_Cp2Call` and test_trust_cp5_d.py's
+    `_Cp3Call` are both thin subclasses of (they only supply their own suite's `reset_globals`/`lock_wait_cap`/
+    `reset_unreadable`; see cp5y_load_engine()'s own docstring for why reusing the loaded module this way is
+    safe and what real cost it avoids paying again). `r.returncode` / `r.stdout` / `r.stderr` read the same way
+    a subprocess.CompletedProcess's do.
+
+    This class used to be two independent, hand-copied classes, one per suite; round-1 and round-2 adversarial
+    review both found the copies had drifted (host-alt-standards: duplicated-test-helper). Moving the shared
+    logic here, with the two suites' own differences passed in as constructor arguments instead of hand-copied
+    code, means there is now exactly one place this logic can drift from itself.
+
+    CONTRACT (not just an example): the with-body must contain exactly one `m.main([...])` call (or, for the one
+    documented exception test_trust_cp5_d.py's own `_Cp3Call` docstring names, a plain module-function call plus
+    a print) and nothing else. __exit__ converts any exception raised anywhere in the body into `returncode = 1`
+    (the same way a real subprocess crashing looks to its caller) for ordinary Exception subclasses only --
+    KeyboardInterrupt and any other non-Exception BaseException (e.g. a future SystemExit subclass misuse)
+    propagate past this call site instead, because a real subprocess dying to Ctrl-C would stop the whole suite,
+    not just fail one command.
+
+    `reset_globals`: a {name: default} dict of the module's own per-call globals, put back to that default both
+    before AND after the call -- not just before: a command that raises partway through (die()/SystemExit
+    before its own cleanup runs) can leave one of these set, and the NEXT caller might not go through this class
+    at all (e.g. test_trust_cp5_d.py's own CP3-T08 probe), so resetting on the way out too keeps the module
+    pristine for whatever runs next.
+
+    `reset_unreadable`: when True, also clears `m._NOTED_UNREADABLE` (a damaged-record warning the module prints
+    "once per file and cause in a process") on entry and exit, so a prior call's warning about path X never
+    silently suppresses a later call's real warning about that SAME path. Only test_trust_cp5_d.py's CP3 suite
+    currently has a check that needs this (X64: an in-process call and an explicit register_active() call
+    sharing one damaged active-runs.json); test_trust_cp5_e.py's CP2 suite has no equivalent check (checked:
+    nothing there asserts a SECOND warning about the SAME damaged path across two separate in-process calls), so
+    it passes False.
+
+    `lock_wait_cap`: none of either suite's check()s assert a MINIMUM wait on a busy per-record lock, only an
+    upper bound or a plain refusal, so capping how long this class's own calls wait for one shortens the suite
+    without weakening what any check proves."""
+
+    def __init__(self, m, d, env, reset_globals, lock_wait_cap, reset_unreadable=False, stdin=None):
+        self.m, self.d, self.env, self.stdin = m, Path(d), env, stdin
+        self.reset_globals, self.lock_wait_cap, self.reset_unreadable = reset_globals, lock_wait_cap, reset_unreadable
+        self.returncode, self.stdout, self.stderr = 0, "", ""
+
+    def __enter__(self):
+        self._cwd = os.getcwd()
+        self._environ = dict(os.environ)
+        self._streams = (sys.stdout, sys.stderr, sys.stdin)
+        missing = [k for k in self.reset_globals if not hasattr(self.m, k)]
+        assert not missing, f"ratchet.py no longer has module global(s) {missing!r} -- update the reset list"
+        for k, v in self.reset_globals.items():
+            setattr(self.m, k, v)
+        if self.reset_unreadable:
+            self.m._NOTED_UNREADABLE.clear()
+        self._record_lock_init = self.m._RecordLock.__init__
+
+        def _fast_record_lock_init(rl_self, record, wait=5.0):
+            self._record_lock_init(rl_self, record, min(wait, self.lock_wait_cap))
+        self.m._RecordLock.__init__ = _fast_record_lock_init
+        os.chdir(self.d)
+        os.environ.clear()
+        os.environ.update(self.env)
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+        if self.stdin is not None:
+            sys.stdin = io.StringIO(self.stdin)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stdout, self.stderr = sys.stdout.getvalue(), sys.stderr.getvalue()
+        sys.stdout, sys.stderr, sys.stdin = self._streams
+        os.chdir(self._cwd)
+        os.environ.clear()
+        os.environ.update(self._environ)
+        self.m._RecordLock.__init__ = self._record_lock_init
+        for k, v in self.reset_globals.items():
+            setattr(self.m, k, v)
+        if self.reset_unreadable:
+            self.m._NOTED_UNREADABLE.clear()
+        if exc_type is SystemExit:
+            code = exc.code
+            self.returncode = code if isinstance(code, int) else (0 if code is None else 1)
+            return True  # like a subprocess's exit: never propagates past the call site
+        if exc_type is not None and not issubclass(exc_type, Exception):
+            return False
+        if exc_type is not None:  # an unhandled crash inside main() would also just exit non-zero as a subprocess
+            self.returncode = 1
+            self.stderr += "".join(traceback.format_exception(exc_type, exc, tb))
+            return True
+        return False
 
 
 def cp5y_guard_bash(d, env, command, session):

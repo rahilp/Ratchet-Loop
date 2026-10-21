@@ -43,7 +43,8 @@ from trust_helpers import (
 # shape rx()'s subprocess.CompletedProcess gives check() bodies below, so none of them needed to change. Because
 # `m` is reused for every call, a handful of its own module-level flags that a real subprocess would always start
 # fresh (set once by a previous command and never reset by ratchet.py itself, since it never expected to be asked
-# to run a second command in the same process) are put back to their pristine default before each call.
+# to run a second command in the same process) are put back to their pristine default both before AND after each
+# call (see trust_helpers.InProcessCall, which _Cp2Call below is a thin constructor over).
 _CP2_RESET_GLOBALS = {"_IN_HOOK": False, "_OVERRIDE_CONFIRMED": False, "_CHAIN_REBUILD": False,
                       "_HOOK_ENV_ADVISORY": False, "_STATE_LOCK_HELD": False, "_ENGINE_ARGV": None}
 
@@ -57,57 +58,23 @@ _CP2_RESET_GLOBALS = {"_IN_HOOK": False, "_OVERRIDE_CONFIRMED": False, "_CHAIN_R
 _CP2_LOCK_WAIT_CAP = 0.3
 
 
-class _Cp2Call:
+class _Cp2Call(trust_helpers.InProcessCall):
     """`with _Cp2Call(m, d, env) as r: m.main([...])` -- the in-process stand-in for one rx(...) subprocess call.
     `r.returncode` / `r.stdout` / `r.stderr` read the same way a subprocess.CompletedProcess's do.
 
-    CONTRACT (not just an example): the with-body must contain exactly that one `m.main([...])` call and nothing
-    else. __exit__ converts any exception raised anywhere in the body into `returncode = 1` (the same way a real
-    subprocess crashing looks to its caller) -- it cannot tell a genuine crash inside main() apart from a bug in
-    test code placed in the same block, so a stray assert or typo there would be silently recorded as "the command
-    failed" instead of crashing loudly. Keep every call site to exactly one `m.main(...)` line."""
+    [Corrected, round 2] This class used to be a hand copy of its CP3 twin (tests/test_trust_cp5_d.py's
+    `_Cp3Call`) that had already drifted from it by round 2 (host-alt-standards: duplicated-test-helper, raised
+    twice). Both classes are now thin constructors over the one shared implementation,
+    trust_helpers.InProcessCall -- see that class's own docstring for the full contract (the lock-wait cap, the
+    entry-and-exit global reset, and the KeyboardInterrupt-propagation guard all live there now, identical for
+    both suites). The ONE remaining difference between this class and `_Cp3Call`: this one passes
+    `reset_unreadable=False` -- CP2's suite here has no check that asserts a SECOND damaged-record warning about
+    the SAME path across two separate in-process calls (checked, this is not a bug in this file); `_Cp3Call`
+    passes True because its own CP3 suite does (X64). If a future CP2 case ever needs that too, change the
+    `False` below to `True`."""
 
     def __init__(self, m, d, env, stdin=None):
-        self.m, self.d, self.env, self.stdin = m, Path(d), env, stdin
-        self.returncode, self.stdout, self.stderr = 0, "", ""
-
-    def __enter__(self):
-        self._cwd = os.getcwd()
-        self._environ = dict(os.environ)
-        self._streams = (sys.stdout, sys.stderr, sys.stdin)
-        missing = [k for k in _CP2_RESET_GLOBALS if not hasattr(self.m, k)]
-        assert not missing, f"ratchet.py no longer has module global(s) {missing!r} -- update the reset list"
-        for k, v in _CP2_RESET_GLOBALS.items():
-            setattr(self.m, k, v)
-        self._record_lock_init = self.m._RecordLock.__init__
-
-        def _fast_record_lock_init(rl_self, record, wait=5.0):
-            self._record_lock_init(rl_self, record, min(wait, _CP2_LOCK_WAIT_CAP))
-        self.m._RecordLock.__init__ = _fast_record_lock_init
-        os.chdir(self.d)
-        os.environ.clear()
-        os.environ.update(self.env)
-        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
-        if self.stdin is not None:
-            sys.stdin = io.StringIO(self.stdin)
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.stdout, self.stderr = sys.stdout.getvalue(), sys.stderr.getvalue()
-        sys.stdout, sys.stderr, sys.stdin = self._streams
-        os.chdir(self._cwd)
-        os.environ.clear()
-        os.environ.update(self._environ)
-        self.m._RecordLock.__init__ = self._record_lock_init
-        if exc_type is SystemExit:
-            code = exc.code
-            self.returncode = code if isinstance(code, int) else (0 if code is None else 1)
-            return True  # like a subprocess's exit: never propagates past the call site
-        if exc_type is not None:  # an unhandled crash inside main() would also just exit non-zero as a subprocess
-            self.returncode = 1
-            self.stderr += "".join(traceback.format_exception(exc_type, exc, tb))
-            return True
-        return False
+        super().__init__(m, d, env, _CP2_RESET_GLOBALS, _CP2_LOCK_WAIT_CAP, reset_unreadable=False, stdin=stdin)
 
 
 # [CP2] cp2_project / cp2_guard_tool / cp2_director below are intentional hand-synced copies of
