@@ -277,6 +277,28 @@
     judge();
   }
 
+  /* ---------- hero demo: the run plays line by line, step 3's review catches a bug ---------- */
+  const demo = document.querySelector('[data-demo]');
+  if (demo && !reduce.matches) {
+    const rows = [...demo.querySelectorAll('.demo__body > li')];
+    const catchRow = demo.querySelector('.d-catch');
+    let k = 0, t = 0, inView = false;
+    demo.classList.add('is-playing');
+    const reset = () => { rows.forEach(r => r.classList.remove('is-on')); catchRow.classList.remove('is-bug'); k = 0; };
+    const next = () => {
+      clearTimeout(t); if (!inView) return;
+      if (k >= rows.length) { t = setTimeout(() => { reset(); next(); }, 5000); return; }
+      const row = rows[k++]; row.classList.add('is-on');
+      if (row === catchRow) {
+        row.classList.add('is-bug');
+        t = setTimeout(() => { row.classList.remove('is-bug'); t = setTimeout(next, 900); }, 1800);
+        return;
+      }
+      t = setTimeout(next, row.classList.contains('d-step') ? 850 : 1000);
+    };
+    new IntersectionObserver(([e]) => { inView = e.isIntersecting; if (inView) next(); else clearTimeout(t); }, { threshold: .2 }).observe(demo);
+  }
+
   /* ---------- the loop diagram: a token walks the ring, the ratchet turns one tooth per commit ---------- */
   const loop = document.querySelector('[data-loop]');
   if (loop) {

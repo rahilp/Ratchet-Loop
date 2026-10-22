@@ -45,6 +45,8 @@ def blocks():
         for el in soup.find_all(["p", "li", "h1", "h2", "h3", "dd", "dt", "summary", "figcaption", "q"]):
             if el.find(["p", "li", "div", "ul", "ol"]):
                 continue
+            if "d-step" in (el.get("class") or []):  # a row of status labels, not prose
+                continue
             text = re.sub(r"\s+", " ", el.get_text(" ")).strip()
             if len(text.split()) >= 6:
                 found.setdefault(text, set()).add(page)

@@ -437,7 +437,7 @@ def main():
               .replace("{{CASE}}", part("_case.html")).replace("{{LOOP}}", part("_loop.html").replace("{{LOOP_SVG}}", loop_svg())).replace("{{FAQ_SECTION}}", faq_section),
               '<script type="application/ld+json">{"@context":"https://schema.org","@graph":[' + sw_ld +
               ',{"@type":"FAQPage","mainEntity":[' + faq_ld + ']}]}</script>',
-              '<link rel="preload" as="image" href="assets/hero-poster.avif" type="image/avif" fetchpriority="high">', "home")]
+              '', "home")]
     for k, (slug, card_title, card_text, h1, accent, lede, ids, _icon) in enumerate(FEATURES):
         body = page_header(k + 1, h1, accent, lede, ids, slug) + sections_html(ids) + next_nav(k)
         pages.append((f"{slug}.html", card_title + PAGE_SUFFIX, card_text, body, "", "", slug))

@@ -34,7 +34,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="preload" as="style" data-fonts href="https://fonts.googleapis.com/css2?family=Geist:wght@300..700&amp;family=Geist+Mono:wght@400;500&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'">
 <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@300..700&amp;family=Geist+Mono:wght@400;500&amp;display=swap"></noscript>
-<link rel="preload" as="image" href="assets/hero-poster.avif" type="image/avif" fetchpriority="high">
+
 <link rel="stylesheet" href="styles.min.css">
 
 <script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"SoftwareApplication","name":"Ratchet Loop","applicationCategory":"DeveloperApplication","operatingSystem":"macOS, Linux, Windows","softwareVersion":"1.14.0","url":"https://ratchetloop.github.io/","downloadUrl":"https://github.com/rahilp/Ratchet-Loop","image":"https://ratchetloop.github.io/assets/og.jpg","description":"A plug-in that makes AI coding agents build in small, checked steps. Each step must pass its tests, a design check, a review by a different AI and your OK.","author":{"@type":"Person","name":"Rahil Pirani"},"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}},{"@type":"FAQPage","mainEntity":[{"@type": "Question", "name": "Which coding agents does it work with?", "acceptedAnswer": {"@type": "Answer", "text": "Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. Install it once on your computer for each CLI you use. Claude Code has the strongest safeguards, because its hooks can tell which agent is acting. The Gates page shows what each CLI checks."}},{"@type": "Question", "name": "How long does it take?", "acceptedAnswer": {"@type": "Answer", "text": "A small feature usually takes 20 to 60 minutes. Bigger ones take longer. The agent works on its own, so you don't have to watch."}},{"@type": "Question", "name": "Is it expensive?", "acceptedAnswer": {"@type": "Answer", "text": "It uses more AI time than letting the agent write code unchecked. To keep that down, Ratchet limits review rounds per step and per run. It uses one reviewer for low-risk steps and cheaper models for simple jobs. It never uses a pay-per-use tool without your OK."}},{"@type": "Question", "name": "Do I need other AI tools installed?", "acceptedAnswer": {"@type": "Answer", "text": "No. Without them, Ratchet uses a different model from the same company. If you have another tool set up, like Codex, Gemini, Copilot, Cursor or OpenCode, that tool reviews first. A model from another company spots different mistakes."}},{"@type": "Question", "name": "Where does my code go?", "acceptedAnswer": {"@type": "Answer", "text": "Into your project, with one git commit per finished step. If you're on your main branch or have unsaved changes, the agent offers to make a new branch first. Ratchet keeps its notes in a .ratchet/ folder."}},{"@type": "Question", "name": "Can I stop halfway?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Say pause. When you're ready, say carry on. You can pick it up in a new chat too. Nothing is lost."}},{"@type": "Question", "name": "What if I don't like the result?", "acceptedAnswer": {"@type": "Answer", "text": "Say so at the end, like you would to a colleague. Your feedback becomes new steps, and the agent saves the lesson for next time."}},{"@type": "Question", "name": "What if the reviewers keep finding the same mistake?", "acceptedAnswer": {"@type": "Answer", "text": "The agent offers to add an automatic check, like a lint rule. After that the mistake is caught in seconds. You decide."}},{"@type": "Question", "name": "The agent says the hooks aren't working.", "acceptedAnswer": {"@type": "Answer", "text": "Close the CLI, open it again in the same folder, and say: Set up Ratchet and continue. If that doesn't work, ask it to check that Ratchet's hooks are installed for this CLI."}}]}]}</script>
@@ -70,8 +70,8 @@
     <div class="hero__grid" data-depth="0.25"></div>
   </div>
   <div class="hero__content wrap" data-depth="-0.08">
-    <h1 id="hero-title" class="hero__title">AI coding agents will tell you it works. <em>Ratchet Loop makes them prove it.</em></h1>
-        <p class="hero__lede">Ratchet Loop works inside Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. You describe a feature, and your agent builds it in small steps, checking each one before it moves on. You don't type any commands. You talk to your agent like normal.</p>
+    <h1 id="hero-title" class="hero__title">Features from your AI coding agent that actually work. <em>Every step is tested and reviewed before the next one starts.</em></h1>
+    <p class="hero__lede">A plug-in for Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. You talk to your agent like normal.</p>
     <div class="hero__ctas">
       <a class="btn btn--primary" href="install.html">Get started <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M5 12h14M13 6l6 6-6 6"/></svg></a>
       <a class="btn btn--ghost" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>View on GitHub</a>
@@ -81,27 +81,25 @@
       <code class="cmd__text">Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI.</code>
       <button class="cmd__copy" type="button" data-copy="Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI." aria-label="Copy the install prompt"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" d="M8 8h11v11H8zM5 16V5h11"/></svg><span data-copy-label class="sr">Copy</span></button>
     </div>
-    <p class="hero__meta">Works in Claude Code <i>·</i> Codex <i>·</i> Gemini CLI <i>·</i> GitHub Copilot CLI</p>
   </div>
 
-  <figure class="hero__film wrap">
-    <div class="film">
-      <div class="film__frame">
-        <video class="film__video" autoplay muted loop playsinline disablepictureinpicture preload="auto" aria-hidden="true" tabindex="-1"
-          data-src-lg="assets/hero-1080.mp4" data-src-lg-webm="assets/hero-1080.webm" data-src-sm="assets/hero-720.mp4"></video>
-        <picture class="film__poster">
-          <source srcset="assets/hero-poster.avif" type="image/avif">
-          <img src="assets/hero-poster.jpg" alt="A blueprint drawing of a ratchet wheel. Three checks light up, tests, looks right and review, then the wheel clicks forward one tooth and locks." width="1920" height="1080" fetchpriority="high" decoding="async">
-        </picture>
-      </div>
-      <figcaption class="film__cap">A ratchet turns one way. Each click is a step that passed its checks and became a commit.</figcaption>
+  <figure class="hero__demo wrap">
+    <div class="demo" data-demo>
+      <div class="demo__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Claude Code · leave-app</span></div>
+      <ol class="demo__body" aria-label="Example: building a feature with Ratchet Loop">
+        <li class="d-msg d-you"><b>You</b><span>Use Ratchet to build this feature. Managers can reject a leave request, and give a reason.</span></li>
+        <li class="d-msg d-agent"><b>Agent</b><span>Here's the plan: 4 steps, each tested and reviewed. Say yes to start.</span></li>
+        <li class="d-msg d-you"><b>You</b><span>yes</span></li>
+        <li class="d-step"><span class="d-n">1</span><span class="d-t">Show pending requests</span><span class="d-g"><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Tests</i><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Design</i><i class="d-rev"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Review</i></span><span class="d-c">Committed</span></li>
+        <li class="d-step"><span class="d-n">2</span><span class="d-t">Approve a request</span><span class="d-g"><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Tests</i><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Design</i><i class="d-rev"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Review</i></span><span class="d-c">Committed</span></li>
+        <li class="d-step d-catch"><span class="d-n">3</span><span class="d-t">Reject, with a reason</span><span class="d-g"><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Tests</i><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Design</i><i class="d-rev"><em class="d-bug">Review found a bug: empty reason accepted</em><em class="d-fixed"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Fixed and re-reviewed</em></i></span><span class="d-c">Committed</span></li>
+        <li class="d-step"><span class="d-n">4</span><span class="d-t">Tell the employee</span><span class="d-g"><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Tests</i><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Design</i><i class="d-rev"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Review</i></span><span class="d-c">Committed</span></li>
+        <li class="d-msg d-agent"><b>Agent</b><span>Done. All 4 steps are tested, reviewed and committed. Here's what to try.</span></li>
+      </ol>
     </div>
   </figure>
 
-  <div class="levels wrap">
-    <div class="levels__item reveal"><span class="levels__n">01</span><div><p class="mono-k">On every step</p><p>Each step is checked before the next one starts</p></div></div>
-    <div class="levels__item reveal"><span class="levels__n">02</span><div><p class="mono-k">Across runs</p><p>What you tell it once carries over to every later run</p></div></div>
-  </div>
+
 </section>
 
 <!-- ============ THE STORY ============ -->
@@ -134,7 +132,19 @@
         <p>Review rounds have limits per step and per run. Paid tools are never used unless you say so. If the agent gets stuck, it stops and asks you.</p>
       </article>
     </div>
-  </div>
+    <figure class="story-film reveal">
+      <div class="film">
+        <div class="film__frame">
+          <video class="film__video" autoplay muted loop playsinline disablepictureinpicture preload="auto" aria-hidden="true" tabindex="-1"
+            data-src-lg="assets/hero-1080.mp4" data-src-lg-webm="assets/hero-1080.webm" data-src-sm="assets/hero-720.mp4"></video>
+          <picture class="film__poster">
+            <source srcset="assets/hero-poster.avif" type="image/avif">
+            <img src="assets/hero-poster.jpg" alt="A blueprint drawing of a ratchet wheel. Three checks light up, tests, looks right and review, then the wheel clicks forward one tooth and locks." width="1920" height="1080" loading="lazy" decoding="async">
+          </picture>
+        </div>
+        <figcaption class="film__cap">A ratchet turns one way. Each click is a step that passed its checks and became a commit.</figcaption>
+      </div>
+    </figure>
   </div>
 </section>
 

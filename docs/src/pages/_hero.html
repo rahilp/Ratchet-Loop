@@ -4,8 +4,8 @@
     <div class="hero__grid" data-depth="0.25"></div>
   </div>
   <div class="hero__content wrap" data-depth="-0.08">
-    <h1 id="hero-title" class="hero__title">AI coding agents will tell you it works. <em>Ratchet Loop makes them prove it.</em></h1>
-        <p class="hero__lede">Ratchet Loop works inside Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. You describe a feature, and your agent builds it in small steps, checking each one before it moves on. You don't type any commands. You talk to your agent like normal.</p>
+    <h1 id="hero-title" class="hero__title">Features from your AI coding agent that actually work. <em>Every step is tested and reviewed before the next one starts.</em></h1>
+    <p class="hero__lede">A plug-in for Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. You talk to your agent like normal.</p>
     <div class="hero__ctas">
       <a class="btn btn--primary" href="install.html">Get started {{ICON_ARROW}}</a>
       <a class="btn btn--ghost" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener">{{ICON_CODE}}View on GitHub</a>
@@ -15,26 +15,24 @@
       <code class="cmd__text">{{INSTALL_PROMPT}}</code>
       <button class="cmd__copy" type="button" data-copy="{{INSTALL_PROMPT}}" aria-label="Copy the install prompt">{{ICON_COPY}}<span data-copy-label class="sr">Copy</span></button>
     </div>
-    <p class="hero__meta">Works in Claude Code <i>·</i> Codex <i>·</i> Gemini CLI <i>·</i> GitHub Copilot CLI</p>
   </div>
 
-  <figure class="hero__film wrap">
-    <div class="film">
-      <div class="film__frame">
-        <video class="film__video" autoplay muted loop playsinline disablepictureinpicture preload="auto" aria-hidden="true" tabindex="-1"
-          data-src-lg="assets/hero-1080.mp4" data-src-lg-webm="assets/hero-1080.webm" data-src-sm="assets/hero-720.mp4"></video>
-        <picture class="film__poster">
-          <source srcset="assets/hero-poster.avif" type="image/avif">
-          <img src="assets/hero-poster.jpg" alt="A blueprint drawing of a ratchet wheel. Three checks light up, tests, looks right and review, then the wheel clicks forward one tooth and locks." width="1920" height="1080" fetchpriority="high" decoding="async">
-        </picture>
-      </div>
-      <figcaption class="film__cap">A ratchet turns one way. Each click is a step that passed its checks and became a commit.</figcaption>
+  <figure class="hero__demo wrap">
+    <div class="demo" data-demo>
+      <div class="demo__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Claude Code · leave-app</span></div>
+      <ol class="demo__body" aria-label="Example: building a feature with Ratchet Loop">
+        <li class="d-msg d-you"><b>You</b><span>Use Ratchet to build this feature. Managers can reject a leave request, and give a reason.</span></li>
+        <li class="d-msg d-agent"><b>Agent</b><span>Here's the plan: 4 steps, each tested and reviewed. Say yes to start.</span></li>
+        <li class="d-msg d-you"><b>You</b><span>yes</span></li>
+        <li class="d-step"><span class="d-n">1</span><span class="d-t">Show pending requests</span><span class="d-g"><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Tests</i><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Design</i><i class="d-rev"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Review</i></span><span class="d-c">Committed</span></li>
+        <li class="d-step"><span class="d-n">2</span><span class="d-t">Approve a request</span><span class="d-g"><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Tests</i><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Design</i><i class="d-rev"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Review</i></span><span class="d-c">Committed</span></li>
+        <li class="d-step d-catch"><span class="d-n">3</span><span class="d-t">Reject, with a reason</span><span class="d-g"><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Tests</i><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Design</i><i class="d-rev"><em class="d-bug">Review found a bug: empty reason accepted</em><em class="d-fixed"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Fixed and re-reviewed</em></i></span><span class="d-c">Committed</span></li>
+        <li class="d-step"><span class="d-n">4</span><span class="d-t">Tell the employee</span><span class="d-g"><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Tests</i><i><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Design</i><i class="d-rev"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.4l2.8 2.8L12.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Review</i></span><span class="d-c">Committed</span></li>
+        <li class="d-msg d-agent"><b>Agent</b><span>Done. All 4 steps are tested, reviewed and committed. Here's what to try.</span></li>
+      </ol>
     </div>
   </figure>
 
-  <div class="levels wrap">
-    <div class="levels__item reveal"><span class="levels__n">01</span><div><p class="mono-k">On every step</p><p>Each step is checked before the next one starts</p></div></div>
-    <div class="levels__item reveal"><span class="levels__n">02</span><div><p class="mono-k">Across runs</p><p>What you tell it once carries over to every later run</p></div></div>
-  </div>
+
 </section>
 
