@@ -378,7 +378,7 @@ def t02_fix_round_deleting_a_1mb_file_can_be_recorded():
               rev.get("files_reviewed"))
 
 
-def t03_fix_round_adding_a_huge_file_gets_the_same_treatment():
+def t03_fix_round_adding_a_huge_file_is_never_summarized():
     # library
     d = _mk_repo("t03lib")
     (d / "src").mkdir()
@@ -818,7 +818,7 @@ def t19_docs_describe_the_large_file_summary():
 
 CASES = [("CP1-T01", t01_delete_1mb_file_shows_headers_and_one_line),
          ("CP1-T02", t02_fix_round_deleting_a_1mb_file_can_be_recorded),
-         ("CP1-T03", t03_fix_round_adding_a_huge_file_gets_the_same_treatment),
+         ("CP1-T03", t03_fix_round_adding_a_huge_file_is_never_summarized),
          ("CP1-T04", t04_huge_add_is_omitted_not_summarized),
          ("CP1-T05", t05_huge_modification_still_named_and_blocks),
          ("CP1-T06", t06_huge_modification_still_blocks_end_to_end),

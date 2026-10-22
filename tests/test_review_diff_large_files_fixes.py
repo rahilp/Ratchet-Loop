@@ -259,7 +259,7 @@ def x09_small_move_that_fits_is_gits_own_rename_output():
           and omitted == [], (shown, omitted))
 
 
-def x10_rename_chunk_blocks_summarizing_an_add():
+def x10_large_add_next_to_a_rename_is_never_summarized():
     d = base._mk_repo("x10")
     lines = [f"line {i}" for i in range(50)]
     _put(d / "a.py", "\n".join(lines) + "\n")
@@ -277,7 +277,7 @@ def x10_rename_chunk_blocks_summarizing_an_add():
 
 CASES += [x05_move_rewritten_70_percent_never_hides_the_add, x06_move_rewritten_100_percent_never_hides_the_add,
           x07_unrelated_large_delete_and_add_fall_back_to_blocking, x08_lone_large_add_is_never_summarized,
-          x09_small_move_that_fits_is_gits_own_rename_output, x10_rename_chunk_blocks_summarizing_an_add]
+          x09_small_move_that_fits_is_gits_own_rename_output, x10_large_add_next_to_a_rename_is_never_summarized]
 
 
 # ---- adversarial round 3 (finding A6): a module split hides nothing in the new module

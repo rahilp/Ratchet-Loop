@@ -13,7 +13,7 @@
       "codex"
     ]
   },
-  "regression_command": "python3 tests/run_all.py tests/test_review_diff_large_files.py tests/test_review_diff_large_files_fixes.py tests/test_fix_round_diff.py tests/test_fix_round_diff_fixes.py tests/test_fix_round.py tests/test_providers.py tests/test_flaky.py tests/test_waiting.py",
+  "regression_command": "python3 tests/run_all.py tests/test_review_diff_large_files.py tests/test_review_diff_large_files_fixes.py tests/test_review_diff_full_rounds.py tests/test_review_diff_full_rounds_fixes.py tests/test_fix_round_diff.py tests/test_fix_round_diff_fixes.py tests/test_fix_round.py tests/test_providers.py tests/test_flaky.py tests/test_waiting.py tests/test_docs.py",
   "commit_per_checkpoint": true,
   "design_md": "DESIGN.md",
   "standards": [
