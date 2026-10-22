@@ -13,7 +13,7 @@
       "codex"
     ]
   },
-  "regression_command": "python3 tests/run_all.py tests/test_review_diff_large_files.py tests/test_review_diff_large_files_fixes.py tests/test_review_diff_full_rounds.py tests/test_review_diff_full_rounds_fixes.py tests/test_fix_round_diff.py tests/test_fix_round_diff_fixes.py tests/test_fix_round.py tests/test_providers.py tests/test_flaky.py tests/test_waiting.py tests/test_docs.py",
+  "regression_command": "python3 tests/run_all.py",
   "commit_per_checkpoint": true,
   "design_md": "DESIGN.md",
   "standards": [
@@ -30,23 +30,34 @@
     ],
     "normal": [
       [
+        "opencode-glm-standards",
+        "copilot-standards",
+        "gemini-standards",
         "host-alt-standards"
       ],
       [
         "codex-correctness",
+        "opencode-glm-correctness",
+        "copilot-correctness",
+        "gemini-correctness",
         "host-alt-correctness"
       ]
     ],
     "high": [
-      [
-        "host-standards"
-      ],
+      "host-standards",
+      "host-correctness",
       [
         "codex-correctness",
-        "host-correctness"
+        "opencode-glm-correctness",
+        "copilot-correctness",
+        "gemini-correctness",
+        "host-alt-correctness"
       ],
       [
-        "host-alt-correctness"
+        "opencode-glm-standards",
+        "copilot-standards",
+        "gemini-standards",
+        "host-alt-standards"
       ]
     ]
   },
@@ -58,6 +69,10 @@
     {
       "id": "claude",
       "preset": "claude"
+    },
+    {
+      "id": "codex",
+      "preset": "codex"
     },
     {
       "id": "copilot",
@@ -87,14 +102,6 @@
       "model": "opencode-go/step-5-preview-free",
       "company": "stepfun",
       "cost": "flat"
-    },
-    {
-      "id": "codex",
-      "preset": "codex",
-      "prefer_for": [
-        "correctness",
-        "standards"
-      ]
     }
   ],
   "test_timeout_sec": 3600,
@@ -102,13 +109,13 @@
   "spec_keep": true,
   "max_adversarial_rounds": 6,
   "role_models": {
-    "ratchet-implementer": "strong",
-    "ratchet-fixer": "strong"
+    "ratchet-implementer": "standard",
+    "ratchet-fixer": "standard"
   },
   "min_review_seconds": 20,
   "host_models": {
     "anthropic": {
-      "strong": "opus",
+      "strong": "inherit",
       "standard": "sonnet",
       "light": "haiku",
       "alternates": [
@@ -117,5 +124,10 @@
       ]
     }
   },
-  "related_test_command": "python3 tests/run_all.py {files}"
+  "related_test_command": "python3 tests/run_all.py {files}",
+  "related_always": [
+    "tests/test_docs.py",
+    "tests/test_brief.py",
+    "tests/test_trust_cp5_d.py"
+  ]
 }
