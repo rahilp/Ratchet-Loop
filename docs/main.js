@@ -277,6 +277,116 @@
     judge();
   }
 
+  /* ---------- the loop diagram: a token walks the ring, the ratchet turns one tooth per commit ---------- */
+  const loop = document.querySelector('[data-loop]');
+  if (loop) {
+    const C = 380, R = 255, CIRC = 2 * Math.PI * R;
+    const STAGES = [
+      ['Test planner', 'Plan tests', 'Writes the test cases before any code exists: the normal path, edge cases, permissions and errors.'],
+      ['Test writer', 'Write tests', 'Turns each case into a real test. There is still no feature code.'],
+      ['Gate 1 · test runner', 'Tests fail', 'Runs the new tests. At least one has to fail, which proves the tests can catch a missing feature. From now on, the tests are frozen.'],
+      ['Implementer', 'Build', 'Writes the code for this step only. It isn\'t allowed to edit the tests.'],
+      ['Gate 1 · test runner', 'Tests pass', 'Every planned test has to pass. Ratchet reads each result itself and checks that no test was deleted.'],
+      ['Gate 2 · screen reviewers', 'Looks right', 'Screenshots of the app are compared with the prototype, in the same state. Any difference that can be fixed sends the step back.'],
+      ['Gate 3 · a different AI', 'Review', 'A reviewer from another company tries to break the code. Each finding has to say which users it harms.'],
+      ['Ratchet', 'Lock', 'The step becomes one git commit, and the ratchet turns one tooth. It can\'t turn back.']
+    ];
+    const FAIL = ['Gate 3 · a different AI', 'Review, round 1', 'The reviewer finds a bug: a rejection with an empty reason goes through. The step can\'t move on.'];
+    const FIX = ['Fixer', 'Fix', 'Makes the reason required and adds a test that proves it. Then the review runs again.'];
+    const PASS2 = ['Gate 3 · a different AI', 'Review, round 2', 'Nothing serious left. The step can move on.'];
+    const FINAL = ['Gate 4 · you', 'Your OK', 'All four steps are locked. Now you try the feature and approve it. Only a clear yes counts.'];
+    const HASH = ['3f9a1c2', '81be04d', 'c7d8e9f', '0a1b2c3'];
+    const seq = [];
+    for (let cp = 0; cp < 4; cp++) for (let n = 0; n < 8; n++) {
+      if (cp === 2 && n === 6) seq.push({ cp, n, kind: 'fail' }, { cp, n: 'fix' }, { cp, n: 6, kind: 'pass2' });
+      else seq.push({ cp, n });
+    }
+    seq.push({ cp: 3, n: 7, kind: 'final' });
+
+    const $ = sel => loop.querySelector(sel);
+    const nodes = [...loop.querySelectorAll('[data-node]')];
+    const ring = nodes.filter(g => g.dataset.node !== 'fix'), fixNode = $('[data-node="fix"]');
+    const token = $('[data-loop-token]'), prog = $('[data-loop-prog]'), wheel = $('[data-loop-wheel]');
+    const go = $('#loop-go'), back = $('#loop-back');
+    const cpText = $('[data-loop-cp]'), cpSub = $('[data-loop-cpsub]');
+    const who = $('[data-loop-who]'), title = $('[data-loop-title]'), text = $('[data-loop-text]');
+    const log = [...loop.querySelectorAll('[data-loop-log] li')];
+    const playBtn = $('[data-loop-play]');
+    let i = 0, angle = -90, onFix = false, turns = 0, locked = 0, playing = !reduce.matches, inView = false, timer = 0, busy = false;
+
+    const put = (x, y) => token.setAttribute('transform', `translate(${x.toFixed(1)} ${y.toFixed(1)})`);
+    const atAngle = a => { const r = a * Math.PI / 180; put(C + R * Math.cos(r), C + R * Math.sin(r)); prog.style.strokeDashoffset = CIRC * (1 - Math.min(1, (a + 90) / 360)); };
+    const ease = t => t < .5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    const tween = (ms, f, done) => {
+      if (reduce.matches) { f(1); return done(); }
+      const t0 = performance.now();
+      const tick = now => { const t = Math.min(1, (now - t0) / ms); f(ease(t)); t < 1 ? requestAnimationFrame(tick) : done(); };
+      requestAnimationFrame(tick);
+    };
+    const moveTo = (s, done) => {
+      if (s.n === 'fix') { onFix = true; const L = go.getTotalLength(); return tween(650, t => { const p = go.getPointAtLength(L * t); put(p.x, p.y); }, done); }
+      if (onFix) { onFix = false; const L = back.getTotalLength(); return tween(650, t => { const p = back.getPointAtLength(L * t); put(p.x, p.y); }, () => { angle = 180; atAngle(angle); done(); }); }
+      let a1 = -90 + 45 * s.n; while (a1 < angle - .01) a1 += 360;
+      if (a1 === angle) { atAngle(angle); return done(); }
+      const a0 = angle;
+      tween(Math.min(900, 240 + (a1 - a0) * 9), t => atAngle(a0 + (a1 - a0) * t), () => { angle = a1 >= 270 ? a1 - 360 : a1; atAngle(angle); done(); });
+    };
+    const card = c => { who.textContent = c[0]; title.textContent = c[1]; text.textContent = c[2]; };
+    const render = s => {
+      const kind = s.kind || (s.n === 'fix' ? 'fix' : '');
+      loop.classList.toggle('is-fixing', kind === 'fail' || kind === 'fix');
+      loop.classList.toggle('is-final', kind === 'final');
+      ring.forEach((g, k) => {
+        g.classList.toggle('is-done', kind === 'final' || (typeof s.n === 'number' ? k < s.n : k < 6));
+        g.classList.toggle('is-now', kind !== 'final' && k === s.n && kind !== 'fail');
+        g.classList.toggle('is-fail', (kind === 'fail' || kind === 'fix') && k === 6);
+        g.classList.remove('is-picked');
+      });
+      fixNode.classList.toggle('is-now', kind === 'fix');
+      fixNode.classList.toggle('is-done', s.cp === 2 && (kind === 'pass2' || (typeof s.n === 'number' && s.n === 7)));
+      card(kind === 'final' ? FINAL : kind === 'fail' ? FAIL : kind === 'fix' ? FIX : kind === 'pass2' ? PASS2 : STAGES[s.n]);
+      if (s.n === 7 && kind !== 'final' && locked === s.cp) {
+        locked = s.cp + 1; turns++;
+        wheel.style.transform = `rotate(${turns * 15}deg)`;
+      }
+      log.forEach((li, k) => {
+        li.classList.toggle('is-locked', k < locked); li.classList.toggle('is-now', k === s.cp && k >= locked);
+        li.querySelector('em').innerHTML = k < locked ? `Locked<span class="loop__hash"> · ${HASH[k]}</span>` : k === s.cp ? 'Building' : 'Waiting';
+      });
+      cpText.textContent = kind === 'final' ? 'Done' : `CP${s.cp + 1}`;
+      cpSub.textContent = `${locked} of 4 locked`;
+      if (kind === 'final') prog.style.strokeDashoffset = 0;
+    };
+    const reset = () => { locked = 0; angle = -90; onFix = false; atAngle(angle); fixNode.classList.remove('is-done'); };
+    const dwell = s => s.kind === 'final' ? 4200 : s.kind === 'fail' ? 2000 : s.n === 7 ? 1500 : 1100;
+    const schedule = () => { clearTimeout(timer); if (playing && inView && !busy) timer = setTimeout(advance, dwell(seq[i])); };
+    const advance = () => {
+      i = (i + 1) % seq.length;
+      if (i === 0) reset();
+      busy = true;
+      moveTo(seq[i], () => { busy = false; render(seq[i]); schedule(); });
+    };
+    const setPlaying = on => {
+      playing = on; loop.classList.toggle('is-paused', !on);
+      const w = on ? 'Pause' : 'Play'; playBtn.setAttribute('aria-label', w); playBtn.title = w;
+      schedule();
+    };
+    playBtn.addEventListener('click', () => { if (!playing && loop.classList.contains('is-picking')) { loop.classList.remove('is-picking'); render(seq[i]); } setPlaying(!playing); });
+    $('[data-loop-step]').addEventListener('click', () => { setPlaying(false); loop.classList.remove('is-picking'); if (!busy) advance(); });
+    $('[data-loop-replay]').addEventListener('click', () => { loop.classList.remove('is-picking'); clearTimeout(timer); i = 0; reset(); render(seq[0]); setPlaying(true); });
+    nodes.forEach(g => {
+      const pick = () => {
+        setPlaying(false); loop.classList.add('is-picking');
+        nodes.forEach(x => x.classList.toggle('is-picked', x === g));
+        card(g.dataset.node === 'fix' ? FIX : STAGES[+g.dataset.node]);
+      };
+      g.addEventListener('click', pick);
+      g.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+    });
+    new IntersectionObserver(([e]) => { inView = e.isIntersecting; schedule(); }, { threshold: .3 }).observe(loop);
+    atAngle(angle); render(seq[0]); setPlaying(playing);
+  }
+
   /* ---------- the same step built twice: plays once in view, Replay restarts it ---------- */
   document.querySelectorAll('[data-case]').forEach(c => {
     const play = () => { c.classList.remove('is-play'); void c.offsetWidth; c.classList.add('is-play'); };

@@ -67,7 +67,6 @@
 <section class="phead" id="top" aria-labelledby="page-title">
   <div class="phead__bg" aria-hidden="true"><div class="hero__grid" data-depth="0.25"></div><img class="hero__draw" src="assets/blueprint.svg" alt="" width="1200" height="1200" decoding="async" data-depth="0.55"></div>
   <div class="wrap phead__inner">
-    <p class="crumb"><a href="index.html#features">Features</a><span aria-hidden="true">/</span>Feature 02</p>
     <h1 id="page-title" class="phead__title">Four gates. <em>The agent can't skip one.</em></h1>
     <p class="lede">Agents skip checks when nothing stops them. They write tests after the code, or call a screen done without looking at it. Ratchet puts four gates on every step, and hooks in your CLI stop the agent from going around them.</p>
     <nav class="phead__jump" aria-label="On this page"><a href="#gates">The four gates</a><a href="#safeguards">Safeguards</a></nav>
@@ -120,7 +119,6 @@
       </div>
     </div>
     <div class="gates__list">
-      <p class="kicker"><span>01</span>The four gates</p>
       <h2 id="gates-title" class="h2">Four gates. <em>Always in this order.</em></h2>
       <p class="lede">The gates run in a fixed order, and a step can't move on until each one passes. Gates 1 to 3 run on every checkpoint. Gate 4 is you, at the end. A step with no screen change, like an API change, skips gate 2.</p>
       <article class="gate" data-gate="1">
@@ -157,7 +155,6 @@
 
 <section class="band band--alt" id="safeguards" aria-labelledby="safe-title">
   <div class="wrap">
-    <p class="kicker"><span>02</span>Safeguards</p>
     <h2 id="safe-title" class="h2">Eight safeguards. <em>Enforced by hooks.</em></h2>
     <p class="lede">When a step is hard, an agent takes shortcuts. It deletes a failing test, edits a test until it passes, or approves its own review. Hooks stop that. A hook is a small program your CLI runs before and after the agent acts. Ratchet's hooks check each action against these rules.</p>
     <div class="rules">

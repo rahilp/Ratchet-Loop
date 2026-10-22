@@ -309,6 +309,49 @@ FEATURES = [
 PAGE_SUFFIX = " · Ratchet Loop"
 
 
+# The loop diagram on the home page: eight stages on a ring, the fix detour, hooks around it, the ratchet in the middle.
+LOOP_NODES = [("Plan tests", 0), ("Write tests", 0), ("Tests fail", 1), ("Build", 0),
+              ("Tests pass", 1), ("Looks right", 2), ("Review", 3), ("Lock", 0)]
+
+
+def loop_svg():
+    C, R = 380, 255
+    circ = TAU * R
+    out = ['<defs><path id="loop-hookpath" d="M380,380 m-348,0 a348,348 0 1,1 696,0 a348,348 0 1,1 -696,0"/>'
+           '<radialGradient id="loop-glow"><stop offset="0" stop-color="#DFE8FB"/><stop offset=".7" stop-color="#EEF2FB" stop-opacity=".6"/>'
+           '<stop offset="1" stop-color="#EEF2FB" stop-opacity="0"/></radialGradient>'
+           '<marker id="loop-arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
+           '<path d="M1,1 L8,5 L1,9" fill="none" stroke="#E8572A" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>',
+           f'<circle cx="{C}" cy="{C}" r="310" fill="url(#loop-glow)"/>',
+           '<g class="loop__hooks"><circle cx="380" cy="380" r="330" class="loop__hookring"/>'
+           '<text class="loop__hooktext"><textPath href="#loop-hookpath" textLength="2170" lengthAdjust="spacing">'
+           + "Hooks check every action, so the agent can't skip a gate · " * 5 + '</textPath></text></g>',
+           f'<circle class="loop__track" cx="{C}" cy="{C}" r="{R}"/>',
+           f'<circle class="loop__prog" cx="{C}" cy="{C}" r="{R}" transform="rotate(-90 {C} {C})" stroke-dasharray="{circ:.1f}" stroke-dashoffset="{circ:.1f}" data-loop-prog/>',
+           '<path class="loop__fixpath" id="loop-go" d="M118,407 C112,470 160,492 206,486" marker-end="url(#loop-arrow)"/>',
+           '<path class="loop__fixpath" id="loop-back" d="M262,452 C262,420 236,398 192,392" marker-end="url(#loop-arrow)"/>']
+    # the ratchet: one tooth per locked checkpoint
+    wheel = pts_path(saw(C, C, 84, 104, 24, rot=math.radians(58), slant=0.86))
+    out.append(f'<g class="loop__wheel" data-loop-wheel><path d="{wheel}"/><circle class="loop__hub" cx="{C}" cy="{C}" r="66"/></g>'
+               '<g class="loop__pawl"><path d="M492,268 L441,304"/><circle cx="492" cy="268" r="7"/></g>'
+               f'<text class="loop__cp" x="{C}" y="{C + 6}" data-loop-cp>CP1</text>'
+               f'<text class="loop__cpsub" x="{C}" y="{C + 32}" data-loop-cpsub>0 of 4 locked</text>')
+    out.append('<g class="loop__token" data-loop-token transform="translate(380 125)"><circle class="loop__halo" r="20"/><circle class="loop__dot" r="8.5"/></g>')
+    for i, (label, gate) in enumerate(LOOP_NODES):
+        a = math.radians(-90 + 45 * i)
+        x, y = C + R * math.cos(a), C + R * math.sin(a)
+        w = round(len(label) * 12.4 + (66 if gate else 50))
+        lx = -w / 2 + (48 if gate else 34)
+        mark = (f'<circle class="chip" cx="{-w / 2 + 26}" cy="0" r="14"/><text class="num" x="{-w / 2 + 26}" y="5.5">{gate}</text>' if gate
+                else f'<circle class="dot" cx="{-w / 2 + 22}" cy="0" r="5.5"/>')
+        name = f"Gate {gate}: {label}" if gate else label
+        out.append(f'<g class="loop__node" data-node="{i}" transform="translate({x:.1f} {y:.1f})" tabindex="0" role="button" aria-label="{name}">'
+                   f'<rect x="{-w / 2}" y="-26" width="{w}" height="52" rx="26"/>{mark}<text x="{lx}" y="7.5">{label}</text></g>')
+    out.append('<g class="loop__node loop__fix" data-node="fix" transform="translate(262 486)" tabindex="0" role="button" aria-label="Fix">'
+               '<rect x="-46" y="-23" width="92" height="46" rx="23"/><circle class="dot" cx="-24" cy="0" r="5.5"/><text x="-12" y="7">Fix</text></g>')
+    return "".join(out)
+
+
 def sections_html(ids):
     """Pull sections out of their files, number their kickers 01, 02... and alternate the band shading."""
     out = []
@@ -333,7 +376,6 @@ def page_header(n, title, accent, lede, ids, slug):
     return f'''<section class="phead" id="top" aria-labelledby="page-title">
   <div class="phead__bg" aria-hidden="true"><div class="hero__grid" data-depth="0.25"></div><img class="hero__draw" src="assets/blueprint.svg" alt="" width="1200" height="1200" decoding="async" data-depth="0.55"></div>
   <div class="wrap phead__inner">
-    <p class="crumb"><a href="index.html#features">Features</a><span aria-hidden="true">/</span>{label}</p>
     <h1 id="page-title" class="phead__title">{title} <em>{accent}</em></h1>
     <p class="lede">{lede}</p>
     <nav class="phead__jump" aria-label="On this page">{jump}</nav>
@@ -392,7 +434,7 @@ def main():
     pages = [("index.html", "Ratchet Loop · Step-by-step building for AI coding agents",
               "Ratchet Loop is a plug-in for Claude Code, Codex, Gemini CLI and Copilot CLI. It splits a feature into small steps, and each step has to pass its tests, match the design and get through a review by a different AI before the next one starts.",
               part("_hero.html") + part("home.html").replace("{{FEATURE_CARDS}}", feature_cards())
-              .replace("{{CASE}}", part("_case.html")).replace("{{FAQ_SECTION}}", faq_section),
+              .replace("{{CASE}}", part("_case.html")).replace("{{LOOP}}", part("_loop.html").replace("{{LOOP_SVG}}", loop_svg())).replace("{{FAQ_SECTION}}", faq_section),
               '<script type="application/ld+json">{"@context":"https://schema.org","@graph":[' + sw_ld +
               ',{"@type":"FAQPage","mainEntity":[' + faq_ld + ']}]}</script>',
               '<link rel="preload" as="image" href="assets/hero-poster.avif" type="image/avif" fetchpriority="high">', "home")]

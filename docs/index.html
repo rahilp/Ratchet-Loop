@@ -71,7 +71,6 @@
     <img class="hero__draw" src="assets/blueprint.svg" alt="" width="1200" height="1200" decoding="async" data-depth="0.55">
   </div>
   <div class="hero__content wrap" data-depth="-0.08">
-    <p class="eyebrow"><svg viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke-linejoin="round" stroke-linecap="round" stroke-width="2.0"><path stroke="#3E6FC4" stroke-opacity=".55" stroke-width="1.20" stroke-dasharray="5 2 1 2" d="M1.5,37 H55.5 M28.5,10 V64"/><circle stroke="#3E6FC4" stroke-opacity=".6" stroke-width="1.20" cx="28.5" cy="37" r="14.8"/><path stroke="#3E6FC4" d="M40.54,23.62 L35.06,14.43 L33.34,14.24 L32.24,19.39 L22.89,14.18 L21.31,14.87 L22.94,19.88 L12.23,20.04 L11.21,21.43 L15.12,24.96 L5.93,30.44 L5.74,32.16 L10.89,33.26 L5.68,42.61 L6.37,44.19 L11.38,42.56 L11.54,53.27 L12.93,54.29 L16.46,50.38 L21.94,59.57 L23.66,59.76 L24.76,54.61 L34.11,59.82 L35.69,59.13 L34.06,54.12 L44.77,53.96 L45.79,52.57 L41.88,49.04 L51.07,43.56 L51.26,41.84 L46.11,40.74 L51.32,31.39 L50.63,29.81 L45.62,31.44 L45.46,20.73 L44.07,19.71Z"/><circle stroke="#3E6FC4" cx="28.5" cy="37" r="4.2"/><path stroke="#E8572A" d="M33.91,7.11 L38.05,20.29 L40.95,23.18 L42.13,21.15 L40.55,5.64Z"/><circle stroke="#E8572A" fill="#FBFAF7" cx="37.23" cy="6.38" r="3.6"/><circle fill="#E8572A" stroke="none" cx="37.23" cy="6.38" r="1.2"/></g></svg>Ratchet Loop for AI coding agents</p>
     <h1 id="hero-title" class="hero__title">Make your coding agent <em>prove every step.</em></h1>
         <p class="hero__lede">Claude Code, Codex and other coding agents can build a whole feature from one message. But they often say "done" when a test is missing, a screen doesn't match the design or an edge case is broken. Ratchet Loop checks every step, so you don't have to.</p>
     <div class="hero__ctas">
@@ -103,29 +102,14 @@
   </div>
 </section>
 
-<!-- ============ THE PROBLEM ============ -->
-<section class="band" id="problem" aria-labelledby="problem-title">
+<!-- ============ THE STORY ============ -->
+<section class="band" id="why" aria-labelledby="why-title">
   <div class="wrap">
-    <p class="kicker">The problem</p>
-    <h2 id="problem-title" class="h2">The agent checks <em>its own work.</em></h2>
+    <h2 id="why-title" class="h2">Agents are fast. <em>Checking them is slow.</em></h2>
     <div class="prose">
-      <p>When a coding agent builds a feature, the same agent writes the tests, runs them and decides when it's done. Nothing stops it from writing tests that already pass, skipping a check, or calling a screen finished without looking at it.</p>
-      <p>On a small change, you catch this in review. On a feature with eight steps, the mistakes pile up, and you find them at the end, all at once.</p>
-      <p>So you end up watching the agent and testing everything yourself.</p>
+      <p>When a coding agent builds a feature, the same agent writes the tests, runs them and decides when it's done. Nothing stops it from writing tests that already pass, or calling a screen finished without looking at it. On a feature with eight steps, the mistakes pile up, and you find them at the end.</p>
+      <p>Ratchet Loop does that checking for you. It splits the feature into small steps, and each step has to pass four gates before the next one starts: its tests, a check against the design, a review by a different AI, and finally your OK. Hooks in your CLI stop the agent from skipping any of them.</p>
     </div>
-  </div>
-</section>
-
-<!-- ============ THE FIX ============ -->
-<section class="band band--alt" id="why" aria-labelledby="why-title">
-  <div class="wrap">
-    <p class="kicker">The fix</p>
-    <h2 id="why-title" class="h2">Ratchet Loop checks <em>every step for you.</em></h2>
-    <div class="prose">
-      <p>Ratchet Loop splits a feature into small steps. Each step has to pass four gates before the next one starts: its tests, a check against the design, a review by a different AI, and finally your OK.</p>
-      <p>The agent can't skip a gate. Hooks in your CLI block it.</p>
-    </div>
-    <p class="list-intro">With Ratchet Loop, you can:</p>
     <div class="why">
       <article class="why__card reveal">
         <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h10M11 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 5v14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
@@ -152,10 +136,47 @@
   </div>
 </section>
 
+<!-- ============ THE LOOP ============ -->
+<section class="band band--alt" id="loop" aria-labelledby="loop-title">
+  <div class="wrap">
+    <h2 id="loop-title" class="h2">Every step goes <em>around the same loop.</em></h2>
+    <div class="prose">
+      <p>Tests come first, and they have to fail before any code is written. Then the code makes them pass, the screen is compared with the design, and a different AI tries to break it. If the reviewer finds a problem, the fixer answers it and the review runs again.</p>
+      <p>Only then is the step saved as a commit, and the ratchet turns one tooth. It never turns back. Click any stage to see who does it.</p>
+    </div>
+    <div class="loop reveal" data-loop>
+      <div class="loop__fig">
+        <svg class="loop__svg" viewBox="0 0 760 760" role="group" aria-label="The Ratchet loop: eight stages around a ring, with hooks around the outside"><defs><path id="loop-hookpath" d="M380,380 m-348,0 a348,348 0 1,1 696,0 a348,348 0 1,1 -696,0"/><radialGradient id="loop-glow"><stop offset="0" stop-color="#DFE8FB"/><stop offset=".7" stop-color="#EEF2FB" stop-opacity=".6"/><stop offset="1" stop-color="#EEF2FB" stop-opacity="0"/></radialGradient><marker id="loop-arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M1,1 L8,5 L1,9" fill="none" stroke="#E8572A" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></marker></defs><circle cx="380" cy="380" r="310" fill="url(#loop-glow)"/><g class="loop__hooks"><circle cx="380" cy="380" r="330" class="loop__hookring"/><text class="loop__hooktext"><textPath href="#loop-hookpath" textLength="2170" lengthAdjust="spacing">Hooks check every action, so the agent can't skip a gate · Hooks check every action, so the agent can't skip a gate · Hooks check every action, so the agent can't skip a gate · Hooks check every action, so the agent can't skip a gate · Hooks check every action, so the agent can't skip a gate · </textPath></text></g><circle class="loop__track" cx="380" cy="380" r="255"/><circle class="loop__prog" cx="380" cy="380" r="255" transform="rotate(-90 380 380)" stroke-dasharray="1602.2" stroke-dashoffset="1602.2" data-loop-prog/><path class="loop__fixpath" id="loop-go" d="M118,407 C112,470 160,492 206,486" marker-end="url(#loop-arrow)"/><path class="loop__fixpath" id="loop-back" d="M262,452 C262,420 236,398 192,392" marker-end="url(#loop-arrow)"/><g class="loop__wheel" data-loop-wheel><path d="M424.51,308.76 L414.03,281.73 L410.10,281.54 L404.56,299.67 L387.44,276.27 L383.59,277.10 L382.93,296.05 L360.33,277.88 L356.84,279.68 L361.10,298.15 L334.57,286.45 L331.66,289.09 L340.56,305.83 L311.91,301.39 L309.78,304.70 L322.71,318.57 L293.88,321.69 L292.68,325.44 L308.76,335.49 L281.73,345.97 L281.54,349.90 L299.67,355.44 L276.27,372.56 L277.10,376.41 L296.05,377.07 L277.88,399.67 L279.68,403.16 L298.15,398.90 L286.45,425.43 L289.09,428.34 L305.83,419.44 L301.39,448.09 L304.70,450.22 L318.57,437.29 L321.69,466.12 L325.44,467.32 L335.49,451.24 L345.97,478.27 L349.90,478.46 L355.44,460.33 L372.56,483.73 L376.41,482.90 L377.07,463.95 L399.67,482.12 L403.16,480.32 L398.90,461.85 L425.43,473.55 L428.34,470.91 L419.44,454.17 L448.09,458.61 L450.22,455.30 L437.29,441.43 L466.12,438.31 L467.32,434.56 L451.24,424.51 L478.27,414.03 L478.46,410.10 L460.33,404.56 L483.73,387.44 L482.90,383.59 L463.95,382.93 L482.12,360.33 L480.32,356.84 L461.85,361.10 L473.55,334.57 L470.91,331.66 L454.17,340.56 L458.61,311.91 L455.30,309.78 L441.43,322.71 L438.31,293.88 L434.56,292.68Z"/><circle class="loop__hub" cx="380" cy="380" r="66"/></g><g class="loop__pawl"><path d="M492,268 L441,304"/><circle cx="492" cy="268" r="7"/></g><text class="loop__cp" x="380" y="386" data-loop-cp>CP1</text><text class="loop__cpsub" x="380" y="412" data-loop-cpsub>0 of 4 locked</text><g class="loop__token" data-loop-token transform="translate(380 125)"><circle class="loop__halo" r="20"/><circle class="loop__dot" r="8.5"/></g><g class="loop__node" data-node="0" transform="translate(380.0 125.0)" tabindex="0" role="button" aria-label="Plan tests"><rect x="-87.0" y="-26" width="174" height="52" rx="26"/><circle class="dot" cx="-65.0" cy="0" r="5.5"/><text x="-53.0" y="7.5">Plan tests</text></g><g class="loop__node" data-node="1" transform="translate(560.3 199.7)" tabindex="0" role="button" aria-label="Write tests"><rect x="-93.0" y="-26" width="186" height="52" rx="26"/><circle class="dot" cx="-71.0" cy="0" r="5.5"/><text x="-59.0" y="7.5">Write tests</text></g><g class="loop__node" data-node="2" transform="translate(635.0 380.0)" tabindex="0" role="button" aria-label="Gate 1: Tests fail"><rect x="-95.0" y="-26" width="190" height="52" rx="26"/><circle class="chip" cx="-69.0" cy="0" r="14"/><text class="num" x="-69.0" y="5.5">1</text><text x="-47.0" y="7.5">Tests fail</text></g><g class="loop__node" data-node="3" transform="translate(560.3 560.3)" tabindex="0" role="button" aria-label="Build"><rect x="-56.0" y="-26" width="112" height="52" rx="26"/><circle class="dot" cx="-34.0" cy="0" r="5.5"/><text x="-22.0" y="7.5">Build</text></g><g class="loop__node" data-node="4" transform="translate(380.0 635.0)" tabindex="0" role="button" aria-label="Gate 1: Tests pass"><rect x="-95.0" y="-26" width="190" height="52" rx="26"/><circle class="chip" cx="-69.0" cy="0" r="14"/><text class="num" x="-69.0" y="5.5">1</text><text x="-47.0" y="7.5">Tests pass</text></g><g class="loop__node" data-node="5" transform="translate(199.7 560.3)" tabindex="0" role="button" aria-label="Gate 2: Looks right"><rect x="-101.0" y="-26" width="202" height="52" rx="26"/><circle class="chip" cx="-75.0" cy="0" r="14"/><text class="num" x="-75.0" y="5.5">2</text><text x="-53.0" y="7.5">Looks right</text></g><g class="loop__node" data-node="6" transform="translate(125.0 380.0)" tabindex="0" role="button" aria-label="Gate 3: Review"><rect x="-70.0" y="-26" width="140" height="52" rx="26"/><circle class="chip" cx="-44.0" cy="0" r="14"/><text class="num" x="-44.0" y="5.5">3</text><text x="-22.0" y="7.5">Review</text></g><g class="loop__node" data-node="7" transform="translate(199.7 199.7)" tabindex="0" role="button" aria-label="Lock"><rect x="-50.0" y="-26" width="100" height="52" rx="26"/><circle class="dot" cx="-28.0" cy="0" r="5.5"/><text x="-16.0" y="7.5">Lock</text></g><g class="loop__node loop__fix" data-node="fix" transform="translate(262 486)" tabindex="0" role="button" aria-label="Fix"><rect x="-46" y="-23" width="92" height="46" rx="23"/><circle class="dot" cx="-24" cy="0" r="5.5"/><text x="-12" y="7">Fix</text></g></svg>
+      </div>
+      <div class="loop__side">
+        <div class="loop__top">
+          <p class="loop__run" data-loop-run>Example: leave approvals</p>
+          <div class="ctrls" role="group" aria-label="Playback">
+            <button class="ctrl ctrl--play" type="button" data-loop-play aria-label="Pause" title="Pause"><svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="5.5" width="3.4" height="13" rx="1.2" fill="currentColor"/><rect x="13.6" y="5.5" width="3.4" height="13" rx="1.2" fill="currentColor"/></svg><svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 6.2v11.6a1 1 0 0 0 1.5.86l9.3-5.8a1 1 0 0 0 0-1.72L10 5.34a1 1 0 0 0-1.5.86z" fill="currentColor"/></svg></button>
+            <button class="ctrl" type="button" data-loop-step aria-label="Next stage" title="Next stage"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6.5v11l8-5.5z" fill="currentColor"/><rect x="15.5" y="6" width="2.6" height="12" rx="1" fill="currentColor"/></svg></button>
+            <button class="ctrl" type="button" data-loop-replay aria-label="Replay from the start" title="Replay"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3M4.5 4.5v4h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+          </div>
+        </div>
+        <div class="loop__card" data-loop-card>
+          <p class="loop__who" data-loop-who>Test planner</p>
+          <h3 data-loop-title>Plan tests</h3>
+          <p data-loop-text>Writes the test cases before any code exists: the normal path, edge cases, permissions and errors.</p>
+        </div>
+        <ol class="loop__log" aria-label="Commits in this run" data-loop-log>
+          <li><b>CP1</b><span>Show pending requests</span><em>Waiting</em></li>
+          <li><b>CP2</b><span>Approve a request</span><em>Waiting</em></li>
+          <li><b>CP3</b><span>Reject, with a reason</span><em>Waiting</em></li>
+          <li><b>CP4</b><span>Tell the employee</span><em>Waiting</em></li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+
 <!-- ============ AN EXAMPLE ============ -->
 <section class="band" id="example" aria-labelledby="example-title">
   <div class="wrap">
-    <p class="kicker">An example</p>
     <h2 id="example-title" class="h2">What happens when <em>the agent misses a bug?</em></h2>
     <div class="prose">
       <p>Take the example of a manager rejecting a leave request. The agent adds a Reject button, writes tests, and they all pass. But it forgot to make the reason required.</p>
@@ -200,7 +221,6 @@
 <!-- ============ MORE THAN TDD ============ -->
 <section class="band band--alt" id="tdd" aria-labelledby="tdd-title">
   <div class="wrap">
-    <p class="kicker">Compared with TDD</p>
     <h2 id="tdd-title" class="h2">Isn't this <em>just TDD?</em></h2>
     <p class="lede">TDD is one of the four gates. Asking an agent to use TDD helps, but the agent still runs its own tests, reports its own results and decides when it's done. Ratchet takes those jobs away from it.</p>
     <div class="vs reveal" role="table" aria-label="Prompting an agent, agent with TDD, and Ratchet Loop compared">
@@ -222,7 +242,6 @@
 <!-- ============ FEATURES ============ -->
 <section class="band" id="features" aria-labelledby="features-title">
   <div class="wrap">
-    <p class="kicker">Features</p>
     <h2 id="features-title" class="h2">Eight features. <em>One loop.</em></h2>
     <p class="lede">Each one fixes a problem you hit when agents build features. Each has its own page.</p>
     <div class="feats">
@@ -241,7 +260,6 @@
 <!-- ============ WORKS WHERE YOU WORK ============ -->
 <section class="band band--alt" id="start" aria-labelledby="start-title">
   <div class="wrap">
-    <p class="kicker">Get started</p>
     <h2 id="start-title" class="h2">Pick your CLI. <em>Install in three messages.</em></h2>
     <ul class="clis" aria-label="Supported coding agents">
       <li><b>Claude Code</b><span>All checks, including which reviewer wrote each review</span></li>
@@ -263,7 +281,6 @@
 
 <section class="band band--alt faq" id="faq" aria-labelledby="faq-title">
   <div class="wrap">
-    <p class="kicker">Questions</p>
     <h2 id="faq-title" class="h2">Before you ask.</h2>
     <div class="faq__list">
     <details>

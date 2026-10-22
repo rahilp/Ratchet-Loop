@@ -1,0 +1,35 @@
+<section class="band band--alt" id="loop" aria-labelledby="loop-title">
+  <div class="wrap">
+    <h2 id="loop-title" class="h2">Every step goes <em>around the same loop.</em></h2>
+    <div class="prose">
+      <p>Tests come first, and they have to fail before any code is written. Then the code makes them pass, the screen is compared with the design, and a different AI tries to break it. If the reviewer finds a problem, the fixer answers it and the review runs again.</p>
+      <p>Only then is the step saved as a commit, and the ratchet turns one tooth. It never turns back. Click any stage to see who does it.</p>
+    </div>
+    <div class="loop reveal" data-loop>
+      <div class="loop__fig">
+        <svg class="loop__svg" viewBox="0 0 760 760" role="group" aria-label="The Ratchet loop: eight stages around a ring, with hooks around the outside">{{LOOP_SVG}}</svg>
+      </div>
+      <div class="loop__side">
+        <div class="loop__top">
+          <p class="loop__run" data-loop-run>Example: leave approvals</p>
+          <div class="ctrls" role="group" aria-label="Playback">
+            <button class="ctrl ctrl--play" type="button" data-loop-play aria-label="Pause" title="Pause"><svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="5.5" width="3.4" height="13" rx="1.2" fill="currentColor"/><rect x="13.6" y="5.5" width="3.4" height="13" rx="1.2" fill="currentColor"/></svg><svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 6.2v11.6a1 1 0 0 0 1.5.86l9.3-5.8a1 1 0 0 0 0-1.72L10 5.34a1 1 0 0 0-1.5.86z" fill="currentColor"/></svg></button>
+            <button class="ctrl" type="button" data-loop-step aria-label="Next stage" title="Next stage"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6.5v11l8-5.5z" fill="currentColor"/><rect x="15.5" y="6" width="2.6" height="12" rx="1" fill="currentColor"/></svg></button>
+            <button class="ctrl" type="button" data-loop-replay aria-label="Replay from the start" title="Replay"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3M4.5 4.5v4h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+          </div>
+        </div>
+        <div class="loop__card" data-loop-card>
+          <p class="loop__who" data-loop-who>Test planner</p>
+          <h3 data-loop-title>Plan tests</h3>
+          <p data-loop-text>Writes the test cases before any code exists: the normal path, edge cases, permissions and errors.</p>
+        </div>
+        <ol class="loop__log" aria-label="Commits in this run" data-loop-log>
+          <li><b>CP1</b><span>Show pending requests</span><em>Waiting</em></li>
+          <li><b>CP2</b><span>Approve a request</span><em>Waiting</em></li>
+          <li><b>CP3</b><span>Reject, with a reason</span><em>Waiting</em></li>
+          <li><b>CP4</b><span>Tell the employee</span><em>Waiting</em></li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>

@@ -1,26 +1,11 @@
-<!-- ============ THE PROBLEM ============ -->
-<section class="band" id="problem" aria-labelledby="problem-title">
+<!-- ============ THE STORY ============ -->
+<section class="band" id="why" aria-labelledby="why-title">
   <div class="wrap">
-    <p class="kicker">The problem</p>
-    <h2 id="problem-title" class="h2">The agent checks <em>its own work.</em></h2>
+    <h2 id="why-title" class="h2">Agents are fast. <em>Checking them is slow.</em></h2>
     <div class="prose">
-      <p>When a coding agent builds a feature, the same agent writes the tests, runs them and decides when it's done. Nothing stops it from writing tests that already pass, skipping a check, or calling a screen finished without looking at it.</p>
-      <p>On a small change, you catch this in review. On a feature with eight steps, the mistakes pile up, and you find them at the end, all at once.</p>
-      <p>So you end up watching the agent and testing everything yourself.</p>
+      <p>When a coding agent builds a feature, the same agent writes the tests, runs them and decides when it's done. Nothing stops it from writing tests that already pass, or calling a screen finished without looking at it. On a feature with eight steps, the mistakes pile up, and you find them at the end.</p>
+      <p>Ratchet Loop does that checking for you. It splits the feature into small steps, and each step has to pass four gates before the next one starts: its tests, a check against the design, a review by a different AI, and finally your OK. Hooks in your CLI stop the agent from skipping any of them.</p>
     </div>
-  </div>
-</section>
-
-<!-- ============ THE FIX ============ -->
-<section class="band band--alt" id="why" aria-labelledby="why-title">
-  <div class="wrap">
-    <p class="kicker">The fix</p>
-    <h2 id="why-title" class="h2">Ratchet Loop checks <em>every step for you.</em></h2>
-    <div class="prose">
-      <p>Ratchet Loop splits a feature into small steps. Each step has to pass four gates before the next one starts: its tests, a check against the design, a review by a different AI, and finally your OK.</p>
-      <p>The agent can't skip a gate. Hooks in your CLI block it.</p>
-    </div>
-    <p class="list-intro">With Ratchet Loop, you can:</p>
     <div class="why">
       <article class="why__card reveal">
         <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h10M11 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 5v14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
@@ -47,10 +32,12 @@
   </div>
 </section>
 
+<!-- ============ THE LOOP ============ -->
+{{LOOP}}
+
 <!-- ============ AN EXAMPLE ============ -->
 <section class="band" id="example" aria-labelledby="example-title">
   <div class="wrap">
-    <p class="kicker">An example</p>
     <h2 id="example-title" class="h2">What happens when <em>the agent misses a bug?</em></h2>
     <div class="prose">
       <p>Take the example of a manager rejecting a leave request. The agent adds a Reject button, writes tests, and they all pass. But it forgot to make the reason required.</p>
@@ -67,7 +54,6 @@
 <!-- ============ MORE THAN TDD ============ -->
 <section class="band band--alt" id="tdd" aria-labelledby="tdd-title">
   <div class="wrap">
-    <p class="kicker">Compared with TDD</p>
     <h2 id="tdd-title" class="h2">Isn't this <em>just TDD?</em></h2>
     <p class="lede">TDD is one of the four gates. Asking an agent to use TDD helps, but the agent still runs its own tests, reports its own results and decides when it's done. Ratchet takes those jobs away from it.</p>
     <div class="vs reveal" role="table" aria-label="Prompting an agent, agent with TDD, and Ratchet Loop compared">
@@ -89,7 +75,6 @@
 <!-- ============ FEATURES ============ -->
 <section class="band" id="features" aria-labelledby="features-title">
   <div class="wrap">
-    <p class="kicker">Features</p>
     <h2 id="features-title" class="h2">Eight features. <em>One loop.</em></h2>
     <p class="lede">Each one fixes a problem you hit when agents build features. Each has its own page.</p>
     <div class="feats">
@@ -101,7 +86,6 @@
 <!-- ============ WORKS WHERE YOU WORK ============ -->
 <section class="band band--alt" id="start" aria-labelledby="start-title">
   <div class="wrap">
-    <p class="kicker">Get started</p>
     <h2 id="start-title" class="h2">Pick your CLI. <em>Install in three messages.</em></h2>
     <ul class="clis" aria-label="Supported coding agents">
       <li><b>Claude Code</b><span>All checks, including which reviewer wrote each review</span></li>

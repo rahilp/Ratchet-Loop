@@ -67,7 +67,6 @@
 <section class="phead" id="top" aria-labelledby="page-title">
   <div class="phead__bg" aria-hidden="true"><div class="hero__grid" data-depth="0.25"></div><img class="hero__draw" src="assets/blueprint.svg" alt="" width="1200" height="1200" decoding="async" data-depth="0.55"></div>
   <div class="wrap phead__inner">
-    <p class="crumb"><a href="index.html#features">Features</a><span aria-hidden="true">/</span>Feature 08</p>
     <h1 id="page-title" class="phead__title">Specs and CI. <em>Works with what your team uses.</em></h1>
     <p class="lede">If your team writes specs, an agent usually ignores them and makes its own plan. Ratchet builds from your spec and proves each scenario with a test. In CI, it keeps the same checks running.</p>
     <nav class="phead__jump" aria-label="On this page"><a href="#specs">Specs and CI</a></nav>
@@ -75,19 +74,18 @@
 </section>
 <section class="band" id="specs" aria-labelledby="specs-title">
   <div class="wrap">
-    <p class="kicker"><span>01</span>Specs and CI</p>
     <h2 id="specs-title" class="h2">Works with <em>what you already use.</em></h2>
     <div class="pair">
       <div class="pair__card reveal">
-        <p class="mono-k">If your team writes specs</p>
-        <h3>OpenSpec, GitHub Spec Kit, BMAD</h3>
+        <h3>If your team writes specs</h3>
+        <p class="pair__eg-k">OpenSpec, GitHub Spec Kit and BMAD are supported.</p>
         <p>Ratchet builds from your spec instead of writing its own plan. Each scenario gets a test that must pass. Each task goes into a step. If something is left out, the plan says why. As steps pass, Ratchet ticks off the tasks in your spec files.</p>
         <p class="pair__eg"><code>Use Ratchet to build the add-dark-mode change.</code> <code>Use Ratchet to build story 1.3.</code></p>
         <p class="fine">No spec tool? The plan you approve works as the spec.</p>
       </div>
       <div class="pair__card reveal">
-        <p class="mono-k">Keep the checks running in CI</p>
-        <h3>"Ask your agent to set up CI."</h3>
+        <h3>Keep the checks running in CI</h3>
+        <p class="pair__eg-k">Say "Ask your agent to set up CI."</p>
         <p>Ratchet writes a GitHub Actions workflow. It runs your tests and the checks saved during your runs on every push and pull request.</p>
         <p>The AI reviews don't run in CI, because CI machines don't have your AI tools signed in. Ratchet never replaces a workflow you wrote yourself.</p>
       </div>
