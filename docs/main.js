@@ -184,7 +184,7 @@
       'Ratchet runs the tests. At least one has to fail its check. A test that crashes or is skipped does not count. From here on, the planned tests are frozen.',
       'The implementer writes code for this checkpoint only, until the tests pass. It cannot edit the tests.',
       'All planned tests must pass. Ratchet reads each result and checks that no test was deleted.',
-      'Two reviewers compare screenshots of the app and the prototype, in the same state. One checks the look, the other checks the behaviour. Any fixable difference blocks.',
+      'Two reviewers compare screenshots of the app and the prototype, in the same state. One checks the look, the other checks the behavior. Any fixable difference blocks.',
       'Reviewers try to break the code. The fixer answers each finding, then the next round starts. Rounds repeat until no blocking findings remain.',
       'The checkpoint becomes one git commit, and the next checkpoint starts. You approve the whole feature at the end.'
     ];
@@ -289,7 +289,7 @@
       ['Gate 1 · test runner', 'Tests pass', 'Every planned test has to pass. Ratchet reads each result itself and checks that no test was deleted.'],
       ['Gate 2 · screen reviewers', 'Looks right', 'Screenshots of the app are compared with the prototype, in the same state. Any difference that can be fixed sends the step back.'],
       ['Gate 3 · a different AI', 'Review', 'A reviewer from another company tries to break the code. Each finding has to say which users it harms.'],
-      ['Ratchet', 'Lock', 'The step becomes one git commit, and the ratchet turns one tooth. It can\'t turn back.']
+      ['Ratchet', 'Lock', 'The step becomes one git commit, and the ratchet turns one tooth.']
     ];
     const FAIL = ['Gate 3 · a different AI', 'Review, round 1', 'The reviewer finds a bug: a rejection with an empty reason goes through. The step can\'t move on.'];
     const FIX = ['Fixer', 'Fix', 'Makes the reason required and adds a test that proves it. Then the review runs again.'];

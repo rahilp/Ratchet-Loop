@@ -997,3 +997,4 @@ section { position: relative; }
 .pair__eg-k { margin: -4px 0 12px; color: var(--muted); font-size: var(--fs-card); }
 .sim__title, .budget__title { margin: 0; }
 @media (max-width: 520px) { .loop__hash { display: none; } .loop__log li { font-size: 14px; } }
+.hero__title { font-size: clamp(2.1rem, 4.3vw, 3.35rem); max-width: 24ch; }

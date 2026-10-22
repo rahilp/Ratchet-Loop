@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Live viewer · Ratchet Loop</title>
-<meta name="description" content="Long runs bury progress in chat. The viewer shows the whole run on one page.">
+<meta name="description" content="A page for each run with the plan, the tests, every review and every commit.">
 <link rel="canonical" href="https://ratchetloop.github.io/live-viewer.html">
 <meta name="theme-color" content="#FBFAF7">
 <meta name="color-scheme" content="light">
@@ -67,15 +67,15 @@
 <section class="phead" id="top" aria-labelledby="page-title">
   <div class="phead__bg" aria-hidden="true"><div class="hero__grid" data-depth="0.25"></div><img class="hero__draw" src="assets/blueprint.svg" alt="" width="1200" height="1200" decoding="async" data-depth="0.55"></div>
   <div class="wrap phead__inner">
-    <h1 id="page-title" class="phead__title">The live viewer. <em>Watch the run as it happens.</em></h1>
-    <p class="lede">A long run leaves hundreds of messages in your chat, and it's hard to tell where things stand. The viewer puts the whole run on one page.</p>
+    <h1 id="page-title" class="phead__title">See the whole run <em>on one page</em></h1>
+    <p class="lede">A long run produces a lot of chat. The viewer keeps the whole run on one page, so you can see where things stand at a glance.</p>
     <nav class="phead__jump" aria-label="On this page"><a href="#viewer">The viewer</a></nav>
   </div>
 </section>
 <section class="band" id="viewer" aria-labelledby="viewer-title">
   <div class="wrap">
-    <h2 id="viewer-title" class="h2">One page per run. <em>Updated as it works.</em></h2>
-    <p class="lede">Every run writes a viewer: one web page with the plan, the tests, each review round and each commit. It updates while the agent works.</p>
+    <h2 id="viewer-title" class="h2">What the viewer shows</h2>
+    <p class="lede">Every run gets a viewer. It's one web page with the plan, every test, every review round and every commit. You don't need it, since everything also shows up in the chat. But some people like to watch.</p>
 
     <div class="shot reveal" data-shot>
       <div class="shot__bar">
@@ -115,8 +115,8 @@
 <section class="cta" aria-labelledby="cta-title">
   <div class="wrap cta__card">
     <svg class="cta__mark" viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke-linejoin="round" stroke-linecap="round" stroke-width="2.0"><path stroke="#3E6FC4" stroke-opacity=".55" stroke-width="1.20" stroke-dasharray="5 2 1 2" d="M1.5,37 H55.5 M28.5,10 V64"/><circle stroke="#3E6FC4" stroke-opacity=".6" stroke-width="1.20" cx="28.5" cy="37" r="14.8"/><path stroke="#3E6FC4" d="M40.54,23.62 L35.06,14.43 L33.34,14.24 L32.24,19.39 L22.89,14.18 L21.31,14.87 L22.94,19.88 L12.23,20.04 L11.21,21.43 L15.12,24.96 L5.93,30.44 L5.74,32.16 L10.89,33.26 L5.68,42.61 L6.37,44.19 L11.38,42.56 L11.54,53.27 L12.93,54.29 L16.46,50.38 L21.94,59.57 L23.66,59.76 L24.76,54.61 L34.11,59.82 L35.69,59.13 L34.06,54.12 L44.77,53.96 L45.79,52.57 L41.88,49.04 L51.07,43.56 L51.26,41.84 L46.11,40.74 L51.32,31.39 L50.63,29.81 L45.62,31.44 L45.46,20.73 L44.07,19.71Z"/><circle stroke="#3E6FC4" cx="28.5" cy="37" r="4.2"/><path stroke="#E8572A" d="M33.91,7.11 L38.05,20.29 L40.95,23.18 L42.13,21.15 L40.55,5.64Z"/><circle stroke="#E8572A" fill="#FBFAF7" cx="37.23" cy="6.38" r="3.6"/><circle fill="#E8572A" stroke="none" cx="37.23" cy="6.38" r="1.2"/></g></svg>
-    <h2 id="cta-title" class="cta__title">Know it works <em>before you merge.</em></h2>
-    <p class="lede">Paste one prompt to install. Describe a feature to build it.</p>
+    <h2 id="cta-title" class="cta__title">Try it on your next feature</h2>
+    <p class="lede">Ask your agent to install it. Then tell it what you want to build.</p>
     <div class="hero__ctas">
       <button class="btn btn--primary" type="button" data-copy="Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI."><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" d="M8 8h11v11H8zM5 16V5h11"/></svg><span data-copy-label>Copy the install prompt</span></button>
       <a class="btn btn--ghost" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>Read the docs on GitHub</a>
@@ -136,7 +136,7 @@
   <nav class="foot__map" aria-label="All pages">
     <a href="how-it-works.html">How it works</a><a href="gates.html">Gates and safeguards</a><a href="reviewers.html">Second opinion</a><a href="live-viewer.html">Live viewer</a><a href="cost.html">Cost control</a><a href="control.html">You stay in control</a><a href="setup.html">Learns your project</a><a href="specs.html">Specs and CI</a><a href="install.html">Install</a>
   </nav>
-  <p class="foot__tag">Your coding agent, one checked step at a time. Made by <a href="https://github.com/rahilp" rel="noopener">Rahil Pirani</a></p>
+  <p class="foot__tag">Made by <a href="https://github.com/rahilp" rel="noopener">Rahil Pirani</a></p>
 </footer>
 
 <div class="toast" role="status" aria-live="polite" data-toast></div>

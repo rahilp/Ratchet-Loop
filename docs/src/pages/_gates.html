@@ -22,8 +22,8 @@
       </div>
     </div>
     <div class="gates__list">
-      <h2 id="gates-title" class="h2">Four gates. <em>Always in this order.</em></h2>
-      <p class="lede">The gates run in a fixed order, and a step can't move on until each one passes. Gates 1 to 3 run on every checkpoint. Gate 4 is you, at the end. A step with no screen change, like an API change, skips gate 2.</p>
+      <h2 id="gates-title" class="h2">The four gates, in order</h2>
+      <p class="lede">A step can't move on until each gate passes. Gates 1 to 3 run on every step. Gate 4 is you, at the end. A step with nothing to look at, like an API change, skips gate 2.</p>
       <article class="gate" data-gate="1">
         <header><span class="gate__n">Gate 1</span><span class="gate__state" data-state>Waiting</span></header>
         <h3>Tests</h3>
@@ -36,7 +36,7 @@
         <h3>Looks right</h3>
         <dl class="gate__rule"><div><dt>Has to be true</dt><dd>The screen matches the prototype, or the old screen when rebuilding one, in the same state.</dd></div>
         <div><dt>How Ratchet makes sure</dt><dd>Both are opened in a browser, put in the same state and screenshotted after the same actions. Two reviewers list every difference. Any difference that can be fixed in code blocks the checkpoint.</dd></div></dl>
-        <ul><li>One reviewer checks the look. The other checks behaviour: clicks, typing and errors.</li><li>Reviewers see only the screenshots and the design file. They never see the code or the chat.</li><li>If the two screenshots don't show the same moment, they are taken again.</li></ul>
+        <ul><li>One reviewer checks the look. The other checks behavior: clicks, typing and errors.</li><li>Reviewers see only the screenshots and the design file. They never see the code or the chat.</li><li>If the two screenshots don't show the same moment, they are taken again.</li></ul>
       </article>
       <article class="gate" data-gate="3">
         <header><span class="gate__n">Gate 3</span><span class="gate__state" data-state>Waiting</span></header>

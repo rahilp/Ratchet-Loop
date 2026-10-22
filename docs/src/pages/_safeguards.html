@@ -1,7 +1,7 @@
 <section class="band" id="safeguards" aria-labelledby="safe-title">
   <div class="wrap">
-    <h2 id="safe-title" class="h2">Eight safeguards. <em>Run by hooks.</em></h2>
-    <p class="lede">When a step is hard, an agent takes shortcuts. It deletes a failing test, edits a test until it passes, or approves its own review. Hooks stop that. A hook is a small program your CLI runs before and after the agent acts. Ratchet's hooks check each action against these rules.</p>
+    <h2 id="safe-title" class="h2">What the hooks stop the agent from doing</h2>
+    <p class="lede">Hooks are small programs your CLI runs before and after the agent acts. Ratchet uses them to check each action, so the agent can't delete a failing test, edit a test until it passes, or approve its own review.</p>
     <div class="rules">
       <div class="rule reveal"><span>R1</span><h3>Results come from Ratchet</h3><p>The agent can't report that tests pass. Ratchet runs them. Reviewers can't report approval. Ratchet decides the verdict from their findings.</p></div>
       <div class="rule reveal"><span>R2</span><h3>Tests come first</h3><p>A test that passes before the feature exists is rejected.</p></div>

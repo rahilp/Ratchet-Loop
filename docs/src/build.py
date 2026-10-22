@@ -20,7 +20,7 @@ FAQ = [
     ("How long does it take?",
      "A small feature usually takes 20 to 60 minutes. Bigger ones take longer. The agent works on its own, so you don't have to watch."),
     ("Is it expensive?",
-     "It uses more AI time than letting the agent write code unchecked. Ratchet keeps it in check. It limits review rounds per step and per run, uses one reviewer for low-risk steps and cheaper models for simple jobs. It never uses a pay-per-use tool without your OK."),
+     "It uses more AI time than letting the agent write code unchecked. To keep that down, Ratchet limits review rounds per step and per run. It uses one reviewer for low-risk steps and cheaper models for simple jobs. It never uses a pay-per-use tool without your OK."),
     ("Do I need other AI tools installed?",
      "No. Without them, Ratchet uses a different model from the same company. If you have another tool set up, like Codex, Gemini, Copilot, Cursor or OpenCode, that tool reviews first. A model from another company spots different mistakes."),
     ("Where does my code go?",
@@ -40,7 +40,7 @@ FAQ = [
 AGENTS = [
     ("app-scout", "App scout", "Plan", "Checks the app runs, finds the test runner and start command, and drafts coding standards if you have none."),
     ("checkpoint-planner", "Checkpoint planner", "Plan", "Splits the feature into small, ordered checkpoints, each with a plain “done when” list and the gates that apply."),
-    ("design-system", "Design system", "Plan", "Writes DESIGN.md, a file with the exact colours, fonts and spacing of your app."),
+    ("design-system", "Design system", "Plan", "Writes DESIGN.md, a file with the exact colors, fonts and spacing of your app."),
     ("prototyper", "Prototyper", "Plan", "Builds a clickable prototype for you to try. You approve it before the real build starts."),
     ("test-planner", "Test planner", "Plan", "Plans each checkpoint’s test cases before any code exists."),
     ("test-writer", "Test writer", "Build", "Turns the planned cases into real tests, written before the code, so at least one fails first."),
@@ -49,7 +49,7 @@ AGENTS = [
     ("fixer", "Fixer", "Build", "Fixes every open review finding, or rebuts a wrong one with evidence. Never weakens a test."),
     ("adversary", "Adversary", "Review", "Assumes the code is wrong and tries to prove it. Approves only by finding nothing."),
     ("visual-reviewer", "Visual reviewer", "Review", "Compares screenshots with the design. Lists each difference it sees, and where."),
-    ("behavior-reviewer", "Behaviour reviewer", "Review", "Clicks through the same journey on both and lists every difference in how they respond."),
+    ("behavior-reviewer", "Behavior reviewer", "Review", "Clicks through the same journey on both and lists every difference in how they respond."),
     ("variant-writer", "Variant writer", "Review", "Hides the same mistake in new code, to prove a new check really catches it."),
 ]
 
@@ -88,14 +88,14 @@ ICONS = {
 FONTS = "https://fonts.googleapis.com/css2?family=Geist:wght@300..700&family=Geist+Mono:wght@400;500&display=swap"
 INSTALL_PROMPT = "Please install Ratchet Loop from https://github.com/rahilp/Ratchet-Loop and set it up for this CLI."
 
-# What Ratchet creates in a project. The excerpts are short examples of each file, labelled as examples on the page.
+# What Ratchet creates in a project. The excerpts are short examples of each file, labeled as examples on the page.
 SETUP = [
     ("DESIGN.md", "Design file", "Your app's look, written down exactly",
-     "Colours, fonts, sizes and spacing. It also shows how each button and field looks when it is normal, hovered, turned off or showing an error. The prototype, the code and the reviewers all use it. So a button looks the same every time.",
+     "Colors, fonts, sizes and spacing. It also shows how each button and field looks when it is normal, hovered, turned off or showing an error. The prototype, the code and the reviewers all use it. So a button looks the same every time.",
      ["For an app you already have, it reads your styles and writes down what you use. It also notes where the app doesn't match itself.",
-      "For a new app, it asks who it's for, the feel you want and any brand colour. Then it picks exact values that are easy to read."],
+      "For a new app, it asks who it's for, the feel you want and any brand color. Then it picks exact values that are easy to read."],
      "DESIGN.md",
-     ["## Colours", "--primary   #2F5FB3   buttons, links", "--danger    #C2410C   destructive actions", "",
+     ["## Colors", "--primary   #2F5FB3   buttons, links", "--danger    #C2410C   destructive actions", "",
       "## Button · primary", "default    bg --primary · text #FFFFFF · radius 8px", "hover      bg #284F96", "disabled   bg #C9D3E6 · text #6B7280"]),
     (".ratchet/standards.md", "Coding standards", "The rules reviewers check the code against",
      "Where each kind of code goes, how errors are handled, how things are named, and security. If you don't have written rules yet, the agent writes 15 to 40 based on your code. Each one points to a real file as an example.",
@@ -222,7 +222,7 @@ def pawl_geom(cx, cy, rr, A, along, out, w0, scale=1.0):
 
 
 def mark_wire(sw=2.0, detail=True, bg="#FBFAF7"):
-    """Blueprint version of the mark: drafting linework, dashed centre lines, orange pawl."""
+    """Blueprint version of the mark: drafting linework, dashed center lines, orange pawl."""
     cx, cy, rr, rt, A = 28.5, 37, 18, 23.5, math.radians(48)
     wheel = pts_path(saw(cx, cy, rr, rt, 12, rot=A))
     pawl, piv, _ = pawl_geom(cx, cy, rr, A, 14, 10, 3.4)
@@ -273,37 +273,37 @@ def minify_css(css):
 
 FEATURES = [
     # slug, card title, card text, page h1, h1 accent, page lede, sections on the page, icon path
-    ("how-it-works", "How it works", "Agents build a whole feature at once. Ratchet builds it one checked step at a time.",
-     "How it works.", "One sentence in. A reviewed feature out.",
-     "Ask an agent for a feature and it usually builds all of it, then tells you it works. If something broke along the way, you find out at the end. Ratchet builds the feature one small step at a time, and checks each step before the next one starts.",
+    ("how-it-works", "How it works", "From a one-line request to a finished, reviewed feature, one step at a time.",
+     "How Ratchet Loop", "builds a feature",
+     "You describe a feature in a sentence or two. The agent plans it as a short list of steps and shows you the plan. Once you say yes, each step is built and checked before the next one starts, and you try the finished feature at the end.",
      ["idea", "run", "checkpoint"], "M4 6h16M4 12h10M4 18h6"),
-    ("gates", "Four gates and safeguards", "Agents skip checks when nothing stops them. Four gates and hooks make every step pass.",
-     "Four gates.", "The agent can't skip one.",
-     "Agents skip checks when nothing stops them. They write tests after the code, or call a screen done without looking at it. Ratchet puts four gates on every step, and hooks in your CLI stop the agent from going around them.",
+    ("gates", "Gates and safeguards", "The four checks every step goes through, and the hooks that stop the agent from skipping them.",
+     "The four checks", "every step has to pass",
+     "Every step goes through the same checks, in the same order. Hooks in your CLI watch what the agent does, so it can't skip a check or quietly weaken one.",
      ["gates", "safeguards"], "M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"),
-    ("reviewers", "A second opinion", "An AI misses its own mistakes. A different AI reviews every step.",
-     "A second opinion.", "From a different AI.",
-     "An AI that checks its own code tends to miss its own mistakes. So Ratchet has a different AI review every step. If you have a tool from another company, that one goes first.",
+    ("reviewers", "A second opinion", "Every step is reviewed by a different AI. If you have one from another company, it goes first.",
+     "Reviews from", "a different AI",
+     "A model that reviews its own code tends to miss what it missed the first time. So each step is reviewed by a different model. If you have an AI from another company set up, that one goes first.",
      ["reviewers", "agents"], "M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM16 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM3 20c0-3 2.5-5 5-5s5 2 5 5M11 20c0-3 2.5-5 5-5s5 2 5 5"),
-    ("live-viewer", "Live viewer", "Long runs bury progress in chat. The viewer shows the whole run on one page.",
-     "The live viewer.", "Watch the run as it happens.",
-     "A long run leaves hundreds of messages in your chat, and it's hard to tell where things stand. The viewer puts the whole run on one page.",
+    ("live-viewer", "Live viewer", "A page for each run with the plan, the tests, every review and every commit.",
+     "See the whole run", "on one page",
+     "A long run produces a lot of chat. The viewer keeps the whole run on one page, so you can see where things stand at a glance.",
      ["viewer"], "M3 5h18v14H3zM3 9h18M7 7h.01"),
-    ("cost", "Cost control", "More checking means more AI time. Hard limits keep the cost steady.",
-     "Cost control.", "Limits you set.",
-     "Checking every step uses more AI time than not checking. Without limits, a step that keeps failing review keeps costing you. Ratchet caps the rounds and spends them where the risk is.",
+    ("cost", "Cost control", "Limits on review rounds, so checking every step doesn't run up your bill.",
+     "Checking every step,", "within limits you set",
+     "Checking every step uses more AI time than letting an agent run unchecked. So Ratchet puts hard limits on review rounds. It only adds reviewers where a step is risky, and it never touches a pay-per-use tool without your OK.",
      ["cost"], "M4 18h16M7 18V9M12 18V5M17 18v-6"),
-    ("control", "You stay in control", "Agents take \"ok\" as a yes. Ratchet waits for a clear one and records every decision.",
-     "You stay in control.", "Ratchet waits for your yes.",
-     "Agents often treat \"ok\" or a thumbs-up as permission to keep going. Ratchet only moves on after a clear yes, and it writes down every decision you make.",
+    ("control", "You stay in control", "Ratchet only moves on when you clearly say yes, and it keeps a record of what you decided.",
+     "Nothing moves on", "without your yes",
+     "You talk to Ratchet the way you already talk to your agent. It moves on only when you clearly approve, writes down what you decided, and gives you a short receipt for your pull request.",
      ["talk", "receipt"], "M12 8v4l3 2M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z"),
-    ("setup", "Learns your project", "Agents forget your app between chats. Ratchet writes it down once, for every run.",
-     "Learns your project.", "Tell it once.",
-     "In every new chat, the agent forgets how your app looks and what you told it last time, so you repeat yourself. Ratchet writes these things down, and every agent reads them before it starts.",
+    ("setup", "Learns your project", "Your design, coding rules and feedback, written down once and used on every run.",
+     "Ratchet remembers", "how your project works",
+     "Ratchet keeps a few plain files in your project: your design, your coding rules, a prototype for new screens and the feedback you've given. Every agent reads them before it starts. You shouldn't have to say the same thing twice.",
      ["setup"], "M6 3h9l3 3v15H6zM9 9h6M9 13h6M9 17h4"),
-    ("specs", "Specs and CI", "Agents ignore your specs. Ratchet builds from them and keeps the checks running in CI.",
-     "Specs and CI.", "Works with what your team uses.",
-     "If your team writes specs, an agent usually ignores them and makes its own plan. Ratchet builds from your spec and proves each scenario with a test. In CI, it keeps the same checks running.",
+    ("specs", "Specs and CI", "Build from OpenSpec, Spec Kit or BMAD, and keep the same checks running in GitHub Actions.",
+     "Build from your spec,", "check it in CI",
+     "If your team already writes specs in OpenSpec, Spec Kit or BMAD, Ratchet builds from them and proves each scenario with a test. It can also set up GitHub Actions, so the same checks keep running after you merge.",
      ["specs"], "M8 4l-5 8 5 8M16 4l5 8-5 8"),
 ]
 PAGE_SUFFIX = " · Ratchet Loop"
@@ -441,7 +441,7 @@ def main():
     for k, (slug, card_title, card_text, h1, accent, lede, ids, _icon) in enumerate(FEATURES):
         body = page_header(k + 1, h1, accent, lede, ids, slug) + sections_html(ids) + next_nav(k)
         pages.append((f"{slug}.html", card_title + PAGE_SUFFIX, card_text, body, "", "", slug))
-    body = page_header(0, "Install once.", "Then just ask.", "Install Ratchet once per computer. After that, you use it in any project by talking to your agent.",
+    body = page_header(0, "Install Ratchet Loop", "in three messages", "It takes three short messages to your agent. You don't need to clone anything or edit any config by hand.",
                        ["install", "faq"], "install") + sections_html(["install", "faq"])
     pages.append(("install.html", "Install" + PAGE_SUFFIX, "Add Ratchet Loop to Claude Code, Codex, Gemini CLI or Copilot CLI. It takes three short messages to your agent.", body, "", "", "install"))
 

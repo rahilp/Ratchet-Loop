@@ -1,31 +1,31 @@
 <!-- ============ THE STORY ============ -->
 <section class="band" id="why" aria-labelledby="why-title">
   <div class="wrap">
-    <h2 id="why-title" class="h2">Agents are fast. <em>Checking them is slow.</em></h2>
+    <h2 id="why-title" class="h2">Stop checking your agent's work by hand</h2>
     <div class="prose">
-      <p>When a coding agent builds a feature, the same agent writes the tests, runs them and decides when it's done. Nothing stops it from writing tests that already pass, or calling a screen finished without looking at it. On a feature with eight steps, the mistakes pile up, and you find them at the end.</p>
-      <p>Ratchet Loop does that checking for you. It splits the feature into small steps, and each step has to pass four gates before the next one starts: its tests, a check against the design, a review by a different AI, and finally your OK. Hooks in your CLI stop the agent from skipping any of them.</p>
+      <p>Coding agents are fast, but they'll tell you something works when it doesn't. The same agent writes the tests, runs them and decides it's finished. So the gaps show up later, when you try the feature yourself.</p>
+      <p>With Ratchet, your agent splits the feature into small steps and builds them one at a time. A step can't start until the last one has passed its checks. If a check fails, the agent fixes the problem and tries again. It can't argue its way past.</p>
     </div>
     <div class="why">
       <article class="why__card reveal">
         <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h10M11 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 5v14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
-        <h3>Leave the agent to work</h3>
-        <p>You approve the plan and try the result. In between, it works on its own and posts a one-line update after each step.</p>
+        <h3>Walk away while it builds</h3>
+        <p>You OK the plan and try the result at the end. In between, you get a one-line update as each step lands.</p>
       </article>
       <article class="why__card reveal">
         <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M8.5 12.2l2.4 2.4 4.6-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-        <h3>Trust it when it says done</h3>
-        <p>A step only counts as done after its tests pass, its screens match the design and a second AI has reviewed the code.</p>
+        <h3>“Done” means checked</h3>
+        <p>A step only counts once its tests pass, the screen matches the design and a second AI has reviewed it.</p>
       </article>
       <article class="why__card reveal">
         <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16 16l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
-        <h3>Catch bugs where they start</h3>
-        <p>Each step is checked and committed before the next one starts, so a bug can't hide under later work. Any step can be undone on its own.</p>
+        <h3>Find a bug in the step that made it</h3>
+        <p>Every step is its own git commit. If something breaks, you know where, and you can undo just that step.</p>
       </article>
       <article class="why__card reveal">
         <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 18h16M7 18V9M12 18V5M17 18v-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
-        <h3>Keep the cost in check</h3>
-        <p>Review rounds are capped per step and per run. Paid tools are never used without your OK. When the agent gets stuck, it stops and asks you.</p>
+        <h3>Keep review costs in check</h3>
+        <p>Review rounds have limits per step and per run. Paid tools are never used unless you say so. If the agent gets stuck, it stops and asks you.</p>
       </article>
     </div>
   </div>
@@ -38,15 +38,14 @@
 <!-- ============ AN EXAMPLE ============ -->
 <section class="band" id="example" aria-labelledby="example-title">
   <div class="wrap">
-    <h2 id="example-title" class="h2">What happens when <em>the agent misses a bug?</em></h2>
+    <h2 id="example-title" class="h2">What happens when the agent misses something?</h2>
     <div class="prose">
-      <p>Take the example of a manager rejecting a leave request. The agent adds a Reject button, writes tests, and they all pass. But it forgot to make the reason required.</p>
-      <p>Here is the same step, built twice.</p>
+      <p>Say you ask for this: managers can reject a leave request, with a reason. The agent adds the button and writes some tests. They pass, because it wrote them after the code. It never checked that the reason is required.</p>
+      <p>Here's that step built twice.</p>
     </div>
 {{CASE}}
     <div class="prose prose--after">
-      <p>On its own, the agent finishes first, reports success, and the bug ships.</p>
-      <p>With Ratchet, a reviewer from another company finds the bug. The fix comes with a new test, and the step is saved as its own commit before the next one starts.</p>
+      <p>On its own, the agent finishes first and the bug ships. With Ratchet, the reviewer catches it, the fix comes with its own test, and the step is committed before the next one starts.</p>
     </div>
   </div>
 </section>
@@ -54,8 +53,8 @@
 <!-- ============ MORE THAN TDD ============ -->
 <section class="band band--alt" id="tdd" aria-labelledby="tdd-title">
   <div class="wrap">
-    <h2 id="tdd-title" class="h2">Isn't this <em>just TDD?</em></h2>
-    <p class="lede">TDD is one of the four gates. Asking an agent to use TDD helps, but the agent still runs its own tests, reports its own results and decides when it's done. Ratchet takes those jobs away from it.</p>
+    <h2 id="tdd-title" class="h2">Isn't this just TDD?</h2>
+    <p class="lede">Tests first is part of it. It's gate 1. But when you ask an agent to do TDD, it still runs its own tests and decides when it's done. Ratchet runs the tests itself, won't let them be edited to pass, and adds three more checks after them.</p>
     <div class="vs reveal" role="table" aria-label="Prompting an agent, agent with TDD, and Ratchet Loop compared">
       <div class="vs__row vs__row--head" role="row"><span role="columnheader"></span><span role="columnheader">Prompting an agent</span><span role="columnheader">Agent doing TDD</span><span role="columnheader">Ratchet Loop</span></div>
       <div class="vs__row" role="row"><b role="rowheader">Tests written before the code</b><i class="n" role="cell">No</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes, and one must fail first</i></div>
@@ -75,8 +74,8 @@
 <!-- ============ FEATURES ============ -->
 <section class="band" id="features" aria-labelledby="features-title">
   <div class="wrap">
-    <h2 id="features-title" class="h2">Eight features. <em>One loop.</em></h2>
-    <p class="lede">Each one fixes a problem you hit when agents build features. Each has its own page.</p>
+    <h2 id="features-title" class="h2">What's in it</h2>
+    <p class="lede">Each part has its own page with the details.</p>
     <div class="feats">
 {{FEATURE_CARDS}}
     </div>
@@ -86,7 +85,7 @@
 <!-- ============ WORKS WHERE YOU WORK ============ -->
 <section class="band band--alt" id="start" aria-labelledby="start-title">
   <div class="wrap">
-    <h2 id="start-title" class="h2">Pick your CLI. <em>Install in three messages.</em></h2>
+    <h2 id="start-title" class="h2">Works in the CLI you already use</h2>
     <ul class="clis" aria-label="Supported coding agents">
       <li><b>Claude Code</b><span>All checks, including which reviewer wrote each review</span></li>
       <li><b>Codex</b><span>Hooks, gates and records</span></li>
