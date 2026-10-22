@@ -179,9 +179,9 @@
     const STAGE_MS = 2800;
     const NAMES = ['Plan tests', 'Write tests', 'Red', 'Build', 'Green', 'Looks right', 'Review', 'Lock'];
     const TEXT = [
-      'The test planner writes test cases before any code exists. They cover the normal path, edge cases, permissions and errors.',
+      'The test planner writes the test cases first, before any code. They cover the normal path, edge cases, who is allowed to do what, and errors.',
       'The test writer turns each case into a runnable test, tagged with its case ID. There is no feature code yet.',
-      'Ratchet runs the tests. At least one must fail on an assertion. A test that crashes or is skipped does not count. From here on, the planned tests are frozen.',
+      'Ratchet runs the tests. At least one has to fail its check. A test that crashes or is skipped does not count. From here on, the planned tests are frozen.',
       'The implementer writes code for this checkpoint only, until the tests pass. It cannot edit the tests.',
       'All planned tests must pass. Ratchet reads each result and checks that no test was deleted.',
       'Two reviewers compare screenshots of the app and the prototype, in the same state. One checks the look, the other checks the behaviour. Any fixable difference blocks.',

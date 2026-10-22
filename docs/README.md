@@ -11,6 +11,7 @@ All asset paths are relative, so the same files also work from this repository's
 ## Edit
 
 - Copy and layout: the page parts in `src/pages/` (`home.html`, `_hero.html` and one `_<section>.html` per section). The feature list, FAQ, agents and setup files are data in `src/build.py`. Run `python3 docs/src/build.py` to regenerate the home page, the eight feature pages, `install.html`, the sitemap and `styles.min.css`. The build also draws the ratchet wheel, logo and favicon, and quotes each agent's real definition from `agents/*.md`, so re-run it after changing an agent's frontmatter.
+- Reading level: all copy is written at an 8th grade level or below. After building, run `python3 docs/src/readability.py`. It lists any paragraph that scores above grade 8.
 - Styles: `styles.css`. Colours, fonts and the type scale (`--fs-*`) are tokens at the top. Headings and body use Geist; Geist Mono is only for code, file names and IDs. Cards use the shadow tokens (`--e1` to `--e3`) instead of borders.
 - Behaviour: `main.js` (parallax, the one-way scroll ratchet, the equation replay, the run walkthrough, the checkpoint simulator, the card grids, the yes checker, mobile menu, video source choice, copy buttons).
 

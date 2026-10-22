@@ -89,8 +89,8 @@
         <div class="tpanel__top"><span class="tpanel__big">S1</span><span class="pill pill--static">DESIGN.md</span></div>
         <h3>Design file</h3>
         <p class="tpanel__lead">Your app&#x27;s look, written down exactly</p>
-        <p class="tpanel__body">Colours, fonts, sizes, spacing and corner radius, plus how each component looks when normal, hovered, disabled or in error. The prototype, the code and the screen reviewers all use it, so a button looks the same every time.</p>
-        <ul class="ticks"><li>For an existing app, it reads your styles and writes down what you use, including where the app is inconsistent.</li><li>For a new app, it asks who it&#x27;s for, the feel you want and any brand colour. Then it picks exact values that are easy to read.</li></ul>
+        <p class="tpanel__body">Colours, fonts, sizes and spacing. It also shows how each button and field looks when it is normal, hovered, turned off or showing an error. The prototype, the code and the reviewers all use it. So a button looks the same every time.</p>
+        <ul class="ticks"><li>For an app you already have, it reads your styles and writes down what you use. It also notes where the app doesn&#x27;t match itself.</li><li>For a new app, it asks who it&#x27;s for, the feel you want and any brand colour. Then it picks exact values that are easy to read.</li></ul>
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>DESIGN.md</span><em>example</em></div>
           <pre class="code__body"><span><i>01</i>## Colours</span><span><i>02</i>--primary   #2F5FB3   buttons, links</span><span><i>03</i>--danger    #C2410C   destructive actions</span><span><i>04</i></span><span><i>05</i>## Button · primary</span><span><i>06</i>default    bg --primary · text #FFFFFF · radius 8px</span><span><i>07</i>hover      bg #284F96</span><span><i>08</i>disabled   bg #C9D3E6 · text #6B7280</span></pre>
@@ -101,7 +101,7 @@
         <div class="tpanel__top"><span class="tpanel__big">S2</span><span class="pill pill--static">.ratchet/standards.md</span></div>
         <h3>Coding standards</h3>
         <p class="tpanel__lead">The rules reviewers check the code against</p>
-        <p class="tpanel__body">Where business logic lives, how errors are handled, naming, imports and security. If you have no written standards, the agent drafts 15 to 40 from your existing code, each with a real file as an example.</p>
+        <p class="tpanel__body">Where each kind of code goes, how errors are handled, how things are named, and security. If you don&#x27;t have written rules yet, the agent writes 15 to 40 based on your code. Each one points to a real file as an example.</p>
         <ul class="ticks"><li>It is marked as a draft. Change anything you disagree with.</li></ul>
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>standards.md</span><em>example</em></div>
@@ -138,7 +138,7 @@
         <h3>Automatic checks</h3>
         <p class="tpanel__lead">Mistakes that keep coming back get caught in seconds</p>
         <p class="tpanel__body">Reviewers tag each finding with the type of mistake. When the same type shows up twice, the agent offers to turn it into an automatic check, like a lint rule. The check is built as its own step and passes every gate.</p>
-        <ul class="ticks"><li>Before it is used, it must catch a bad example and the original mistake, and pass on today&#x27;s code.</li><li>For security, data or money mistakes, a separate agent that never sees the check tries to slip disguised versions past it.</li></ul>
+        <ul class="ticks"><li>Before the check is used, it has to catch a bad example and the first mistake it was made for. It also has to pass on the code you have today.</li><li>For mistakes with security, data or money, another agent tries to sneak hidden copies of the mistake past the check. That agent never gets to see the check.</li></ul>
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>no-db-in-routes.check</span><em>example</em></div>
           <pre class="code__body"><span><i>01</i>rule:    routes may not import the database client</span><span><i>02</i>why:     found twice in review (CP2, CP4)</span><span><i>03</i>proven:  catches bad-example.ts and the CP4 code</span><span><i>04</i>         passes on the current code</span><span><i>05</i>runs:    with your tests, and in CI</span></pre>
@@ -186,7 +186,7 @@
   <nav class="foot__map" aria-label="All pages">
     <a href="how-it-works.html">How it works</a><a href="gates.html">Gates and safeguards</a><a href="reviewers.html">Second opinion</a><a href="live-viewer.html">Live viewer</a><a href="cost.html">Cost control</a><a href="control.html">You stay in control</a><a href="setup.html">Learns your project</a><a href="specs.html">Specs and CI</a><a href="install.html">Install</a>
   </nav>
-  <p class="foot__tag">Checkpoint-and-gate building for AI coding agents · by <a href="https://github.com/rahilp" rel="noopener">Rahil Pirani</a></p>
+  <p class="foot__tag">Your coding agent, one checked step at a time. Made by <a href="https://github.com/rahilp" rel="noopener">Rahil Pirani</a></p>
 </footer>
 
 <div class="toast" role="status" aria-live="polite" data-toast></div>

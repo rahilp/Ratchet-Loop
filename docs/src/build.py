@@ -16,13 +16,13 @@ TAU = math.tau
 
 FAQ = [
     ("Which coding agents does it work with?",
-     "Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. Install it once on your computer for each CLI you use. Claude Code has the strongest safeguards, because its hooks can tell which agent is acting. The Gates page lists what each CLI enforces."),
+     "Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. Install it once on your computer for each CLI you use. Claude Code has the strongest safeguards, because its hooks can tell which agent is acting. The Gates page shows what each CLI checks."),
     ("How long does it take?",
      "A small feature usually takes 20 to 60 minutes. Bigger ones take longer. The agent works on its own, so you don't have to watch."),
     ("Is it expensive?",
      "It uses more AI time than letting the agent write code unchecked. Ratchet keeps it in check. It limits review rounds per step and per run, uses one reviewer for low-risk steps and cheaper models for simple jobs. It never uses a pay-per-use tool without your OK."),
     ("Do I need other AI tools installed?",
-     "No. Without them, Ratchet uses a different model from the same company. If you have another tool signed in, like Codex, Gemini, Copilot, Cursor or OpenCode, it reviews first. A model from another company catches different mistakes."),
+     "No. Without them, Ratchet uses a different model from the same company. If you have another tool set up, like Codex, Gemini, Copilot, Cursor or OpenCode, that tool reviews first. A model from another company spots different mistakes."),
     ("Where does my code go?",
      "Into your project, with one git commit per finished step. If you're on your main branch or have unsaved changes, the agent offers to make a new branch first. Ratchet keeps its notes in a .ratchet/ folder."),
     ("Can I stop halfway?",
@@ -39,18 +39,18 @@ FAQ = [
 # Ratchet's agents in hand-off order. The detail panel quotes each agent's real definition file.
 AGENTS = [
     ("app-scout", "App scout", "Plan", "Checks the app runs, finds the test runner and start command, and drafts coding standards if you have none."),
-    ("checkpoint-planner", "Checkpoint planner", "Plan", "Splits the feature into small, ordered checkpoints, each with plain “done when” criteria and the gates that apply."),
-    ("design-system", "Design system", "Plan", "Writes DESIGN.md: exact colours, type, spacing and every state of every component."),
-    ("prototyper", "Prototyper", "Plan", "Builds a clickable prototype from DESIGN.md for you to approve before anything is built."),
+    ("checkpoint-planner", "Checkpoint planner", "Plan", "Splits the feature into small, ordered checkpoints, each with a plain “done when” list and the gates that apply."),
+    ("design-system", "Design system", "Plan", "Writes DESIGN.md, a file with the exact colours, fonts and spacing of your app."),
+    ("prototyper", "Prototyper", "Plan", "Builds a clickable prototype for you to try. You approve it before the real build starts."),
     ("test-planner", "Test planner", "Plan", "Plans each checkpoint’s test cases before any code exists."),
     ("test-writer", "Test writer", "Build", "Turns the planned cases into real tests, written before the code, so at least one fails first."),
     ("implementer", "Implementer", "Build", "Writes the code for exactly one checkpoint. Never edits tests."),
     ("test-runner", "Test runner", "Build", "Runs Gate 1 and, when it fails, returns a short diagnosis instead of a wall of logs."),
     ("fixer", "Fixer", "Build", "Fixes every open review finding, or rebuts a wrong one with evidence. Never weakens a test."),
     ("adversary", "Adversary", "Review", "Assumes the code is wrong and tries to prove it. Approves only by finding nothing."),
-    ("visual-reviewer", "Visual reviewer", "Review", "Compares screenshots against the reference and lists every visual difference, with where it is."),
+    ("visual-reviewer", "Visual reviewer", "Review", "Compares screenshots with the design. Lists each difference it sees, and where."),
     ("behavior-reviewer", "Behaviour reviewer", "Review", "Clicks through the same journey on both and lists every difference in how they respond."),
-    ("variant-writer", "Variant writer", "Review", "Writes disguised bad code to prove a new automatic check really catches the mistake."),
+    ("variant-writer", "Variant writer", "Review", "Hides the same mistake in new code, to prove a new check really catches it."),
 ]
 
 
@@ -91,14 +91,14 @@ INSTALL_PROMPT = "Please install Ratchet Loop from https://github.com/rahilp/Rat
 # What Ratchet creates in a project. The excerpts are short examples of each file, labelled as examples on the page.
 SETUP = [
     ("DESIGN.md", "Design file", "Your app's look, written down exactly",
-     "Colours, fonts, sizes, spacing and corner radius, plus how each component looks when normal, hovered, disabled or in error. The prototype, the code and the screen reviewers all use it, so a button looks the same every time.",
-     ["For an existing app, it reads your styles and writes down what you use, including where the app is inconsistent.",
+     "Colours, fonts, sizes and spacing. It also shows how each button and field looks when it is normal, hovered, turned off or showing an error. The prototype, the code and the reviewers all use it. So a button looks the same every time.",
+     ["For an app you already have, it reads your styles and writes down what you use. It also notes where the app doesn't match itself.",
       "For a new app, it asks who it's for, the feel you want and any brand colour. Then it picks exact values that are easy to read."],
      "DESIGN.md",
      ["## Colours", "--primary   #2F5FB3   buttons, links", "--danger    #C2410C   destructive actions", "",
       "## Button · primary", "default    bg --primary · text #FFFFFF · radius 8px", "hover      bg #284F96", "disabled   bg #C9D3E6 · text #6B7280"]),
     (".ratchet/standards.md", "Coding standards", "The rules reviewers check the code against",
-     "Where business logic lives, how errors are handled, naming, imports and security. If you have no written standards, the agent drafts 15 to 40 from your existing code, each with a real file as an example.",
+     "Where each kind of code goes, how errors are handled, how things are named, and security. If you don't have written rules yet, the agent writes 15 to 40 based on your code. Each one points to a real file as an example.",
      ["It is marked as a draft. Change anything you disagree with."],
      "standards.md",
      ["## S-07  Business logic lives in services/", "Route handlers check the input and call a service.", "They never talk to the database directly.", "Example: src/services/leave.ts", "", "Status: draft · edit anything you disagree with"]),
@@ -116,8 +116,8 @@ SETUP = [
       "- Accepted: long names may wrap to two lines in the table.", "  Your reason: it only affects a rare case."]),
     ("checks/", "Automatic checks", "Mistakes that keep coming back get caught in seconds",
      "Reviewers tag each finding with the type of mistake. When the same type shows up twice, the agent offers to turn it into an automatic check, like a lint rule. The check is built as its own step and passes every gate.",
-     ["Before it is used, it must catch a bad example and the original mistake, and pass on today's code.",
-      "For security, data or money mistakes, a separate agent that never sees the check tries to slip disguised versions past it."],
+     ["Before the check is used, it has to catch a bad example and the first mistake it was made for. It also has to pass on the code you have today.",
+      "For mistakes with security, data or money, another agent tries to sneak hidden copies of the mistake past the check. That agent never gets to see the check."],
      "no-db-in-routes.check",
      ["rule:    routes may not import the database client", "why:     found twice in review (CP2, CP4)", "proven:  catches bad-example.ts and the CP4 code", "         passes on the current code", "runs:    with your tests, and in CI"]),
     ("specs/", "Record of what's built", "Every rule, linked to the test that proves it",
@@ -183,7 +183,7 @@ def team_markup():
         lines += [("description: " if j == 0 else "  ") + ln for j, ln in enumerate(desc)]
         lines += [f"tools: {fm.get('tools', '')}", "---"]
         code = (f'        <p class="tpanel__file">{CODE_ICON}agents/{fname}</p>\n'
-                + code_window(fname, lines, "markdown", "Agent definition, quoted from the repository"))
+                + code_window(fname, lines, "markdown", "The agent's file, copied from GitHub"))
         panels.append(tab_panel("agent", i, f"A{i}", f"{group} stage", title, role, "", [], code, on))
     grid.append('        </div>')
     return "\n".join(grid), "\n".join(panels)
@@ -277,19 +277,19 @@ FEATURES = [
      "How it works.", "One sentence in. A reviewed feature out.",
      "Ask an agent for a feature and it usually builds all of it, then tells you it works. If something broke along the way, you find out at the end. Ratchet builds the feature one small step at a time, and checks each step before the next one starts.",
      ["idea", "run", "checkpoint"], "M4 6h16M4 12h10M4 18h6"),
-    ("gates", "Four gates and safeguards", "Agents skip checks when nothing stops them. Four gates, enforced by hooks, make every step pass.",
+    ("gates", "Four gates and safeguards", "Agents skip checks when nothing stops them. Four gates and hooks make every step pass.",
      "Four gates.", "The agent can't skip one.",
      "Agents skip checks when nothing stops them. They write tests after the code, or call a screen done without looking at it. Ratchet puts four gates on every step, and hooks in your CLI stop the agent from going around them.",
      ["gates", "safeguards"], "M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"),
     ("reviewers", "A second opinion", "An AI misses its own mistakes. A different AI reviews every step.",
      "A second opinion.", "From a different AI.",
-     "An AI reviewing its own code tends to miss the same mistakes it made writing it. Ratchet has a different AI review every step, from another company when you have one installed.",
+     "An AI that checks its own code tends to miss its own mistakes. So Ratchet has a different AI review every step. If you have a tool from another company, that one goes first.",
      ["reviewers", "agents"], "M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM16 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM3 20c0-3 2.5-5 5-5s5 2 5 5M11 20c0-3 2.5-5 5-5s5 2 5 5"),
     ("live-viewer", "Live viewer", "Long runs bury progress in chat. The viewer shows the whole run on one page.",
      "The live viewer.", "Watch the run as it happens.",
      "A long run leaves hundreds of messages in your chat, and it's hard to tell where things stand. The viewer puts the whole run on one page.",
      ["viewer"], "M3 5h18v14H3zM3 9h18M7 7h.01"),
-    ("cost", "Cost control", "More checking means more AI time. Hard limits keep the cost predictable.",
+    ("cost", "Cost control", "More checking means more AI time. Hard limits keep the cost steady.",
      "Cost control.", "Limits you set.",
      "Checking every step uses more AI time than not checking. Without limits, a step that keeps failing review keeps costing you. Ratchet caps the rounds and spends them where the risk is.",
      ["cost"], "M4 18h16M7 18V9M12 18V5M17 18v-6"),
@@ -429,10 +429,10 @@ def main():
     sw_ld = ('{"@type":"SoftwareApplication","name":"Ratchet Loop","applicationCategory":"DeveloperApplication",'
              '"operatingSystem":"macOS, Linux, Windows","softwareVersion":"1.14.0","url":"' + SITE + '",'
              '"downloadUrl":"https://github.com/rahilp/Ratchet-Loop","image":"' + SITE + 'assets/og.jpg",'
-             '"description":"A checkpoint-and-gate build loop for AI coding agents. Every checkpoint must pass behavior tests, UI review, adversarial code review and human review before the next one starts.",'
+             '"description":"A plug-in that makes AI coding agents build in small, checked steps. Each step must pass its tests, a design check, a review by a different AI and your OK.",'
              '"author":{"@type":"Person","name":"Rahil Pirani"},"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}')
     pages = [("index.html", "Ratchet Loop · Step-by-step building for AI coding agents",
-              "Ratchet Loop is a plug-in for Claude Code, Codex, Gemini CLI and Copilot CLI. It splits a feature into small steps, and each step has to pass its tests, match the design and get through a review by a different AI before the next one starts.",
+              "Ratchet Loop is a plug-in for Claude Code, Codex, Gemini CLI and Copilot CLI. It builds a feature in small steps. Each step must pass its tests, match the design and get a review from a different AI.",
               part("_hero.html") + part("home.html").replace("{{FEATURE_CARDS}}", feature_cards())
               .replace("{{CASE}}", part("_case.html")).replace("{{LOOP}}", part("_loop.html").replace("{{LOOP_SVG}}", loop_svg())).replace("{{FAQ_SECTION}}", faq_section),
               '<script type="application/ld+json">{"@context":"https://schema.org","@graph":[' + sw_ld +
@@ -443,7 +443,7 @@ def main():
         pages.append((f"{slug}.html", card_title + PAGE_SUFFIX, card_text, body, "", "", slug))
     body = page_header(0, "Install once.", "Then just ask.", "Install Ratchet once per computer. After that, you use it in any project by talking to your agent.",
                        ["install", "faq"], "install") + sections_html(["install", "faq"])
-    pages.append(("install.html", "Install" + PAGE_SUFFIX, "Install Ratchet Loop in Claude Code, Codex, Gemini CLI or Copilot CLI with three messages to your agent.", body, "", "", "install"))
+    pages.append(("install.html", "Install" + PAGE_SUFFIX, "Add Ratchet Loop to Claude Code, Codex, Gemini CLI or Copilot CLI. It takes three short messages to your agent.", body, "", "", "install"))
 
     head, nav, cta, foot = part("_head.html"), part("_nav.html"), part("_cta.html"), part("_foot.html")
     for fname, title, desc, body, ld, preload, cur in pages:

@@ -7,14 +7,14 @@
         <p class="mono-k">Who gets asked, in order</p>
         <ol class="ladder">
           <li class="reveal"><span>1</span><div><h3>Another company</h3><p>Any AI tool on your machine that is installed and signed in.</p></div></li>
-          <li class="reveal"><span>2</span><div><h3>Another model</h3><p>Same company, different model. Sonnet reviewing work done by Opus, for example.</p></div></li>
-          <li class="reveal"><span>3</span><div><h3>The same model</h3><p>Only if nothing else is available.</p></div></li>
+          <li class="reveal"><span>2</span><div><h3>Another model</h3><p>Same company, but a different model. For example, Sonnet checks work done by Opus.</p></div></li>
+          <li class="reveal"><span>3</span><div><h3>The same model</h3><p>Only if there is nothing else to use.</p></div></li>
         </ol>
       </div>
       <div>
         <p class="mono-k">How many look, by risk</p>
         <div class="risk reveal">
-          <div class="risk__row"><b>Low</b><span class="risk__dots" role="img" aria-label="1 reviewer"><i></i></span><p>1 reviewer. Only serious findings block.</p></div>
+          <div class="risk__row"><b>Low</b><span class="risk__dots" role="img" aria-label="1 reviewer"><i></i></span><p>1 reviewer. Only big problems hold up the step.</p></div>
           <div class="risk__row"><b>Normal</b><span class="risk__dots" role="img" aria-label="2 reviewers"><i></i><i></i></span><p>2 reviewers. The default.</p></div>
           <div class="risk__row"><b>High</b><span class="risk__dots" role="img" aria-label="4 reviewers"><i></i><i></i><i></i><i></i></span><p>4 reviewers. The plan must say which users could be harmed, and how.</p></div>
         </div>
@@ -24,7 +24,7 @@
       <li>Claude Code</li><li>Codex</li><li>Gemini CLI</li><li>Copilot CLI</li><li>Cursor</li><li>OpenCode</li><li>Oh My Pi</li><li>Pi</li><li>A command you add</li>
     </ul>
     <div class="facts">
-      <div class="fact reveal"><h3>Aimed at your users</h3><p>Each reviewer starts with the goal of the plan. A finding has to say which user it hurts and how. The worse the harm, the higher the severity.</p></div>
+      <div class="fact reveal"><h3>Aimed at your users</h3><p>Each reviewer starts with the goal of the plan. A finding has to say which user it hurts and how. The worse the harm, the more serious the finding.</p></div>
       <div class="fact reveal"><h3>A broken reviewer is swapped out</h3><p>If one tool fails, only that tool is skipped. Another working tool from a different company takes its place.</p></div>
       <div class="fact reveal"><h3>Cut-off replies get one retry</h3><p>If a review stops halfway, the reviewer is asked once more before it counts as a failure.</p></div>
       <div class="fact reveal"><h3>Stuck steps get a fresh look</h3><p>If a step fails review twice in a row, a new reviewer reads the goal and the history. It either suggests a simpler step or asks you.</p></div>

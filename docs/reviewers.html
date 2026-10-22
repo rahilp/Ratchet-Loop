@@ -68,7 +68,7 @@
   <div class="phead__bg" aria-hidden="true"><div class="hero__grid" data-depth="0.25"></div><img class="hero__draw" src="assets/blueprint.svg" alt="" width="1200" height="1200" decoding="async" data-depth="0.55"></div>
   <div class="wrap phead__inner">
     <h1 id="page-title" class="phead__title">A second opinion. <em>From a different AI.</em></h1>
-    <p class="lede">An AI reviewing its own code tends to miss the same mistakes it made writing it. Ratchet has a different AI review every step, from another company when you have one installed.</p>
+    <p class="lede">An AI that checks its own code tends to miss its own mistakes. So Ratchet has a different AI review every step. If you have a tool from another company, that one goes first.</p>
     <nav class="phead__jump" aria-label="On this page"><a href="#reviewers">Who reviews</a><a href="#agents">The agents</a></nav>
   </div>
 </section>
@@ -81,14 +81,14 @@
         <p class="mono-k">Who gets asked, in order</p>
         <ol class="ladder">
           <li class="reveal"><span>1</span><div><h3>Another company</h3><p>Any AI tool on your machine that is installed and signed in.</p></div></li>
-          <li class="reveal"><span>2</span><div><h3>Another model</h3><p>Same company, different model. Sonnet reviewing work done by Opus, for example.</p></div></li>
-          <li class="reveal"><span>3</span><div><h3>The same model</h3><p>Only if nothing else is available.</p></div></li>
+          <li class="reveal"><span>2</span><div><h3>Another model</h3><p>Same company, but a different model. For example, Sonnet checks work done by Opus.</p></div></li>
+          <li class="reveal"><span>3</span><div><h3>The same model</h3><p>Only if there is nothing else to use.</p></div></li>
         </ol>
       </div>
       <div>
         <p class="mono-k">How many look, by risk</p>
         <div class="risk reveal">
-          <div class="risk__row"><b>Low</b><span class="risk__dots" role="img" aria-label="1 reviewer"><i></i></span><p>1 reviewer. Only serious findings block.</p></div>
+          <div class="risk__row"><b>Low</b><span class="risk__dots" role="img" aria-label="1 reviewer"><i></i></span><p>1 reviewer. Only big problems hold up the step.</p></div>
           <div class="risk__row"><b>Normal</b><span class="risk__dots" role="img" aria-label="2 reviewers"><i></i><i></i></span><p>2 reviewers. The default.</p></div>
           <div class="risk__row"><b>High</b><span class="risk__dots" role="img" aria-label="4 reviewers"><i></i><i></i><i></i><i></i></span><p>4 reviewers. The plan must say which users could be harmed, and how.</p></div>
         </div>
@@ -98,7 +98,7 @@
       <li>Claude Code</li><li>Codex</li><li>Gemini CLI</li><li>Copilot CLI</li><li>Cursor</li><li>OpenCode</li><li>Oh My Pi</li><li>Pi</li><li>A command you add</li>
     </ul>
     <div class="facts">
-      <div class="fact reveal"><h3>Aimed at your users</h3><p>Each reviewer starts with the goal of the plan. A finding has to say which user it hurts and how. The worse the harm, the higher the severity.</p></div>
+      <div class="fact reveal"><h3>Aimed at your users</h3><p>Each reviewer starts with the goal of the plan. A finding has to say which user it hurts and how. The worse the harm, the more serious the finding.</p></div>
       <div class="fact reveal"><h3>A broken reviewer is swapped out</h3><p>If one tool fails, only that tool is skipped. Another working tool from a different company takes its place.</p></div>
       <div class="fact reveal"><h3>Cut-off replies get one retry</h3><p>If a review stops halfway, the reviewer is asked once more before it counts as a failure.</p></div>
       <div class="fact reveal"><h3>Stuck steps get a fresh look</h3><p>If a step fails review twice in a row, a new reviewer reads the goal and the history. It either suggests a simpler step or asks you.</p></div>
@@ -140,40 +140,40 @@
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>ratchet-app-scout.md</span><em>markdown</em></div>
           <pre class="code__body"><span><i>01</i>---</span><span><i>02</i>name: ratchet-app-scout</span><span><i>03</i>description: Ratchet loop scout. Checks the current state of the app before a</span><span><i>04</i>  build — detects the stack, test runner, start command and URL,</span><span><i>05</i>  makes sure the app actually runs, finds login credentials/seed</span><span><i>06</i>  data for UI captures, and drafts .ratchet/standards.md from the</span><span><i>07</i>  codebase if no written standard exists. Spawned by the</span><span><i>08</i>  ratchet-orchestrator in parallel with the checkpoint planner.</span><span><i>09</i>tools: Read, Grep, Glob, Bash, Write</span><span><i>10</i>---</span></pre>
-          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repository<b>ready</b></figcaption>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>The agent's file, copied from GitHub<b>ready</b></figcaption>
         </figure>
       </div>
       <div class="tpanel" role="tabpanel" id="agent-2" aria-labelledby="agent-tab-2" hidden>
         <div class="tpanel__top"><span class="tpanel__big">A2</span><span class="pill pill--static">Plan stage</span></div>
         <h3>Checkpoint planner</h3>
-        <p class="tpanel__lead">Splits the feature into small, ordered checkpoints, each with plain “done when” criteria and the gates that apply.</p>
+        <p class="tpanel__lead">Splits the feature into small, ordered checkpoints, each with a plain “done when” list and the gates that apply.</p>
         <p class="tpanel__file"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>agents/ratchet-checkpoint-planner.md</p>
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>ratchet-checkpoint-planner.md</span><em>markdown</em></div>
           <pre class="code__body"><span><i>01</i>---</span><span><i>02</i>name: ratchet-checkpoint-planner</span><span><i>03</i>description: Ratchet checkpoint planner. Splits a large feature, screen</span><span><i>04</i>  migration or refactor into small ordered checkpoints of</span><span><i>05</i>  increasing complexity, each with plain-language &quot;done when&quot;</span><span><i>06</i>  criteria and a decision on which gates apply, written to</span><span><i>07</i>  checkpoints.json. PLAN mode creates the plan; EXTEND mode</span><span><i>08</i>  appends checkpoints from human feedback. Returns QUESTIONS</span><span><i>09</i>  instead of guessing when the request is ambiguous. Spawned by</span><span><i>10</i>  ratchet-orchestrator.</span><span><i>11</i>tools: Read, Grep, Glob, Bash, Write, Edit</span><span><i>12</i>---</span></pre>
-          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repository<b>ready</b></figcaption>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>The agent's file, copied from GitHub<b>ready</b></figcaption>
         </figure>
       </div>
       <div class="tpanel" role="tabpanel" id="agent-3" aria-labelledby="agent-tab-3" hidden>
         <div class="tpanel__top"><span class="tpanel__big">A3</span><span class="pill pill--static">Plan stage</span></div>
         <h3>Design system</h3>
-        <p class="tpanel__lead">Writes DESIGN.md: exact colours, type, spacing and every state of every component.</p>
+        <p class="tpanel__lead">Writes DESIGN.md, a file with the exact colours, fonts and spacing of your app.</p>
         <p class="tpanel__file"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>agents/ratchet-design-system.md</p>
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>ratchet-design-system.md</span><em>markdown</em></div>
           <pre class="code__body"><span><i>01</i>---</span><span><i>02</i>name: ratchet-design-system</span><span><i>03</i>description: Ratchet design-system agent. Creates or updates DESIGN.md —</span><span><i>04</i>  exact design tokens, component specs with every state, layout,</span><span><i>05</i>  content and accessibility rules, and an implementation map to</span><span><i>06</i>  real files — by extracting from the existing codebase or</span><span><i>07</i>  building from a brief. Follows the ratchet-design-md skill.</span><span><i>08</i>  Spawned by ratchet-orchestrator before prototyping when no</span><span><i>09</i>  DESIGN.md exists, or directly when the user wants a design</span><span><i>10</i>  system file.</span><span><i>11</i>tools: Read, Grep, Glob, Bash, Write, Edit</span><span><i>12</i>---</span></pre>
-          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repository<b>ready</b></figcaption>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>The agent's file, copied from GitHub<b>ready</b></figcaption>
         </figure>
       </div>
       <div class="tpanel" role="tabpanel" id="agent-4" aria-labelledby="agent-tab-4" hidden>
         <div class="tpanel__top"><span class="tpanel__big">A4</span><span class="pill pill--static">Plan stage</span></div>
         <h3>Prototyper</h3>
-        <p class="tpanel__lead">Builds a clickable prototype from DESIGN.md for you to approve before anything is built.</p>
+        <p class="tpanel__lead">Builds a clickable prototype for you to try. You approve it before the real build starts.</p>
         <p class="tpanel__file"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>agents/ratchet-prototyper.md</p>
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>ratchet-prototyper.md</span><em>markdown</em></div>
           <pre class="code__body"><span><i>01</i>---</span><span><i>02</i>name: ratchet-prototyper</span><span><i>03</i>description: Ratchet design/prototype agent. Builds a single-file, clickable</span><span><i>04</i>  HTML prototype of the planned feature from DESIGN.md, with every</span><span><i>05</i>  checkpoint&#x27;s UI state addressable via ?state=&lt;name&gt; and</span><span><i>06</i>  data-testid hooks shared with the real implementation — used to</span><span><i>07</i>  get human/client approval before building and as the reference</span><span><i>08</i>  for the UI gate. Follows the ratchet-prototype skill. Spawned by</span><span><i>09</i>  ratchet-orchestrator during planning when no other UI reference</span><span><i>10</i>  exists.</span><span><i>11</i>tools: Read, Grep, Glob, Bash, Write, Edit</span><span><i>12</i>---</span></pre>
-          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repository<b>ready</b></figcaption>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>The agent's file, copied from GitHub<b>ready</b></figcaption>
         </figure>
       </div>
       <div class="tpanel" role="tabpanel" id="agent-5" aria-labelledby="agent-tab-5" hidden>
@@ -184,7 +184,7 @@
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>ratchet-test-planner.md</span><em>markdown</em></div>
           <pre class="code__body"><span><i>01</i>---</span><span><i>02</i>name: ratchet-test-planner</span><span><i>03</i>description: Ratchet test planner. For ONE checkpoint, plans ID-tagged</span><span><i>04</i>  behavior test cases before any code exists (happy path, edge</span><span><i>05</i>  cases, permissions, failure modes), splitting code-provable</span><span><i>06</i>  cases from browser-only ones, and writes tests/CPn.json plus the</span><span><i>07</i>  checkpoint&#x27;s tests.files/command. Follows the</span><span><i>08</i>  ratchet-tdd-planner skill. Spawned by ratchet-orchestrator, one</span><span><i>09</i>  per checkpoint, in parallel.</span><span><i>10</i>tools: Read, Grep, Glob, Bash, Write, Edit</span><span><i>11</i>---</span></pre>
-          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repository<b>ready</b></figcaption>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>The agent's file, copied from GitHub<b>ready</b></figcaption>
         </figure>
       </div>
       <div class="tpanel" role="tabpanel" id="agent-6" aria-labelledby="agent-tab-6" hidden>
@@ -195,7 +195,7 @@
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>ratchet-test-writer.md</span><em>markdown</em></div>
           <pre class="code__body"><span><i>01</i>---</span><span><i>02</i>name: ratchet-test-writer</span><span><i>03</i>description: Ratchet test writer. Turns a checkpoint&#x27;s planned test cases</span><span><i>04</i>  (tests/CPn.json) into real, runnable tests tagged with their</span><span><i>05</i>  case IDs, written BEFORE the implementation so every one can run</span><span><i>06</i>  and at least one fails on an assertion. Spawned by</span><span><i>07</i>  ratchet-orchestrator at the start of each checkpoint (sometimes</span><span><i>08</i>  several in parallel on different files).</span><span><i>09</i>tools: Read, Grep, Glob, Bash, Write, Edit</span><span><i>10</i>---</span></pre>
-          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repository<b>ready</b></figcaption>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>The agent's file, copied from GitHub<b>ready</b></figcaption>
         </figure>
       </div>
       <div class="tpanel" role="tabpanel" id="agent-7" aria-labelledby="agent-tab-7" hidden>
@@ -206,7 +206,7 @@
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>ratchet-implementer.md</span><em>markdown</em></div>
           <pre class="code__body"><span><i>01</i>---</span><span><i>02</i>name: ratchet-implementer</span><span><i>03</i>description: Ratchet implementer. Writes the production code for exactly ONE</span><span><i>04</i>  checkpoint so its planned tests pass and its UI matches the</span><span><i>05</i>  reference and DESIGN.md — or, when re-spawned with a failing</span><span><i>06</i>  test log or a UI review, fixes exactly those failures. Never</span><span><i>07</i>  edits tests. Spawned by ratchet-orchestrator.</span><span><i>08</i>tools: Read, Grep, Glob, Bash, Write, Edit, MultiEdit</span><span><i>09</i>---</span></pre>
-          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repository<b>ready</b></figcaption>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>The agent's file, copied from GitHub<b>ready</b></figcaption>
         </figure>
       </div>
       <div class="tpanel" role="tabpanel" id="agent-8" aria-labelledby="agent-tab-8" hidden>
@@ -217,7 +217,7 @@
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>ratchet-test-runner.md</span><em>markdown</em></div>
           <pre class="code__body"><span><i>01</i>---</span><span><i>02</i>name: ratchet-test-runner</span><span><i>03</i>description: Ratchet test runner. Runs Gate 1 (behavior) for a checkpoint</span><span><i>04</i>  through ratchet.py, and when it fails reads the log and returns</span><span><i>05</i>  a short, precise diagnosis (which case IDs fail, why, where the</span><span><i>06</i>  bug most likely is) so the orchestrator never has to load long</span><span><i>07</i>  test output into its own context. Does not fix anything. Spawned</span><span><i>08</i>  by ratchet-orchestrator.</span><span><i>09</i>tools: Read, Grep, Glob, Bash</span><span><i>10</i>---</span></pre>
-          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repository<b>ready</b></figcaption>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>The agent's file, copied from GitHub<b>ready</b></figcaption>
         </figure>
       </div>
       <div class="tpanel" role="tabpanel" id="agent-9" aria-labelledby="agent-tab-9" hidden>
@@ -228,7 +228,7 @@
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>ratchet-fixer.md</span><em>markdown</em></div>
           <pre class="code__body"><span><i>01</i>---</span><span><i>02</i>name: ratchet-fixer</span><span><i>03</i>description: Ratchet fixer. Takes the adversarial reviewers&#x27; open findings</span><span><i>04</i>  for a checkpoint and fixes every one of them — or, if a finding</span><span><i>05</i>  is factually wrong, writes an evidence-backed rebuttal — without</span><span><i>06</i>  touching anything unrelated and without weakening tests. Re-runs</span><span><i>07</i>  the checkpoint tests before returning. Spawned by the</span><span><i>08</i>  ratchet-adversarial-loop after each non-approving round.</span><span><i>09</i>tools: Read, Grep, Glob, Bash, Write, Edit, MultiEdit</span><span><i>10</i>---</span></pre>
-          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repository<b>ready</b></figcaption>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>The agent's file, copied from GitHub<b>ready</b></figcaption>
         </figure>
       </div>
       <div class="tpanel" role="tabpanel" id="agent-10" aria-labelledby="agent-tab-10" hidden>
@@ -239,18 +239,18 @@
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>ratchet-adversary.md</span><em>markdown</em></div>
           <pre class="code__body"><span><i>01</i>---</span><span><i>02</i>name: ratchet-adversary</span><span><i>03</i>description: Ratchet adversarial reviewer. Assumes the checkpoint&#x27;s code is</span><span><i>04</i>  wrong and tries to prove it — hunting for violations of the</span><span><i>05</i>  project&#x27;s written standards (lens=standards) and for bugs, edge</span><span><i>06</i>  cases, security and data-integrity problems (lens=correctness),</span><span><i>07</i>  or both. Every finding cites a rule or a concrete failure</span><span><i>08</i>  scenario. Approves only by returning zero findings. Never fixes</span><span><i>09</i>  code. Spawned fresh each round by the ratchet-adversarial-loop.</span><span><i>10</i>tools: Read, Grep, Glob, Bash, Write</span><span><i>11</i>---</span></pre>
-          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repository<b>ready</b></figcaption>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>The agent's file, copied from GitHub<b>ready</b></figcaption>
         </figure>
       </div>
       <div class="tpanel" role="tabpanel" id="agent-11" aria-labelledby="agent-tab-11" hidden>
         <div class="tpanel__top"><span class="tpanel__big">A11</span><span class="pill pill--static">Review stage</span></div>
         <h3>Visual reviewer</h3>
-        <p class="tpanel__lead">Compares screenshots against the reference and lists every visual difference, with where it is.</p>
+        <p class="tpanel__lead">Compares screenshots with the design. Lists each difference it sees, and where.</p>
         <p class="tpanel__file"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>agents/ratchet-visual-reviewer.md</p>
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>ratchet-visual-reviewer.md</span><em>markdown</em></div>
           <pre class="code__body"><span><i>01</i>---</span><span><i>02</i>name: ratchet-visual-reviewer</span><span><i>03</i>description: Ratchet UI-gate visual reviewer. A perfectionist design reviewer</span><span><i>04</i>  that compares screenshots of the real app against the reference</span><span><i>05</i>  (prototype/old screen) in matched states and lists every visual</span><span><i>06</i>  difference — structure, spacing, alignment, size, typography,</span><span><i>07</i>  color, iconography — with severity and on-screen location,</span><span><i>08</i>  judging sizes proportionally. Returns INVALID if the two</span><span><i>09</i>  screenshots are not the same state. Works only from an isolated</span><span><i>10</i>  INPUT.md folder; run by ui_review.py through a provider other</span><span><i>11</i>  than the host when one is available, otherwise as the host&#x27;s own</span><span><i>12</i>  sub-agent.</span><span><i>13</i>tools: Read, Write</span><span><i>14</i>---</span></pre>
-          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repository<b>ready</b></figcaption>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>The agent's file, copied from GitHub<b>ready</b></figcaption>
         </figure>
       </div>
       <div class="tpanel" role="tabpanel" id="agent-12" aria-labelledby="agent-tab-12" hidden>
@@ -261,18 +261,18 @@
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>ratchet-behavior-reviewer.md</span><em>markdown</em></div>
           <pre class="code__body"><span><i>01</i>---</span><span><i>02</i>name: ratchet-behavior-reviewer</span><span><i>03</i>description: Ratchet UI-gate behaviour reviewer. Compares how the real app</span><span><i>04</i>  and the reference respond to the same interaction journey —</span><span><i>05</i>  step-by-step screenshots, accessibility trees, console errors</span><span><i>06</i>  and browser-only test cases — and lists every behavioural</span><span><i>07</i>  difference (wrong result, missing feedback, broken focus,</span><span><i>08</i>  validation, navigation, loading/empty/error states). Returns</span><span><i>09</i>  INVALID when the starting states don&#x27;t match. Works only from an</span><span><i>10</i>  isolated INPUT.md folder; run by ui_review.py through a provider</span><span><i>11</i>  other than the host when one is available, otherwise as the</span><span><i>12</i>  host&#x27;s own sub-agent.</span><span><i>13</i>tools: Read, Write</span><span><i>14</i>---</span></pre>
-          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repository<b>ready</b></figcaption>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>The agent's file, copied from GitHub<b>ready</b></figcaption>
         </figure>
       </div>
       <div class="tpanel" role="tabpanel" id="agent-13" aria-labelledby="agent-tab-13" hidden>
         <div class="tpanel__top"><span class="tpanel__big">A13</span><span class="pill pill--static">Review stage</span></div>
         <h3>Variant writer</h3>
-        <p class="tpanel__lead">Writes disguised bad code to prove a new automatic check really catches the mistake.</p>
+        <p class="tpanel__lead">Hides the same mistake in new code, to prove a new check really catches it.</p>
         <p class="tpanel__file"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>agents/ratchet-variant-writer.md</p>
         <figure class="code">
           <div class="code__bar"><span class="code__dots" aria-hidden="true"><i></i><i></i><i></i></span><span>ratchet-variant-writer.md</span><em>markdown</em></div>
           <pre class="code__body"><span><i>01</i>---</span><span><i>02</i>name: ratchet-variant-writer</span><span><i>03</i>description: Ratchet variant writer. For a high-risk kind of mistake that is</span><span><i>04</i>  about to get an automatic check, writes disguised bad variants</span><span><i>05</i>  of the mistake and look-alike good code, WITHOUT seeing the</span><span><i>06</i>  check, so the check is proven against cases its author didn&#x27;t</span><span><i>07</i>  choose. Spawned by ratchet-orchestrator at the start of a</span><span><i>08</i>  high-risk guardrail step.</span><span><i>09</i>tools: Read, Grep, Glob, Write</span><span><i>10</i>---</span></pre>
-          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>Agent definition, quoted from the repository<b>ready</b></figcaption>
+          <figcaption class="code__foot"><span class="dot" aria-hidden="true"></span>The agent's file, copied from GitHub<b>ready</b></figcaption>
         </figure>
       </div>
     </div>
@@ -304,7 +304,7 @@
   <nav class="foot__map" aria-label="All pages">
     <a href="how-it-works.html">How it works</a><a href="gates.html">Gates and safeguards</a><a href="reviewers.html">Second opinion</a><a href="live-viewer.html">Live viewer</a><a href="cost.html">Cost control</a><a href="control.html">You stay in control</a><a href="setup.html">Learns your project</a><a href="specs.html">Specs and CI</a><a href="install.html">Install</a>
   </nav>
-  <p class="foot__tag">Checkpoint-and-gate building for AI coding agents · by <a href="https://github.com/rahilp" rel="noopener">Rahil Pirani</a></p>
+  <p class="foot__tag">Your coding agent, one checked step at a time. Made by <a href="https://github.com/rahilp" rel="noopener">Rahil Pirani</a></p>
 </footer>
 
 <div class="toast" role="status" aria-live="polite" data-toast></div>
