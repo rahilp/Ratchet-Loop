@@ -152,6 +152,46 @@ def stretch_factor(max_stretch: float):
     return min(max(1.0, load / cpus), max_stretch), load, cpus
 
 
+def run_with_stretched_timeout(argv, base: float, max_stretch: float = DEFAULT_MAX_STRETCH, cwd=None, env=None,
+                                capture_output: bool = True, text: bool = True, popen=subprocess.Popen,
+                                monotonic=time.monotonic):
+    """Runs argv in its own process group and waits for it to finish, the way subprocess.run() would, except the
+    time limit follows stretch_factor() exactly like Runner.wait() does: it is re-read on every poll, so it is
+    `base` times the highest stretch_factor(max_stretch) reading seen since the call started (a load spike while
+    it runs still extends it, a load drop never takes back time already granted, and it is never less than
+    `base`). On expiry the whole process tree is stopped with kill_tree() and subprocess.TimeoutExpired is
+    raised (its .timeout is the limit that was in force). On success, returns a subprocess.CompletedProcess like
+    subprocess.run() would, with one extra attribute, `.timeout_limit`: the limit in force when the call
+    finished, so a caller (or a test) can see what was actually used without ever waiting one out in real time.
+    `popen` and `monotonic` default to subprocess.Popen/time.monotonic (every real call site leaves them alone);
+    a test may inject stand-ins to make the whole call deterministic, with no real sleep or wall-clock read."""
+    proc = popen(argv, stdout=subprocess.PIPE if capture_output else None,
+                 stderr=subprocess.PIPE if capture_output else None, stdin=subprocess.DEVNULL,
+                 cwd=cwd, env=env, text=text, start_new_session=True)
+    t0 = monotonic()
+    limit = base
+    out = err = None
+    while True:
+        factor, _, _ = stretch_factor(max_stretch)
+        limit = max(limit, base * factor)
+        remaining = limit - (monotonic() - t0)
+        if remaining <= 0:
+            kill_tree(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            raise subprocess.TimeoutExpired(argv, limit)
+        try:
+            out, err = proc.communicate(timeout=min(POLL_SECONDS, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    result = subprocess.CompletedProcess(argv, proc.returncode, out, err)
+    result.timeout_limit = limit
+    return result
+
+
 # ---- running one suite -------------------------------------------------------------------------------------
 
 

@@ -13,7 +13,7 @@
       "codex"
     ]
   },
-  "regression_command": "python3 tests/run_all.py",
+  "regression_command": "python3 tests/run_all.py tests/test_install.py tests/test_runner_load.py tests/test_runner_load_fixes.py tests/test_load_timeouts.py tests/test_run_all_dedupe.py",
   "commit_per_checkpoint": true,
   "design_md": "DESIGN.md",
   "standards": [
@@ -30,7 +30,7 @@
     ],
     "normal": [
       [
-        "host-alt-standards"
+        "any-standards"
       ],
       [
         "codex-correctness",
@@ -39,7 +39,7 @@
     ],
     "high": [
       [
-        "host-standards"
+        "any-standards"
       ],
       [
         "codex-correctness",
@@ -91,6 +91,12 @@
       "model": "opencode-go/step-5-preview-free",
       "company": "stepfun",
       "cost": "flat"
+    },
+    {
+      "id": "omp-glm",
+      "preset": "omp",
+      "model": "opencode-go/glm-5.3",
+      "cost": "flat"
     }
   ],
   "test_timeout_sec": 3600,
@@ -98,13 +104,13 @@
   "spec_keep": true,
   "max_adversarial_rounds": 6,
   "role_models": {
-    "ratchet-implementer": "strong",
-    "ratchet-fixer": "strong"
+    "ratchet-implementer": "standard",
+    "ratchet-fixer": "standard"
   },
   "min_review_seconds": 20,
   "host_models": {
     "anthropic": {
-      "strong": "inherit",
+      "strong": "opus",
       "standard": "sonnet",
       "light": "haiku",
       "alternates": [
@@ -112,5 +118,6 @@
         "opus"
       ]
     }
-  }
+  },
+  "related_test_command": "python3 tests/run_all.py {files}"
 }

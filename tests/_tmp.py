@@ -1,5 +1,6 @@
 """
-Shared temp-folder helper for every tests/test_*.py suite.
+Shared temp-folder helper for every tests/test_*.py suite. Also exports `set_fake_load`/`restore_env`, the
+shared RATCHET_FAKE_LOADAVG/RATCHET_FAKE_CPUS helpers every suite that simulates machine load uses.
 
 Every temp folder a suite needs comes from `mkdtemp()` here, never from tempfile.mkdtemp/mkstemp
 directly (tests/test_cleanup.py scans for that). Each folder is removed:
@@ -50,6 +51,34 @@ OBJECTIVE_MIN = {
 # shared reason so they don't all have to say it separately.
 RISK_REASON_MIN = ("a wrong check here would let a corner-cutting agent ship broken or unsafe behavior straight "
                    "past review, hurting whoever uses the resulting feature")
+
+# Load-aware-timeout suites fake the machine load through these two env vars (read_load() in run_all.py), so
+# more than one suite needs to set and restore them; shared here so each one doesn't carry its own copy.
+FAKE_LOAD_VARS = ("RATCHET_FAKE_LOADAVG", "RATCHET_FAKE_CPUS")
+
+
+def set_fake_load(load, cpus):
+    """Fakes RATCHET_FAKE_LOADAVG/RATCHET_FAKE_CPUS for this process (either may be None to leave that one
+    variable unset); returns what to hand to restore_env()."""
+    saved = {k: os.environ.get(k) for k in FAKE_LOAD_VARS}
+    if load is None:
+        os.environ.pop("RATCHET_FAKE_LOADAVG", None)
+    else:
+        os.environ["RATCHET_FAKE_LOADAVG"] = str(load)
+    if cpus is None:
+        os.environ.pop("RATCHET_FAKE_CPUS", None)
+    else:
+        os.environ["RATCHET_FAKE_CPUS"] = str(cpus)
+    return saved
+
+
+def restore_env(saved):
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
 
 _LOCK = threading.RLock()
 _LIVE: list = []          # TmpDir objects not cleaned up yet, oldest first
