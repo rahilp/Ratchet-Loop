@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Four gates and safeguards · Ratchet Loop</title>
-<meta name="description" content="Tests, a design check, a code review and your OK. Hooks stop the agent from skipping any of them.">
+<meta name="description" content="Agents skip checks when nothing stops them. Four gates, enforced by hooks, make every step pass.">
 <link rel="canonical" href="https://ratchetloop.github.io/gates.html">
 <meta name="theme-color" content="#FBFAF7">
 <meta name="color-scheme" content="light">
@@ -69,7 +69,7 @@
   <div class="wrap phead__inner">
     <p class="crumb"><a href="index.html#features">Features</a><span aria-hidden="true">/</span>Feature 02</p>
     <h1 id="page-title" class="phead__title">Four gates. <em>The agent can't skip one.</em></h1>
-    <p class="lede">Every step passes the same gates in the same order. Hooks in your CLI enforce them.</p>
+    <p class="lede">Agents skip checks when nothing stops them. They write tests after the code, or call a screen done without looking at it. Ratchet puts four gates on every step, and hooks in your CLI stop the agent from going around them.</p>
     <nav class="phead__jump" aria-label="On this page"><a href="#gates">The four gates</a><a href="#safeguards">Safeguards</a></nav>
   </div>
 </section>
@@ -122,7 +122,7 @@
     <div class="gates__list">
       <p class="kicker"><span>01</span>The four gates</p>
       <h2 id="gates-title" class="h2">Four gates. <em>Always in this order.</em></h2>
-      <p class="lede">Gates 1 to 3 run on every checkpoint. Gate 4 is you, once the feature is finished. A checkpoint with no visible change, such as an API change, skips gate 2.</p>
+      <p class="lede">The gates run in a fixed order, and a step can't move on until each one passes. Gates 1 to 3 run on every checkpoint. Gate 4 is you, at the end. A step with no screen change, like an API change, skips gate 2.</p>
       <article class="gate" data-gate="1">
         <header><span class="gate__n">Gate 1</span><span class="gate__state" data-state>Waiting</span></header>
         <h3>Tests</h3>
@@ -159,7 +159,7 @@
   <div class="wrap">
     <p class="kicker"><span>02</span>Safeguards</p>
     <h2 id="safe-title" class="h2">Eight safeguards. <em>Enforced by hooks.</em></h2>
-    <p class="lede">A hook is a small program your CLI runs before and after the agent acts. Ratchet's hooks check each action against these rules, so the agent can't skip a gate or lower one.</p>
+    <p class="lede">When a step is hard, an agent takes shortcuts. It deletes a failing test, edits a test until it passes, or approves its own review. Hooks stop that. A hook is a small program your CLI runs before and after the agent acts. Ratchet's hooks check each action against these rules.</p>
     <div class="rules">
       <div class="rule reveal"><span>R1</span><h3>Results come from Ratchet</h3><p>The agent can't report that tests pass. Ratchet runs them. Reviewers can't report approval. Ratchet decides the verdict from their findings.</p></div>
       <div class="rule reveal"><span>R2</span><h3>Tests come first</h3><p>A test that passes before the feature exists is rejected.</p></div>

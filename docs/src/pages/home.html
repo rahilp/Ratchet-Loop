@@ -1,30 +1,65 @@
-<!-- ============ WHAT IT MEANS FOR YOU ============ -->
-<section class="band" id="why" aria-labelledby="why-title">
+<!-- ============ THE PROBLEM ============ -->
+<section class="band" id="problem" aria-labelledby="problem-title">
   <div class="wrap">
-    <p class="kicker">Why use it</p>
-    <h2 id="why-title" class="h2">The agent writes the code. <em>Ratchet checks it.</em></h2>
-    <p class="lede">Coding agents often say a feature works when it doesn't. The usual fix is to watch them and test everything yourself. Ratchet Loop does that checking for you, on every step.</p>
+    <p class="kicker">The problem</p>
+    <h2 id="problem-title" class="h2">The agent checks <em>its own work.</em></h2>
+    <div class="prose">
+      <p>When a coding agent builds a feature, the same agent writes the tests, runs them and decides when it's done. Nothing stops it from writing tests that already pass, skipping a check, or calling a screen finished without looking at it.</p>
+      <p>On a small change, you catch this in review. On a feature with eight steps, the mistakes pile up, and you find them at the end, all at once.</p>
+      <p>So you end up watching the agent and testing everything yourself.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ THE FIX ============ -->
+<section class="band band--alt" id="why" aria-labelledby="why-title">
+  <div class="wrap">
+    <p class="kicker">The fix</p>
+    <h2 id="why-title" class="h2">Ratchet Loop checks <em>every step for you.</em></h2>
+    <div class="prose">
+      <p>Ratchet Loop splits a feature into small steps. Each step has to pass four gates before the next one starts: its tests, a check against the design, a review by a different AI, and finally your OK.</p>
+      <p>The agent can't skip a gate. Hooks in your CLI block it.</p>
+    </div>
+    <p class="list-intro">With Ratchet Loop, you can:</p>
     <div class="why">
       <article class="why__card reveal">
         <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h10M11 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 5v14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
-        <h3>Leave it running</h3>
-        <p>You approve the plan and try the result. In between, the agent works on its own and posts a one-line update after each step.</p>
+        <h3>Leave the agent to work</h3>
+        <p>You approve the plan and try the result. In between, it works on its own and posts a one-line update after each step.</p>
       </article>
       <article class="why__card reveal">
         <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M8.5 12.2l2.4 2.4 4.6-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-        <h3>Trust “done”</h3>
-        <p>A step counts as done only after Ratchet has run its tests, compared its screens with the design and had a second AI review the code.</p>
+        <h3>Trust it when it says done</h3>
+        <p>A step only counts as done after its tests pass, its screens match the design and a second AI has reviewed the code.</p>
       </article>
       <article class="why__card reveal">
         <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16 16l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
-        <h3>Find bugs early</h3>
-        <p>Each step is checked and committed before the next one begins. A bug shows up in the step that caused it, and each step can be undone on its own.</p>
+        <h3>Catch bugs where they start</h3>
+        <p>Each step is checked and committed before the next one starts, so a bug can't hide under later work. Any step can be undone on its own.</p>
       </article>
       <article class="why__card reveal">
         <span class="why__icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 18h16M7 18V9M12 18V5M17 18v-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
-        <h3>Set the limits</h3>
+        <h3>Keep the cost in check</h3>
         <p>Review rounds are capped per step and per run. Paid tools are never used without your OK. When the agent gets stuck, it stops and asks you.</p>
       </article>
+    </div>
+  </div>
+  </div>
+</section>
+
+<!-- ============ AN EXAMPLE ============ -->
+<section class="band" id="example" aria-labelledby="example-title">
+  <div class="wrap">
+    <p class="kicker">An example</p>
+    <h2 id="example-title" class="h2">What happens when <em>the agent misses a bug?</em></h2>
+    <div class="prose">
+      <p>Take the example of a manager rejecting a leave request. The agent adds a Reject button, writes tests, and they all pass. But it forgot to make the reason required.</p>
+      <p>Here is the same step, built twice.</p>
+    </div>
+{{CASE}}
+    <div class="prose prose--after">
+      <p>On its own, the agent finishes first, reports success, and the bug ships.</p>
+      <p>With Ratchet, a reviewer from another company finds the bug. The fix comes with a new test, and the step is saved as its own commit before the next one starts.</p>
     </div>
   </div>
 </section>
@@ -33,8 +68,8 @@
 <section class="band band--alt" id="tdd" aria-labelledby="tdd-title">
   <div class="wrap">
     <p class="kicker">Compared with TDD</p>
-    <h2 id="tdd-title" class="h2">Tests first is one gate. <em>Ratchet adds three more.</em></h2>
-    <p class="lede">Asking an agent to use TDD helps. But the agent still runs its own tests, reports its own results and decides when it's done. Ratchet takes those jobs away from it.</p>
+    <h2 id="tdd-title" class="h2">Isn't this <em>just TDD?</em></h2>
+    <p class="lede">TDD is one of the four gates. Asking an agent to use TDD helps, but the agent still runs its own tests, reports its own results and decides when it's done. Ratchet takes those jobs away from it.</p>
     <div class="vs reveal" role="table" aria-label="Prompting an agent, agent with TDD, and Ratchet Loop compared">
       <div class="vs__row vs__row--head" role="row"><span role="columnheader"></span><span role="columnheader">Prompting an agent</span><span role="columnheader">Agent doing TDD</span><span role="columnheader">Ratchet Loop</span></div>
       <div class="vs__row" role="row"><b role="rowheader">Tests written before the code</b><i class="n" role="cell">No</i><i class="y" role="cell">Yes</i><i class="y" role="cell">Yes, and one must fail first</i></div>
@@ -56,28 +91,18 @@
   <div class="wrap">
     <p class="kicker">Features</p>
     <h2 id="features-title" class="h2">Eight features. <em>One loop.</em></h2>
-    <p class="lede">Each one has its own page with details and examples.</p>
+    <p class="lede">Each one fixes a problem you hit when agents build features. Each has its own page.</p>
     <div class="feats">
 {{FEATURE_CARDS}}
     </div>
   </div>
 </section>
 
-<!-- ============ PROOF ============ -->
-<section class="band band--alt" id="example" aria-labelledby="example-title">
-  <div class="wrap">
-    <p class="kicker">An example</p>
-    <h2 id="example-title" class="h2">From a plausible answer <em>to a checked change.</em></h2>
-    <p class="lede">One step, built twice. On its own, the agent reports success. With Ratchet, a reviewer finds the bug before the step is committed.</p>
-{{CASE}}
-  </div>
-</section>
-
 <!-- ============ WORKS WHERE YOU WORK ============ -->
-<section class="band" id="start" aria-labelledby="start-title">
+<section class="band band--alt" id="start" aria-labelledby="start-title">
   <div class="wrap">
     <p class="kicker">Get started</p>
-    <h2 id="start-title" class="h2">Works in your CLI. <em>Three messages to set up.</em></h2>
+    <h2 id="start-title" class="h2">Pick your CLI. <em>Install in three messages.</em></h2>
     <ul class="clis" aria-label="Supported coding agents">
       <li><b>Claude Code</b><span>All checks, including which reviewer wrote each review</span></li>
       <li><b>Codex</b><span>Hooks, gates and records</span></li>

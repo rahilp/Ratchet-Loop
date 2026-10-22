@@ -277,6 +277,13 @@
     judge();
   }
 
+  /* ---------- the same step built twice: plays once in view, Replay restarts it ---------- */
+  document.querySelectorAll('[data-case]').forEach(c => {
+    const play = () => { c.classList.remove('is-play'); void c.offsetWidth; c.classList.add('is-play'); };
+    new IntersectionObserver(([e], o) => { if (e.isIntersecting) { play(); o.disconnect(); } }, { threshold: .35 }).observe(c);
+    c.querySelector('[data-case-replay]').addEventListener('click', play);
+  });
+
   /* ---------- cards: a soft light that follows the pointer ---------- */
   if (matchMedia('(hover: hover) and (pointer: fine)').matches) {
     document.querySelectorAll('.feat, .why__card, .rule, .fact, .tcard, .pnext__link').forEach(c => {

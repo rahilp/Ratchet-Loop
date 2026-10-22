@@ -1,25 +1,28 @@
-    <div class="case reveal">
-      <div class="case__head"><p class="mono-k">Example · leave approvals · CP3 reject with a reason</p><span class="tag">Illustrative</span></div>
+    <div class="case reveal" data-case>
+      <div class="case__head"><p class="mono-k">Leave approvals <span>· step 3 of 4: reject a request, with a reason</span></p><button class="pill" type="button" data-case-replay>{{ICON_REPLAY}}Replay</button></div>
       <div class="case__cols">
         <div class="case__col case__col--bad">
           <p class="case__label">Agent on its own</p>
-          <ul>
-            <li><i>✓</i>Reject button added</li>
-            <li><i>✓</i>Tests written after the code. All pass.</li>
-            <li><i>✓</i>"Done. Rejecting works."</li>
-          </ul>
-          <p class="case__out"><b>Ships:</b> a rejection with an empty reason goes through.</p>
+          <ol class="lane">
+            <li style="--i:0"><span class="lane__k">write</span><span class="lane__t">Reject button and API</span><i>✓</i></li>
+            <li style="--i:1"><span class="lane__k">test</span><span class="lane__t">Tests written after the code</span><i>✓</i></li>
+            <li style="--i:2"><span class="lane__k">run</span><span class="lane__t">All tests pass</span><i>✓</i></li>
+            <li style="--i:3"><span class="lane__k">reply</span><span class="lane__t">"Done. Rejecting works."</span><i>✓</i></li>
+          </ol>
+          <p class="case__out" style="--i:4"><b>Ships with a bug.</b> A rejection with an empty reason goes through.</p>
         </div>
         <div class="case__col case__col--good">
           <p class="case__label">With Ratchet Loop</p>
-          <ul>
-            <li><i>✓</i>Gate 1 · 6 tests written first. 1 fails, then all 6 pass.</li>
-            <li><i>✓</i>Gate 2 · matches the prototype</li>
-            <li><i class="hot">✕</i>Gate 3 · a reviewer finds that an empty reason is accepted</li>
-            <li><i>✓</i>The fix makes the reason required, with a test for it</li>
-            <li><i>✓</i>Gate 3 · round 2 · nothing serious left</li>
-          </ul>
-          <p class="case__out"><b>Locks:</b> CP3 as its own commit. CP4 starts.</p>
+          <ol class="lane">
+            <li style="--i:0"><span class="lane__k">plan</span><span class="lane__t">6 tests planned before any code</span><i>✓</i></li>
+            <li style="--i:1"><span class="lane__k">gate 1</span><span class="lane__t">1 test fails, then all 6 pass</span><i>✓</i></li>
+            <li style="--i:2"><span class="lane__k">gate 2</span><span class="lane__t">Screen matches the prototype</span><i>✓</i></li>
+            <li style="--i:3" class="is-hot"><span class="lane__k">gate 3</span><span class="lane__t">Reviewer: an empty reason is accepted</span><i>✕</i></li>
+            <li style="--i:4"><span class="lane__k">fix</span><span class="lane__t">Reason is now required, with a new test</span><i>✓</i></li>
+            <li style="--i:5"><span class="lane__k">gate 3</span><span class="lane__t">Round 2: nothing serious left</span><i>✓</i></li>
+            <li style="--i:6"><span class="lane__k">lock</span><span class="lane__t">Saved as its own commit</span><i>✓</i></li>
+          </ol>
+          <p class="case__out" style="--i:7"><b>Bug caught before the commit.</b> Step 4 starts on working code.</p>
         </div>
       </div>
     </div>
