@@ -221,12 +221,12 @@ def pawl_geom(cx, cy, rr, A, along, out, w0, scale=1.0):
     return pts_path(poly), piv, tip
 
 
-def mark_wire(sw=2.0, detail=True, bg="#FBFAF7"):
+def mark_wire(sw=2.0, detail=True, bg="#FFFFFF"):
     """Blueprint version of the mark: drafting linework, dashed center lines, orange pawl."""
     cx, cy, rr, rt, A = 28.5, 37, 18, 23.5, math.radians(48)
     wheel = pts_path(saw(cx, cy, rr, rt, 12, rot=A))
     pawl, piv, _ = pawl_geom(cx, cy, rr, A, 14, 10, 3.4)
-    blue, hot = "#3E6FC4", "#E8572A"
+    blue, hot = "#2563EB", "#E8572A"
     g = [f'<g fill="none" stroke-linejoin="round" stroke-linecap="round" stroke-width="{sw}">']
     if detail:
         g.append(f'<path stroke="{blue}" stroke-opacity=".55" stroke-width="{sw * .6:.2f}" stroke-dasharray="5 2 1 2" '
@@ -374,7 +374,7 @@ def page_header(n, title, accent, lede, ids, slug):
     jump = "".join(f'<a href="#{i}">{names[i]}</a>' for i in ids)
     label = f"Feature {n:02d}" if n else "Get started"
     return f'''<section class="phead" id="top" aria-labelledby="page-title">
-  <div class="phead__bg" aria-hidden="true"><div class="hero__grid" data-depth="0.25"></div><img class="hero__draw" src="assets/blueprint.svg" alt="" width="1200" height="1200" decoding="async" data-depth="0.55"></div>
+  <div class="phead__bg" aria-hidden="true"><div class="hero__grid" data-depth="0.25"></div></div>
   <div class="wrap phead__inner">
     <h1 id="page-title" class="phead__title">{title} <em>{accent}</em></h1>
     <p class="lede">{lede}</p>

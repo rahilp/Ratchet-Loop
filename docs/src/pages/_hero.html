@@ -2,22 +2,24 @@
 <section class="hero" id="top" aria-labelledby="hero-title">
   <div class="hero__bg" aria-hidden="true">
     <div class="hero__grid" data-depth="0.25"></div>
-    <img class="hero__draw" src="assets/blueprint.svg" alt="" width="1200" height="1200" decoding="async" data-depth="0.55">
   </div>
   <div class="hero__content wrap" data-depth="-0.08">
     <h1 id="hero-title" class="hero__title">AI coding agents will tell you it works. <em>Ratchet Loop makes them prove it.</em></h1>
         <p class="hero__lede">Ratchet Loop works inside Claude Code, Codex, Gemini CLI and GitHub Copilot CLI. You describe a feature, and your agent builds it in small steps, checking each one before it moves on. You don't type any commands. You talk to your agent like normal.</p>
     <div class="hero__ctas">
-      <a class="btn btn--primary" href="#features">Explore the features {{ICON_ARROW}}</a>
-      <a class="btn btn--ghost" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener">{{ICON_CODE}}Code</a>
-      <button class="btn btn--ghost" type="button" data-copy="{{INSTALL_PROMPT}}">{{ICON_COPY}}<span data-copy-label>Copy install prompt</span></button>
+      <a class="btn btn--primary" href="install.html">Get started {{ICON_ARROW}}</a>
+      <a class="btn btn--ghost" href="https://github.com/rahilp/Ratchet-Loop" rel="noopener">{{ICON_CODE}}View on GitHub</a>
+    </div>
+    <div class="cmd">
+      <span class="cmd__label">Paste into your agent</span>
+      <code class="cmd__text">{{INSTALL_PROMPT}}</code>
+      <button class="cmd__copy" type="button" data-copy="{{INSTALL_PROMPT}}" aria-label="Copy the install prompt">{{ICON_COPY}}<span data-copy-label class="sr">Copy</span></button>
     </div>
     <p class="hero__meta">Works in Claude Code <i>·</i> Codex <i>·</i> Gemini CLI <i>·</i> GitHub Copilot CLI</p>
   </div>
 
   <figure class="hero__film wrap">
     <div class="film">
-      <div class="film__head"><p class="mono-k">The ratchet <span>· one tooth per finished step</span></p><span class="tag">12 s loop</span></div>
       <div class="film__frame">
         <video class="film__video" autoplay muted loop playsinline disablepictureinpicture preload="auto" aria-hidden="true" tabindex="-1"
           data-src-lg="assets/hero-1080.mp4" data-src-lg-webm="assets/hero-1080.webm" data-src-sm="assets/hero-720.mp4"></video>

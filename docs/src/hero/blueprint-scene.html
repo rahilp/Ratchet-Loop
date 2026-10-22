@@ -1,12 +1,12 @@
 <!doctype html>
 <html><head><meta charset="utf-8">
 <style>
-  html,body{margin:0;width:1920px;height:1080px;overflow:hidden;background:#FBFAF7}
+  html,body{margin:0;width:1920px;height:1080px;overflow:hidden;background:#FFFFFF}
   svg{display:block}
-  text{font-family:"JetBrains Mono",ui-monospace,monospace}
-  text.serif{font-family:"Inter",system-ui,sans-serif;font-weight:500}
+  text{font-family:"Geist Mono",ui-monospace,monospace}
+  text.serif{font-family:"Geist",system-ui,sans-serif;font-weight:500}
 </style>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@500&display=block">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;600&family=Geist:wght@500&display=block">
 </head><body>
 <svg id="s" width="1920" height="1080" viewBox="0 0 1920 1080" xmlns="http://www.w3.org/2000/svg"></svg>
 <script>
@@ -14,7 +14,7 @@
 // 12 s, 4 clicks. The wheel and its studs are rotationally symmetric, so frame 360 equals frame 0.
 const FPS = 30, LOOP = 12, FRAMES = FPS * LOOP, CLICKS = 4, CYCLE = LOOP / CLICKS;
 const TEETH = 24, PITCH = 360 / TEETH, TAU = Math.PI * 2;
-const BLUE = '#3E6FC4', BLUE_L = '#9DB7E6', GRID = '#ECEAF2', INK = '#1F2A44', MUTED = '#8A90A6', HOT = '#E8572A', PASS = '#2E9E6A';
+const BLUE = '#2563EB', BLUE_L = '#A9C1F5', GRID = '#EEF0F4', INK = '#0B0D12', MUTED = '#8A8F9C', HOT = '#E8572A', PASS = '#1F9D5B';
 const CX = 1220, CY = 590, RR = 262, RT = 322, A = 58 * Math.PI / 180;
 const svg = document.getElementById('s');
 const NS = 'http://www.w3.org/2000/svg';
@@ -46,12 +46,12 @@ el('text', { x: CX, y: CY + 422, 'text-anchor': 'middle', fill: MUTED, 'font-siz
 const rotor = el('g', {});
 el('path', { d, fill: 'rgba(62,111,196,.045)', stroke: BLUE, 'stroke-width': 3, 'stroke-linejoin': 'round' }, rotor);
 el('circle', { cx: CX, cy: CY, r: 230, fill: 'none', stroke: BLUE_L, 'stroke-width': 1.6 }, rotor);
-for (let k = 0; k < 6; k++) { const [x, y] = pt(k * TAU / 6 + .3, 152); el('circle', { cx: x, cy: y, r: 42, fill: '#FBFAF7', stroke: BLUE, 'stroke-width': 2.4 }, rotor); }
-el('circle', { cx: CX, cy: CY, r: 76, fill: '#FBFAF7', stroke: BLUE, 'stroke-width': 3 }, rotor);
+for (let k = 0; k < 6; k++) { const [x, y] = pt(k * TAU / 6 + .3, 152); el('circle', { cx: x, cy: y, r: 42, fill: '#FFFFFF', stroke: BLUE, 'stroke-width': 2.4 }, rotor); }
+el('circle', { cx: CX, cy: CY, r: 76, fill: '#FFFFFF', stroke: BLUE, 'stroke-width': 3 }, rotor);
 el('circle', { cx: CX, cy: CY, r: 34, fill: 'none', stroke: BLUE, 'stroke-width': 2.4 }, rotor);
 for (let k = 0; k < 6; k++) { const [x, y] = pt(k * TAU / 6, 60); el('circle', { cx: x, cy: y, r: 6, fill: 'none', stroke: BLUE, 'stroke-width': 1.8 }, rotor); }
 const studs = [];
-for (let k = 0; k < TEETH; k++) { const a = A + (k + .5) * TAU / TEETH; const [x, y] = pt(a, 246); studs.push({ a, e: el('circle', { cx: x, cy: y, r: 8, fill: '#FBFAF7', stroke: BLUE, 'stroke-width': 2 }, rotor) }); }
+for (let k = 0; k < TEETH; k++) { const a = A + (k + .5) * TAU / TEETH; const [x, y] = pt(a, 246); studs.push({ a, e: el('circle', { cx: x, cy: y, r: 8, fill: '#FFFFFF', stroke: BLUE, 'stroke-width': 2 }, rotor) }); }
 
 // pawl
 const tip = pt(A, RR + 4);
@@ -62,7 +62,7 @@ const q = (s, t) => [piv[0] + n[0] * s + u[0] * t, piv[1] + n[1] * s + u[1] * t]
 const pawl = el('g', {});
 const poly = [q(26, 0), q(17, L * .8), tip, q(-12, L * .9), q(-26, 0)];
 el('path', { d: 'M' + poly.map(p => p.map(v => v.toFixed(1)).join(',')).join(' L') + 'Z', fill: 'rgba(232,87,42,.07)', stroke: HOT, 'stroke-width': 3.2, 'stroke-linejoin': 'round' }, pawl);
-el('circle', { cx: piv[0], cy: piv[1], r: 26, fill: '#FBFAF7', stroke: HOT, 'stroke-width': 3.2 }, pawl);
+el('circle', { cx: piv[0], cy: piv[1], r: 26, fill: '#FFFFFF', stroke: HOT, 'stroke-width': 3.2 }, pawl);
 el('circle', { cx: piv[0], cy: piv[1], r: 8, fill: HOT }, pawl);
 // spring up to a fixed mount
 const MY = piv[1] - 120;
@@ -117,7 +117,7 @@ window.renderFrame = i => {
     let past = ((A - world) % TAU + TAU) % TAU;           // how far clockwise past the pawl
     const passed = past > 0 && past < Math.PI * 1.15;
     const fresh = passed && past < TAU / TEETH * 1.05;
-    s.e.setAttribute('fill', fresh && f > .86 ? HOT : passed ? BLUE : '#FBFAF7');
+    s.e.setAttribute('fill', fresh && f > .86 ? HOT : passed ? BLUE : '#FFFFFF');
   }
   // lamps
   [0.10, 0.28, 0.46].forEach((on, k) => {
