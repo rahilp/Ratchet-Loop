@@ -1136,3 +1136,11 @@ body { background: #fff; color: var(--body); }
 .mini-steps span { color: var(--muted); }
 .mini-steps li { background: #fff; }
 .feat h3, .why__card h3 { letter-spacing: -.015em; }
+/* the hero's single column must never grow to fit the nowrap install prompt */
+.hero__content { grid-template-columns: minmax(0, 1fr); }
+.hero__content > * { max-width: 100%; }
+.cmd { min-width: 0; }
+@media (max-width: 560px) {
+  .hero__ctas { width: 100%; }
+  .hero__ctas .btn { flex: 1 1 100%; }
+}
