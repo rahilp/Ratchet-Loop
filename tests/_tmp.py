@@ -1,5 +1,6 @@
 """
-Shared temp-folder helper for every tests/test_*.py suite.
+Shared temp-folder helper for every tests/test_*.py suite. Also exports `set_fake_load`/`restore_env`, the
+shared RATCHET_FAKE_LOADAVG/RATCHET_FAKE_CPUS helpers every suite that simulates machine load uses.
 
 Every temp folder a suite needs comes from `mkdtemp()` here, never from tempfile.mkdtemp/mkstemp
 directly (tests/test_cleanup.py scans for that). Each folder is removed:
@@ -25,6 +26,7 @@ Stdlib only.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import os
 import shutil
 import signal
@@ -34,6 +36,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from unittest import mock
 
 # CP1: every plan needs a top-level 'objective' (who it is for, what they want, what done means, what is out
 # of scope). Test fixtures that write checkpoints.json directly (not through the real planner) use this minimal
@@ -50,6 +53,67 @@ OBJECTIVE_MIN = {
 # shared reason so they don't all have to say it separately.
 RISK_REASON_MIN = ("a wrong check here would let a corner-cutting agent ship broken or unsafe behavior straight "
                    "past review, hurting whoever uses the resulting feature")
+
+# Load-aware-timeout suites fake the machine load through these two env vars (read_load() in run_all.py), so
+# more than one suite needs to set and restore them; shared here so each one doesn't carry its own copy.
+FAKE_LOAD_VARS = ("RATCHET_FAKE_LOADAVG", "RATCHET_FAKE_CPUS")
+
+
+def set_fake_load(load, cpus):
+    """Fakes RATCHET_FAKE_LOADAVG/RATCHET_FAKE_CPUS for this process (either may be None to leave that one
+    variable unset); returns what to hand to restore_env()."""
+    saved = {k: os.environ.get(k) for k in FAKE_LOAD_VARS}
+    if load is None:
+        os.environ.pop("RATCHET_FAKE_LOADAVG", None)
+    else:
+        os.environ["RATCHET_FAKE_LOADAVG"] = str(load)
+    if cpus is None:
+        os.environ.pop("RATCHET_FAKE_CPUS", None)
+    else:
+        os.environ["RATCHET_FAKE_CPUS"] = str(cpus)
+    return saved
+
+
+def restore_env(saved):
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
+# A test's "unset"/"idle" default-load sub-case means to exercise run_all.read_load()'s own env-unset fallback
+# branch (os.getloadavg()/os.cpu_count()), not whatever the real host it happens to run on is doing right now --
+# a genuinely busy test runner would otherwise stretch that sub-case's timeout past its floor and make the
+# ==120/==590 check flaky. IDLE_LOADAVG/IDLE_CPUS is a fixed reading well under 1.0 load-per-cpu so that
+# fallback branch reads as idle on any host, however busy it actually is.
+IDLE_LOADAVG = 1.0
+IDLE_CPUS = 8
+
+
+@contextlib.contextmanager
+def idle_os_load():
+    """Context manager patching os.getloadavg()/os.cpu_count() -- what run_all.read_load() falls back to when
+    RATCHET_FAKE_LOADAVG/RATCHET_FAKE_CPUS are unset -- to a fixed, known-idle reading (load 1.0 on 8 CPUs) for
+    the duration of the `with` block. Shared here (not a second copy per suite, per the project's convention)
+    for every default/"unset"/"idle" load sub-case that needs a deterministic answer regardless of how busy
+    the real host genuinely is when the test runs."""
+    with mock.patch("os.getloadavg", return_value=(IDLE_LOADAVG, IDLE_LOADAVG, IDLE_LOADAVG)), \
+            mock.patch("os.cpu_count", return_value=IDLE_CPUS):
+        yield
+
+
+def run_all_covers(universe) -> set:
+    """Suite names from `universe` that tests/run_all.py already ran as their own suites in this run: a name
+    is covered only when RATCHET_RUN_ALL is set AND it is also listed in RATCHET_RUN_ALL_SUITES. Shared by
+    every suite that needs this skip-when-already-covered dedup pattern (tests/test_trust_cp5_regression.py's
+    run_all_covers() and tests/test_status_plain.py's covered_suites() each call this with their own universe)
+    so the RATCHET_RUN_ALL / RATCHET_RUN_ALL_SUITES semantics live in one place."""
+    if not os.environ.get("RATCHET_RUN_ALL"):
+        return set()
+    named = set(os.environ.get("RATCHET_RUN_ALL_SUITES", "").split(","))
+    return named & set(universe)
+
 
 _LOCK = threading.RLock()
 _LIVE: list = []          # TmpDir objects not cleaned up yet, oldest first

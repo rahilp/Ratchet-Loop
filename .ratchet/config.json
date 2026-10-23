@@ -80,6 +80,12 @@
       "model": "opencode-go/step-5-preview-free",
       "company": "stepfun",
       "cost": "flat"
+    },
+    {
+      "id": "omp-glm",
+      "preset": "omp",
+      "model": "opencode-go/glm-5.3",
+      "cost": "flat"
     }
   ],
   "test_timeout_sec": 3600,
