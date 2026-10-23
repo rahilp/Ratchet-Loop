@@ -547,6 +547,7 @@ python3 tests/test_lanes_start_extra.py
 python3 tests/test_lanes_request.py
 python3 tests/test_lane_added_tests.py
 python3 tests/test_limits.py
+python3 tests/test_load_determinism.py
 python3 tests/test_load_timeouts.py
 python3 tests/test_load_timeouts_fixes.py
 python3 tests/test_merge_guard.py
@@ -579,6 +580,7 @@ python3 tests/test_shortcuts.py
 python3 tests/test_shortcuts_extra.py
 python3 tests/test_shortcuts_guard.py
 python3 tests/test_runner_load.py
+python3 tests/test_runner_load_concurrency.py
 python3 tests/test_runner_load_fixes.py
 python3 tests/test_signing.py
 python3 tests/test_specs.py

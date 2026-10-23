@@ -14,6 +14,7 @@ Assumed interface (the implementation must provide it):
 Everything runs in throwaway git projects with a temp HOME / RATCHET_HOME; the repo's own .ratchet is never touched.
 """
 import ast
+import contextlib
 import datetime as dt
 import importlib.util
 import json
@@ -474,8 +475,13 @@ def cp2_t01(project):
     # call's own `.timeout_limit` attribute, exactly like tests/test_install.py's CP1-T01..T05 do for Env.run().
     for label, load, cpus in (("unset", None, None), ("low-load", "1", "8"), ("unavailable", "unavailable", None)):
         saved = set_fake_load(load, cpus)
+        # "unset" means to exercise read_load()'s env-unset fallback (os.getloadavg()/os.cpu_count()), not
+        # whatever the real host running this test happens to be doing right now -- fake that fallback idle
+        # so this sub-case's ==120 check is deterministic on any host (CP4).
+        ctx = _tmp.idle_os_load() if load is None else contextlib.nullcontext()
         try:
-            r = rx(project, "status")
+            with ctx:
+                r = rx(project, "status")
         finally:
             restore_env(saved)
         check(f"[CP2-T01] {label}: rx()'s subprocess timeout is exactly 120, byte for byte the same as before "
@@ -493,10 +499,15 @@ def cp2_t02():
     # is never actually started) and the effective limit is read off the returned `.timeout_limit`.
     for label, load, cpus in (("unset", None, None), ("low-load", "1", "8"), ("unavailable", "unavailable", None)):
         saved = set_fake_load(load, cpus)
+        # "unset" means to exercise read_load()'s env-unset fallback (os.getloadavg()/os.cpu_count()), not
+        # whatever the real host running this test happens to be doing right now -- fake that fallback idle
+        # so this sub-case's ==590 check is deterministic on any host (CP4).
+        ctx = _tmp.idle_os_load() if load is None else contextlib.nullcontext()
         _, fake_popen = _patch_run(real=False)
         saved_env = _set_run_all_env({})  # RATCHET_RUN_ALL unset: the suite actually runs, never skipped
         try:
-            ok, result = _try_call(lambda: cp3_t21_run_one("test_hooks.py", popen=fake_popen))
+            with ctx:
+                ok, result = _try_call(lambda: cp3_t21_run_one("test_hooks.py", popen=fake_popen))
         finally:
             restore_env(saved_env)
             restore_env(saved)
@@ -698,19 +709,24 @@ def cp2_t10(project):
     for label, load, cpus in (("idle", None, None), ("borderline", "6", "4"), ("high", "16", "4"),
                                ("unavailable", "unavailable", None)):
         saved = set_fake_load(load, cpus)
+        # "idle" means to exercise read_load()'s env-unset fallback (os.getloadavg()/os.cpu_count()), not
+        # whatever the real host running this test happens to be doing right now -- fake that fallback idle
+        # so this sub-case's floor checks are deterministic on any host (CP4).
+        ctx = _tmp.idle_os_load() if load is None else contextlib.nullcontext()
         try:
-            expected_factor, _, _ = run_all.stretch_factor(run_all.DEFAULT_MAX_STRETCH)
-            expected_rx = max(120.0, 120.0 * expected_factor)
-            expected_cp3 = max(590.0, 590.0 * expected_factor)
+            with ctx:
+                expected_factor, _, _ = run_all.stretch_factor(run_all.DEFAULT_MAX_STRETCH)
+                expected_rx = max(120.0, 120.0 * expected_factor)
+                expected_cp3 = max(590.0, 590.0 * expected_factor)
 
-            r = rx(project, "status")
+                r = rx(project, "status")
 
-            _, fake_popen = _patch_run(real=False)
-            saved_env = _set_run_all_env({})
-            try:
-                ok, result = _try_call(lambda: cp3_t21_run_one("test_hooks.py", popen=fake_popen))
-            finally:
-                restore_env(saved_env)
+                _, fake_popen = _patch_run(real=False)
+                saved_env = _set_run_all_env({})
+                try:
+                    ok, result = _try_call(lambda: cp3_t21_run_one("test_hooks.py", popen=fake_popen))
+                finally:
+                    restore_env(saved_env)
         finally:
             restore_env(saved)
         check(f"[CP2-T10] {label}: rx()'s effective timeout equals exactly "

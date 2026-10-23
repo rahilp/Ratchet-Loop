@@ -26,6 +26,7 @@ Stdlib only.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import os
 import shutil
 import signal
@@ -35,6 +36,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from unittest import mock
 
 # CP1: every plan needs a top-level 'objective' (who it is for, what they want, what done means, what is out
 # of scope). Test fixtures that write checkpoints.json directly (not through the real planner) use this minimal
@@ -78,6 +80,27 @@ def restore_env(saved):
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
+
+
+# A test's "unset"/"idle" default-load sub-case means to exercise run_all.read_load()'s own env-unset fallback
+# branch (os.getloadavg()/os.cpu_count()), not whatever the real host it happens to run on is doing right now --
+# a genuinely busy test runner would otherwise stretch that sub-case's timeout past its floor and make the
+# ==120/==590 check flaky. IDLE_LOADAVG/IDLE_CPUS is a fixed reading well under 1.0 load-per-cpu so that
+# fallback branch reads as idle on any host, however busy it actually is.
+IDLE_LOADAVG = 1.0
+IDLE_CPUS = 8
+
+
+@contextlib.contextmanager
+def idle_os_load():
+    """Context manager patching os.getloadavg()/os.cpu_count() -- what run_all.read_load() falls back to when
+    RATCHET_FAKE_LOADAVG/RATCHET_FAKE_CPUS are unset -- to a fixed, known-idle reading (load 1.0 on 8 CPUs) for
+    the duration of the `with` block. Shared here (not a second copy per suite, per the project's convention)
+    for every default/"unset"/"idle" load sub-case that needs a deterministic answer regardless of how busy
+    the real host genuinely is when the test runs."""
+    with mock.patch("os.getloadavg", return_value=(IDLE_LOADAVG, IDLE_LOADAVG, IDLE_LOADAVG)), \
+            mock.patch("os.cpu_count", return_value=IDLE_CPUS):
+        yield
 
 
 def run_all_covers(universe) -> set:
