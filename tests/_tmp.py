@@ -80,6 +80,18 @@ def restore_env(saved):
             os.environ[k] = v
 
 
+def run_all_covers(universe) -> set:
+    """Suite names from `universe` that tests/run_all.py already ran as their own suites in this run: a name
+    is covered only when RATCHET_RUN_ALL is set AND it is also listed in RATCHET_RUN_ALL_SUITES. Shared by
+    every suite that needs this skip-when-already-covered dedup pattern (tests/test_trust_cp5_regression.py's
+    run_all_covers() and tests/test_status_plain.py's covered_suites() each call this with their own universe)
+    so the RATCHET_RUN_ALL / RATCHET_RUN_ALL_SUITES semantics live in one place."""
+    if not os.environ.get("RATCHET_RUN_ALL"):
+        return set()
+    named = set(os.environ.get("RATCHET_RUN_ALL_SUITES", "").split(","))
+    return named & set(universe)
+
+
 _LOCK = threading.RLock()
 _LIVE: list = []          # TmpDir objects not cleaned up yet, oldest first
 _PROCS: list = []         # processes tracked without a folder (see track())
