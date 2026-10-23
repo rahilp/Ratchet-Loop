@@ -125,7 +125,7 @@
   "min_review_seconds": 20,
   "host_models": {
     "anthropic": {
-      "strong": "inherit",
+      "strong": "opus",
       "standard": "sonnet",
       "light": "haiku",
       "alternates": [
@@ -133,5 +133,11 @@
         "opus"
       ]
     }
-  }
+  },
+  "related_test_command": "python3 tests/run_all.py {files}",
+  "related_always": [
+    "tests/test_docs.py",
+    "tests/test_brief.py",
+    "tests/test_trust_cp5_d.py"
+  ]
 }

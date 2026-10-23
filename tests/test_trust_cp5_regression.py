@@ -19,13 +19,13 @@ Moved verbatim from the old tests/test_trust.py; shared helpers live in tests/tr
 
     python3 tests/test_trust_cp5_regression.py
 """
-import os
 import subprocess
 import sys
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
+import _tmp
 import trust_helpers
 from trust_helpers import check
 
@@ -34,11 +34,10 @@ REGRESSION_SUITES = ("test_gates.py", "test_hooks_waiver.py")
 
 
 def run_all_covers() -> set:
-    """Suite names from REGRESSION_SUITES that tests/run_all.py already ran as their own suites in this run."""
-    if not os.environ.get("RATCHET_RUN_ALL"):
-        return set()
-    named = set(os.environ.get("RATCHET_RUN_ALL_SUITES", "").split(","))
-    return named & set(REGRESSION_SUITES)
+    """Suite names from REGRESSION_SUITES that tests/run_all.py already ran as their own suites in this run.
+    Calls the shared _tmp.run_all_covers() helper tests/test_status_plain.py's covered_suites() also calls, so
+    the RATCHET_RUN_ALL / RATCHET_RUN_ALL_SUITES dedup semantics live in one place."""
+    return _tmp.run_all_covers(REGRESSION_SUITES)
 
 
 def cp5_regression_existing_approval_suites_still_pass():

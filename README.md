@@ -275,12 +275,12 @@ Round 1 of a step always asks every reviewer. After that, review gets cheaper on
 - **Fewer reviewers after round 1.** (When the fixer has actually run, the one-reviewer round below takes over from this narrowing.) Once a round blocks, the next one only asks back the reviewer(s) whose kind of review still has an open serious finding, or an open finding of any severity that names a done-means line of the plan's objective; one that approved isn't re-run. If the fix doesn't actually settle it, the round after that brings back the full set again, rather than narrowing down forever.
 - **No double-counting.** If two review slots would end up at the same reviewer (same company, same model, same kind of review), it only runs once, and you're told the real number that reviewed, not the number of slots configured.
 - **A replaced round that nobody reviewed yet is free.** If the code changes again before any reviewer wrote a review, re-opening the round doesn't use up any of your review budget. Once a review has been written, though, that round counts, whether or not it was ever recorded.
-- **On a big diff, what changed since the last reviewed round comes first.** When a step's diff is too large to hand a reviewer whole, the files changed since the last round a reviewer actually saw come first; anything still left out after that is named by file, not just a character count, so a reviewer always sees what's new since it last looked, and knows by name what it didn't see.
+- **On a big diff, what changed since the last reviewed round comes first.** When a step's diff is too large to hand a reviewer whole, the files changed since the last round adv-record recorded (approved or blocked; a refused round, or one replaced before anyone reviewed it, never moves it) come first; anything still left out after that is named by file, not just a character count, so a reviewer always sees what's new since it last looked, and knows by name what it didn't see. In such a full round (round 1, or a later round that reviews the whole step's diff), a file the step purely deleted (a textbook single-hunk delete, nothing else in it) is shown as git's own headers plus one line saying it was deleted and how many lines were left out, biggest first and only as many as needed, and it counts as shown, not cut. A file the step added is never summarized: every other changed file, whether or not it changed since the last round, is packed in ahead of every added one (the files changed since the last round are still printed first), the smallest added file goes first, and an added file that doesn't fit is cut (shown only as far as the room allows) and named like any other cut file. A diff that fits is shown exactly as git prints it, and a first round with no added or deleted file in it is still cut at the limit with a plain note, as before.
 - **Small issues stop blocking after a couple of rounds.** Serious findings always block, every round. A minor one — a nit, a style note — blocks for the first couple of rounds (`converge_after_round` in config, default 2; so round 3 on), after which it's simply recorded for the final review instead of starting another round over it. The one exception: a finding that names a done-means line of the plan's objective always blocks, whatever its severity or round, until it is fixed or you accept it yourself (a plan approved before this rule existed keeps the rules it was approved under, with a plain note instead of a block).
 - **A small fix after approval gets one reviewer, covering both lenses.** Once a step's adversarial gate has approved, a code fix at or under `small_edit_lines` (default 20 changed lines, measured since the last full multi-reviewer approval so several small fixes in a row still add up to a full round) opens its next round with a single reviewer who checks both standards and correctness, instead of the step's whole reviewer set — unless the step is high risk, which always keeps the full round. The commit message and `status` say when a round was reviewed this way, and by whom.
 - **After a block, the fix round gets one reviewer.** Once a round blocked and the fixer has run, the next round is a fix round: it opens with exactly one reviewer, whatever the fix's size and whatever the step's risk. That one reviewer is the one whose blocking finding was fixed, with the same provider and the same lens (kind of review), so a Codex correctness finding is re-checked by Codex correctness; when several reviewers blocked, one from a company other than the host's is preferred, and then the lowest slot number. Any finding that actually blocked that round counts, whatever its severity, so a round that blocked on minor findings alone (at normal or high risk, where every severity blocks) starts a fix round too. If that reviewer is unavailable (benched, out of quota, or already at its share of review starts), its slot's own stand-in for the same lens takes the round, and no provider that had not reviewed the step is ever brought in. A fix round counts toward the step's and the run's review limits like any other round, and when it blocks again it goes to the usual check-in before another round can open. `status` and the commit message name each fix round and the one reviewer that re-checked it.
 
-- **A fix round's reviewer sees only the fix.** In a fix round (after a block, or the small fix after an approval above), the reviewer is shown only the fixer's diff, meaning what changed since the last round a reviewer actually saw, plus the open findings the fix was meant to fix (id, severity, file, line, description, suggested fix, and the rebuttal reason if the fixer argued and lost); a finding you accepted is not listed. A small fix after an approval has no findings to list. Round 1, a fix over `small_edit_lines` and a high-risk step's fix keep the whole step's diff. A host sub-agent and another company's CLI get the same scope. If a fix is too big to show whole, the prompt names the files it left out and a review of it is refused rather than counted, whatever it found. Only a fix round gets a shorter minimum review time, one that scales with the size of its diff and never exceeds `min_review_seconds` (default 20 seconds), so a review of a 2-line fix that comes back in about 10 seconds is accepted; a full round keeps `min_review_seconds` as configured.
+- **A fix round's reviewer sees only the fix.** In a fix round (after a block, or the small fix after an approval above), the reviewer is shown only the fixer's diff, meaning what changed since the last round adv-record recorded (approved or blocked; a refused round, or one replaced before anyone reviewed it, never moves it), plus the open findings the fix was meant to fix (id, severity, file, line, description, suggested fix, and the rebuttal reason if the fixer argued and lost); a finding you accepted is not listed. A small fix after an approval has no findings to list. Round 1, a fix over `small_edit_lines` and a high-risk step's fix keep the whole step's diff. A host sub-agent and another company's CLI get the same scope. If a fix is too big to show whole, a file the fix purely deleted (a textbook single-hunk delete, nothing else in it) is shown as git's own headers plus one line saying it was deleted and how many lines were left out, biggest first and only as many as needed; such a file counts as shown. A file the fix added is never summarized, whatever else the fix contains: it is shown whole, or named as not shown, because added content is what can ship or run, and a file moved and rewritten or split out of another file reaches the reviewer as an add. A file moved with most of it unchanged is shown as git's own move, with every changed line. A real modification too large to include is still named as not shown, and a review that left out any file is refused rather than counted, whatever it found, so it still stops the round from being recorded. Only a fix round gets a shorter minimum review time, one that scales with the size of its diff and never exceeds `min_review_seconds` (default 20 seconds), so a review of a 2-line fix that comes back in about 10 seconds is accepted; a full round keeps `min_review_seconds` as configured.
 
 ### One flaky failure doesn't cost you anything
 
@@ -547,6 +547,7 @@ python3 tests/test_lanes_start_extra.py
 python3 tests/test_lanes_request.py
 python3 tests/test_lane_added_tests.py
 python3 tests/test_limits.py
+python3 tests/test_load_determinism.py
 python3 tests/test_load_timeouts.py
 python3 tests/test_load_timeouts_fixes.py
 python3 tests/test_merge_guard.py
@@ -572,6 +573,10 @@ python3 tests/test_receipt_proof.py
 python3 tests/test_related_tests.py
 python3 tests/test_related_tests_fixes.py
 python3 tests/test_results.py
+python3 tests/test_review_diff_full_rounds.py
+python3 tests/test_review_diff_full_rounds_fixes.py
+python3 tests/test_review_diff_large_files.py
+python3 tests/test_review_diff_large_files_fixes.py
 python3 tests/test_review_objective.py
 python3 tests/test_run_all_dedupe.py
 python3 tests/test_runner.py
@@ -579,14 +584,17 @@ python3 tests/test_shortcuts.py
 python3 tests/test_shortcuts_extra.py
 python3 tests/test_shortcuts_guard.py
 python3 tests/test_runner_load.py
+python3 tests/test_runner_load_concurrency.py
 python3 tests/test_runner_load_fixes.py
 python3 tests/test_signing.py
+python3 tests/test_since_tree_rejected_round.py
 python3 tests/test_specs.py
 python3 tests/test_split_check.py
 python3 tests/test_stale_lock.py
 python3 tests/test_status_plain.py
 python3 tests/test_stop_on_change.py
 python3 tests/test_stop_on_change_fixes.py
+python3 tests/test_stretched_timeout_cleanup.py
 python3 tests/test_trust_cp1.py
 python3 tests/test_trust_cp3.py
 python3 tests/test_trust_cp4.py

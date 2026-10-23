@@ -7,14 +7,19 @@ process, several at once. With FILE arguments (paths relative to the working fol
 runs only those suites, in the same way; a FILE that does not exist is refused before anything starts, so a
 partly wrong list never runs half. Ratchet's own `related_test_command` ("python3 tests/run_all.py {files}")
 calls it this way to run the test files related to a step before the full suite. Suites run several at once
-(half the CPU cores by default, at least 2). Each suite gets its own empty temp folder (TMPDIR, TEMP and TMP
-point at it); a suite that leaves anything in that folder is reported as failed even when its own checks
-passed. A suite still running after --timeout seconds (more on a busy machine, see below) is stopped and
-reported as timed out.
+(half the CPU cores by default, at least 2; fewer on a busy machine, see below). Each suite gets its own empty
+temp folder (TMPDIR, TEMP and TMP point at it); a suite that leaves anything in that folder is reported as
+failed even when its own checks passed. A suite still running after --timeout seconds (more on a busy machine,
+see below) is stopped and reported as timed out.
 
 The time limit grows with machine load: on every check it is --timeout times the one-minute load average divided by
 the CPU count (never less than --timeout, never more than --timeout times --max-stretch, default 4; a load drop never
-shortens a limit already granted), so a suite that is only slow because the machine is busy is given more time. The end summary has one line for each suite that ran
+shortens a limit already granted), so a suite that is only slow because the machine is busy is given more time. The
+number of suites started at once is also reduced on a busy machine (the one-minute load average strictly above the
+CPU count, read once at start): the requested or computed count is cut by the same load/CPU share, down to a floor of 2
+(never lower unless fewer than 2 were requested or there are fewer than 2 suites to run, in which case that smaller
+number is left alone -- there is no floor to raise it to). --max-stretch's clamp also bounds how far this cut can go,
+so --max-stretch 1 disables it along with the timeout stretch. The end summary has one line for each suite that ran
 past its --timeout or was stopped at a stretched limit. RATCHET_FAKE_LOADAVG (a number, "unavailable", or @FILE
 holding a number) and RATCHET_FAKE_CPUS replace the real readings; the tests use them.
 
@@ -150,6 +155,57 @@ def stretch_factor(max_stretch: float):
         return 1.0, None, None
     load, cpus = reading
     return min(max(1.0, load / cpus), max_stretch), load, cpus
+
+
+def run_with_stretched_timeout(argv, base: float, max_stretch: float = DEFAULT_MAX_STRETCH, cwd=None, env=None,
+                                capture_output: bool = True, text: bool = True, popen=subprocess.Popen,
+                                monotonic=time.monotonic):
+    """Runs argv in its own process group and waits for it to finish, the way subprocess.run() would, except the
+    time limit follows stretch_factor() exactly like Runner.wait() does: it is re-read on every poll, so it is
+    `base` times the highest stretch_factor(max_stretch) reading seen since the call started (a load spike while
+    it runs still extends it, a load drop never takes back time already granted, and it is never less than
+    `base`). On expiry the whole process tree is stopped with kill_tree() and subprocess.TimeoutExpired is
+    raised (its .timeout is the limit that was in force). If a KeyboardInterrupt, SystemExit, or any other
+    exception arrives anywhere in the poll loop -- while re-reading the load/clock for the next stretched limit,
+    or while waiting in proc.communicate() -- the process tree is stopped with kill_tree() the same way, before
+    the exception is re-raised unchanged -- the interrupt is never swallowed, and it is never stopped twice. On
+    success, returns a subprocess.CompletedProcess like
+    subprocess.run() would, with one extra attribute, `.timeout_limit`: the limit in force when the call
+    finished, so a caller (or a test) can see what was actually used without ever waiting one out in real time.
+    `popen` and `monotonic` default to subprocess.Popen/time.monotonic (every real call site leaves them alone);
+    a test may inject stand-ins to make the whole call deterministic, with no real sleep or wall-clock read."""
+    proc = popen(argv, stdout=subprocess.PIPE if capture_output else None,
+                 stderr=subprocess.PIPE if capture_output else None, stdin=subprocess.DEVNULL,
+                 cwd=cwd, env=env, text=text, start_new_session=True)
+    t0 = monotonic()
+    limit = base
+    out = err = None
+    while True:
+        try:
+            factor, _, _ = stretch_factor(max_stretch)
+            limit = max(limit, base * factor)
+            remaining = limit - (monotonic() - t0)
+        except BaseException:
+            kill_tree(proc)
+            raise
+        if remaining <= 0:
+            kill_tree(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            raise subprocess.TimeoutExpired(argv, limit)
+        try:
+            out, err = proc.communicate(timeout=min(POLL_SECONDS, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            continue
+        except BaseException:
+            kill_tree(proc)
+            raise
+    result = subprocess.CompletedProcess(argv, proc.returncode, out, err)
+    result.timeout_limit = limit
+    return result
 
 
 # ---- running one suite -------------------------------------------------------------------------------------
@@ -435,15 +491,18 @@ def parse_args(argv):
                                 description="Run every tests/test_*.py suite at the same time.")
     p.add_argument("--dir", default=str(HERE), help="folder holding the test_*.py suites (default: tests/)")
     p.add_argument("--workers", type=int, default=default_workers(),
-                   help=f"how many suites run at once (default {default_workers()}: half the CPU cores, at least 2; "
-                        "each suite starts its own subprocesses, so one suite per core overloads the machine "
-                        "and was slower when measured)")
+                   help=f"how many suites run at once, at most (default {default_workers()}: half the CPU cores, at "
+                        "least 2; each suite starts its own subprocesses, so one suite per core overloads the machine "
+                        "and was slower when measured); on a busy machine (load strictly above the CPU count) fewer "
+                        "start at once, down to a floor of 2 unless this itself asked for fewer")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                    help="seconds before a suite is stopped and reported as timed out; on a busy machine the limit grows, "
                         f"up to --max-stretch times this (default {DEFAULT_TIMEOUT:.0f})")
     p.add_argument("--max-stretch", type=float, default=DEFAULT_MAX_STRETCH,
                    help="the time limit grows with machine load (timeout x load / CPUs); this is the most times "
-                        f"the timeout it can grow to (default {DEFAULT_MAX_STRETCH:.0f}; 1 turns the stretch off)")
+                        f"the timeout it can grow to (default {DEFAULT_MAX_STRETCH:.0f}; 1 turns the stretch off). "
+                        "It also bounds how far the worker-concurrency cap can cut the number of suites running at "
+                        "once on a busy machine, so --max-stretch 1 turns that cap off too")
     p.add_argument("--tail", type=int, default=DEFAULT_TAIL,
                    help=f"lines of output shown for each failed suite (default {DEFAULT_TAIL})")
     p.add_argument("files", nargs="*", metavar="FILE",
@@ -497,6 +556,25 @@ def main(argv=None) -> int:
     history = load_timings().get(str(folder), {})
     order = start_order(suites, history if isinstance(history, dict) else {})
     workers = min(args.workers, len(order))
+    # Load-aware cap: on a busy machine, start fewer suites at once than requested/computed, using the exact
+    # same stretch_factor()/read_load() reading and magnitude (the share to reduce by) that
+    # run_with_stretched_timeout() uses for the timeout stretch -- reused as-is, not a second, divergent
+    # formula. This is a backstop against genuine, measurable oversubscription: it only reduces `workers` once
+    # the one-minute load average is actually above the CPU count (factor > 1.0), the same point past which
+    # stretch_factor() itself starts growing the timeout. At exactly load == cpus, stretch_factor() returns its
+    # floor of 1.0 ("never shrink a timeout below the requested one"), so int(workers / 1.0) == workers and this
+    # leaves the count unchanged -- intentional, not a bug: the cap reacts to measurable oversubscription, not to
+    # the exact mathematical saturation boundary. On an idle or unreadable-load machine this never triggers and
+    # `workers` is untouched -- byte for byte what it is today. It only ever reduces `workers`, never raises it;
+    # it only imposes a floor of 2 when it actually reduces a count that was 2 or more to begin with (a
+    # requested/computed count already below 2, such as --workers 1 or a single-suite run, is left alone --
+    # there is no floor to enforce there).
+    factor, load, cpus = stretch_factor(args.max_stretch)
+    if load is not None and cpus and factor > 1.0:
+        capped = min(workers, max(2, int(workers / factor)))
+        if capped < workers:
+            print(f"Worker count capped from {workers} to {capped} (load {load:.1f} on {cpus} CPUs).", flush=True)
+        workers = capped
     print(f"Running {len(order)} suites from {folder}, {workers} at a time, slowest first "
           f"(timeout {args.timeout:.0f}s each).", flush=True)
 

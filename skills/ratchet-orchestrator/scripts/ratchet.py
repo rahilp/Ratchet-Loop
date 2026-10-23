@@ -11328,10 +11328,10 @@ def _adv_open_findings(ctx, cp_id: str, rnd, cps=None) -> list:
 # suggested fix, and any rebuttal reason already recorded for it). A first round, a narrowed round (the old
 # convergence fallback), and any full round (including a fix over small_edit_lines after an approval, and every
 # high-risk step's own full round) are never scoped this way: they keep the whole step diff exactly as CP5 left
-# it. `prev_round_tree` (already carried forward through a free replacement -- see cmd_reviewers) is reused
-# as-is for the scope boundary, so a second fix round in a row scopes to just that second fix, and a round that
-# replaces one nobody reviewed yet scopes to everything since the last round actually reviewed, not just the
-# latest edit.
+# it. `prev_round_tree` (already set to the last round adv-record actually recorded -- see cmd_reviewers) is
+# reused as-is for the scope boundary, so a second fix round in a row scopes to just that second fix, and a round
+# that replaces one adv-record never recorded (never reviewed, or reviewed but refused) scopes to everything
+# since the last round adv-record recorded, not just the latest edit.
 
 def _scope_for_round(ctx: "Ctx", cp_id: str, rnd: dict | None, cps: dict, fp_id: str) -> dict | None:
     """The CP6 scope for `rnd`, or None when it keeps the whole step diff. Returns {"since_tree", "changed_files",
@@ -16585,6 +16585,11 @@ def cmd_reviewers(args):
         g["attempts"] += 1
         st["adv_rounds_total"] = int(st.get("adv_rounds_total", 0)) + 1
         prev = rnd["round"] if rnd else 0
+        # A round that WAS reviewed but adv-record refused it (omitted_files, too fast, no files_reviewed) is
+        # charged on purpose: only a round nobody reviewed yet is free (below). A refused round never moves the
+        # baseline (below), so the next round still shows the fix, and running out of rounds still stops at the
+        # usual blocked-for-human/director-decision message.
+        # `free_replace` is kept only as CP1-T15's structural anchor for the refund block below; nothing else reads it.
         free_replace = False
         if rnd and not rnd.get("recorded"):
             # Replacing a round nobody reviewed yet (the code changed again before any review was written) costs
@@ -16595,13 +16600,13 @@ def cmd_reviewers(args):
                 g["attempts"] = max(0, g["attempts"] - 1)
                 st["adv_rounds_total"] = max(0, int(st.get("adv_rounds_total", 0)) - 1)
         old_key = review_key_file(ctx.root, st, args.cp, "adv", prev) if prev else None
-        # The round being replaced, before it is overwritten -- unless it was itself never reviewed (free
-        # replace): its own fingerprint is not a baseline any reviewer has seen, so carry forward ITS
-        # prev_round_tree (the last ACTUALLY-REVIEWED tree) instead, never the discarded round's fingerprint.
-        if free_replace:
-            prev_round_tree = rnd.get("prev_round_tree")
-        else:
-            prev_round_tree = rnd["fingerprint"] if rnd else None
+        # The new round's baseline is the last round adv-record actually RECORDED (g["rounds"], append-only,
+        # written only at a successful cmd_adv_record, approved or blocked) -- never the discarded round's own
+        # fingerprint, and never a field carried forward from it: a round adv-record refused (or never ran on)
+        # never moves the baseline, however it is replaced, and this heals an already-open round that still
+        # carries a wrong baseline from an earlier refusal, with no hand edit of state.json.
+        last_rec = (g.get("rounds") or [])[-1:]
+        prev_round_tree = last_rec[0].get("fingerprint") if last_rec else None
         rnd = {"round": prev + 1, "nonce": new_nonce, "fingerprint": fp, "opened_at": now(),
                "reviewers": [r["id"] for r in resolved], "narrowed": narrow_now, "small_fix": small_fix,
                "kind": kind, "fix_round": fix_pick,
