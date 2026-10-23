@@ -589,6 +589,7 @@ python3 tests/test_stale_lock.py
 python3 tests/test_status_plain.py
 python3 tests/test_stop_on_change.py
 python3 tests/test_stop_on_change_fixes.py
+python3 tests/test_stretched_timeout_cleanup.py
 python3 tests/test_trust_cp1.py
 python3 tests/test_trust_cp3.py
 python3 tests/test_trust_cp4.py

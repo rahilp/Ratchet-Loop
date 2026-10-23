@@ -165,7 +165,11 @@ def run_with_stretched_timeout(argv, base: float, max_stretch: float = DEFAULT_M
     `base` times the highest stretch_factor(max_stretch) reading seen since the call started (a load spike while
     it runs still extends it, a load drop never takes back time already granted, and it is never less than
     `base`). On expiry the whole process tree is stopped with kill_tree() and subprocess.TimeoutExpired is
-    raised (its .timeout is the limit that was in force). On success, returns a subprocess.CompletedProcess like
+    raised (its .timeout is the limit that was in force). If a KeyboardInterrupt, SystemExit, or any other
+    exception arrives anywhere in the poll loop -- while re-reading the load/clock for the next stretched limit,
+    or while waiting in proc.communicate() -- the process tree is stopped with kill_tree() the same way, before
+    the exception is re-raised unchanged -- the interrupt is never swallowed, and it is never stopped twice. On
+    success, returns a subprocess.CompletedProcess like
     subprocess.run() would, with one extra attribute, `.timeout_limit`: the limit in force when the call
     finished, so a caller (or a test) can see what was actually used without ever waiting one out in real time.
     `popen` and `monotonic` default to subprocess.Popen/time.monotonic (every real call site leaves them alone);
@@ -177,9 +181,13 @@ def run_with_stretched_timeout(argv, base: float, max_stretch: float = DEFAULT_M
     limit = base
     out = err = None
     while True:
-        factor, _, _ = stretch_factor(max_stretch)
-        limit = max(limit, base * factor)
-        remaining = limit - (monotonic() - t0)
+        try:
+            factor, _, _ = stretch_factor(max_stretch)
+            limit = max(limit, base * factor)
+            remaining = limit - (monotonic() - t0)
+        except BaseException:
+            kill_tree(proc)
+            raise
         if remaining <= 0:
             kill_tree(proc)
             try:
@@ -192,6 +200,9 @@ def run_with_stretched_timeout(argv, base: float, max_stretch: float = DEFAULT_M
             break
         except subprocess.TimeoutExpired:
             continue
+        except BaseException:
+            kill_tree(proc)
+            raise
     result = subprocess.CompletedProcess(argv, proc.returncode, out, err)
     result.timeout_limit = limit
     return result
