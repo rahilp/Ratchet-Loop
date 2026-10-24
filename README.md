@@ -524,6 +524,7 @@ python3 tests/test_docs_accuracy.py
 python3 tests/test_flaky.py
 python3 tests/test_feedback_fixes.py
 python3 tests/test_fix_round.py
+python3 tests/test_fix_round_carry_bench.py
 python3 tests/test_fix_round_diff.py
 python3 tests/test_fix_round_diff_fixes.py
 python3 tests/test_fix_round_fixes.py
