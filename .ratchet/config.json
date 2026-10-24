@@ -49,10 +49,6 @@
       "preset": "claude"
     },
     {
-      "id": "codex",
-      "preset": "codex"
-    },
-    {
       "id": "copilot",
       "preset": "copilot",
       "model": "grok-4.7"
@@ -86,6 +82,13 @@
       "preset": "omp",
       "model": "opencode-go/glm-5.3",
       "cost": "flat"
+    },
+    {
+      "id": "codex",
+      "preset": "codex",
+      "prefer_for": [
+        "both"
+      ]
     }
   ],
   "test_timeout_sec": 3600,

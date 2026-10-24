@@ -367,9 +367,13 @@ def scoped_diff_parts(root: Path, since_tree: str, current_tree: str) -> tuple[s
     a modified file, reaches git as an add, so an add is shown in full or omitted and named (-M only makes a move
     read better; it is not what keeps an edit from being hidden). Only as many deletes are summarized as needed,
     biggest first (a tie goes to the file git prints first): every pure delete whose summary is shorter than its
-    full chunk starts summarized, the other files are fitted in git's order, then summaries are swapped back to
-    the full chunk, smallest first, while the total stays within MAX_DIFF. Any other file that does not fit whole
-    (a real modification, or any added file) is omitted and named, exactly as before."""
+    full chunk starts summarized. The fitting loop then tries every non-add (a modification, or a pure delete,
+    summarized or not) in git's order before any pure add, so a real change never loses its room to a new file
+    listed earlier by git; the pure adds themselves are tried smallest first (a tie keeps git's order), mirroring
+    _pack_full_round's own grouping. Afterwards summaries are swapped back to the full chunk, smallest first,
+    while the total stays within MAX_DIFF. Any other file that does not fit whole (a real modification, or any
+    added file) is omitted and named, exactly as before. Shown files still PRINT in git's own order below,
+    whatever order they were fitted in."""
     header = f"# Changes since the last round actually reviewed ({since_tree[:10]} → {current_tree[:10]})\n"
     diff = git(root, "diff-tree", "-r", "-p", "-M", "--no-color", since_tree, current_tree)
     if not diff:
@@ -385,9 +389,14 @@ def scoped_diff_parts(root: Path, since_tree: str, current_tree: str) -> tuple[s
             t = _summarize_pure(c, *pure)
             if len(t) < len(c):
                 summary[i] = t
+    is_add = {i: bool((pure := _pure_add_delete(c)) and pure[0] == "added") for i, (_f, c) in enumerate(chunks)}
+    # fitting order: every non-add in git's order, then the pure adds smallest first (a tie keeps git's order)
+    order = [i for i in range(len(chunks)) if not is_add[i]] + \
+        sorted((i for i in range(len(chunks)) if is_add[i]), key=lambda i: len(chunks[i][1]))
     use = {}  # chunk index -> the text shown for it (absent: omitted)
     total = len(header)
-    for i, (_f, c) in enumerate(chunks):
+    for i in order:
+        _f, c = chunks[i]
         t = summary.get(i, c)
         if total + len(t) > MAX_DIFF:
             continue

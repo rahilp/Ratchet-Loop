@@ -577,6 +577,7 @@ python3 tests/test_review_diff_full_rounds.py
 python3 tests/test_review_diff_full_rounds_fixes.py
 python3 tests/test_review_diff_large_files.py
 python3 tests/test_review_diff_large_files_fixes.py
+python3 tests/test_scoped_diff_priority.py
 python3 tests/test_review_objective.py
 python3 tests/test_run_all_dedupe.py
 python3 tests/test_runner.py
