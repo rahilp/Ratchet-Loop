@@ -15772,6 +15772,16 @@ def cmd_approve_changes(args):
     cur = st.get("current")
     if cur and (st["checkpoints"].get(cur) or {}).get("red_tests") is not None:
         st["checkpoints"][cur]["red_tests"] = _snapshot_tests(ctx, cp_by_id(ctx.plan(), cur))
+    # An approved edit to a checkpoint whose open round predates reviewers-pin tracking (no reviewers_pin key):
+    # stamp a baseline so the next `reviewers` call re-evaluates the round against the live pin. With a live pin
+    # the baseline is the round's own reviewers (so a restated, unchanged pin keeps the round); with none it is
+    # None (an unpinned checkpoint never force-reopens).
+    for pr in probs:
+        m = re.fullmatch(r"checkpoint (\S+) in checkpoints\.json", pr)
+        rnd = (((st["checkpoints"].get(m.group(1)) or {}).get("adv_round")) or None) if m else None
+        if rnd and not rnd.get("recorded") and "reviewers_pin" not in rnd:
+            live = next((c for c in plan["checkpoints"] if c.get("id") == m.group(1)), {}).get("reviewers")
+            rnd["reviewers_pin"] = list(rnd.get("reviewers") or []) if live else None
     st["approved"] = _approval_snapshot_keeping_dm(ctx, st)  # after the red baseline moved, so the snapshot records it
     _clear_pending(st)
     ctx.log(st, "changes_approved", by=msg["by"], changed="; ".join(probs)[:400], **_policy_field(args))
@@ -16453,7 +16463,15 @@ def cmd_reviewers(args):
     if g["status"] != "passed" and _docs_only_review_skip(ctx, st, cfg, cp, cps, args.cp, json_out=args.json):
         return
     rnd = cps.get("adv_round")
-    if not rnd or rnd.get("recorded") or rnd["fingerprint"] != fp:
+    # A round opened before this field existed has no "reviewers_pin" key at all (not even None). Its resolved
+    # reviewers can legitimately differ from the pin (narrowing, substitution), so they are never compared here:
+    # such a round never triggers pin_changed by itself. approve-changes stamps a baseline reviewers_pin on it
+    # when an approved edit to this checkpoint lands, and from then on the normal comparison below applies.
+    if not rnd or "reviewers_pin" not in rnd:
+        pin_changed = False
+    else:
+        pin_changed = sorted(rnd.get("reviewers_pin") or []) != sorted(cp.get("reviewers") or [])
+    if not rnd or rnd.get("recorded") or rnd["fingerprint"] != fp or pin_changed:
         ci = _checkin_state(cps)
         if ci.get("open"):
             die(f"{args.cp}: a check-in is open from round {ci['open']['round']} (reviews have been dragging). "
@@ -16505,7 +16523,11 @@ def cmd_reviewers(args):
         # replaced before anyone reviewed it stays one (its reviewer and slot are carried forward), since the
         # blocked round it follows is no longer the latest recorded one once this round has advanced past it.
         fix_pick = _fix_round_pick(ctx, cfg, args.cp, cp, cps, g, fp)
-        if fix_pick is None and _is_fix_after_block(rnd) and not rnd.get("recorded") and rnd.get("fix_round"):
+        # A pin now set on the checkpoint beats a carried fix pick too (the same guard `_fix_round_pick` applies
+        # to a fresh pick), so a pin edit on an open fix round opens with the pinned reviewer, not the one the
+        # open fix round carried.
+        if (fix_pick is None and not cp.get("reviewers") and _is_fix_after_block(rnd) and not rnd.get("recorded")
+                and rnd.get("fix_round")):
             fix_pick = rnd["fix_round"]
         kind = FIX_AFTER_BLOCK if fix_pick else None
         small_fix = bool(fix_pick)
@@ -16608,6 +16630,7 @@ def cmd_reviewers(args):
         last_rec = (g.get("rounds") or [])[-1:]
         prev_round_tree = last_rec[0].get("fingerprint") if last_rec else None
         rnd = {"round": prev + 1, "nonce": new_nonce, "fingerprint": fp, "opened_at": now(),
+               "reviewers_pin": cp.get("reviewers"),
                "reviewers": [r["id"] for r in resolved], "narrowed": narrow_now, "small_fix": small_fix,
                "kind": kind, "fix_round": fix_pick,
                "prev_round_tree": prev_round_tree,
@@ -16795,6 +16818,17 @@ def cmd_reviewers(args):
            "fixes_md": str(fixes) if rnd["round"] > 1 else None,
            "run_rounds_used": st.get("adv_rounds_total", 0), "run_rounds_cap": cfg["max_adversarial_rounds_run"],
            "reviewers": rows}
+    # A legacy round with no reviewers_pin key at all (no recorded pin baseline) re-shown while the checkpoint
+    # currently has a pin set. Computed from the FINAL round object (after any replacement
+    # above has happened), so a round just opened/replaced -- which does store reviewers_pin -- never gets this
+    # stale warning; it only fires when a legacy round is actually the one being re-shown right now.
+    legacy_pin_note = "reviewers_pin" not in rnd and bool(cp.get("reviewers"))
+    legacy_pin_msg = (f"Round {rnd['round']} predates reviewers-pin tracking (no reviewers_pin on this round), so "
+                      f"it has no recorded pin baseline and is shown as-is; an approved edit to this checkpoint "
+                      f"(most commonly its reviewers pin, through approve-changes) makes the next reviewers call "
+                      f"re-evaluate it against the live pin.") if legacy_pin_note else None
+    if legacy_pin_msg:
+        res["legacy_pin_note"] = legacy_pin_msg
     if args.json:
         print(json.dumps(res, indent=2))
         return
@@ -16814,6 +16848,8 @@ def cmd_reviewers(args):
     off_note = _docs_only_quick_path_off_note(ctx, cfg, cp, cps)
     if off_note:
         print(off_note)
+    if legacy_pin_msg:
+        print(legacy_pin_msg)
     if isinstance(obj, dict) and obj:
         print(f"Who it's for: {obj.get('users', '')}")
         print(f"What they want: {obj.get('goal', '')}")
