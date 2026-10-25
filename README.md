@@ -582,6 +582,7 @@ python3 tests/test_reviewers_pin_reopen.py
 python3 tests/test_scoped_diff_priority.py
 python3 tests/test_review_objective.py
 python3 tests/test_run_all_dedupe.py
+python3 tests/test_run_cmd_env.py
 python3 tests/test_runner.py
 python3 tests/test_shortcuts.py
 python3 tests/test_shortcuts_extra.py
