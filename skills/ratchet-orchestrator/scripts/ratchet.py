@@ -9158,6 +9158,18 @@ def _wait_stretched(proc, timeout: float, max_stretch: float, watch: "_Watch | N
     return timed_out, limit, note, changed
 
 
+# Vars that pin a subprocess to THIS run/session, not for a child test/regression/check command to inherit:
+# RATCHET_ROOT redirects a child's own `ratchet.py` calls at the current run's worktree instead of its own
+# project (the root cause of test_hooks/test_install/test_lanes_start_extra/test_shortcuts_extra failing when
+# RATCHET_ROOT is exported in the launching shell); RATCHET_ROLE, RATCHET_HOME, RATCHET_HUMAN_OVERRIDE and
+# RATCHET_DIRECTOR_KEY_FILE are the same names RESERVED_ENV (below) already treats as director/human-session-only,
+# which a spawned command must never see either. RATCHET_RUN_ALL/RATCHET_RUN_ALL_SUITES/RATCHET_RUN_ALL_TAG are
+# deliberately NOT here: tests/run_all.py sets those for its own children, and _run_cmd stripping them would be
+# pointless (run_all re-sets them) and could disturb run_all's own dedupe logic.
+_RUN_CMD_LEAK_VARS = ("RATCHET_ROOT", "RATCHET_ROLE", "RATCHET_HOME", "RATCHET_HUMAN_OVERRIDE",
+                      "RATCHET_DIRECTOR_KEY_FILE")
+
+
 def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None, watch: "_Watch | None" = None):
     """Run a test or check command in its own process group and wait for it with _wait_stretched: on a busy machine
     its time limit is `timeout` (test_timeout_sec) times the load average over the CPU count, re-read while it runs
@@ -9184,6 +9196,8 @@ def _run_cmd(ctx, command, log_path, timeout, report: Path | None = None, watch:
     Anything that escapes the wait (a git failure on the last look, a signal) kills the command's group first.
     Output goes through temp files, so a command that prints a lot never stalls on a full pipe."""
     env = dict(os.environ, CI="1", FORCE_COLOR="0")
+    for k in _RUN_CMD_LEAK_VARS:
+        env.pop(k, None)
     env.pop("RATCHET_TEST_REPORT", None)
     if report is not None:
         try:
