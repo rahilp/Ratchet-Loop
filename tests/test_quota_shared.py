@@ -1457,5 +1457,34 @@ def cp4t10_scoped_diff_real_changes_before_adds_adds_smallest_first():
           (shown, omitted))
 
 
+@case("CP4-T11")
+def cp4t11_scoped_diff_adds_smallest_first_actually_decides_outcome():
+    """{CP4-T11} [host-alt-correctness/A1 re-raise] CP4-T10 proves non-adds-before-adds, but in its numbers the
+    smallest-first sort among the adds never actually changes which add is kept (the 171000-byte add can never
+    fit after the ~18000-byte real modification regardless of add order, and the 500-byte add always fits
+    regardless of order). This case makes the real modification SMALL on purpose (never the deciding factor) so
+    which add is tried first is what decides the result: a large pure add ("aaa_big_add.txt") and a smaller pure
+    add ("bbb_small_add.txt") both sort before the real modification ("zzz_modified.txt") in git's natural
+    order. Mutation-proved against a copy of scoped_diff_parts with only the smallest-first sort among adds
+    removed (non-adds-first kept): that mutation flips the result to {aaa_big_add.txt, zzz_modified.txt} shown
+    and {bbb_small_add.txt} omitted -- the opposite of what this case expects."""
+    d = _cp4t10_mk_repo("t11")
+    (d / "zzz_modified.txt").write_text("line\n" * 100, encoding="utf-8")
+    since = _cp4t10_snapshot(d)
+    (d / "zzz_modified.txt").write_text("line\n" * 100 + "CHANGED\n" * 20, encoding="utf-8")
+    (d / "aaa_big_add.txt").write_text("x" * 171000, encoding="utf-8")
+    (d / "bbb_small_add.txt").write_text("y" * 15000, encoding="utf-8")
+    current = _cp4t10_snapshot(d)
+    er = _cp4t10_load_external_review()
+    _text, shown, omitted = er.scoped_diff_parts(d, since, current)
+    check("{CP4-T11} the small real modification is shown",
+          "zzz_modified.txt" in shown, (shown, omitted))
+    check("{CP4-T11} among the adds, the smaller one is kept (adds-smallest-first actually decides it here)",
+          "bbb_small_add.txt" in shown and "aaa_big_add.txt" in omitted, (shown, omitted))
+    check("{CP4-T11} exactly {zzz_modified.txt, bbb_small_add.txt} shown and {aaa_big_add.txt} omitted",
+          set(shown) == {"zzz_modified.txt", "bbb_small_add.txt"} and set(omitted) == {"aaa_big_add.txt"},
+          (shown, omitted))
+
+
 if __name__ == "__main__":
     main()
