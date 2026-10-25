@@ -13,7 +13,7 @@
       "codex"
     ]
   },
-  "regression_command": "env -u RATCHET_ROOT python3 tests/run_all.py --workers 6 $(ls tests/test_*.py | grep -vE \"test_(hooks|install|lanes_start_extra|shortcuts_extra|status_plain)\\.py\") && env -u RATCHET_ROOT python3 tests/run_all.py --workers 1 tests/test_hooks.py tests/test_install.py tests/test_lanes_start_extra.py tests/test_shortcuts_extra.py tests/test_status_plain.py",
+  "regression_command": "python3 tests/run_all.py",
   "commit_per_checkpoint": true,
   "design_md": "DESIGN.md",
   "standards": [
@@ -91,7 +91,7 @@
       ]
     }
   ],
-  "test_timeout_sec": 7200,
+  "test_timeout_sec": 3600,
   "max_adversarial_rounds_run": 60,
   "spec_keep": true,
   "max_adversarial_rounds": 6,
