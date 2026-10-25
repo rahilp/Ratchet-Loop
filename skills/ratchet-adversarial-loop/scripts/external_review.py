@@ -355,7 +355,7 @@ def _pack_full_round(lead: str, groups: list[list[tuple[str, str]]]) -> str:
 def scoped_diff_parts(root: Path, since_tree: str, current_tree: str) -> tuple[str, list[str], list[str]]:
     """Lane H CP6: the diff for a SCOPED round (a fix round, or a small fix made after an approval) -- ONLY what
     changed since `since_tree` (the last round actually reviewed), never the whole checkpoint. Returns
-    (text, shown, omitted), in git's order, up to MAX_DIFF, never cut mid-file. `shown` is every file the
+    (text, shown, omitted), up to MAX_DIFF, never cut mid-file. `shown` is every file the
     reviewer saw either in full or, for a textbook pure delete only, as an honest summary; `omitted` is
     every file that is neither, named in the text. When the whole diff fits, it is returned exactly as git
     prints it with rename detection (-M) on (every file's whole diff, nothing summarized; a file moved with most
@@ -367,9 +367,11 @@ def scoped_diff_parts(root: Path, since_tree: str, current_tree: str) -> tuple[s
     a modified file, reaches git as an add, so an add is shown in full or omitted and named (-M only makes a move
     read better; it is not what keeps an edit from being hidden). Only as many deletes are summarized as needed,
     biggest first (a tie goes to the file git prints first): every pure delete whose summary is shorter than its
-    full chunk starts summarized, the other files are fitted in git's order, then summaries are swapped back to
-    the full chunk, smallest first, while the total stays within MAX_DIFF. Any other file that does not fit whole
-    (a real modification, or any added file) is omitted and named, exactly as before."""
+    full chunk starts summarized, the budget is then spent on every modified file and pure delete (summarized or
+    not) BEFORE any pure add -- smallest-first among the adds -- so a pure add pulled in by an unrelated merge
+    never starves out a file actually under review, then summaries are swapped back to the full chunk, smallest
+    first, while the total stays within MAX_DIFF. Any other file that does not fit whole (a real modification, or
+    any added file) is omitted and named, exactly as before."""
     header = f"# Changes since the last round actually reviewed ({since_tree[:10]} → {current_tree[:10]})\n"
     diff = git(root, "diff-tree", "-r", "-p", "-M", "--no-color", since_tree, current_tree)
     if not diff:

@@ -1393,5 +1393,69 @@ def cp4t09_measure_harness_contract_and_cp1_evidence_schema():
           {"missing": missing, "command": cp1.get("command")})
 
 
+import importlib.util as _cp4t10_importlib_util  # noqa: E402  (CP4-T10: loads external_review.py by path, same
+# idiom test_review_diff_large_files.py's _load_external_review()/ER already use)
+
+_CP4T10_EXT_PATH = ROOT / "skills" / "ratchet-adversarial-loop" / "scripts" / "external_review.py"
+
+
+def _cp4t10_load_external_review():
+    spec = _cp4t10_importlib_util.spec_from_file_location("ratchet_external_review_cp4_t10", _CP4T10_EXT_PATH)
+    mod = _cp4t10_importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _cp4t10_git(d, *args):
+    r = subprocess.run(["git", "-c", "core.quotepath=off", *args], cwd=str(d), capture_output=True, text=True)
+    assert r.returncode == 0, (args, r.stdout, r.stderr)
+    return r.stdout
+
+
+def _cp4t10_mk_repo(name):
+    d = Path(_tmp.mkdtemp(prefix=f"ratchet-cp4t10-repo-{name}-"))
+    _cp4t10_git(d, "init", "-q")
+    _cp4t10_git(d, "config", "user.email", "t@t")
+    _cp4t10_git(d, "config", "user.name", "t")
+    return d
+
+
+def _cp4t10_snapshot(d):
+    _cp4t10_git(d, "add", "-A")
+    return _cp4t10_git(d, "write-tree").strip()
+
+
+@case("CP4-T10")
+def cp4t10_scoped_diff_real_changes_before_adds_adds_smallest_first():
+    """{CP4-T10} [host-alt-correctness/A1] scoped_diff_parts' MAX_DIFF-budget packing order -- every modified
+    file and pure delete before any pure add, smallest-add-first among the adds -- was nothing but an in-code
+    comment: no existing case (test_review_diff_large_files.py, test_review_diff_large_files_fixes.py,
+    test_review_diff_full_rounds.py, test_review_diff_full_rounds_fixes.py, test_since_tree_rejected_round.py)
+    exercised it, and a plain git-order loop also passed every one of them. Builds a since->current diff where
+    a large pure add ("aaa_big_add.txt") and a small pure add ("bbb_small_add.txt") both sort before a real
+    modification ("zzz_modified.txt") in git's natural order, over MAX_DIFF. Mutation-proved: reverting the
+    ordering fix to plain git order makes the big add win the budget instead and the real modification get
+    omitted -- the exact starvation this fix prevents and this run's own CP4 adversarial rounds 3/5/6/8/9 hit
+    repeatedly."""
+    d = _cp4t10_mk_repo("t10")
+    (d / "zzz_modified.txt").write_text("line\n" * 100, encoding="utf-8")
+    since = _cp4t10_snapshot(d)
+    (d / "zzz_modified.txt").write_text("line\n" * 100 + "CHANGED\n" * 2000, encoding="utf-8")
+    (d / "aaa_big_add.txt").write_text("x" * 171000, encoding="utf-8")
+    (d / "bbb_small_add.txt").write_text("y" * 500, encoding="utf-8")
+    current = _cp4t10_snapshot(d)
+    er = _cp4t10_load_external_review()
+    _text, shown, omitted = er.scoped_diff_parts(d, since, current)
+    check("{CP4-T10} the real modification is shown, not starved out by an unrelated merge-in pure add",
+          "zzz_modified.txt" in shown, (shown, omitted))
+    check("{CP4-T10} the large pure add is the one omitted, not the modification",
+          "aaa_big_add.txt" in omitted and "zzz_modified.txt" not in omitted, (shown, omitted))
+    check("{CP4-T10} among the adds, the smaller one is kept (adds-smallest-first)",
+          "bbb_small_add.txt" in shown, (shown, omitted))
+    check("{CP4-T10} exactly {zzz_modified.txt, bbb_small_add.txt} shown and {aaa_big_add.txt} omitted",
+          set(shown) == {"zzz_modified.txt", "bbb_small_add.txt"} and set(omitted) == {"aaa_big_add.txt"},
+          (shown, omitted))
+
+
 if __name__ == "__main__":
     main()
