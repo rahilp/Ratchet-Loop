@@ -41,6 +41,15 @@ sys.path.insert(0, str(HERE))
 import _tmp                     # noqa: E402
 import test_gates as g          # noqa: E402  (project, approve_plan, to_adversarial, rx, ENV)
 
+# [CP4 fix round 1: omp-glm-correctness/A1, omp-glm-standards/X1, codex-standards/X1] A monotonic mark taken as
+# close to process start as this file can manage (right after its own imports), so CP4-T02's real top-level check
+# (now computed at the very end of main(), after every CP4-Txx case including CP4-T09 has run -- see main() below)
+# can bound the REAL top-level wall-clock of `python3 -I tests/test_quota_shared.py` (what a user, tests/run_all.py
+# and the checkpoint's own gate command actually run and wait on), with no second nested full-suite spawn. Same
+# reasoning and placement as test_trust_cp5_d.py's CP3 block's _CP3_PROCESS_START / test_trust_cp5_e.py's CP2
+# block's _CP2_PROCESS_START.
+_CP4_PROCESS_START = time.monotonic()
+
 PASS = FAIL = 0
 CASE_STATUS: dict[str, bool] = {}
 CASE_MESSAGES: dict[str, list] = {}
@@ -148,24 +157,26 @@ class Lane:
     def __init__(self, m: Machine, name, providers=(), depth=None, settings=()):
         self.m = m
         self.rounds = 0
-        self.dir = g.project(name, extra_cp={"risk": "normal"})
+        # fast-path replaces: python3 ratchet.py init feature / config --set / plan-submit (project()'s own setup)
+        self.dir = g.project(name, extra_cp={"risk": "normal"}, fast=True)
         # providers and rules are set up BEFORE the plan is approved: a change to the review rules after approval
         # would stop every reviewers call until approve-changes
         for n in providers:
+            # fast-path replaces: python3 ratchet.py providers --add <n> --command ... --company ... --no-check
             r = self.run("providers", "--add", n, "--command", json.dumps([n, "{prompt}"]), "--company",
-                         COMPANY[n], "--no-check")
+                         COMPANY[n], "--no-check", fast=True)
             assert r.returncode == 0, r.stdout + r.stderr
         sets = list(settings)
         if depth is not None:
             sets.append("review_depth=" + json.dumps({"normal": depth}))
         if sets:
-            r = self.run("config", "--set", *sets)
+            r = self.run("config", "--set", *sets, fast=True)  # fast-path replaces: python3 ratchet.py config --set ...
             assert r.returncode == 0, r.stdout + r.stderr
-        g.approve_plan(self.dir)
-        g.to_adversarial(self.dir)
+        g.approve_plan(self.dir, fast=True)     # fast-path replaces: python3 ratchet.py ask approve-plan / approve-plan
+        g.to_adversarial(self.dir, fast=True)   # fast-path replaces: python3 ratchet.py tests-written/red/implemented/behavior
 
-    def run(self, *args):
-        return g.rx(self.dir, *args, env=self.m.env)
+    def run(self, *args, fast=False):
+        return g.rx(self.dir, *args, env=self.m.env, fast=fast)
 
     def popen(self, *args):
         return subprocess.Popen([sys.executable, str(g.ENGINE), *args], cwd=self.dir, env=self.m.env,
@@ -302,6 +313,8 @@ def t03_eight_lanes_results_at_the_same_moment_all_saved_and_record_intact():
     # four checks from each of two lanes, one per provider, all started before any is waited for
     mix = [(A, "fakea"), (B, "fakeb"), (A, "fakec"), (B, "faked"), (A, "fakee"), (B, "fakef"), (A, "fakeg"),
            (B, "fakeh")]
+    # kept as real Lane popen() subprocesses, not the fast path: this is the thing the case proves -- eight
+    # lanes genuinely race as separate OS processes for provider-health.json's real file lock contention
     procs = [(n, lane.popen("providers", "--check", n)) for lane, n in mix]
     results = [(n, p.wait(timeout=120), p.stderr.read()) for n, p in procs]
     check("[CP2-T03] all eight checks exit 0", all(rc == 0 for _n, rc, _e in results), results)
@@ -493,6 +506,8 @@ def t11_two_lanes_testing_the_same_provider_at_once_leave_one_clean_entry():
     m = Machine(["fakee"])
     kw = dict(providers=["fakee"])
     A, B, C = make_lanes(m, [("lane-a", kw), ("lane-b", kw), ("lane-c", dict(kw, depth=depth_for("fakee")))])
+    # kept as real Lane popen() subprocesses, not the fast path: two lanes genuinely race as separate OS
+    # processes for provider-health.json's real file lock contention -- the thing this case proves
     procs = [A.popen("providers", "--check", "fakee"), B.popen("providers", "--check", "fakee"),
              A.popen("providers", "--check", "fakee"), B.popen("providers", "--check", "fakee")]
     codes = [p.wait(timeout=120) for p in procs]
@@ -569,6 +584,36 @@ def main():
             traceback.print_exc()
         finally:
             g.ENV["RATCHET_HOME"] = ORIG_HOME
+    # [CP4 fix round 1: omp-glm-correctness/A1, omp-glm-standards/X1, codex-standards/X1] The REAL top-level
+    # wall-clock check for {CP4-T02}, moved here (from inside cp4t02_suite_finishes_well_under_120s_via_cp1_harness,
+    # see that function's own docstring) so it runs AFTER every other TESTS case including CP4-T09 has finished --
+    # the true end of `python3 -I tests/test_quota_shared.py`, the same end-to-end quantity CP1's baseline harness
+    # measured, with no second nested full-suite spawn. check() merges every call tagged with one id (an id only
+    # passes if every call tagged with it does), so this still counts under {CP4-T02} even though it runs outside
+    # that function's own scheduled turn in the loop above.
+    # Captured BEFORE the (cheap, ~1s) reference-workload measurement below, so that measurement's own cost is
+    # never counted against the budget it helps compute.
+    _cp4_real_elapsed = time.monotonic() - _CP4_PROCESS_START
+    idle_load_avg = 1.5  # same idle baseline _cp3_t02_budget() itself uses; a little background noise is free
+    _load_reading = read_load()
+    load_avg = _load_reading[0] if _load_reading is not None else idle_load_avg
+    cpus = os.cpu_count()
+    # [CP4 fix round 2: host-alt-correctness/C3] speed-aware on top of the existing load-aware term -- see the
+    # _CP4_REFERENCE_SPAWN_SEC / _cp4_speed_factor() block above for why and how.
+    _cp4_ref_measured = _cp4_measure_reference_workload()
+    _cp4_speed = _cp4_speed_factor(_cp4_ref_measured)
+    budget = min(CP4_T02_BUDGET_CEILING_SEC, _cp3_t02_budget(load_avg, cpus) * _cp4_speed)
+    _CUR_CASE = "CP4-T02"
+    check("{CP4-T02} the REAL top-level solo invocation's own wall-clock (measured end-to-end in this very "
+          "process, from _CP4_PROCESS_START to right after every other TESTS case has run) is under its budget "
+          "(CP3's _cp3_t02_budget() formula -- a flat 90s ceiling plus an allowance for this box's own raw load "
+          f"average (read_load()[0] = {load_avg:.2f}) above an idle baseline of {idle_load_avg:.1f}) -- scaled by "
+          f"a speed factor of {_cp4_speed:.2f}x (a {3}-spawn reference workload took {_cp4_ref_measured:.2f}s here "
+          f"vs {_CP4_REFERENCE_SPAWN_SEC:.2f}s on the box that budget was calibrated on), capped at "
+          f"{CP4_T02_BUDGET_CEILING_SEC:.0f}s (well below CP1's own ~260-300s original baseline, so a real "
+          f"regression still goes red)) = {budget:.1f}s, measured the same way CP1's baseline harness measured "
+          "it -- down from the ~286-300s CP1 recorded before this checkpoint", _cp4_real_elapsed < budget,
+          (_cp4_real_elapsed, budget, load_avg, _cp4_speed, _cp4_ref_measured))
     _CUR_CASE = None
     write_report()
     print(f"\n{PASS} passed, {FAIL} failed")
@@ -805,6 +850,8 @@ def x07_lanes_opening_rounds_at_the_same_moment_send_one_test_request():
     kw = dict(providers=["fakeb"], depth=depth_for("fakeb"))
     lanes = make_lanes(m, [("lane-a", kw), ("lane-b", kw), ("lane-c", kw)])
     (m.bin / "fakeb.slow").write_text("x")                   # the request takes 5 s: the others reach it meanwhile
+    # kept as real Lane popen() subprocesses, not the fast path: three lanes genuinely race as separate OS
+    # processes for provider-health.json's real file lock contention -- the thing this case proves
     procs = [ln.popen("reviewers", "CP1", "--json") for ln in lanes]
     outs = []
     for p in procs:
@@ -830,6 +877,8 @@ def x10_lanes_opening_rounds_at_the_same_moment_while_the_provider_fails_send_on
     lanes = make_lanes(m, [("lane-a", kw), ("lane-b", kw), ("lane-c", kw)])
     m.fail("fakeb")
     (m.bin / "fakeb.slow").write_text("x")                   # the failing request takes 5 s: the others reach it meanwhile
+    # kept as real Lane popen() subprocesses, not the fast path: three lanes genuinely race as separate OS
+    # processes for provider-health.json's real file lock contention -- the thing this case proves
     procs = [ln.popen("reviewers", "CP1", "--json") for ln in lanes]
     outs = []
     for p in procs:
@@ -904,16 +953,19 @@ class ModelLane(Lane):
     def __init__(self, m, name, specs):
         self.m = m
         self.rounds = 0
-        self.dir = g.project(name, extra_cp={"risk": "normal"})
+        # fast-path replaces: python3 ratchet.py init feature / config --set / plan-submit (project()'s own setup)
+        self.dir = g.project(name, extra_cp={"risk": "normal"}, fast=True)
         for pid, prog, model, company in specs:
+            # fast-path replaces: python3 ratchet.py providers --add <pid> --command ... --model ... --company ... --no-check
             r = self.run("providers", "--add", pid, "--command", json.dumps([prog, "--model", "{model}", "{prompt}"]),
-                         "--model", model, "--company", company, "--no-check")
+                         "--model", model, "--company", company, "--no-check", fast=True)
             assert r.returncode == 0, r.stdout + r.stderr
         depth = [[f"{pid}-both"] for pid, _p, _m, _c in specs]
-        r = self.run("config", "--set", "review_depth=" + json.dumps({"normal": depth}))
+        # fast-path replaces: python3 ratchet.py config --set review_depth=...
+        r = self.run("config", "--set", "review_depth=" + json.dumps({"normal": depth}), fast=True)
         assert r.returncode == 0, r.stdout + r.stderr
-        g.approve_plan(self.dir)
-        g.to_adversarial(self.dir)
+        g.approve_plan(self.dir, fast=True)     # fast-path replaces: python3 ratchet.py ask approve-plan / approve-plan
+        g.to_adversarial(self.dir, fast=True)   # fast-path replaces: python3 ratchet.py tests-written/red/implemented/behavior
 
 
 @case("CP2-X08")
@@ -961,6 +1013,384 @@ def x09_status_json_lists_a_provider_any_lane_benched():
     check("[CP2-X09] ... each with a reason, a start and an end", bool(one.get("reason")) and bool(one.get("since"))
           and bool(one.get("until")), one)
     check("[CP2-X09] ... and does not list the working provider", not any(k.startswith("fakeb-") for k in down), down)
+
+
+# ------------------------------------------------------------------------------------------------ CP4
+# Converts this file's and test_gates.py's pure-setup subprocess calls to an in-process engine call, so this
+# whole suite finishes in well under 120s instead of its current ~286-300s. The 23 cases above are not
+# touched: these CP4-Txx cases prove the conversion kept every one of them passing, is fast, names every
+# call site it converted (and every real subprocess it deliberately kept), and left ratchet.py itself and
+# every other importer of test_gates.py's helpers unchanged. New check() messages below use the CURLY
+# {CP4-Txx} tag convention (never square [CP4-Txx]), so tests/test_split_check.py's and
+# tests/test_integrate_safety.py's square-bracket CP-group scans never see them.
+import ast                      # noqa: E402  (CP4-T03/T07: finds real fast=True call sites and add_parser() calls)
+from run_all import read_load   # noqa: E402  (CP4-T02: reuses run_all.py's own guarded os.getloadavg() read)
+# [CP4 fix round 1: codex-standards/X2, codex-correctness/X2, omp-glm-correctness/A3] CP4-T02's real top-level
+# budget reuses CP3's own formula rather than inventing a new one -- see _cp3_t02_budget()'s docstring in
+# test_trust_cp5_d.py for the constants it is built from.
+from test_trust_cp5_d import _cp3_t02_budget  # noqa: E402
+import measure_suite_baseline as _msb  # noqa: E402  (CP4-T09: REAL_SUITES, the schema it writes)
+
+CP4_ENGINE_REL = "skills/ratchet-orchestrator/scripts/ratchet.py"
+CP4_MEASURE_REL = "tests/measure_suite_baseline.py"
+# [CP4 fix round 2 per director check-in 'simplify': host-alt-standards/B1+B2, host-alt-correctness/C1+C2 --
+# forever-freezing ratchet.py/measure_suite_baseline.py against a committed snapshot (round 1's answer to
+# codex-correctness/X2 et al) broke the first time either file had a normal edit, which this plan's own
+# out-of-scope line (Lane M's concurrent ratchet.py refactor) names as expected, imminent work. CP4-T07/T09 no
+# longer hold either file to a historical byte-for-byte freeze of any kind (no `git show`, no committed snapshot
+# compared for equality). CP1's evidence fixture below is kept only as a schema example for a live contract
+# check (CP4-T09), never hashed or compared for byte equality.]
+CP4_FIXTURES_DIR = HERE / "fixtures" / "cp4_base"
+CP4_EVIDENCE_PATH = CP4_FIXTURES_DIR / "baseline_timings_at_cp4_write_time.json"
+
+# [CP4 fix round 2: host-alt-correctness/C3] CP4-T02's real top-level budget used to scale only with THIS box's
+# own load average (_cp3_t02_budget's load term), never with how fast the box itself is: measured 82.1s solo
+# against a 90.0s budget at load_avg 0.97 (effectively idle, so no load allowance applied) -- only ~8s (9%)
+# margin. A correct implementation on a slower (not busier) machine could flake red on that alone. These add a
+# SPEED term on top of (never instead of) the existing load term: time a tiny, fixed, cheap reference workload
+# (3 cold `python3 ratchet.py --help` spawns -- representative because every real-subprocess case in this
+# suite, and CP4-T09's measure-harness subprocess, pay the same per-spawn interpreter-startup + 21k-line-file-
+# compile cost) and scale the whole load-aware budget by how much slower that reference measures here than on
+# the box this round's 82.1s/90.0s numbers were measured on (_CP4_REFERENCE_SPAWN_SEC, measured there the same
+# way). A machine at least as fast gets factor 1.0 (no extra allowance, same ~9% margin as today); a slower
+# machine's budget grows by the same ratio its own reference workload did, so the realized PERCENTAGE margin
+# is preserved rather than shrinking to zero. _CP4_SPEED_FACTOR_CAP and CP4_T02_BUDGET_CEILING_SEC bound how
+# far that can go: the final budget can never approach CP1's own recorded ~260-300s original baseline for this
+# suite, so a real regression (the suite genuinely getting slow again) still goes red regardless of what the
+# reference workload measures.
+_CP4_REFERENCE_SPAWN_SEC = 0.96  # 3 cold `ratchet.py --help` spawns, measured on the box the 82.1s/90.0s
+                                  # numbers above were measured on (host-alt-correctness/C3's own box)
+_CP4_SPEED_FACTOR_CAP = 3.0
+CP4_T02_BUDGET_CEILING_SEC = 220.0  # well below CP1's own ~260-300s original baseline (host-alt-correctness/C3)
+
+
+def _cp4_measure_reference_workload(n=3):
+    """Times `n` cold `python3 ratchet.py --help` spawns (well under a second total) -- a cheap, fixed proxy
+    for this box's own interpreter-startup + engine-compile speed, the same fixed cost every real-subprocess
+    case in this suite pays on every call."""
+    t0 = time.monotonic()
+    for _ in range(n):
+        subprocess.run([sys.executable, str(ROOT / CP4_ENGINE_REL), "--help"], capture_output=True)
+    return time.monotonic() - t0
+
+
+def _cp4_speed_factor(reference_measured_sec, reference_baseline_sec=_CP4_REFERENCE_SPAWN_SEC,
+                       cap=_CP4_SPEED_FACTOR_CAP):
+    """>=1.0: how much slower this machine measurably is than the box _CP4_REFERENCE_SPAWN_SEC was measured
+    on, via the tiny fixed reference workload above. Never below 1.0 (a faster machine does not shrink the
+    budget, it just passes with more margin) and capped at `cap` so a noisy or anomalous reference measurement
+    cannot inflate the budget without bound."""
+    if reference_baseline_sec <= 0:
+        return 1.0
+    return max(1.0, min(cap, reference_measured_sec / reference_baseline_sec))
+
+
+_REPLACES_COMMENT_RE = re.compile(r"#.*fast-path replaces:", re.IGNORECASE)
+_CASE_DECL_RE = re.compile(r'@case\("([^"]+)"\)')
+_POPEN_REASON_MARKERS = ("separate os process", "real os process", "genuinely race", "file lock contention",
+                         "file lock", "race as separate", "contend")
+_INPROCESS_RACE_MARKERS = ("already in-process", "already-in-process", "forced-interleave", "already a forced")
+
+
+def cp4_committed_base(path):
+    """The committed fixture file's content at `path` (a plain Path.read_text(), never `git show` of a historical
+    commit and never a read of uncommitted .ratchet/ run state -- see the CP4_*_PATH constants above)."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise RuntimeError(f"reading committed fixture {path} failed: {e}")
+
+
+def cp4_fast_path_call_sites(path):
+    """[(1-based lineno, has_replaces_comment)] for every real Call node in `path` that passes a `fast=True`
+    keyword argument to a helper. Uses `ast`, not a text search, so a docstring or comment that merely
+    mentions the words "fast=True" (as this very file's own docstrings do, describing the convention) is
+    never mistaken for an actual call site."""
+    src = Path(path).read_text(encoding="utf-8")
+    lines = src.splitlines()
+    tree = ast.parse(src, filename=str(path))
+    sites = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "fast" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                lineno = node.lineno
+                nearby = "\n".join(lines[max(0, lineno - 3):lineno])
+                sites.append((lineno, bool(_REPLACES_COMMENT_RE.search(nearby))))
+    return sites
+
+
+def cp4_case_owning_line(lines, idx):
+    """Which @case("...") id the 0-based `idx` line falls under, scanning upward from it."""
+    for i in range(idx, -1, -1):
+        m = _CASE_DECL_RE.match(lines[i].strip())
+        if m:
+            return m.group(1)
+    return None
+
+
+@case("CP4-T01")
+def cp4t01_all_23_original_cases_still_pass():
+    """{CP4-T01} By the time this case runs, every one of the 23 original CP2-Txx/CP2-Xxx cases has already
+    run earlier in this same process (TESTS keeps file order, and this case is registered last) -- so this
+    reads their already-recorded CASE_STATUS/CASE_MESSAGES rather than re-running or re-measuring anything,
+    exactly what the per-test report write_report() is about to produce for the whole file."""
+    original_ids = [cid for cid, _fn in TESTS if cid.startswith("CP2-")]
+    check("{CP4-T01} exactly the 23 original cases are registered, none missing and none duplicated",
+          len(original_ids) == 23 and len(set(original_ids)) == 23, sorted(original_ids))
+    missing = [cid for cid in original_ids if cid not in CASE_STATUS]
+    check("{CP4-T01} every original case actually ran before this one (none skipped, none reordered after "
+          "this case)", missing == [], missing)
+    failed = [cid for cid in original_ids if not CASE_STATUS.get(cid, False)]
+    check("{CP4-T01} all 23 original cases passed -- none failed, none silently dropped, none weakened",
+          failed == [], {cid: CASE_MESSAGES.get(cid) for cid in failed})
+
+
+@case("CP4-T02")
+def cp4t02_suite_finishes_well_under_120s_via_cp1_harness():
+    """{CP4-T02} [Fix round 1: omp-glm-correctness/A1, omp-glm-standards/X1, codex-standards/X1 -- self-timing
+    doubled runtime] This case used to shell out to CP1's own tests/measure_suite_baseline.py to time itself,
+    which re-ran this ENTIRE file (all cases, including this very one, guarded one level deep by a nested-run
+    sentinel) as a child process just to produce a number: every REAL invocation of
+    `python3 -I tests/test_quota_shared.py` (the checkpoint's own gate command, tests/run_all.py, any
+    contributor running the file directly) therefore paid for TWO full passes, while the old check here only
+    bounded the nested half -- half the real cost.
+
+    The REAL top-level, end-to-end wall-clock assertion -- still filed under this same {CP4-T02} id (check()
+    merges every call tagged with one id: an id only passes if every call tagged with it does) -- now runs at
+    the TRUE end of main(), after every other TESTS case including CP4-T09 has finished, right before the final
+    report is written: see main() below. Nothing needs to run at this case's own scheduled position in TESTS;
+    this is the same correction CP3 made to test_trust_cp5_d.py's own self-timing case (see that file's
+    t02_wall_clock_well_under_120s() docstring)."""
+
+
+@case("CP4-T03")
+def cp4t03_every_fast_path_call_site_names_what_it_replaces():
+    """{CP4-T03} Every call site that opts into the in-process fast path (fast=True) must carry a comment,
+    on its own line or one of the two lines above it, naming the real subprocess command it replaces -- a
+    silent fast=True call site is not allowed. Also demands at least one such site exist: before the
+    conversion lands there are none, so this fails for the right reason (feature missing), not vacuously."""
+    sites, offenders = [], []
+    for rel in ("tests/test_gates.py", "tests/test_quota_shared.py"):
+        for lineno, has_comment in cp4_fast_path_call_sites(ROOT / rel):
+            sites.append(f"{rel}:{lineno}")
+            if not has_comment:
+                offenders.append(f"{rel}:{lineno}")
+    check("{CP4-T03} at least one fast-path (fast=True) call site exists in test_gates.py or "
+          "test_quota_shared.py", len(sites) > 0, "no fast=True call site found yet")
+    check("{CP4-T03} every fast-path call site names the real subprocess command it replaces in a nearby "
+          "comment ('# fast-path replaces: ...')", offenders == [], offenders)
+
+
+@case("CP4-T04")
+def cp4t04_every_real_subprocess_kept_names_its_reason():
+    """{CP4-T04} Lane.popen() call sites inside CP2-T03, CP2-T11, CP2-X07 and CP2-X10 -- which make two or
+    three lanes genuinely race as separate OS processes for provider-health.json's real file lock -- and
+    CP2-X11's already in-process forced-interleave race, must each carry a comment naming that specific
+    reason. This is the exact carve-out the objective names: a converted or silently-reasoned site fails
+    this, naming file:line."""
+    path = ROOT / "tests" / "test_quota_shared.py"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    expected = {"CP2-T03", "CP2-T11", "CP2-X07", "CP2-X10"}
+    found, offenders = set(), []
+    for i, line in enumerate(lines):
+        if ".popen(" not in line or "def popen" in line:
+            continue
+        cid = cp4_case_owning_line(lines, i)
+        if cid not in expected:
+            continue
+        found.add(cid)
+        nearby = "\n".join(lines[max(0, i - 2):i + 1]).lower()
+        if not any(marker in nearby for marker in _POPEN_REASON_MARKERS):
+            offenders.append(f"test_quota_shared.py:{i + 1} ({cid})")
+    check("{CP4-T04} all four real-subprocess cases (CP2-T03, CP2-T11, CP2-X07, CP2-X10) still call "
+          "Lane.popen() at least once (the boundary itself is not converted away)",
+          expected <= found, sorted(expected - found))
+    check("{CP4-T04} every one of those popen() call sites names the real-OS-process file-lock-contention "
+          "reason in a nearby comment", offenders == [], offenders)
+    start = next((i for i, l in enumerate(lines) if '@case("CP2-X11")' in l), None)
+    end = len(lines)
+    if start is not None:
+        for j in range(start + 1, len(lines)):
+            if lines[j].startswith("@case(") or lines[j].startswith("class "):
+                end = j
+                break
+    section = "\n".join(lines[start:end]).lower() if start is not None else ""
+    check("{CP4-T04} CP2-X11's already in-process forced-interleave race names that specific reason in a "
+          "comment (not silently converted, not silently re-reasoned)",
+          start is not None and any(m in section for m in _INPROCESS_RACE_MARKERS),
+          "CP2-X11 section not found" if start is None else "no matching reason marker found in it")
+
+
+@case("CP4-T05")
+def cp4t05_test_gates_default_helpers_still_work_unchanged():
+    """{CP4-T05} Exercises test_gates.py's own project()/approve_plan()/to_adversarial()/rx() -- the exact
+    functions the opt-in fast path is added to -- directly, with NO fast argument anywhere, proving their
+    default (unchanged) behavior still drives a real project through real ratchet.py subprocesses end to
+    end. Deliberately does NOT spawn test_gates.py's own ~300-call, ~228s self-test file as a subprocess:
+    embedding that cost inside test_quota_shared.py would make CP4-T02's own well-under-120s target for THIS
+    file permanently unmeetable, no matter how fast the 23 original cases become -- which would defeat the
+    point of both cases. A fresh, independent run of test_gates.py's own suite (itself unaffected by this
+    checkpoint, since its default path is untouched) is already covered by tests/run_all.py running
+    test_gates.py as its own suite, not re-embedded here."""
+    d = g.project("cp4t05")
+    r = g.approve_plan(d)
+    check("{CP4-T05} g.approve_plan() with no fast argument still succeeds via a real subprocess",
+          r.returncode == 0, r.stderr)
+    g.to_adversarial(d)  # raises (a crash, counted as this case failing) if any of its own asserts fail
+    r = g.rx(d, "status")
+    check("{CP4-T05} g.rx() with no fast argument still runs ratchet.py as a real subprocess and succeeds",
+          r.returncode == 0, r.stderr)
+    state = json.loads((d / ".ratchet" / "runs" / "f" / "state.json").read_text())
+    gate = (state.get("checkpoints", {}).get("CP1", {}).get("gates", {}).get("behavior", {}))
+    check("{CP4-T05} the project really reached and passed the adversarial step end to end, through "
+          "project()->approve_plan()->to_adversarial()->rx() exactly as before",
+          gate.get("status") == "passed", gate)
+
+
+@case("CP4-T06")
+def cp4t06_a_concrete_other_importer_of_test_gates_still_passes_unchanged():
+    """{CP4-T06} tests/test_providers.py is a concrete OTHER suite that imports test_gates and calls
+    project()/approve_plan()/to_adversarial()/rx() with no fast-path argument at all. Imports it for real
+    (proving it still imports cleanly against the new, extended helper signatures) and drives one project
+    through ITS OWN env_with()/fake_bin()/rx() fixtures end to end, the same cheap, bounded way CP4-T05
+    exercises test_gates directly -- not by re-running its whole ~65-check, ~90s self-test file: embedding
+    that cost here, on top of CP4-T05's and the 23 original cases', would make CP4-T02's own
+    well-under-120s target for this file unmeetable no matter how good the conversion is. A fresh,
+    independent run of test_providers.py's own suite (itself unaffected by this checkpoint) is already
+    covered by tests/run_all.py, not re-embedded here."""
+    tp = __import__("test_providers")
+    b = tp.fake_bin("codex")
+    env = tp.env_with(b)
+    d = g.project("cp4t06")
+    r = tp.rx(d, "config", "--set", 'providers=[{"id":"codex","preset":"codex"}]', env=env)
+    check("{CP4-T06} test_providers.py's own rx() wrapper (built on test_gates.g.rx with no fast argument) "
+          "still runs ratchet.py as a real subprocess and succeeds", r.returncode == 0, r.stderr)
+    g.approve_plan(d)
+    g.to_adversarial(d)
+    state = json.loads((d / ".ratchet" / "runs" / "f" / "state.json").read_text())
+    gate = (state.get("checkpoints", {}).get("CP1", {}).get("gates", {}).get("behavior", {}))
+    check("{CP4-T06} the project really reached and passed the adversarial step end to end, through "
+          "test_providers.py's own fixtures built on test_gates' unmodified default helpers",
+          gate.get("status") == "passed", gate)
+
+
+@case("CP4-T07")
+def cp4t07_fast_path_matches_real_subprocess_and_no_hidden_cli_test_only_entry_point():
+    """{CP4-T07} [Fix round 2 per director check-in 'simplify': the historical freeze this case used to hold
+    ratchet.py to (a committed snapshot compared for byte equality -- host-alt-standards/B1, host-alt-
+    correctness/C1, and round-1's own codex-correctness/X2, omp-glm-correctness/A3, codex-standards/X2) is
+    gone. Freezing ratchet.py forever broke the moment any ordinary feature commit touched it, which this
+    plan's own out-of-scope line (Lane M's concurrent ratchet.py refactor) names as expected, imminent work.
+    What this case actually needs to keep proving -- that the fast path is a faithful stand-in for a real
+    subprocess, and that ratchet.py was not given a hidden, CLI-reachable test-only entry point -- is checked
+    directly, never by pinning the file's bytes against a historical commit.
+
+    Parity: the exact same read-only command, through trust_helpers.cp5y_load_engine()'s in-process fast path
+    and through a real `python3 ratchet.py` subprocess, must agree on exit code and on every status field
+    that is not itself about wall-clock timing -- able to fail: a fast path that silently diverged from real
+    subprocess behavior (stale cached state, a different CLI dispatch) shows up here as a mismatch.
+
+    Structural: ratchet.py's normal CLI dispatch (every `add_parser(...)` call that wires up a real
+    subcommand) must not itself be the thing a test-only addition hid behind -- no subcommand's name or help
+    text calls itself test-only. A live, current-state check of the one guarantee the old diff-based check
+    tried to get (that a "test-only" carve-out never becomes reachable from the real CLI), able to fail: adding
+    `sp.add_parser("test-only-x", help="test-only: ...")` would trip it."""
+    d = g.project("cp4t07")
+    r_fast = g.rx(d, "status", "--json", fast=True)  # fast-path replaces: python3 ratchet.py status --json
+    r_real = g.rx(d, "status", "--json")
+    check("{CP4-T07} the fast in-process path and a real `python3 ratchet.py` subprocess agree on exit code "
+          "for the same read-only command", r_fast.returncode == r_real.returncode,
+          (r_fast.returncode, r_real.returncode, r_fast.stderr[:300], r_real.stderr[:300]))
+    try:
+        j_fast, j_real = json.loads(r_fast.stdout), json.loads(r_real.stdout)
+    except (json.JSONDecodeError, TypeError) as e:
+        check("{CP4-T07} both status --json outputs parse as JSON", False, str(e))
+    else:
+        fields = ("phase", "current", "step", "next", "stop_ok", "done", "total", "slug", "feature", "root")
+        mismatches = {k: (j_fast.get(k), j_real.get(k)) for k in fields if j_fast.get(k) != j_real.get(k)}
+        check("{CP4-T07} the fast path and a real subprocess agree on status's observable, non-timing fields "
+              "(phase, current step, next action, stop_ok, done/total checkpoint counts, slug, feature, root)",
+              mismatches == {}, mismatches)
+
+    src = (ROOT / CP4_ENGINE_REL).read_text(encoding="utf-8")
+    tree = ast.parse(src, filename=CP4_ENGINE_REL)
+    offenders = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_parser"):
+            continue
+        name = node.args[0].value if node.args and isinstance(node.args[0], ast.Constant) else None
+        help_kw = next((kw.value.value for kw in node.keywords
+                        if kw.arg == "help" and isinstance(kw.value, ast.Constant)), None)
+        text = " ".join(str(x) for x in (name, help_kw) if x)
+        if re.search(r"test.?only", text, re.IGNORECASE):
+            offenders.append(f"{CP4_ENGINE_REL}:{node.lineno} ({name!r})")
+    check("{CP4-T07} ratchet.py's normal CLI dispatch (add_parser) wires up no subcommand whose name or help "
+          "text calls itself test-only", offenders == [], offenders)
+
+
+@case("CP4-T08")
+def cp4t08_cp2_t11_and_cp2_x11_still_hold_after_fast_path_setup():
+    """{CP4-T08} CP2-T11 (two lanes' setup now built through the fast path, but their concurrent
+    `providers --check` calls still go through Lane.popen's real, separate OS processes) and CP2-X11 (the
+    lockless-writer race) already ran earlier in this same process (see CP4-T01's docstring on TESTS'
+    ordering); this reads their already-recorded status so a quota-accounting regression the fast-path setup
+    introduces (writing provider-health.json outside update_record's real lock) is caught here by name, not
+    only folded into CP4-T01's generic parity count."""
+    for cid in ("CP2-T11", "CP2-X11"):
+        check(f"{{CP4-T08}} {cid} ran earlier in this process and is recorded", cid in CASE_STATUS,
+              sorted(CASE_STATUS))
+        check(f"{{CP4-T08}} {cid} passed (the shared record's real lock still caught every case it proves)",
+              CASE_STATUS.get(cid, False), CASE_MESSAGES.get(cid, []))
+
+
+@case("CP4-T09")
+def cp4t09_measure_harness_contract_and_cp1_evidence_schema():
+    """{CP4-T09} [Fix round 2 per director check-in 'simplify': the byte-identity freeze this case used to hold
+    tests/measure_suite_baseline.py to, and the hash check it ran against CP1's baseline_timings.json fixture
+    (host-alt-standards/B1+B2, host-alt-correctness/C1+C2), are both gone. The hash half was tautological: it
+    hashed a fixture this same fix round created and compared it to a constant committed in the same change --
+    it could only fail if someone edited the fixture itself, never if CP1's real evidence changed, even though
+    its own message claimed the opposite. What this case actually needs to keep proving -- that the measure
+    harness still runs and writes evidence in its documented schema, and that CP1's recorded evidence still
+    matches that schema -- is checked directly as a live contract/schema check. No hash, no historical diff."""
+    tmp = Path(_tmp.mkdtemp(prefix="cp4t09-measure-"))
+    fake = tmp / "fake_ok.py"
+    fake.write_text("import sys, time\ntime.sleep(0.05)\nsys.exit(0)\n", encoding="utf-8")
+    out = tmp / "out.json"
+    env = dict(os.environ)
+    env.pop("RATCHET_TEST_REPORT", None)
+    r = subprocess.run([sys.executable, "-I", str(ROOT / CP4_MEASURE_REL), "--suites", str(fake), "--out", str(out)],
+                       capture_output=True, text=True, timeout=60, env=env)
+    check("{CP4-T09} tests/measure_suite_baseline.py --suites ... --out ... still runs and exits 0 for a "
+          "passing fake suite", r.returncode == 0, (r.returncode, r.stderr[:300]))
+    try:
+        data = json.loads(out.read_text(encoding="utf-8"))
+    except OSError as e:
+        check("{CP4-T09} setup: the --out evidence file was written", False, str(e))
+        return
+    entry = (data.get("suites") or {}).get(fake.name)
+    check('{CP4-T09} the evidence it writes still matches its documented schema: {"command": str, "suites": '
+          '{<basename>: {"elapsed_sec": number, "passed": bool}}}',
+          isinstance(data.get("command"), str) and "--suites" in data["command"] and isinstance(entry, dict)
+          and isinstance(entry.get("elapsed_sec"), (int, float)) and entry.get("elapsed_sec") >= 0
+          and entry.get("passed") is True, data)
+
+    try:
+        cp1 = json.loads(cp4_committed_base(CP4_EVIDENCE_PATH))
+    except (RuntimeError, json.JSONDecodeError) as e:
+        check("{CP4-T09} setup: CP1's committed baseline_timings.json fixture is readable and parses as JSON",
+              False, str(e))
+        return
+    missing = [s for s in _msb.REAL_SUITES
+               if not (isinstance((entry := (cp1.get("suites") or {}).get(Path(s).name)), dict)
+                       and all(k in entry for k in ("elapsed_sec", "passed")))]
+    check("{CP4-T09} CP1's recorded baseline_timings.json evidence still has every real suite's entry in that "
+          "same schema (command string, suites[<basename>] = {elapsed_sec, passed}) -- a contract check, not "
+          "a byte-for-byte freeze", isinstance(cp1.get("command"), str) and missing == [],
+          {"missing": missing, "command": cp1.get("command")})
 
 
 if __name__ == "__main__":

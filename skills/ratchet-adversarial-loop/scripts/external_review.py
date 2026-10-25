@@ -387,7 +387,18 @@ def scoped_diff_parts(root: Path, since_tree: str, current_tree: str) -> tuple[s
                 summary[i] = t
     use = {}  # chunk index -> the text shown for it (absent: omitted)
     total = len(header)
-    for i, (_f, c) in enumerate(chunks):
+    # Real-changes-first priority, mirroring the full-round packer's non-add-before-add order: every modified
+    # file and every pure delete (summarized or not) gets budget before any pure add, so an add pulled in by an
+    # unrelated merge never starves out a file actually under review. Within the adds, smallest first, so a huge
+    # add is the one left out rather than a smaller one. This only changes the ORDER budget is spent in; the
+    # fitting test and MAX_DIFF are unchanged. A non-add that fit before still fits (non-adds go first); a pure
+    # add may move from shown to omitted when a non-add claims its budget first -- that is the intended
+    # prioritization, not a regression.
+    kinds = [_pure_add_delete(c) for _f, c in chunks]
+    order = [i for i, p in enumerate(kinds) if not (p and p[0] == "added")] + \
+            sorted((i for i, p in enumerate(kinds) if p and p[0] == "added"), key=lambda i: len(chunks[i][1]))
+    for i in order:
+        c = chunks[i][1]
         t = summary.get(i, c)
         if total + len(t) > MAX_DIFF:
             continue

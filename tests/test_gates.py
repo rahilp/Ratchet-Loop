@@ -10,7 +10,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import _tmp
+import trust_helpers
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
@@ -20,6 +22,34 @@ ENV["RATCHET_HOME"] = str(HOME)
 ENV["RATCHET_HOST_PROVIDER"] = "anthropic"  # deterministic, whichever agent CLI runs the tests
 PASS = FAIL = 0
 
+# [CP4] Opt-in fast path for project()/approve_plan()/to_adversarial()/rx() (and say(), which the first two call
+# internally): instead of spawning `python3 ratchet.py ...` (which recompiles ratchet.py's ~21k lines every time),
+# run the SAME command in-process against trust_helpers.cp5y_load_engine()'s one memoized module object. Every
+# other caller (every other suite importing this file, and every call here with no `fast` argument) keeps the
+# real-subprocess default -- this is opt-in, never the default.
+#
+# trust_helpers.InProcessCall mutates process-wide state for the length of each call (os.environ, cwd, sys.stdout/
+# stderr/stdin) -- safe for one call at a time, but test_quota_shared.py's make_lanes() builds several Lane()s on
+# separate THREADS at once (a plain performance overlap, real subprocesses are safe to run concurrently that way).
+# _FAST_LOCK serialises the in-process calls so two threads never swap os.environ/cwd under each other; real
+# subprocess calls (fast=False, and Lane.popen()) are never touched by this lock and stay genuinely concurrent.
+_FAST_LOCK = threading.Lock()
+
+# [CP4 fix round 1: omp-glm-standards/X4, omp-glm-correctness/A5] This used to be a third independent hand-copy
+# of the same module-global reset list test_trust_cp5_e.py's _CP2_RESET_GLOBALS and test_trust_cp5_d.py's
+# _CP3_RESET_GLOBALS already are -- three copies that must stay in lockstep with ratchet.py's own globals but
+# could silently drift from each other. Now imports trust_helpers' one canonical copy instead of adding a third.
+_CP4_RESET_GLOBALS = trust_helpers.DEFAULT_RESET_GLOBALS
+_CP4_LOCK_WAIT_CAP = trust_helpers.DEFAULT_LOCK_WAIT_CAP
+
+
+class _FastCall(trust_helpers.InProcessCall):
+    """`with _FastCall(m, d, env) as r: m.main([...])` -- this file's thin constructor over
+    trust_helpers.InProcessCall, matching test_trust_cp5_e.py's `_Cp2Call` / test_trust_cp5_d.py's `_Cp3Call`."""
+
+    def __init__(self, m, d, env, stdin=None):
+        super().__init__(m, d, env, _CP4_RESET_GLOBALS, _CP4_LOCK_WAIT_CAP, reset_unreadable=False, stdin=stdin)
+
 
 def check(name, cond, detail=""):
     global PASS, FAIL
@@ -27,7 +57,12 @@ def check(name, cond, detail=""):
     print(f"  {'✓' if cond else '✗'} {name}" + ("" if cond else f"   {str(detail)[:300]}"))
 
 
-def rx(d, *args, env=None):
+def rx(d, *args, env=None, fast=False):
+    if fast:
+        m = trust_helpers.cp5y_load_engine()
+        with _FAST_LOCK, _FastCall(m, d, env or ENV) as r:
+            m.main(list(args))  # fast-path replaces: python3 ratchet.py <args> as a real subprocess
+        return r
     return subprocess.run([sys.executable, str(ENGINE), *args], cwd=d, capture_output=True, text=True,
                           env=env or ENV)
 
@@ -35,17 +70,21 @@ def rx(d, *args, env=None):
 TRANSCRIPTS = Path(_tmp.mkdtemp(prefix="ratchet-transcripts-"))
 
 
-def say(d, text, session="s-owner"):
+def say(d, text, session="s-owner", fast=False):
     """What happens when the user types a message: the agent CLI writes it to its transcript and calls the prompt hook."""
     import datetime as dt
     tp = TRANSCRIPTS / f"{Path(d).name}-{session}.jsonl"
     with tp.open("a") as f:
         f.write(json.dumps({"type": "user", "message": {"role": "user", "content": text},
                             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
+    payload = json.dumps({"cwd": str(d), "prompt": text, "session_id": session, "transcript_path": str(tp)})
+    if fast:
+        m = trust_helpers.cp5y_load_engine()
+        with _FAST_LOCK, _FastCall(m, d, ENV, stdin=payload) as r:
+            m.main(["hook", "prompt", "--host", "claude"])  # fast-path replaces: python3 ratchet.py hook prompt --host claude
+        return r
     return subprocess.run([sys.executable, str(ENGINE), "hook", "prompt", "--host", "claude"], cwd=d, text=True,
-                          capture_output=True, env=ENV,
-                          input=json.dumps({"cwd": str(d), "prompt": text, "session_id": session,
-                                            "transcript_path": str(tp)}))
+                          capture_output=True, env=ENV, input=payload)
 
 
 def guard(d, tool, tool_input, cwd=None, agent=None):
@@ -66,7 +105,7 @@ def git(d, *a):
     return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True)
 
 
-def project(name="p", cps=1, extra_cp=None, config=None) -> Path:
+def project(name="p", cps=1, extra_cp=None, config=None, fast=False) -> Path:
     d = Path(_tmp.mkdtemp(prefix=f"ratchet-{name}-"))
     for c in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
         git(d, *c)
@@ -75,11 +114,11 @@ def project(name="p", cps=1, extra_cp=None, config=None) -> Path:
     (d / "src/a.js").write_text("export const a = 1;\n")
     git(d, "add", "-A")
     git(d, "commit", "-qm", "init")
-    say(d, "please build the feature")          # the request that starts the run (owner session)
-    r = rx(d, "init", "feature", "--slug", "f")
+    say(d, "please build the feature", fast=fast)          # the request that starts the run (owner session)
+    r = rx(d, "init", "feature", "--slug", "f", fast=fast)
     assert r.returncode == 0, r.stderr
     # no other-provider CLIs: tests never call a real agent CLI installed on the machine running them
-    rx(d, "config", "--set", "min_review_seconds=0", "providers=[]", *(config or []))
+    rx(d, "config", "--set", "min_review_seconds=0", "providers=[]", *(config or []), fast=fast)
     run = d / ".ratchet/runs/f"
     (run / "app-scout.json").write_text("{}")
     plan = {"feature": "x", "objective": _tmp.OBJECTIVE_MIN, "checkpoints": []}
@@ -94,15 +133,15 @@ def project(name="p", cps=1, extra_cp=None, config=None) -> Path:
         plan["checkpoints"].append(cp)
         (run / "tests" / f"CP{i}.json").write_text(json.dumps({"cases": [{"id": f"CP{i}-T01", "layer": "code", "proves": [1]}]}))
     (run / "checkpoints.json").write_text(json.dumps(plan))
-    r = rx(d, "plan-submit")
+    r = rx(d, "plan-submit", fast=fast)
     assert r.returncode == 0, r.stderr + r.stdout
     return d
 
 
-def approve_plan(d):
-    rx(d, "ask", "approve-plan")  # CP5: an approval answers the question Ratchet printed
-    say(d, "yes, go ahead")
-    r = rx(d, "approve-plan")
+def approve_plan(d, fast=False):
+    rx(d, "ask", "approve-plan", fast=fast)  # CP5: an approval answers the question Ratchet printed
+    say(d, "yes, go ahead", fast=fast)
+    r = rx(d, "approve-plan", fast=fast)
     assert r.returncode == 0, r.stderr
     return r
 
@@ -113,13 +152,13 @@ def write_tests(d, cp="CP1"):
         f"t('[{cp}-T01] works', () => a.equal(f(), 1));\n")
 
 
-def to_adversarial(d, cp="CP1"):
+def to_adversarial(d, cp="CP1", fast=False):
     write_tests(d, cp)
-    assert rx(d, "tests-written", cp).returncode == 0
-    assert rx(d, "red", cp).returncode == 0
+    assert rx(d, "tests-written", cp, fast=fast).returncode == 0
+    assert rx(d, "red", cp, fast=fast).returncode == 0
     (d / "src/f.js").write_text("export const f = () => 1;\n")
-    assert rx(d, "implemented", cp).returncode == 0
-    r = rx(d, "behavior", cp)
+    assert rx(d, "implemented", cp, fast=fast).returncode == 0
+    r = rx(d, "behavior", cp, fast=fast)
     assert r.returncode == 0, r.stderr
 
 

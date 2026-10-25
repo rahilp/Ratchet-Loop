@@ -667,6 +667,18 @@ def cp5x_frozen_ui_project(env):
     return d
 
 
+# [CP4 fix round 1] The one canonical copy of the engine-global reset list and lock-wait cap every in-process
+# caller needs (see InProcessCall's own `reset_globals`/`lock_wait_cap` docstring below for why they exist).
+# test_trust_cp5_e.py's `_CP2_RESET_GLOBALS`/`_CP2_LOCK_WAIT_CAP` and test_trust_cp5_d.py's
+# `_CP3_RESET_GLOBALS`/`_CP3_LOCK_WAIT_CAP` are each checkpoint's own already-committed hand-copy of this same
+# dict and value (left as-is: they are other checkpoints' files, out of scope for this fix); test_gates.py's
+# CP4 block imports THESE instead of adding a third independent hand-copy that could drift from the other two
+# unnoticed when ratchet.py gains or renames a module global (omp-glm-standards/X4, omp-glm-correctness/A5).
+DEFAULT_RESET_GLOBALS = {"_IN_HOOK": False, "_OVERRIDE_CONFIRMED": False, "_CHAIN_REBUILD": False,
+                         "_HOOK_ENV_ADVISORY": False, "_STATE_LOCK_HELD": False, "_ENGINE_ARGV": None}
+DEFAULT_LOCK_WAIT_CAP = 0.3  # none of the fast-path callers' checks assert a MINIMUM wait on a busy per-record lock
+
+
 @functools.lru_cache(maxsize=None)
 def cp5y_load_engine():
     """The engine module, loaded once per test process (memoized) -- see engine()'s docstring: the real cost is
