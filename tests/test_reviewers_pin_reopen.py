@@ -80,7 +80,7 @@ PLANNED = [f"CP2-T{i:02d}" for i in range(1, 14)]
 PASS = FAIL = 0
 CASE_STATUS: dict = {}
 CASE_MESSAGES: dict = {}
-ID_RE = re.compile(r"\[(CP2-T\d+)\]")
+ID_RE = re.compile(r"\[(CP2-[TX]\d+)\]")
 
 SLUG = "f"
 OLD_ADV_ROUND_KEYS = {"round", "nonce", "fingerprint", "opened_at", "reviewers", "narrowed", "small_fix", "kind",
@@ -152,6 +152,16 @@ def _strip_new_adv_round_keys(d, slug=SLUG, cp="CP1"):
         adv = st["checkpoints"][cp].get("adv_round") or {}
         for k in [k for k in list(adv.keys()) if k not in OLD_ADV_ROUND_KEYS]:
             del adv[k]
+    dt.mutate(d, drop, slug=slug)
+
+
+def _strip_approved_reviewers(d, slug=SLUG):
+    """Drops state.json's `approved.reviewers` map entirely, so the run's approval snapshot looks exactly like
+    one written before that field existed (a real pre-upgrade run's shape), rather than merely stripping the
+    round's own keys (`_strip_new_adv_round_keys`). Combined with that helper, this is the actual legacy shape
+    every real upgraded run has on its first `approve-changes` under the new code (H6/S3)."""
+    def drop(st):
+        (st.get("approved") or {}).pop("reviewers", None)
     dt.mutate(d, drop, slug=slug)
 
 
@@ -555,6 +565,592 @@ def x04_lane_r_shape_one_pin_and_approve_reopens_on_the_next_call():
 CASES += [
     ("CP2-X03", x03_a_narrowed_legacy_round_with_an_unchanged_pin_does_not_reopen),
     ("CP2-X04", x04_lane_r_shape_one_pin_and_approve_reopens_on_the_next_call),
+]
+
+
+# ------------------------------------------------------------------------------------------------- CP2-X05
+# Extra check added after the final cross-vendor review (codex X1): approve-changes on an UNRELATED checkpoint
+# edit must not stamp a narrowed legacy round's resolved reviewers as its pin baseline (a false reopen next call).
+
+def x05_an_unrelated_approved_edit_on_a_narrowed_legacy_round_does_not_reopen():
+    """codex X1: pinned to two reviewers, round 2 narrowed to one, stripped to legacy shape; an approved summary
+    edit (pin untouched) must leave the next reviewers call on the same round and nonce."""
+    d = fr._start("cp2x05", extra_cp={"reviewers": ["host-standards", "host-correctness"]})
+    rnd1 = fr._open(d)
+    rid = fr._pick(rnd1, "standards")
+    fr._block(d, rnd1, {rid: [fr._finding("F1")]})
+    fr._write_code(d, 30, "cp2x05")
+    rnd2 = fr._open(d)
+    check("[CP2-X05] (fixture) round 2 is narrowed to a subset of the unchanged pin",
+          rnd2.get("round") == 2 and fr._ids(rnd2) == [rid], (rnd2.get("round"), fr._ids(rnd2)))
+    nonce2 = rnd2["round_nonce"]
+    _strip_new_adv_round_keys(d)
+    _edit_summary(d, "an unrelated summary edit")
+    ask, ac = _approve_changes(d)
+    check("[CP2-X05] the unrelated edit is accepted with approve-changes", ac.returncode == 0, fr._out(ac))
+    r = g.rx(d, "reviewers", "CP1", "--json")
+    assert r.returncode == 0, fr._out(r)
+    j = json.loads(r.stdout)
+    check("[CP2-X05] still round 2 naming the same narrowed reviewer",
+          j.get("round") == 2 and fr._ids(j) == [rid], (j.get("round"), fr._ids(j)))
+    check("[CP2-X05] the same nonce", j.get("round_nonce") == nonce2, (nonce2, j.get("round_nonce")))
+
+
+CASES += [
+    ("CP2-X05", x05_an_unrelated_approved_edit_on_a_narrowed_legacy_round_does_not_reopen),
+]
+
+
+# ------------------------------------------------------------------------------------------- CP2-X06, CP2-X07
+# Extra checks added after two independent adversarial reviewers (host-alt-standards, host-alt-correctness)
+# found that cmd_approve_changes' legacy-pin recovery must still reopen a narrowed/substituted legacy round
+# when the pin genuinely changed to a reviewer the round never had -- the round's own (un-substituted) reviewers
+# are no longer a subset of the new live pin, so the mismatch must stamp a baseline that reopens next call,
+# never leave the round legacy (which would reproduce the original deadlock this whole run exists to fix: lane R
+# CP4 round 8's exact shape).
+
+def x06_a_narrowed_legacy_round_pinned_to_a_genuinely_different_reviewer_reopens_on_the_next_call():
+    """host-alt-standards / host-alt-correctness: pinned to two reviewers from the start, round 2 narrowed by a
+    block+fix to one of them, stripped to legacy shape (no reviewers_pin key), then pinned to a THIRD reviewer
+    that was never in the original two-reviewer pin. Only the round's own new keys are stripped here, so the
+    approval snapshot's `approved.reviewers` map (with the original two-reviewer pin recorded for this
+    checkpoint) is still present -- this drives the PRIMARY, stored-baseline branch, not the no-baseline one:
+    the stored pin differs from the live pin, so this proves that branch stamps a baseline and the round reopens
+    on the very next call, rather than staying legacy forever."""
+    d = fr._start("cp2x06", extra_cp={"reviewers": ["host-standards", "host-correctness"]})
+    rnd1 = fr._open(d)
+    rid = fr._pick(rnd1, "standards")
+    fr._block(d, rnd1, {rid: [fr._finding("F1")]})
+    fr._write_code(d, 30, "cp2x06")
+    rnd2 = fr._open(d)
+    check("[CP2-X06] (fixture) round 2 is narrowed to a subset of the original two-reviewer pin",
+          rnd2.get("round") == 2 and fr._ids(rnd2) == [rid], (rnd2.get("round"), fr._ids(rnd2)))
+    nonce2 = rnd2["round_nonce"]
+    _strip_new_adv_round_keys(d)
+    ask, ac = _pin_and_approve(d, ["host-both"])
+    check("[CP2-X06] pinning to a genuinely different reviewer is accepted with approve-changes",
+          ac.returncode == 0, fr._out(ac))
+    r = fr._open(d)
+    check("[CP2-X06] the very next reviewers call reopens the round (round number rises above 2)",
+          (r.get("round") or 0) > 2, r.get("round"))
+    check("[CP2-X06] the new round names exactly the newly pinned reviewer",
+          fr._ids(r) == ["host-both"], fr._ids(r))
+    check("[CP2-X06] a fresh round_nonce (different from the narrowed round's)",
+          bool(r.get("round_nonce")) and r.get("round_nonce") != nonce2, (nonce2, r.get("round_nonce")))
+
+
+def x07_approve_changes_never_mutates_a_recorded_legacy_rounds_own_stored_data():
+    """Control for the X06 fix: the legacy-pin stamping block only ever applies to an open, UNRECORDED round
+    (`not rnd.get("recorded")`). A round that was already recorded (blocked and triaged) must come out of
+    approve-changes with its own adv_round data byte-for-byte unchanged, even when the live pin genuinely
+    changes in the same approval -- no reviewers_pin key appears on it, and nothing else about it moves either."""
+    d = fr._start("cp2x07", extra_cp={"reviewers": ["host-standards", "host-correctness"]})
+    rnd1 = fr._open(d)
+    rid = fr._pick(rnd1, "standards")
+    fr._block(d, rnd1, {rid: [fr._finding("F1")]})
+    _strip_new_adv_round_keys(d)
+    before = dict(fr._cps(d).get("adv_round") or {})
+    check("[CP2-X07] (fixture) the recorded round has no reviewers_pin key of its own",
+          "reviewers_pin" not in before, before)
+    ask, ac = _pin_and_approve(d, ["host-both"])
+    check("[CP2-X07] the pin change is accepted with approve-changes", ac.returncode == 0, fr._out(ac))
+    after = dict(fr._cps(d).get("adv_round") or {})
+    check("[CP2-X07] still no reviewers_pin key on the recorded round", "reviewers_pin" not in after, after)
+    check("[CP2-X07] the recorded round's own stored data is byte-for-byte unchanged by approve-changes",
+          after == before, (before, after))
+
+
+CASES += [
+    ("CP2-X06", x06_a_narrowed_legacy_round_pinned_to_a_genuinely_different_reviewer_reopens_on_the_next_call),
+    ("CP2-X07", x07_approve_changes_never_mutates_a_recorded_legacy_rounds_own_stored_data),
+]
+
+
+# ------------------------------------------------------------------------------------------- CP2-X08..X10
+# CP4 round-2 H6/S3: every case above builds its run with the new code, so state.json's `approved.reviewers`
+# map is always present -- even the "legacy round" cases only strip the round's own keys, never the approval
+# snapshot. A real legacy round only exists in a run whose first `approve-changes` under this code finds no
+# `reviewers` map at all (an approval written by older code), which is the ambiguous branch H4/S4/X1/codex X1
+# found false-reopening. These three cases combine `_strip_new_adv_round_keys` with the new
+# `_strip_approved_reviewers` helper to build that real shape and drive it through the fixed ambiguous branch.
+# CP4 round-3 codex-standards/X3 then proved the containment-based "narrowed vs equality" heuristic this branch
+# used has a real gap (a narrowed round's pin can grow or swap while still containing the narrowed subset, and
+# containment alone misses it). The final design drops that heuristic entirely: ANY non-empty live pin on a
+# no-baseline legacy round unconditionally stamps reviewers_pin=None, so the branch always reopens once (free
+# only while the round's folder holds no review file yet; otherwise it costs an attempt like any other replaced
+# reviewed round) and is exact afterward. X08 below reflects that: it now reopens on every pin-adjacent
+# approve-changes, not just a genuine pin change.
+
+def x08_a_narrowed_real_legacy_round_with_an_unchanged_pin_reopens_once_then_is_exact():
+    """H4/S4/X1/codex X1's shape, under the final design (CP4 round-3 codex-standards/X3): containment was
+    proven to miss a genuine pin change on a narrowed round (e.g. [std,cor] narrowed to [std], pin becomes
+    [std,host-both]: {std} subset-of {std,host-both}, so containment wrongly says "unchanged"). The fix drops
+    that heuristic: ANY approve-changes on a no-baseline legacy round with a non-empty live pin unconditionally
+    stamps reviewers_pin=None, so the very next `reviewers` call always reopens once -- even on an unrelated
+    summary edit with the pin itself untouched -- naming the step's full current (unnarrowed) pin. This is the
+    one-time safe default, free only while the round's folder holds no review file yet (CP2-T07's own scope);
+    after this reopen the fresh round stamps a real baseline, so every later approve-changes on this checkpoint
+    is exact (see X09 for the "genuinely changed pin" case this reopen also always covers)."""
+    d = fr._start("cp2x08", extra_cp={"reviewers": ["host-standards", "host-correctness"]})
+    rnd1 = fr._open(d)
+    rid = fr._pick(rnd1, "standards")
+    fr._block(d, rnd1, {rid: [fr._finding("F1")]})
+    fr._write_code(d, 30, "cp2x08")
+    rnd2 = fr._open(d)
+    check("[CP2-X08] (fixture) round 2 is narrowed to a subset of the unchanged pin",
+          rnd2.get("round") == 2 and fr._ids(rnd2) == [rid], (rnd2.get("round"), fr._ids(rnd2)))
+    nonce2 = rnd2["round_nonce"]
+    _strip_new_adv_round_keys(d)
+    _strip_approved_reviewers(d)
+    _edit_summary(d, "an unrelated summary edit (real legacy shape)")
+    ask, ac = _approve_changes(d)
+    check("[CP2-X08] the unrelated edit is accepted with approve-changes", ac.returncode == 0, fr._out(ac))
+    r = g.rx(d, "reviewers", "CP1", "--json")
+    assert r.returncode == 0, fr._out(r)
+    j = json.loads(r.stdout)
+    check("[CP2-X08] the safe default reopens the round once (round number rises above 2)",
+          (j.get("round") or 0) > 2, j.get("round"))
+    check("[CP2-X08] the new round names the step's full, unnarrowed two-reviewer pin",
+          sorted(fr._ids(j)) == ["host-correctness", "host-standards"], fr._ids(j))
+    check("[CP2-X08] a fresh round_nonce (different from the narrowed round's)",
+          bool(j.get("round_nonce")) and j.get("round_nonce") != nonce2, (nonce2, j.get("round_nonce")))
+
+
+def x09_a_narrowed_real_legacy_round_pinned_to_a_genuinely_different_reviewer_reopens():
+    """The X06 shape, but with the approval snapshot's `reviewers` map also dropped (the real legacy shape):
+    pinned to two reviewers, round 2 narrowed to one by a block+fix, stripped to legacy with no approved.reviewers
+    at all, then pinned to a THIRD reviewer never in the original pin. The round's own (un-substituted)
+    reviewer is not a subset of the new live pin, so the next call must reopen it -- never leave it legacy
+    forever, which would reproduce the original deadlock bug for exactly the population (a real upgraded run)
+    this checkpoint is about."""
+    d = fr._start("cp2x09", extra_cp={"reviewers": ["host-standards", "host-correctness"]})
+    rnd1 = fr._open(d)
+    rid = fr._pick(rnd1, "standards")
+    fr._block(d, rnd1, {rid: [fr._finding("F1")]})
+    fr._write_code(d, 30, "cp2x09")
+    rnd2 = fr._open(d)
+    check("[CP2-X09] (fixture) round 2 is narrowed to a subset of the original two-reviewer pin",
+          rnd2.get("round") == 2 and fr._ids(rnd2) == [rid], (rnd2.get("round"), fr._ids(rnd2)))
+    nonce2 = rnd2["round_nonce"]
+    _strip_new_adv_round_keys(d)
+    _strip_approved_reviewers(d)
+    ask, ac = _pin_and_approve(d, ["host-both"])
+    check("[CP2-X09] pinning to a genuinely different reviewer is accepted with approve-changes",
+          ac.returncode == 0, fr._out(ac))
+    r = fr._open(d)
+    check("[CP2-X09] the very next reviewers call reopens the round (round number rises above 2)",
+          (r.get("round") or 0) > 2, r.get("round"))
+    check("[CP2-X09] the new round names exactly the newly pinned reviewer",
+          fr._ids(r) == ["host-both"], fr._ids(r))
+    check("[CP2-X09] a fresh round_nonce (different from the narrowed round's)",
+          bool(r.get("round_nonce")) and r.get("round_nonce") != nonce2, (nonce2, r.get("round_nonce")))
+
+
+def x10_control_a_narrowed_real_legacy_round_with_the_pin_removed_does_not_reopen():
+    """CONTROL, not a fix: documents the accepted, information-theoretic migration limit (CP4 H5/S5, closed via
+    a director-signed accept-finding, not by code). Same real legacy shape as X08/X09, but the live pin is
+    REMOVED entirely (`reviewers` key deleted) instead of changed. A never-pinned round's own reviewers are
+    structurally identical to a pinned-then-removed round's, so pin removal on a no-baseline legacy round is
+    undetectable no matter what the fix guesses; the final design's unconditional stamp only fires when the
+    live pin is non-empty, so an empty live pin leaves this round's reviewers_pin untouched and it does NOT
+    reopen even though the pin genuinely went away. This must keep passing as a green control: if a future
+    change makes this reopen, that is a deliberate decision to close H5/S5, and it should show up here as a
+    changed test, not a silent drift."""
+    d = fr._start("cp2x10", extra_cp={"reviewers": ["host-standards", "host-correctness"]})
+    rnd1 = fr._open(d)
+    rid = fr._pick(rnd1, "standards")
+    fr._block(d, rnd1, {rid: [fr._finding("F1")]})
+    fr._write_code(d, 30, "cp2x10")
+    rnd2 = fr._open(d)
+    check("[CP2-X10] (fixture) round 2 is narrowed to a subset of the original two-reviewer pin",
+          rnd2.get("round") == 2 and fr._ids(rnd2) == [rid], (rnd2.get("round"), fr._ids(rnd2)))
+    nonce2 = rnd2["round_nonce"]
+    _strip_new_adv_round_keys(d)
+    _strip_approved_reviewers(d)
+    ask, ac = _pin_and_approve(d, None)
+    check("[CP2-X10] removing the pin is accepted with approve-changes", ac.returncode == 0, fr._out(ac))
+    r = g.rx(d, "reviewers", "CP1", "--json")
+    assert r.returncode == 0, fr._out(r)
+    j = json.loads(r.stdout)
+    check("[CP2-X10] (accepted limit) still round 2 naming the same narrowed reviewer, even with no live pin",
+          j.get("round") == 2 and fr._ids(j) == [rid], (j.get("round"), fr._ids(j)))
+    check("[CP2-X10] the same nonce", j.get("round_nonce") == nonce2, (nonce2, j.get("round_nonce")))
+
+
+CASES += [
+    ("CP2-X08", x08_a_narrowed_real_legacy_round_with_an_unchanged_pin_reopens_once_then_is_exact),
+    ("CP2-X09", x09_a_narrowed_real_legacy_round_pinned_to_a_genuinely_different_reviewer_reopens),
+    ("CP2-X10", x10_control_a_narrowed_real_legacy_round_with_the_pin_removed_does_not_reopen),
+]
+
+
+# ------------------------------------------------------------------------------------------- CP2-X11, CP2-X12
+# CP4 round-2 H6/S3 (continued): X08-X10 above all start from a checkpoint pinned from the start, so none of
+# them exercises an UNPINNED checkpoint on the real legacy shape (no approved.reviewers map at all) -- the exact
+# shape lane R's never-pinned checkpoints take on their very first post-upgrade approve-changes.
+
+def x11_a_never_pinned_real_legacy_round_keeps_its_round_on_an_unrelated_edit():
+    """H6/S3: an unpinned checkpoint's round 1, with the round's own keys stripped to legacy shape AND
+    approved.reviewers dropped entirely (no prior pin baseline of any kind, for this checkpoint or the run).
+    An approved, unrelated summary edit must not reopen it: same round, same reviewer ids, same nonce."""
+    d = fr._start("cp2x11")
+    rnd1 = fr._open(d)
+    ids1 = fr._ids(rnd1)
+    nonce1 = (fr._cps(d).get("adv_round") or {}).get("nonce")
+    _strip_new_adv_round_keys(d)
+    _strip_approved_reviewers(d)
+    _edit_summary(d, "an unrelated summary edit (never-pinned, real legacy shape)")
+    ask, ac = _approve_changes(d)
+    check("[CP2-X11] the unrelated edit is accepted with approve-changes", ac.returncode == 0, fr._out(ac))
+    r = g.rx(d, "reviewers", "CP1", "--json")
+    assert r.returncode == 0, fr._out(r)
+    j = json.loads(r.stdout)
+    check("[CP2-X11] still round 1 with the same reviewer ids", j.get("round") == 1 and fr._ids(j) == ids1,
+          (j.get("round"), ids1, fr._ids(j)))
+    check("[CP2-X11] the same nonce", j.get("round_nonce") == nonce1, (nonce1, j.get("round_nonce")))
+
+
+def x12_a_never_pinned_real_legacy_round_reopens_once_a_pin_is_added():
+    """H6/S3: same never-pinned, real legacy shape as X11. Pinning the checkpoint to a reviewer it never had
+    and approving makes the very next reviewers call reopen with exactly that reviewer, a fresh nonce."""
+    d = fr._start("cp2x12")
+    rnd1 = fr._open(d)
+    ids1 = fr._ids(rnd1)
+    nonce1 = (fr._cps(d).get("adv_round") or {}).get("nonce")
+    _strip_new_adv_round_keys(d)
+    _strip_approved_reviewers(d)
+    ask, ac = _pin_and_approve(d, ["host-both"])
+    check("[CP2-X12] pinning the never-pinned checkpoint is accepted with approve-changes", ac.returncode == 0,
+          fr._out(ac))
+    r = g.rx(d, "reviewers", "CP1", "--json")
+    assert r.returncode == 0, fr._out(r)
+    j = json.loads(r.stdout)
+    check("[CP2-X12] the next reviewers call opens a new round naming only host-both",
+          (j.get("round") or 0) > 1 and fr._ids(j) == ["host-both"] and "host-both" not in ids1,
+          (j.get("round"), ids1, fr._ids(j)))
+    check("[CP2-X12] a fresh nonce", bool(j.get("round_nonce")) and j.get("round_nonce") != nonce1,
+          (nonce1, j.get("round_nonce")))
+
+
+CASES += [
+    ("CP2-X11", x11_a_never_pinned_real_legacy_round_keeps_its_round_on_an_unrelated_edit),
+    ("CP2-X12", x12_a_never_pinned_real_legacy_round_reopens_once_a_pin_is_added),
+]
+
+
+# ------------------------------------------------------------------------------------------------- CP2-X13
+# The final design drops containment/narrowed-vs-equality heuristics entirely: on a no-baseline legacy round
+# (approved.reviewers dropped entirely), ANY non-empty live pin unconditionally stamps reviewers_pin=None, so
+# the round always reopens once regardless of whether the new pin happens to contain the old one. This case
+# covers a round pinned directly from round-open and never narrowed (its own reviewers exactly mirror the pin
+# at open time), with the pin then GROWN (a reviewer added) -- proving the unconditional stamp still reopens it
+# even though the round's reviewers remain a SUBSET of the new, wider pin.
+
+def x13_a_non_narrowed_real_legacy_round_pinned_directly_reopens_when_the_pin_grows():
+    """Pinned from the very start to a single reviewer (host-standards); round 1 opens with exactly that
+    reviewer and is never narrowed (no block, no fix round). Stripped to the real legacy shape (round's own new
+    keys dropped AND approved.reviewers dropped entirely), then the pin is grown to add a second reviewer
+    (host-correctness) alongside the original one. The round's own reviewer (host-standards) is still a SUBSET
+    of the new pin, so a containment-based test would wrongly call this unchanged; the final design's
+    unconditional None stamp (any non-empty live pin on a no-baseline round reopens it) reopens it regardless,
+    naming both pinned reviewers."""
+    d = fr._start("cp2x13", extra_cp={"reviewers": ["host-standards"]})
+    rnd1 = fr._open(d)
+    ids1 = fr._ids(rnd1)
+    check("[CP2-X13] (fixture) round 1 is pinned directly to the single reviewer, not narrowed",
+          rnd1.get("round") == 1 and ids1 == ["host-standards"] and not rnd1.get("narrowed"),
+          (rnd1.get("round"), ids1, rnd1.get("narrowed")))
+    nonce1 = (fr._cps(d).get("adv_round") or {}).get("nonce")
+    _strip_new_adv_round_keys(d)
+    _strip_approved_reviewers(d)
+    ask, ac = _pin_and_approve(d, ["host-standards", "host-correctness"])
+    check("[CP2-X13] growing the pin is accepted with approve-changes", ac.returncode == 0, fr._out(ac))
+    r = g.rx(d, "reviewers", "CP1", "--json")
+    assert r.returncode == 0, fr._out(r)
+    j = json.loads(r.stdout)
+    check("[CP2-X13] the very next reviewers call reopens the round (round number rises above 1)",
+          (j.get("round") or 0) > 1, j.get("round"))
+    check("[CP2-X13] the new round names exactly the grown pin",
+          sorted(fr._ids(j)) == ["host-correctness", "host-standards"], fr._ids(j))
+    check("[CP2-X13] a fresh round_nonce (different from round 1's)",
+          bool(j.get("round_nonce")) and j.get("round_nonce") != nonce1, (nonce1, j.get("round_nonce")))
+
+
+CASES += [
+    ("CP2-X13", x13_a_non_narrowed_real_legacy_round_pinned_directly_reopens_when_the_pin_grows),
+]
+
+
+# ------------------------------------------------------------------------------------------------- CP2-X14
+# CP4 round-3 codex-standards/X3's exact counter-example: a narrowed round whose new pin still CONTAINS the
+# narrowed reviewer, but adds a different one and drops the one that got narrowed away. The old containment
+# check ("is the round's own un-substituted reviewer still a subset of the live pin?") says yes here, and
+# wrongly calls this unchanged -- this is the gap that made the final design drop containment entirely.
+
+def x14_a_narrowed_real_legacy_round_pinned_to_an_added_reviewer_that_still_contains_the_narrowed_one_reopens():
+    """Pinned to two reviewers, round 2 narrowed to host-standards by a block+fix (the real legacy shape, same
+    as X08-X10). The pin is then changed to [host-standards, host-both]: host-standards (the narrowed
+    survivor) stays in the pin, host-correctness is dropped, and host-both is added. Containment alone would
+    say {host-standards} subset-of {host-standards, host-both} and call this "unchanged" -- codex-standards/X3's
+    proof that the old heuristic has a real gap. The final, unconditional safe default must still reopen this,
+    naming exactly the new two-reviewer pin."""
+    d = fr._start("cp2x14", extra_cp={"reviewers": ["host-standards", "host-correctness"]})
+    rnd1 = fr._open(d)
+    rid = fr._pick(rnd1, "standards")
+    fr._block(d, rnd1, {rid: [fr._finding("F1")]})
+    fr._write_code(d, 30, "cp2x14")
+    rnd2 = fr._open(d)
+    check("[CP2-X14] (fixture) round 2 is narrowed to a subset of the original two-reviewer pin",
+          rnd2.get("round") == 2 and fr._ids(rnd2) == [rid], (rnd2.get("round"), fr._ids(rnd2)))
+    nonce2 = rnd2["round_nonce"]
+    _strip_new_adv_round_keys(d)
+    _strip_approved_reviewers(d)
+    ask, ac = _pin_and_approve(d, ["host-standards", "host-both"])
+    check("[CP2-X14] pinning to a containing-but-different pair is accepted with approve-changes",
+          ac.returncode == 0, fr._out(ac))
+    r = g.rx(d, "reviewers", "CP1", "--json")
+    assert r.returncode == 0, fr._out(r)
+    j = json.loads(r.stdout)
+    check("[CP2-X14] the very next reviewers call reopens the round (round number rises above 2)",
+          (j.get("round") or 0) > 2, j.get("round"))
+    check("[CP2-X14] the new round names exactly the new pin",
+          sorted(fr._ids(j)) == ["host-both", "host-standards"], fr._ids(j))
+    check("[CP2-X14] a fresh round_nonce (different from the narrowed round's)",
+          bool(j.get("round_nonce")) and j.get("round_nonce") != nonce2, (nonce2, j.get("round_nonce")))
+
+
+CASES += [
+    ("CP2-X14", x14_a_narrowed_real_legacy_round_pinned_to_an_added_reviewer_that_still_contains_the_narrowed_one_reopens),
+]
+
+
+# ------------------------------------------------------------------------------------------------- CP2-X15
+# CP4 round-4 omp-glm-standards/X1: the stamping loop in cmd_approve_changes must cover EVERY checkpoint with an
+# open, unrecorded, pin-less round, not only the checkpoint(s) named in this particular approval's own diff --
+# the snapshot rewrite at the end of cmd_approve_changes records every checkpoint's live `reviewers` into
+# `approved.reviewers` unconditionally, so a checkpoint left out of the stamping loop would have its live pin
+# silently baked into that new baseline the first time ANY other checkpoint is approved, permanently losing its
+# one-time migration reopen.
+
+def x15_an_edit_to_a_different_checkpoint_still_stamps_this_checkpoints_open_legacy_round():
+    """Two checkpoints, CP1 and CP2, sharing the real no-baseline legacy shape (approved.reviewers dropped
+    entirely from state.json -- a run-wide shape, not per-checkpoint). CP1 is pinned from the start and has an
+    open, unrecorded legacy round (its own new adv_round keys stripped too, so it has no reviewers_pin of its
+    own). The approve-changes call in this test edits only CP2 (an unrelated summary field) -- CP1 is never
+    named in this approval's diff. CP1's round must still get its safe-default reopen on the very next
+    `reviewers CP1` call: the stamping loop must not be scoped to only the checkpoint(s) this particular
+    approval happened to touch."""
+    d = g.project("cp2x15", cps=2, extra_cp={"risk": "normal", "reviewers": ["host-standards", "host-correctness"]})
+    g.approve_plan(d)
+    g.to_adversarial(d, "CP1")
+    rnd1 = fr._open(d)
+    check("[CP2-X15] (fixture) CP1's round 1 is pinned directly to both reviewers, not narrowed",
+          rnd1.get("round") == 1 and sorted(fr._ids(rnd1)) == ["host-correctness", "host-standards"]
+          and not rnd1.get("narrowed"), (rnd1.get("round"), fr._ids(rnd1), rnd1.get("narrowed")))
+    nonce1 = (fr._cps(d).get("adv_round") or {}).get("nonce")
+    _strip_new_adv_round_keys(d)
+    _strip_approved_reviewers(d)
+    _edit_summary(d, "an unrelated summary edit on CP2, not CP1", cp="CP2")
+    ask, ac = _approve_changes(d)
+    check("[CP2-X15] CP2's unrelated edit is accepted with approve-changes", ac.returncode == 0, fr._out(ac))
+    r = g.rx(d, "reviewers", "CP1", "--json")
+    assert r.returncode == 0, fr._out(r)
+    j = json.loads(r.stdout)
+    check("[CP2-X15] CP1's round still reopens even though this approval only named CP2 (round rises above 1)",
+          (j.get("round") or 0) > 1, j.get("round"))
+    check("[CP2-X15] the new round names exactly CP1's pinned pair",
+          sorted(fr._ids(j)) == ["host-correctness", "host-standards"], fr._ids(j))
+    check("[CP2-X15] a fresh round_nonce (different from round 1's)",
+          bool(j.get("round_nonce")) and j.get("round_nonce") != nonce1, (nonce1, j.get("round_nonce")))
+
+
+CASES += [
+    ("CP2-X15", x15_an_edit_to_a_different_checkpoint_still_stamps_this_checkpoints_open_legacy_round),
+]
+
+
+# ------------------------------------------------------------------------------------------------- CP2-X16
+# CP4 round-5 omp-glm-correctness/X1: the same stamping loop (`_stamp_legacy_round_baselines`) must run from
+# every command that writes the unconditional approval snapshot -- `approve-plan`, `plan-extend` and
+# `approve-changes` -- not only the `approve-changes` call site CP2-X15 already covers. This drives
+# `plan-extend` itself as the trigger.
+
+def x16_plan_extend_also_stamps_a_different_checkpoints_open_legacy_round():
+    """`plan-extend` cannot be reached until the run's only checkpoint (CP1) is already `complete`: `feedback`
+    only runs at `awaiting_checkpoint_review` / `awaiting_final_review` / `done`, and `complete` requires every
+    required gate -- including `adversarial` -- to already be `passed` (skills/ratchet-orchestrator/scripts/
+    ratchet.py cmd_complete, ~line 14195-14233). A checkpoint whose own round is genuinely still open and
+    unrecorded can therefore never coexist with a phase that allows `plan-extend` to run, unlike CP2-X15's
+    approve-changes case where CP1 is still mid-build. So this case drives CP1 through one real, clean round and
+    `complete` first, then rolls its already-recorded round back (`_strip_new_adv_round_keys`, plus an explicit
+    drop of `recorded` this case adds, both via `dt.mutate`) to the open, pin-less legacy shape
+    `_stamp_legacy_round_baselines` is written for. Dropping `recorded` is also the only way to isolate the
+    helper's own effect here from `cmd_reviewers`' separate, unrelated rule that an ALREADY-recorded round always
+    opens fresh on the next ask regardless of any pin (ratchet.py cmd_reviewers, the `rnd.get("recorded")` arm of
+    its reopen condition) -- left alone, that rule would reopen the round on its own and make this case pass
+    whether or not `_stamp_legacy_round_baselines` ever ran.
+
+    `plan-extend` also independently refuses any edit to an EXISTING checkpoint's own config, including its
+    `reviewers` field (cmd_plan_extend's `edited` check, keyed on the whole checkpoint's hash) -- so CP1's pin is
+    never rewritten here, unlike CP2-X15/X10's "genuinely different reviewer" edits. Instead this relies on the
+    same unconditional, no-stored-baseline stamp CP2-X15 itself exercises: `_strip_approved_reviewers` drops
+    `approved.reviewers` entirely, so the stamping loop has no prior pin on record for CP1 and stamps
+    `reviewers_pin = None` unconditionally.
+
+    The proof itself is read straight from state.json rather than from a further `reviewers CP1` call: once
+    `plan-extend` appends CP2, `st["current"]` moves to CP2 and `_cur` refuses `reviewers CP1` outright ("CP1 is
+    not the current checkpoint (CP2). Checkpoints run strictly in order.", ratchet.py `_cur`) -- a checkpoint
+    plan-extend has moved past can never be asked about again through the CLI, confirmed by running this case
+    before this paragraph was written and hitting exactly that refusal. So this checks the one place the stamp's
+    effect is still observable: CP1's own `adv_round.reviewers_pin` in state.json, absent before `plan-extend`
+    (stripped above) and stamped to `None` by it."""
+    d = fr._start("cp2x16", extra_cp={"reviewers": ["host-standards", "host-correctness"]})
+    rnd1 = fr._open(d)
+    check("[CP2-X16] (fixture) CP1's round 1 is pinned directly to both reviewers, not narrowed",
+          rnd1.get("round") == 1 and sorted(fr._ids(rnd1)) == ["host-correctness", "host-standards"]
+          and not rnd1.get("narrowed"), (rnd1.get("round"), fr._ids(rnd1), rnd1.get("narrowed")))
+    nonce1 = (fr._cps(d).get("adv_round") or {}).get("nonce")
+    fr._approve(d, rnd1)
+    r = g.rx(d, "complete", "CP1")
+    check("[CP2-X16] (fixture) CP1 completes cleanly", r.returncode == 0, fr._out(r))
+
+    _strip_new_adv_round_keys(d)
+    _strip_approved_reviewers(d)
+
+    def _drop_recorded(st):
+        (st["checkpoints"]["CP1"].get("adv_round") or {}).pop("recorded", None)
+    dt.mutate(d, _drop_recorded)
+
+    before_adv = fr._cps(d).get("adv_round") or {}
+    check("[CP2-X16] (fixture) CP1's round is now legacy-shaped: open (not recorded), no reviewers_pin key",
+          not before_adv.get("recorded") and "reviewers_pin" not in before_adv, before_adv)
+
+    run = Path(d) / ".ratchet/runs" / SLUG
+    plan = json.loads((run / "checkpoints.json").read_text())
+    plan["checkpoints"].append({
+        "id": "CP2", "title": "Step 2", "summary": "s", "done_when": ["works"],
+        "gates": {"behavior": True, "ui": False, "adversarial": True}, "risk": "low",
+        "tests": {"files": ["tests/cp2.test.js"], "command": "node --test tests/cp2.test.js"}})
+    (run / "checkpoints.json").write_text(json.dumps(plan))
+    (run / "tests" / "CP2.json").write_text(json.dumps({"cases": [{"id": "CP2-T01", "layer": "code"}]}))
+
+    g.say(d, "can we also add a second step")
+    fb = g.rx(d, "feedback", "--text", "also add a second step")
+    check("[CP2-X16] feedback is recorded", fb.returncode == 0, fr._out(fb))
+    pe = g.rx(d, "plan-extend")
+    check("[CP2-X16] plan-extend succeeds (the new checkpoint is added, CP1 itself was never edited)",
+          pe.returncode == 0, fr._out(pe))
+
+    no_longer_current = g.rx(d, "reviewers", "CP1", "--json")
+    check("[CP2-X16] (ground truth) CP1 is no longer the current checkpoint after plan-extend, so `reviewers "
+          "CP1` itself is refused -- this is why the proof below reads state.json instead of calling it again",
+          no_longer_current.returncode != 0 and "not the current checkpoint" in fr._out(no_longer_current),
+          fr._out(no_longer_current))
+
+    after_adv = fr._cps(d).get("adv_round") or {}
+    check("[CP2-X16] plan-extend's own call to _stamp_legacy_round_baselines stamped CP1's legacy round "
+          "(reviewers_pin now present, set to None, the safe-default stamp for a no-baseline checkpoint)",
+          "reviewers_pin" in after_adv and after_adv.get("reviewers_pin") is None, after_adv)
+    check("[CP2-X16] stamping never touched anything else about the round (still round 1, same nonce)",
+          after_adv.get("round") == before_adv.get("round") and after_adv.get("nonce") == before_adv.get("nonce")
+          and after_adv.get("nonce") == nonce1, (before_adv, after_adv, nonce1))
+
+
+CASES += [
+    ("CP2-X16", x16_plan_extend_also_stamps_a_different_checkpoints_open_legacy_round),
+]
+
+
+# ------------------------------------------------------------------------------------------------- CP2-X17
+# CP4 round-6 host-alt-correctness/A1: the real-world lane-R deadlock. A checkpoint's pin was edited and approved
+# entirely under the OLD engine (before `cmd_reviewers` itself called `_stamp_legacy_round_baselines`): by the
+# time the new code runs, `approved.cps`'s hash for this checkpoint already matches the live checkpoint (nothing
+# pending), the round is legacy (no `reviewers_pin` key) and `approved.reviewers` is missing entirely.
+# `approve-changes` early-returns "Nothing has changed since approval." before it ever reaches the stamping
+# call, so it is the only command left that always runs -- `reviewers` itself -- that must be able to stamp and
+# reopen the round on its own, on this same call, with no approve-changes round-trip needed.
+
+def x17_lane_r_shape_reviewers_itself_reopens_when_approve_changes_cannot_help():
+    """The exact deadlock CP4 exists to fix: a legacy round (no `reviewers_pin` key), no `approved.reviewers`
+    baseline at all, and an approval snapshot whose checkpoint hash ALREADY matches the live checkpoint (the pin
+    was approved once already, as a real pre-upgrade run's history would have it -- here, simply never edited
+    since the plan itself was approved with this pin already in place, so nothing is pending). `approve-changes`
+    finds nothing pending and refuses to help; only `reviewers`, which now runs the same stamp unconditionally
+    before deciding whether to replace the round, can reopen it."""
+    d = fr._start("cp2x17", extra_cp={"reviewers": ["host-correctness"]})
+    rnd1 = fr._open(d)
+    check("[CP2-X17] (fixture) round 1 opens pinned to the single configured reviewer",
+          rnd1.get("round") == 1 and fr._ids(rnd1) == ["host-correctness"], (rnd1.get("round"), fr._ids(rnd1)))
+    nonce1 = (fr._cps(d).get("adv_round") or {}).get("nonce")
+    _strip_new_adv_round_keys(d)
+    _strip_approved_reviewers(d)
+    before_adv = fr._cps(d).get("adv_round") or {}
+    check("[CP2-X17] (fixture) the round is now legacy-shaped: open, not recorded, no reviewers_pin key",
+          not before_adv.get("recorded") and "reviewers_pin" not in before_adv, before_adv)
+    st_now = json.loads((Path(d) / f".ratchet/runs/{SLUG}/state.json").read_text())
+    check("[CP2-X17] (fixture) no approved.reviewers baseline exists at all (the pre-upgrade shape)",
+          "reviewers" not in (st_now.get("approved") or {}), st_now.get("approved"))
+    noop = g.rx(d, "approve-changes")
+    check("[CP2-X17] approve-changes alone cannot help: nothing is pending, so it no-ops",
+          noop.returncode == 0 and "Nothing has changed since approval." in fr._out(noop), fr._out(noop))
+    r = g.rx(d, "reviewers", "CP1", "--json")
+    assert r.returncode == 0, fr._out(r)
+    j = json.loads(r.stdout)
+    check("[CP2-X17] `reviewers` itself reopens the round on this same call (round number rises)",
+          (j.get("round") or 0) > 1, j.get("round"))
+    check("[CP2-X17] the fresh round names exactly the pinned reviewer",
+          fr._ids(j) == ["host-correctness"], fr._ids(j))
+    after_nonce = (fr._cps(d).get("adv_round") or {}).get("nonce")
+    check("[CP2-X17] a fresh nonce (different from the legacy round's own)",
+          bool(after_nonce) and after_nonce != nonce1, (nonce1, after_nonce))
+
+
+def x18_has_baseline_legacy_pin_message_names_only_an_approved_change_to_this_checkpoint():
+    """host-alt-correctness/A3: CP2-X02 only checks the shared "predates reviewers-pin tracking" phrase both
+    legacy_pin_note wordings contain. This checks the full, exact has_baseline wording (approved.reviewers
+    already carries this checkpoint's own baseline, the pin itself unchanged): it must name only "an approved
+    change to this checkpoint's own reviewers field", and must never claim approve-plan or plan-extend could
+    help (neither can run while this checkpoint's round is open and current)."""
+    d = fr._start("cp2x18", extra_cp={"reviewers": ["host-standards", "host-correctness"]})
+    fr._open(d)
+    _strip_new_adv_round_keys(d)
+    r = g.rx(d, "reviewers", "CP1", "--json")
+    assert r.returncode == 0, fr._out(r)
+    j = json.loads(r.stdout)
+    note = j.get("legacy_pin_note") or ""
+    check("[CP2-X18] the has-baseline wording names an approved change to this checkpoint's own reviewers field",
+          "only an approved change to this checkpoint's own reviewers field will stamp a baseline here" in note,
+          note)
+    check("[CP2-X18] it never names approve-plan or plan-extend as a way to help",
+          "approve-plan" not in note and "plan-extend" not in note, note)
+
+
+def x19_a_recorded_legacy_round_is_replaced_with_no_stale_legacy_pin_note():
+    """host-alt-correctness/A3: the `not rnd.get("recorded")` gate on legacy_pin_note. A recorded (blocked)
+    legacy round always gets replaced the moment `reviewers` is called again, whatever its pin shape, so the
+    note (which only ever describes a round being RE-SHOWN as-is) must never appear on the fresh round that
+    replaces it."""
+    d = fr._start("cp2x19", extra_cp={"reviewers": ["host-standards", "host-correctness"]})
+    rnd1 = fr._open(d)
+    rid = fr._pick(rnd1, "standards")
+    fr._block(d, rnd1, {rid: [fr._finding("F1")]})
+    _strip_new_adv_round_keys(d)
+    before_adv = fr._cps(d).get("adv_round") or {}
+    check("[CP2-X19] (fixture) the round is recorded and legacy-shaped (no reviewers_pin key)",
+          bool(before_adv.get("recorded")) and "reviewers_pin" not in before_adv, before_adv)
+    r = g.rx(d, "reviewers", "CP1", "--json")
+    assert r.returncode == 0, fr._out(r)
+    j = json.loads(r.stdout)
+    check("[CP2-X19] the round is replaced (round number rises above the recorded round's)",
+          (j.get("round") or 0) > (before_adv.get("round") or 0), (before_adv.get("round"), j.get("round")))
+    check("[CP2-X19] no legacy_pin_note on the fresh round that replaced the recorded one",
+          "legacy_pin_note" not in j, j.get("legacy_pin_note"))
+
+
+CASES += [
+    ("CP2-X17", x17_lane_r_shape_reviewers_itself_reopens_when_approve_changes_cannot_help),
+    ("CP2-X18", x18_has_baseline_legacy_pin_message_names_only_an_approved_change_to_this_checkpoint),
+    ("CP2-X19", x19_a_recorded_legacy_round_is_replaced_with_no_stale_legacy_pin_note),
 ]
 
 

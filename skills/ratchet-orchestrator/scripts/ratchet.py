@@ -2501,6 +2501,10 @@ def approval_snapshot(ctx, st) -> dict:
             # Same fallback as _plan_hash: a checkpoint missing "id" must not crash the snapshot every
             # command's integrity check runs; validate_plan is what names that as a plan problem.
             "cps": {c.get("id", f"#{i}"): _sha(c) for i, c in enumerate(plan["checkpoints"])},
+            # the checkpoint's own reviewers-pin FIELD as it stood at this approval (the raw value, not a hash): lets
+            # approve-changes tell a genuine pin change (the field itself differs) apart from narrowing or substitution
+            # (which never touch this field), with no guessing from resolved reviewers.
+            "reviewers": {c.get("id", f"#{i}"): c.get("reviewers") for i, c in enumerate(plan["checkpoints"])},
             "tests": {c.get("id", f"#{i}"): _sha(test_plan(ctx, c.get("id", f"#{i}")))
                      for i, c in enumerate(plan["checkpoints"])},
             "rules": {k: _sha(cfg.get(k)) for k in RULE_KEYS},
@@ -8706,6 +8710,7 @@ def cmd_approve_plan(args):
     msg = _require_human(ctx, st, "approve-plan", getattr(args, "director_token", None))
     if (st.get("pending") or {}).get("action") == "approve-plan":
         st.pop("pending", None)  # answered
+    _stamp_legacy_round_baselines(st, plan)
     st["approved"] = approval_snapshot(ctx, st)  # the owner chat is unchanged: only `resume --claim` moves a run
     links = _done_means_links(ctx, plan)
     if not links or any(links.values()):
@@ -11514,6 +11519,62 @@ def _approval_snapshot_keeping_dm(ctx, st, keep_objective: bool = True) -> dict:
         new_obj = snap.get("objective") if isinstance(snap.get("objective"), dict) else {}
         snap["objective"] = {**old_obj, **new_obj, "done_means": list(old_obj["done_means"])}
     return snap
+
+
+def _stamp_legacy_round_baselines(st, plan):
+    """Gives every checkpoint's open, unrecorded, pin-less adversarial round (one that predates reviewers-pin
+    tracking: no `reviewers_pin` key) its one-time migration stamp before an approval snapshot is written that
+    would otherwise bake the checkpoint's live `reviewers` pin in as that round's first baseline with no chance
+    to reopen. Must run, over EVERY checkpoint, before any of the three commands that call `approval_snapshot`
+    (`approve-plan`, `plan-extend`, `approve-changes`) write `st["approved"]`: that snapshot records every
+    checkpoint's live `reviewers` pin unconditionally, so whichever of the three is first to run after an
+    upgrade is the one that would otherwise silently bake in a pre-upgrade run's checkpoints with no stamp
+    (CP4 round 5, omp-glm-correctness/X1 -- found only guarded in approve-changes, the same gap at the other
+    two). `cmd_reviewers` itself also calls this, unconditionally, before it decides whether to replace the open
+    round (CP4 round 6, host-alt-correctness/A1): the common upgraded shape is a checkpoint whose pin was already
+    edited and approved entirely under the old engine, so `approved.cps`'s hash already matches the live
+    checkpoint and `approve-changes` finds nothing pending ("Nothing has changed since approval.") -- the only
+    command left that always runs, with no "something changed" precondition, is `reviewers`, so it must be able
+    to stamp and reopen the round on its own, on this same call, rather than wait on an approval event that would
+    never come. approve-plan never sees a checkpoint with an `adv_round` at all (no round has opened before the
+    plan is first approved), so the loop is a no-op there. plan-extend's existing checkpoints DO already carry an
+    `adv_round` -- they are the ones `complete` already closed out -- but every one of those rounds is
+    `recorded`, so it is the loop's own `not rnd.get("recorded")` guard that skips them, not the absence of a
+    round; it stays a no-op there only for that reason, and would stop being one if a recorded round's
+    `recorded` flag were ever cleared.
+
+    With a prior `approved.reviewers` baseline already on record for a checkpoint, this stamps the OLD baseline
+    only when it genuinely differs from the live pin (the precise, zero-false-reopen path). With no such
+    baseline at all (a pre-upgrade run's first encounter with this code), there is no fixed guess at the prior
+    pin that is correct in every direction (a narrowed round's own reviewers can look "unchanged" under
+    containment even when the pin actually grew or swapped -- CP4 round-3 codex-standards/X3's counter-example
+    -- and pin removal is undetectable no matter what is guessed, since a never-pinned round's own reviewers are
+    structurally identical to a pinned-then-removed round's), so the safe default fires whenever the live pin is
+    non-empty: treat the prior pin as unknown and stamp None unconditionally, so the very next `reviewers` call
+    re-evaluates the round against the live pin. Replacing an unrecorded round this way is free only while its
+    folder holds no review file yet (CP2-T07's own scope); "unrecorded" does not by itself guarantee
+    "unreviewed" (a reviewer's output file can land on disk before `adv-record` ever runs or refuses it, for
+    example a round `adv-record` already refused for `omitted_files`): a round whose folder already holds a
+    review file costs an attempt to replace, the same as any other reviewed round, legacy or not.
+
+    Returns True when it actually stamped at least one checkpoint's round (so a caller with no other reason to
+    save state, such as `cmd_reviewers` on a call that ends up re-showing the SAME round, still persists the
+    stamp instead of leaving it computed only in memory)."""
+    old_reviewers = (st.get("approved") or {}).get("reviewers")
+    stamped = False
+    for cid, cp_state in st["checkpoints"].items():
+        rnd = cp_state.get("adv_round")
+        if rnd and not rnd.get("recorded") and "reviewers_pin" not in rnd:
+            live_cp = next((c for c in plan["checkpoints"] if c.get("id") == cid), {})
+            if isinstance(old_reviewers, dict) and cid in old_reviewers:
+                old_pin = old_reviewers[cid]
+                if sorted(old_pin or []) != sorted(live_cp.get("reviewers") or []):
+                    rnd["reviewers_pin"] = old_pin
+                    stamped = True
+            elif live_cp.get("reviewers"):
+                rnd["reviewers_pin"] = None
+                stamped = True
+    return stamped
 
 
 def _dm_findings_block(ctx, st, plan) -> bool:
@@ -14812,6 +14873,7 @@ def cmd_plan_extend(args):
     _advance(st, new_ids[0], fingerprint(ctx.root)["id"], _head_sha(ctx.root))
     # the user's feedback is the approval for the appended checkpoints and the appended done-means lines (the
     # approved lines were checked above to be an unchanged prefix)
+    _stamp_legacy_round_baselines(st, plan)
     st["approved"] = _approval_snapshot_keeping_dm(ctx, st, keep_objective=False)
     register_active(ctx.root, st["slug"])
     ctx.log(st, "plan_extended", added=new_ids)
@@ -15772,16 +15834,12 @@ def cmd_approve_changes(args):
     cur = st.get("current")
     if cur and (st["checkpoints"].get(cur) or {}).get("red_tests") is not None:
         st["checkpoints"][cur]["red_tests"] = _snapshot_tests(ctx, cp_by_id(ctx.plan(), cur))
-    # An approved edit to a checkpoint whose open round predates reviewers-pin tracking (no reviewers_pin key):
-    # stamp a baseline so the next `reviewers` call re-evaluates the round against the live pin. With a live pin
-    # the baseline is the round's own reviewers (so a restated, unchanged pin keeps the round); with none it is
-    # None (an unpinned checkpoint never force-reopens).
-    for pr in probs:
-        m = re.fullmatch(r"checkpoint (\S+) in checkpoints\.json", pr)
-        rnd = (((st["checkpoints"].get(m.group(1)) or {}).get("adv_round")) or None) if m else None
-        if rnd and not rnd.get("recorded") and "reviewers_pin" not in rnd:
-            live = next((c for c in plan["checkpoints"] if c.get("id") == m.group(1)), {}).get("reviewers")
-            rnd["reviewers_pin"] = list(rnd.get("reviewers") or []) if live else None
+    # Every checkpoint's open, unrecorded, pin-less legacy round gets its one-time migration stamp here, not only
+    # the ones named in this approval's `probs`: the snapshot rewrite below (_approval_snapshot_keeping_dm) records
+    # every checkpoint's live reviewers unconditionally, so a checkpoint left out here would have its pre-upgrade
+    # pin silently baked into the new baseline the first time ANY checkpoint is approved, losing its one-time
+    # migration reopen for good. See _stamp_legacy_round_baselines for the full rule.
+    _stamp_legacy_round_baselines(st, plan)
     st["approved"] = _approval_snapshot_keeping_dm(ctx, st)  # after the red baseline moved, so the snapshot records it
     _clear_pending(st)
     ctx.log(st, "changes_approved", by=msg["by"], changed="; ".join(probs)[:400], **_policy_field(args))
@@ -16465,8 +16523,25 @@ def cmd_reviewers(args):
     rnd = cps.get("adv_round")
     # A round opened before this field existed has no "reviewers_pin" key at all (not even None). Its resolved
     # reviewers can legitimately differ from the pin (narrowing, substitution), so they are never compared here:
-    # such a round never triggers pin_changed by itself. approve-changes stamps a baseline reviewers_pin on it
-    # when an approved edit to this checkpoint lands, and from then on the normal comparison below applies.
+    # such a round never triggers pin_changed by itself. _stamp_legacy_round_baselines (run from approve-plan,
+    # plan-extend and approve-changes, before each writes its approval snapshot, AND run right here, unconditionally,
+    # before this very comparison) decides whether to stamp one of two ways, and the two ways leave this legacy
+    # round in different states, not the same one: when the last approval snapshot already recorded this
+    # checkpoint's own reviewers field, it diffs that stored field directly against the live pin and stamps the
+    # OLD pin only on a genuine difference -- an UNCHANGED reviewers field leaves the round legacy here, same as
+    # before. When the snapshot predates that field for this checkpoint (no stored baseline at all), there is no
+    # fixed guess at the prior pin that is correct in every direction (CP4 round-3 codex-standards/X3), so it
+    # unconditionally stamps None whenever the live pin is non-empty -- here ANY approval event while the live pin
+    # is non-empty stamps and reopens, an unchanged pin included; only an EMPTY live pin leaves a no-baseline
+    # round legacy. Calling it here too (not only from the three approval-writing commands) is what closes CP4
+    # round-6 host-alt-correctness/A1: the common upgraded shape is a checkpoint whose pin was already edited and
+    # approved entirely under the old engine, so `approve-changes` finds nothing pending and never reaches its own
+    # call -- `reviewers` is the only command left that always runs, with no "something changed" precondition, so
+    # it stamps and reopens the round on this same call instead of waiting on an approval event that would never
+    # come. `stamped_legacy` is threaded through below so a call that stamps some OTHER checkpoint's round (this
+    # loop runs over every checkpoint, not only args.cp) still persists that stamp even when args.cp's own round
+    # takes the "same round" branch below and would otherwise have no other reason to save state.
+    stamped_legacy = _stamp_legacy_round_baselines(st, plan)
     if not rnd or "reviewers_pin" not in rnd:
         pin_changed = False
     else:
@@ -16772,7 +16847,10 @@ def cmd_reviewers(args):
             if swapped_in:  # record the same-round swap the same shape a fresh round's own substitutions use
                 rnd["substitutions"] = (rnd.get("substitutions") or []) + swapped_in
             ctx.log(st, "reviewer_fallback", cp=args.cp, detail="re-resolved within round " + str(rnd["round"]))
-        if changed or newly_failed:
+        if changed or newly_failed or stamped_legacy:
+            # stamped_legacy: this round wasn't replaced (pin_changed stayed False for args.cp itself), but the
+            # same call may have stamped some OTHER checkpoint's legacy round above; that mutation needs saving
+            # too, or it is computed only in memory and lost.
             ctx.save_state(st)
         if not refill_reserved:  # the record's lock was busy (or nothing was replaced): starts recorded now
             update_review_starts(cfg, rnd["nonce"], started, given_back)
@@ -16822,11 +16900,35 @@ def cmd_reviewers(args):
     # currently has a pin set. Computed from the FINAL round object (after any replacement
     # above has happened), so a round just opened/replaced -- which does store reviewers_pin -- never gets this
     # stale warning; it only fires when a legacy round is actually the one being re-shown right now.
-    legacy_pin_note = "reviewers_pin" not in rnd and bool(cp.get("reviewers"))
-    legacy_pin_msg = (f"Round {rnd['round']} predates reviewers-pin tracking (no reviewers_pin on this round), so "
-                      f"it has no recorded pin baseline and is shown as-is; an approved edit to this checkpoint "
-                      f"(most commonly its reviewers pin, through approve-changes) makes the next reviewers call "
-                      f"re-evaluate it against the live pin.") if legacy_pin_note else None
+    legacy_pin_note = not rnd.get("recorded") and "reviewers_pin" not in rnd and bool(cp.get("reviewers"))
+    # Whether a baseline is on record for this checkpoint under the live `reviewers` field decides which promise
+    # is true (see _stamp_legacy_round_baselines): with no stored baseline yet, this very call already stamped
+    # and reopened it above when the live pin is non-empty (the legacy_pin_note computed here, on the FINAL round
+    # object, is already False in that case) -- the only command left able to leave this note showing in that
+    # shape is the next `approve-changes` call, even one that only touches a different checkpoint (the loop runs
+    # over every checkpoint unconditionally), once it runs. approve-plan and plan-extend never apply here: a
+    # checkpoint with an open adv_round is mid-run, and neither of those two can run while it is. Once a baseline
+    # IS on record for this checkpoint, only a genuine, approved change to THIS checkpoint's own reviewers field
+    # makes the next approval stamp it; an edit to some other checkpoint, or an approval that leaves this
+    # checkpoint's reviewers field unchanged, stamps nothing here.
+    has_baseline = isinstance((st.get("approved") or {}).get("reviewers"), dict) \
+        and args.cp in (st.get("approved") or {}).get("reviewers")
+    if legacy_pin_note and has_baseline:
+        legacy_pin_msg = (f"Round {rnd['round']} predates reviewers-pin tracking (no reviewers_pin on this round), "
+                          f"so it has no recorded pin baseline and is shown as-is; a baseline is already on record "
+                          f"for this checkpoint's reviewers field, so only an approved change to this checkpoint's "
+                          f"own reviewers field will stamp a baseline here and make the next reviewers call "
+                          f"re-evaluate it against the live pin.")
+    elif legacy_pin_note:
+        legacy_pin_msg = (f"Round {rnd['round']} predates reviewers-pin tracking (no reviewers_pin on this round), so "
+                          f"it has no recorded pin baseline and is shown as-is; running `reviewers` again resolves "
+                          f"this itself (it runs the same stamp before this check), and the next `approve-changes` "
+                          f"call -- even one that edits a different checkpoint -- also stamps a baseline here, once; "
+                          f"after that, only a genuine change to this checkpoint's own reviewers field reopens it. "
+                          f"Never `approve-plan` or `plan-extend`: neither can run while this checkpoint's round is "
+                          f"open and current.")
+    else:
+        legacy_pin_msg = None
     if legacy_pin_msg:
         res["legacy_pin_note"] = legacy_pin_msg
     if args.json:
