@@ -98,6 +98,10 @@ never inspects its on-disk text directly): 31 files
   `test_results.py`/`test_signing.py`; loads ratchet.py dynamically twice itself
   (`ratchet_engine_trust`, `ratchet_cp5_round2`), and is itself `import`ed (not run directly) by
   every file above that uses it.
+- `test_review_diff_large_files.py` — lane R: fix rounds summarize huge deleted files in
+  `skills/ratchet-adversarial-loop/scripts/external_review.py`; loads THAT module dynamically
+  (`ratchet_external_review_cp1_test`) via `spec_from_file_location` to call `scoped_diff_parts`
+  directly. Never touches ratchet.py itself, but matches the same module-load pattern.
 
 ## Kind 2 — source-text/AST only (reads ratchet.py's literal on-disk text and/or walks its parsed
 tree, never loads it as a module itself): 5 files
@@ -122,6 +126,11 @@ tree, never loads it as a module itself): 5 files
   **pinned pre-split commit** (`git show a24a31d:tests/test_trust.py`), never the working tree. Not
   itself about ratchet.py's split, but the structural precedent pattern this run's own CPn tests
   reuse to prove a mechanical move lost nothing.
+- `test_review_diff_full_rounds.py` — lane R: full rounds summarize deletes, deprioritize huge
+  adds, in `collect_diff()` of `external_review.py`. CP2-T19's own structural check: `ast.parse`
+  (line ~950) over `tests/test_flaky.py`'s on-disk text (both the live working tree and the pinned
+  `git merge-base HEAD main` copy), walking for specific `FunctionDef`s to prove this lane didn't
+  need to touch them. Never inspects ratchet.py itself or loads a module.
 
 ## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 6 files
 
@@ -156,6 +165,14 @@ tree, never loads it as a module itself): 5 files
   pre-move commit's text (via `git show`) to compare each function's body byte-for-byte, find
   leftover top-level `def`s, check for star imports, and locate `DEFAULT_CONFIG`/
   `OLD_DEFAULT_REVIEW_DEPTH` wherever they now live.
+- `test_since_tree_rejected_round.py` — lane R: a review round adv-record REFUSED must not advance
+  `cmd_reviewers`' baseline. Its generated `_REBASELINE` snippet (~line 97) calls
+  `spec_from_file_location` to load ratchet.py by path and re-baseline a throwaway project's
+  integrity chain via `record_chain`. Separately, CP1-T15 reads ratchet.py's own on-disk text
+  (`(ROOT / rel).read_text()`, or the pinned landing/base commit's text via `git show`) and uses
+  `ast.parse`/`ast.walk` (lines ~642, ~725) to structurally compare `cmd_reviewers`'s body —
+  masking only the span that sets `prev_round_tree` — against the pre-lane commit, to prove the
+  rest of the function is untouched.
 
 ## Kind 4 — brief-named, but don't literally match either live-grep pattern today: 2 files
 
