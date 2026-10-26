@@ -1,0 +1,17 @@
+{
+  "command": "/usr/bin/python3 -I /home/rahil/.paseo/worktrees/02m50n60/ratchet-fast-integration-tests/tests/measure_suite_baseline.py --suites tests/test_trust_cp5_d.py,tests/test_trust_cp5_e.py,tests/test_quota_shared.py",
+  "suites": {
+    "test_trust_cp5_d.py": {
+      "elapsed_sec": 439.72454135800945,
+      "passed": true
+    },
+    "test_trust_cp5_e.py": {
+      "elapsed_sec": 100.97683608002262,
+      "passed": true
+    },
+    "test_quota_shared.py": {
+      "elapsed_sec": 260.93776292097755,
+      "passed": true
+    }
+  }
+}

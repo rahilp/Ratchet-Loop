@@ -144,16 +144,105 @@ def _diff_file_chunks(diff_text: str) -> list[tuple[str, str]]:
     return out
 
 
+_HUNK_ADD_RE = re.compile(r"@@ -0,0 \+1(?:,([1-9][0-9]*))? @@")
+_HUNK_DEL_RE = re.compile(r"@@ -1(?:,([1-9][0-9]*))? \+0,0 @@")
+_INDEX_ADD_RE = re.compile(r"index 0+\.\.[0-9a-f]+(?: [0-7]{6})?")
+_INDEX_DEL_RE = re.compile(r"index [0-9a-f]+\.\.0+(?: [0-7]{6})?")
+_NO_NEWLINE = "\\ No newline at end of file"
+
+
+def _pure_add_delete(chunk: str) -> tuple[str, int] | None:
+    """('added', n) or ('deleted', n) when one file's chunk (from _diff_file_chunks) is a textbook pure add or
+    delete, else None. Accepts ONLY, in this order: the diff --git line; one 'new file mode' / 'deleted file mode'
+    line; one index line with the null side all zeros; '--- /dev/null' + '+++ b/<path>' (add) or '--- a/<path>'
+    + '+++ /dev/null' (delete), naming the diff --git line's own path; exactly one '@@ -0,0 +1[,n] @@' (add) or
+    '@@ -1[,n] +0,0 @@' (delete) line; exactly n body lines that all start with '+' (add) or '-' (delete); at most
+    one trailing '\\ No newline at end of file'. Anything else (a mixed line, a second hunk, a count that does not
+    match, a rename/copy/similarity/mode line, extra text) returns None. Lines are split on '\\n' only, never
+    str.splitlines(), which also breaks on characters git does not (U+2028, \\x0b, ...)."""
+    if not chunk.endswith("\n"):
+        return None
+    lines = chunk[:-1].split("\n")
+    if len(lines) < 7 or not lines[0].startswith("diff --git "):
+        return None
+    if re.fullmatch(r"new file mode [0-7]{6}", lines[1]):
+        kind, sign, index_re, hunk_re = "added", "+", _INDEX_ADD_RE, _HUNK_ADD_RE
+        if lines[3] != "--- /dev/null" or not lines[4].startswith("+++ "):
+            return None
+        b_tok = lines[4][4:]
+        if b_tok.endswith("\t") and " " in b_tok:  # git ends a ---/+++ line with a tab when the path has a space
+            b_tok = b_tok[:-1]
+        if b_tok.startswith("b/"):
+            a_tok = "a/" + b_tok[2:]
+        elif b_tok.startswith('"b/'):
+            a_tok = '"a/' + b_tok[3:]
+        else:
+            return None
+    elif re.fullmatch(r"deleted file mode [0-7]{6}", lines[1]):
+        kind, sign, index_re, hunk_re = "deleted", "-", _INDEX_DEL_RE, _HUNK_DEL_RE
+        if not lines[3].startswith("--- ") or lines[4] != "+++ /dev/null":
+            return None
+        a_tok = lines[3][4:]
+        if a_tok.endswith("\t") and " " in a_tok:
+            a_tok = a_tok[:-1]
+        if a_tok.startswith("a/"):
+            b_tok = "b/" + a_tok[2:]
+        elif a_tok.startswith('"a/'):
+            b_tok = '"b/' + a_tok[3:]
+        else:
+            return None
+    else:
+        return None
+    if lines[0] != f"diff --git {a_tok} {b_tok}" or not index_re.fullmatch(lines[2]):
+        return None
+    m = hunk_re.fullmatch(lines[5])
+    if not m:
+        return None
+    n = int(m.group(1)) if m.group(1) else 1
+    body, tail = lines[6:6 + n], lines[6 + n:]
+    if len(body) != n or not all(l.startswith(sign) for l in body):
+        return None
+    if tail not in ([], [_NO_NEWLINE]):
+        return None
+    return kind, n
+
+
+def _summarize_pure(chunk: str, kind: str, n: int) -> str:
+    """The short stand-in for a pure delete (kind, n from _pure_add_delete): git's own header lines up to and
+    including '+++', copied verbatim, then one honest line in place of the '@@' line and the body. A pure add is
+    never summarized (neither caller, scoped_diff_parts nor _pack_full_round, passes one), so any other kind is
+    refused."""
+    if kind != "deleted":
+        raise ValueError(f"only a pure delete may be summarized, not {kind!r}")
+    head = "\n".join(chunk.split("\n")[:5]) + "\n"
+    return head + f"[file deleted; {n} lines of former content omitted]\n"
+
+
 def collect_diff(root: Path, base_tree: str | None, current_tree: str | None, prev_round_tree: str | None = None) -> str:
     """Everything that changed since the checkpoint started — committed, uncommitted and untracked alike.
 
     Both sides are tree ids from ratchet.py's fingerprint (a snapshot of the whole working tree), so a
     checkpoint can't hide code from reviewers by committing it or by naming a commit 'ratchet(...)'.
 
-    `prev_round_tree`: round 2+ only (None on round 1, which keeps the plain order below). The tree the
+    `prev_round_tree`: round 2+ only (None on round 1, which keeps git's order, except that a round-1 diff over
+    the limit with a pure add in it moves the adds after the other files, smallest first). The tree the
     PREVIOUS review round was stamped with: files that changed since then are put first, so a reviewer always
     sees what is new since it last looked, even when the whole diff is too large to include and the rest gets
     cut. When the size limit still cuts content, the files left out are named, not just a generic char count.
+
+    A full (unscoped) round's diff that fits under MAX_DIFF is returned exactly as git prints it. When it does
+    not fit, _pack_full_round packs it: always in a later round (with no pure add or delete in it, that gives
+    the same result as before), and in round 1 only when it holds a textbook pure add or pure delete
+    (_pure_add_delete). A pure delete may be shown as git's own header lines plus one line saying it was deleted
+    and how many lines were left out (_summarize_pure), biggest first and only as many as needed, and it counts
+    as shown, never as cut.
+    An added file is never summarized: every other changed file (modifications, and summarized deletes) is
+    packed ahead of the adds, the adds go last (smallest first, so a huge one is the one cut), and an add that
+    does not fit is cut and named in the same 'left out or cut short' note as any other cut file. In a later
+    round the two groups (changed since the previous round, then the rest) set the print order, each with its
+    adds after its other files, but the budget goes to every non-add in both groups before any add, so an add
+    changed since the previous round never takes room a real change in the rest needs. A round-1 diff over the limit with no pure add or delete in it
+    is cut at MAX_DIFF exactly as before; the no-base_tree fallback above is unchanged.
     """
     if not (base_tree and current_tree):  # non-git project or an old run: the working-tree diff against HEAD
         parts = ["# Diff against HEAD\n", git(root, "diff", "HEAD", "--", ".", ":(exclude).ratchet")]
@@ -173,9 +262,12 @@ def collect_diff(root: Path, base_tree: str | None, current_tree: str | None, pr
     full_diff = git(root, "diff-tree", "-r", "-p", "--no-color", base_tree, current_tree)
     if not prev_round_tree or prev_round_tree == current_tree:
         text = header + full_diff
-        if len(text) > MAX_DIFF:
-            text = text[:MAX_DIFF] + f"\n\n[diff truncated at {MAX_DIFF} chars — flag anything you could not see]"
-        return text
+        if len(text) <= MAX_DIFF:
+            return text
+        chunks = _diff_file_chunks(full_diff)
+        if not any(_pure_add_delete(c) for _f, c in chunks):  # no pure add or delete: the plain cut, as before
+            return text[:MAX_DIFF] + f"\n\n[diff truncated at {MAX_DIFF} chars — flag anything you could not see]"
+        return _pack_full_round(header, [chunks])
     chunks = _diff_file_chunks(full_diff)
     changed_since = {f for f in git(root, "diff-tree", "-r", "--no-renames", "--name-only",
                                     prev_round_tree, current_tree).splitlines() if f}
@@ -184,45 +276,146 @@ def collect_diff(root: Path, base_tree: str | None, current_tree: str | None, pr
     note = (f"# Files changed since the previous review round ({', '.join(f for f, _ in priority) or '(none)'}): "
             "their diffs come first below.\n") if priority else \
            "# No files changed since the previous review round; showing the whole diff below.\n"
-    parts = [header, note]
-    total = len(header) + len(note)
-    cut = []
-    for f, c in priority + rest:
+    if len(header) + len(note) + sum(len(c) for _f, c in chunks) <= MAX_DIFF:
+        return header + note + "".join(c for _f, c in priority + rest)
+    return _pack_full_round(header + note, [priority, rest])
+
+
+def _pack_full_round(lead: str, groups: list[list[tuple[str, str]]]) -> str:
+    """collect_diff's packing of a full round's diff that is over MAX_DIFF. `groups` is a list of [(path, chunk)]
+    lists printed one after another (round 1: one group in git's order; a later round: the files changed since
+    the previous round, then the rest). Within each group the non-adds keep git's order and the pure adds
+    (_pure_add_delete) follow them, smallest first (a tie keeps git's order). Every pure delete whose summary
+    (_summarize_pure) is shorter than its chunk starts summarized; a pure add is never summarized.
+    The groups set the print order only, never the budget: every group's non-adds are fitted first (in print
+    order), and only then every group's adds (in print order), so a real change in a later group always gets room
+    ahead of an add in an earlier one. A non-add that does not fit whole is shown as far as it fits and cut (so
+    nothing after it fits either); an add that does not fit whole is cut and skipped, so the files after it still
+    get their room. Then the summaries are swapped back to the full chunk, smallest first, while the total stays
+    within MAX_DIFF (once a non-add is cut no room is left, so none is), and only then does any room left go to the
+    first cut add in that fitting order, shown as far as it fits in its own place. That uses up all the room
+    left, so nothing is printed after it; were another chunk ever to follow it, it is cut back to its last whole
+    line, so that chunk's 'diff --git' line starts a line of its own. Every cut or left-out file (including one
+    that got no room at all) is named, in print order, in the 'left out or cut short' note."""
+    items = []  # (path, full chunk, summary or None, is a pure add), in print order
+    for group in groups:
+        non_adds, adds = [], []
+        for f, c in group:
+            pure = _pure_add_delete(c)
+            if pure and pure[0] == "added":
+                adds.append((f, c, None, True))
+                continue
+            summary = None
+            if pure and pure[0] == "deleted":
+                t = _summarize_pure(c, *pure)
+                if len(t) < len(c):
+                    summary = t
+            non_adds.append((f, c, summary, False))
+        items += non_adds + sorted(adds, key=lambda it: len(it[1]))
+    use = {}  # item index -> the text shown for it (absent: left out)
+    cut = []  # item indexes named in the note
+    total = len(lead)
+    # fitting order: every group's non-adds (in print order) before any group's adds (in print order)
+    order = [i for i in range(len(items)) if not items[i][3]] + [i for i in range(len(items)) if items[i][3]]
+    for i in order:
+        _f, c, summary, is_add = items[i]
+        t = summary if summary is not None else c
         remaining = MAX_DIFF - total
-        if remaining <= 0:
-            cut.append(f)
+        if 0 < remaining and len(t) <= remaining:
+            use[i] = t
+            total += len(t)
             continue
-        if len(c) > remaining:  # this file's own diff is what the size limit cuts into (shown as far as it fits)
-            parts.append(c[:remaining])
+        cut.append(i)
+        if not is_add and remaining > 0:  # this file's own diff is what the size limit cuts into
+            use[i] = t[:remaining]
             total += remaining
-            cut.append(f)
-            continue
-        parts.append(c)
-        total += len(c)
+    # swap the summaries back, smallest first (on a tie, the file printed later first), while all fits;
+    # a cut add never keeps a delete summarized (when a non-add was cut, no room is left, so nothing is swapped back)
+    for i in sorted((i for i in use if items[i][2] is not None), key=lambda i: (len(items[i][1]), -i)):
+        full = items[i][1]
+        if total - len(use[i]) + len(full) <= MAX_DIFF:
+            total += len(full) - len(use[i])
+            use[i] = full
+    first = next((i for i in cut if items[i][3] and i not in use), None)
+    if first is not None and MAX_DIFF - total > 0:  # the first cut add (in fitting order) gets all the room left
+        part = items[first][1][:MAX_DIFF - total]
+        if any(i in use for i in range(first + 1, len(items))):  # another file follows it: end on a whole line
+            part = part[:part.rfind("\n") + 1]
+        if part:
+            use[first] = part
+            total += len(part)
+    cut.sort()  # named in print order
+    parts = [lead] + [use[i] for i in range(len(items)) if i in use]
     if cut:
         parts.append(f"\n[diff truncated at {MAX_DIFF} chars — left out or cut short (ask about these if they "
-                     f"matter): {', '.join(cut)}]")
+                     f"matter): {', '.join(items[i][0] for i in cut)}]")
     return "".join(parts)
 
 
 def scoped_diff_parts(root: Path, since_tree: str, current_tree: str) -> tuple[str, list[str], list[str]]:
     """Lane H CP6: the diff for a SCOPED round (a fix round, or a small fix made after an approval) -- ONLY what
     changed since `since_tree` (the last round actually reviewed), never the whole checkpoint. Returns
-    (text, shown, omitted): whole files only, in git's order, up to MAX_DIFF; a file that does not fit whole is
-    left out and named in the text, never cut mid-file, so `shown` is exactly what the reviewer could read.
-    New and deleted files are included as git's own diff format marks them."""
+    (text, shown, omitted), up to MAX_DIFF, never cut mid-file. `shown` is every file the
+    reviewer saw either in full or, for a textbook pure delete only, as an honest summary; `omitted` is
+    every file that is neither, named in the text. When the whole diff fits, it is returned exactly as git
+    prints it with rename detection (-M) on (every file's whole diff, nothing summarized; a file moved with most
+    of it unchanged is one rename chunk instead of a delete plus an add). New and deleted files are included as
+    git's own diff format marks them. When the whole diff does not fit, a textbook pure delete (_pure_add_delete)
+    may always be shown instead as git's own header lines plus one line saying the file was deleted and how many
+    lines were left out (_summarize_pure); it counts as shown. A pure add is never summarized, whatever the rest
+    of the diff contains: added content is what can ship or run, and a file moved and rewritten, or split out of
+    a modified file, reaches git as an add, so an add is shown in full or omitted and named (-M only makes a move
+    read better; it is not what keeps an edit from being hidden). Only as many deletes are summarized as needed,
+    biggest first (a tie goes to the file git prints first): every pure delete whose summary is shorter than its
+    full chunk starts summarized. The fitting loop then tries every non-add (a modification, or a pure delete,
+    summarized or not) in git's order before any pure add, so a real change never loses its room to a new file
+    listed earlier by git; the pure adds themselves are tried smallest first (a tie keeps git's order), mirroring
+    _pack_full_round's own grouping. Afterwards summaries are swapped back to the full chunk, smallest first,
+    while the total stays within MAX_DIFF. Any other file that does not fit whole (a real modification, or any
+    added file) is omitted and named, exactly as before. Shown files still PRINT in git's own order below,
+    whatever order they were fitted in."""
     header = f"# Changes since the last round actually reviewed ({since_tree[:10]} → {current_tree[:10]})\n"
-    diff = git(root, "diff-tree", "-r", "-p", "--no-color", since_tree, current_tree)
+    diff = git(root, "diff-tree", "-r", "-p", "-M", "--no-color", since_tree, current_tree)
     if not diff:
         return header + "(no file content differs here -- the change was likely a rename or mode-only edit)\n", [], []
-    parts, shown, omitted, total = [header], [], [], len(header)
-    for f, c in _diff_file_chunks(diff):
-        if total + len(c) > MAX_DIFF:
-            omitted.append(f)
+    chunks = _diff_file_chunks(diff)
+    if len(header) + sum(len(c) for _f, c in chunks) <= MAX_DIFF:  # it all fits: git's own -M output, nothing summarized
+        return header + "".join(c for _f, c in chunks), [f for f, _c in chunks], []
+    # only a pure delete may be summarized; a pure add never is, whatever else the diff holds
+    summary = {}  # chunk index -> its summarized form, for each pure delete whose summary is shorter
+    for i, (_f, c) in enumerate(chunks):
+        pure = _pure_add_delete(c)
+        if pure and pure[0] == "deleted":
+            t = _summarize_pure(c, *pure)
+            if len(t) < len(c):
+                summary[i] = t
+    is_add = {i: bool((pure := _pure_add_delete(c)) and pure[0] == "added") for i, (_f, c) in enumerate(chunks)}
+    # fitting order: every non-add in git's order, then the pure adds smallest first (a tie keeps git's order)
+    order = [i for i in range(len(chunks)) if not is_add[i]] + \
+        sorted((i for i in range(len(chunks)) if is_add[i]), key=lambda i: len(chunks[i][1]))
+    use = {}  # chunk index -> the text shown for it (absent: omitted)
+    total = len(header)
+    for i in order:
+        _f, c = chunks[i]
+        t = summary.get(i, c)
+        if total + len(t) > MAX_DIFF:
             continue
-        parts.append(c)
-        shown.append(f)
-        total += len(c)
+        use[i] = t
+        total += len(t)
+    # swap summaries back to the full chunk, smallest first (so the biggest stay summarized; on a tie, the file git
+    # prints later is restored first), while everything still fits
+    for i in sorted((i for i in summary if i in use), key=lambda i: (len(chunks[i][1]), -i)):
+        full = chunks[i][1]
+        if total - len(use[i]) + len(full) <= MAX_DIFF:
+            total += len(full) - len(use[i])
+            use[i] = full
+    parts, shown, omitted = [header], [], []
+    for i, (f, _c) in enumerate(chunks):
+        if i in use:
+            parts.append(use[i])
+            shown.append(f)
+        else:
+            omitted.append(f)
     if omitted:
         parts.append(f"\n[diff too large: these changed files are NOT shown and were NOT reviewed by you "
                      f"(do not approve without them; say so in a finding): {', '.join(omitted)}]")
@@ -623,7 +816,8 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
     base = cps.get("base_tree")
     if scope is not None:
         _t, shown, omitted = scoped_diff_parts(ctx.root, scope["since_tree"], fp)
-        # only the files the reviewer was actually shown; a diff cut at the size limit names what it left out
+        # only the files the reviewer was shown, in full or as an honest pure delete summary; a diff over the
+        # size limit names what it left out (neither shown in full nor summarized)
         if omitted:
             review["files_reviewed"], review["omitted_files"] = shown, omitted
         else:

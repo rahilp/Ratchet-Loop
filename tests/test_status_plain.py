@@ -13,6 +13,8 @@ Assumed interface (the implementation must provide it):
   * blocked `next`      still JSON (phase, action, stop_ok) plus "options": [{"letter": "A", "text": "..."}]
 Everything runs in throwaway git projects with a temp HOME / RATCHET_HOME; the repo's own .ratchet is never touched.
 """
+import ast
+import contextlib
 import datetime as dt
 import importlib.util
 import json
@@ -21,8 +23,14 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import traceback
 import _tmp
+import cp2_t11_base_pairs
+import run_all
+from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
@@ -67,6 +75,13 @@ ENV.update(HOME=str(HOME), RATCHET_HOME=str(HOME / "rh"), CODEX_HOME=str(HOME / 
            COPILOT_HOME=str(HOME / "copilothome"), RATCHET_HOST_PROVIDER="anthropic", PATH=path_without_agent_clis())
 TRANSCRIPTS = Path(_tmp.mkdtemp(prefix="ratchet-sp-transcripts-"))
 PASS = FAIL = 0
+# CP2: generic "[CPn-Txx]" bracket-id extraction, the same pattern tests/test_install.py (CP1) and
+# tests/test_run_all_dedupe.py already use, so this file's own per-test JSON report (RATCHET_TEST_REPORT)
+# can tally pass/fail per planned case id without changing any existing check(...) call's text or condition.
+ID_RE = re.compile(r"\[(CP\d+-T\d+)\]")
+CASE_STATUS: dict = {}
+CASE_MESSAGES: dict = {}
+CHECK_NAME_COUNTS: Counter = Counter()  # exact rendered `name` text -> how many times check() was called with it
 GO = "yes, go ahead without hooks"
 JARGON = re.compile(r"\b(fingerprint|lens|slot|nonce|adversarial|director|approve-changes|gate|stop_blocks|round cap)\b", re.I)
 RAW_PHASE = re.compile(r"\b(awaiting|planning)_[a-z_]+\b")
@@ -84,12 +99,27 @@ KEEP = []
 def check(name, cond, detail=""):
     global PASS, FAIL
     PASS, FAIL = (PASS + 1, FAIL) if cond else (PASS, FAIL + 1)
+    CHECK_NAME_COUNTS[name] += 1
+    m = ID_RE.search(name)
+    if m:
+        cid = m.group(1)
+        CASE_STATUS[cid] = CASE_STATUS.get(cid, True) and bool(cond)
+        if not cond:
+            CASE_MESSAGES.setdefault(cid, []).append(f"{name}: {str(detail)[:200]}")
     print(f"  {'✓' if cond else '✗'} {name}" + ("" if cond else f"   {str(detail)[:300]}"))
 
 
-def rx(d, *args, env=None):
-    return subprocess.run([sys.executable, str(ENGINE), *args], cwd=d, capture_output=True, text=True,
-                          env=env or ENV, timeout=120)
+def rx(d, *args, env=None, popen=subprocess.Popen, monotonic=time.monotonic):
+    # CP2: delegates to run_all.run_with_stretched_timeout() (the same helper tests/run_all.py's own Runner
+    # and tests/test_install.py's Env.run() use), so the limit follows run_all.stretch_factor() re-read on
+    # every poll -- a flat 120s on a normal, idle, or unreadable-load machine (factor 1.0, same as before
+    # this checkpoint), stretched when the machine is genuinely busy, and a load spike mid-call still raises
+    # it (never a one-time stretch_factor() snapshot taken before the call). `popen`/`monotonic` are optional
+    # seams (defaulting to the real subprocess.Popen/time.monotonic, untouched at every real call site) a
+    # test may inject to make the call fully deterministic, reusing tests/test_install.py's CP1-T06/T07
+    # pattern.
+    return run_all.run_with_stretched_timeout([sys.executable, str(ENGINE), *args], 120.0, cwd=d,
+                                               env=env or ENV, popen=popen, monotonic=monotonic)
 
 
 def git(d, *a):
@@ -242,6 +272,609 @@ def blocks_by_title(text):
         return None, [sum(1 for l in lines if t in l) for t in TITLES]
     idx.append(len(lines))
     return ["\n".join(lines[idx[i]:idx[i + 1]]) for i in range(6)], None
+
+
+# =================================================================================================================
+# CP2: dedup and load-aware timeout in this very suite's own engine-CLI calls and nested-suite re-runs.
+#
+# This checkpoint's "production code" is this file's own rx() helper and the CP3-T21 block (the `for t in
+# ("test_gates.py", "test_hooks.py"): ... check(...)` loop a few hundred lines below). Before this checkpoint
+# both were flat: rx() always waited 120s and CP3-T21 always waited 590s and always re-ran both suites, even
+# when tests/run_all.py already ran them as their own suites in this same run (doubling their ~6-minute cost
+# for nothing). This checkpoint adds, to this file, the standing contract the functions below must keep:
+#   - a top-level `covered_suites()` function, shaped exactly like
+#     tests/test_trust_cp5_regression.py's `run_all_covers()` (same RATCHET_RUN_ALL / RATCHET_RUN_ALL_SUITES
+#     semantics, via the shared `_tmp.run_all_covers()` helper both files call), but over the universe
+#     {"test_gates.py", "test_hooks.py"} (CP2-T09 proves the match).
+#   - rx() computing its subprocess.run(..., timeout=...) as
+#     max(120, 120 * run_all.stretch_factor(run_all.DEFAULT_MAX_STRETCH)[0]) instead of a flat 120.
+#   - the CP3-T21 loop's body (everything above its existing, unchanged `check(f"[CP3-T21] {t} exits 0", ...)`
+#     call) pulled out into two top-level functions so this checkpoint's cases can drive it directly instead
+#     of running the whole file recursively:
+#       * `cp3_t21_run_one(name)`: for one suite filename, returns the SimpleNamespace/CompletedProcess-like
+#         result (skipping the subprocess call with a canned pass when `name` is in covered_suites(), else
+#         running it for real with a timeout of max(590, 590 * run_all.stretch_factor(...)[0])).
+#       * `cp3_t21_engine_suites()`: loops over both suite names, calling cp3_t21_run_one() for each and then
+#         the SAME existing `check(f"[CP3-T21] {t} exits 0", ...)` call (CP2-T11/T12 pin that this call's text
+#         and condition never change, and that there is still exactly one such call site), called once from
+#         main() in CP3-T21's current place.
+#
+# A case below that calls covered_suites()/cp3_t21_run_one()/cp3_t21_engine_suites() still goes through
+# _try_call() so a future regression in one of those names reports a clean check() failure rather than an
+# uncaught crash.
+#
+# CP2's own test-writing brief explicitly allows monkeypatching subprocess.run to capture the *requested*
+# timeout value (never driving a real kill-on-timeout path) for every case here that only needs to prove the
+# computed VALUE, not that a hang is actually stopped (that proof already lives in tests/test_install.py's
+# CP1-T06/T07, reusing run_all.run_with_stretched_timeout()'s injectable popen/monotonic seams). CP2-T03 needs
+# to prove a suite genuinely still runs and passes, so it uses a real, fast call instead; CP2-T04's own real
+# proof for test_hooks.py comes from CP3-T21's own real run earlier in this same process (see cp2_t04()), so
+# it never launches a second, independent real test_hooks.py subprocess just to re-prove the same thing.
+
+set_fake_load = _tmp.set_fake_load
+restore_env = _tmp.restore_env
+
+# The commit this checkpoint's test-writing started from (the tip of the branch before this file's CP2
+# section was added). CP2-T11 pins the ORIGINAL check(...) call sites against this exact commit, so a later
+# edit here can only ADD new ones, never remove, reword or narrow one that already existed.
+STATUS_PLAIN_BASE_COMMIT = "699da723422e890bac8f3eebbc9bbc0e63bd549d"
+
+CP3_T21_SUITES = ("test_gates.py", "test_hooks.py")
+
+# The most recent cp3_t21_run_one() result per suite name, keyed by suite filename. main() always runs
+# cp3_t21_engine_suites() (the "[CP3-T21] existing engine suites stay green" block) once, for real, before
+# run_cp2_cases() -- this lets cp2_t04() confirm that prior real result for test_hooks.py instead of launching
+# a second, independent real subprocess just to re-prove the same thing (see cp2_t04()).
+CP3_T21_RESULTS: dict = {}
+
+# [CP2 round 3, adv-round-02 fix X1] The result main()'s own CP3-T21 block recorded for test_hooks.py,
+# snapshotted exactly once by main() right after cp3_t21_engine_suites() returns and before any CP2-Txx case
+# runs. cp2_t04()'s real-call sub-check reads this instead of CP3_T21_RESULTS directly, because
+# cp2_t02()'s stubbed call (which runs before cp2_t04() in run_cp2_cases()'s call order) overwrites
+# CP3_T21_RESULTS["test_hooks.py"] with its own canned result.
+CP2_T04_REAL_RESULT = None
+
+
+def covered_suites() -> set:
+    """Suite names from {"test_gates.py", "test_hooks.py"} that tests/run_all.py already ran as their own
+    suites in this run. Calls the same parameterized _tmp.run_all_covers() helper tests/test_trust_cp5_regression.py's
+    run_all_covers() calls (same RATCHET_RUN_ALL / RATCHET_RUN_ALL_SUITES semantics), just over this file's
+    own universe (CP2-T09 proves the two functions agree combo by combo on the same universe)."""
+    return _tmp.run_all_covers(CP3_T21_SUITES)
+
+
+def cp3_t21_run_one(name, popen=subprocess.Popen, monotonic=time.monotonic):
+    """Runs one CP3-T21 engine suite (test_gates.py/test_hooks.py) as a real subprocess via
+    run_all.run_with_stretched_timeout() (floor 590s, re-reading run_all.stretch_factor() on every poll
+    exactly like rx()'s own timeout -- never a one-time snapshot before the call) and returns the result --
+    unless `name` is already covered_suites() (tests/run_all.py's own run of it already proved it in this
+    run), in which case the real subprocess is skipped and a canned passing result is returned instead, the
+    same skip-when-already-covered pattern tests/test_trust_cp5_regression.py's run_all_covers() uses. Also
+    records the result in CP3_T21_RESULTS under `name`, so a later, cheaper check (cp2_t04()'s real-call
+    sub-check) can read it back instead of running the suite again. `popen`/`monotonic` are the same optional
+    seams rx() takes, threaded straight through to run_with_stretched_timeout()."""
+    if name in covered_suites():
+        r = SimpleNamespace(returncode=0, stdout="", stderr="",
+                            tail=f"covered by run_all: {name} runs as its own suite in this run")
+    else:
+        r = run_all.run_with_stretched_timeout([sys.executable, str(ROOT / "tests" / name)], 590.0,
+                                                popen=popen, monotonic=monotonic)
+    CP3_T21_RESULTS[name] = r
+    return r
+
+
+def cp3_t21_engine_suites(popen=subprocess.Popen, monotonic=time.monotonic):
+    """The CP3-T21 loop's entry point: for each engine suite, runs (or skips, per cp3_t21_run_one()) it and
+    records the result through the one pre-existing check(...) call site, unchanged from before this
+    checkpoint except that a skipped suite's detail now says why (the tail text cp3_t21_run_one() computed for
+    it) instead of silently looking identical to a real run. `popen`/`monotonic` are threaded straight through
+    to cp3_t21_run_one()."""
+    for t in CP3_T21_SUITES:
+        r = cp3_t21_run_one(t, popen=popen, monotonic=monotonic)
+        tail = getattr(r, "tail", "")
+        detail = (tail + " " if tail else "") + r.stdout[-300:] + r.stderr[-200:]
+        check(f"[CP3-T21] {t} exits 0", r.returncode == 0, detail)
+
+
+def _try_call(fn):
+    """Calls fn() and returns (True, value); if a name this checkpoint's fix is expected to add doesn't exist
+    yet, returns (False, exc) instead of letting the case crash, so a planned CP2 case reports a clean
+    check() failure rather than an uncaught crash while the fix is still missing."""
+    try:
+        return True, fn()
+    except (NameError, AttributeError, TypeError) as e:
+        return False, e
+
+
+class _FakeQuickProc:
+    """Stand-in for subprocess.Popen that finishes immediately with returncode 0 and empty output, so a
+    heavy real suite (test_gates.py, test_hooks.py) is never actually started just to read off the timeout
+    value run_all.run_with_stretched_timeout() computed for it."""
+
+    def __init__(self, argv):
+        self.argv = argv
+        self.pid = 9999
+        self.returncode = 0
+
+    def communicate(self, timeout=None):
+        return "", ""
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _patch_run(real):
+    """Returns (calls, fake_popen): a stand-in for the `popen` seam run_all.run_with_stretched_timeout()
+    takes (the call site rx()/cp3_t21_run_one() now delegate to), recording the argv of every call. When
+    real is True it still starts the real process (used only for rx(), which is fast); when False it returns
+    a _FakeQuickProc that finishes immediately, so a heavy real suite (test_gates.py, test_hooks.py) is never
+    actually started just to read off the timeout value that would have been used."""
+    calls = []
+    real_popen = subprocess.Popen
+
+    def fake_popen(argv, **kw):
+        calls.append({"args": argv, **kw})
+        if real:
+            return real_popen(argv, **kw)
+        return _FakeQuickProc(argv)
+    return calls, fake_popen
+
+
+def _set_run_all_env(env):
+    """Sets RATCHET_RUN_ALL/RATCHET_RUN_ALL_SUITES exactly to `env` (both cleared first), returning what to
+    hand to restore_env()."""
+    saved = {k: os.environ.get(k) for k in ("RATCHET_RUN_ALL", "RATCHET_RUN_ALL_SUITES")}
+    os.environ.pop("RATCHET_RUN_ALL", None)
+    os.environ.pop("RATCHET_RUN_ALL_SUITES", None)
+    os.environ.update({k: v for k, v in env.items() if v is not None})
+    return saved
+
+
+def _run_cp3_t21_guarded(env, real=False):
+    """Calls cp3_t21_engine_suites() directly with its `popen` seam stubbed (recording the argv of every
+    call instead of actually starting the process, unless real=True) and the given RATCHET_RUN_ALL/
+    RATCHET_RUN_ALL_SUITES, mirroring tests/test_run_all_dedupe.py's _run_guarded() against
+    test_trust_cp5_regression.py. Returns (argvs, (ok, result), status_after): the list of argv lists the
+    `popen` seam was actually called with, the _try_call() outcome of calling cp3_t21_engine_suites() itself,
+    and CASE_STATUS["CP3-T21"] right after the call (None if the function doesn't exist yet, or if it exists
+    but recorded nothing)."""
+    calls, fake_popen = _patch_run(real)
+    saved_env = _set_run_all_env(env)
+    CASE_STATUS.pop("CP3-T21", None)
+    try:
+        ok, result = _try_call(lambda: cp3_t21_engine_suites(popen=fake_popen))
+    finally:
+        restore_env(saved_env)
+    argvs = [kw.get("args") for kw in calls]
+    return argvs, (ok, result), CASE_STATUS.get("CP3-T21")
+
+
+def collect_check_pairs(source, filename="<src>"):
+    """Every check(...) call site in `source` as a (name-source-text, condition-source-text) pair, read from
+    the AST so renaming a loop variable or re-wrapping a call is caught, not just a changed literal string."""
+    tree = ast.parse(source, filename=filename)
+    pairs = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "check" and len(node.args) >= 2:
+            name_src = ast.get_source_segment(source, node.args[0])
+            cond_src = ast.get_source_segment(source, node.args[1])
+            if name_src is not None and cond_src is not None:
+                pairs.append((name_src, cond_src))
+    return pairs
+
+
+def cp2_t01(project):
+    print("CP2-T01: rx()'s engine-CLI timeout is unchanged on a normal, idle, or unreadable-load machine")
+    # CP2 round 2: rx() now delegates to run_all.run_with_stretched_timeout() (it re-reads stretch_factor() on
+    # every poll instead of a one-time snapshot before the call, so a mid-call load spike still extends it --
+    # see cp2_t10()'s added spike checks for that proof). subprocess.run is no longer the call site (Popen is,
+    # inside run_with_stretched_timeout()), so the effective limit is read off the real, fast, non-hanging
+    # call's own `.timeout_limit` attribute, exactly like tests/test_install.py's CP1-T01..T05 do for Env.run().
+    for label, load, cpus in (("unset", None, None), ("low-load", "1", "8"), ("unavailable", "unavailable", None)):
+        saved = set_fake_load(load, cpus)
+        # "unset" means to exercise read_load()'s env-unset fallback (os.getloadavg()/os.cpu_count()), not
+        # whatever the real host running this test happens to be doing right now -- fake that fallback idle
+        # so this sub-case's ==120 check is deterministic on any host (CP4).
+        ctx = _tmp.idle_os_load() if load is None else contextlib.nullcontext()
+        try:
+            with ctx:
+                r = rx(project, "status")
+        finally:
+            restore_env(saved)
+        check(f"[CP2-T01] {label}: rx()'s subprocess timeout is exactly 120, byte for byte the same as before "
+              "this checkpoint",
+              r.timeout_limit == 120, r.timeout_limit)
+        check(f"[CP2-T01] {label}: the status call still completes normally (exit 0)",
+              r.returncode == 0, r.stderr[:200] + r.stdout[:200])
+
+
+def cp2_t02():
+    print("CP2-T02: CP3-T21's own subprocess timeout is unchanged when a suite actually runs on a normal, "
+          "idle, or unreadable-load machine")
+    # CP2 round 2: cp3_t21_run_one() now delegates to run_all.run_with_stretched_timeout() too; its `popen`
+    # seam is stubbed via _patch_run(real=False) (an immediate-success fake process, so the heavy real suite
+    # is never actually started) and the effective limit is read off the returned `.timeout_limit`.
+    for label, load, cpus in (("unset", None, None), ("low-load", "1", "8"), ("unavailable", "unavailable", None)):
+        saved = set_fake_load(load, cpus)
+        # "unset" means to exercise read_load()'s env-unset fallback (os.getloadavg()/os.cpu_count()), not
+        # whatever the real host running this test happens to be doing right now -- fake that fallback idle
+        # so this sub-case's ==590 check is deterministic on any host (CP4).
+        ctx = _tmp.idle_os_load() if load is None else contextlib.nullcontext()
+        _, fake_popen = _patch_run(real=False)
+        saved_env = _set_run_all_env({})  # RATCHET_RUN_ALL unset: the suite actually runs, never skipped
+        try:
+            with ctx:
+                ok, result = _try_call(lambda: cp3_t21_run_one("test_hooks.py", popen=fake_popen))
+        finally:
+            restore_env(saved_env)
+            restore_env(saved)
+        check(f"[CP2-T02] {label}: the timeout used for test_hooks.py is exactly 590, unchanged from before "
+              "this checkpoint",
+              ok and getattr(result, "timeout_limit", None) == 590,
+              result if not ok else getattr(result, "timeout_limit", None))
+
+
+def cp2_t03(project):
+    print("CP2-T03: rx()'s timeout stretches under simulated high load, matching run_all.stretch_factor() exactly")
+    # CP2 round 2: reads the real call's own `.timeout_limit` (run_all.run_with_stretched_timeout()'s own
+    # return value) instead of a captured subprocess.run(timeout=...) kwarg -- see cp2_t01() above.
+    for load, cpus in (("16", "4"), ("40", "4")):
+        saved = set_fake_load(load, cpus)
+        try:
+            expected_factor, _, _ = run_all.stretch_factor(run_all.DEFAULT_MAX_STRETCH)
+            expected = max(120.0, 120.0 * expected_factor)
+            r = rx(project, "status")
+        finally:
+            restore_env(saved)
+        check(f"[CP2-T03] load {load} on {cpus} CPUs: rx()'s subprocess timeout equals exactly "
+              f"120*run_all.stretch_factor(run_all.DEFAULT_MAX_STRETCH)[0] ({expected}), never less than 120",
+              r.timeout_limit == expected, r.timeout_limit)
+        check(f"[CP2-T03] load {load} on {cpus} CPUs: the real status call still completes and passes inside "
+              "that stretched budget",
+              r.returncode == 0, r.stderr[:200] + r.stdout[:200])
+
+
+def cp2_t04():
+    print("CP2-T04: CP3-T21's nested-suite timeout stretches under simulated high load, matching "
+          "run_all.stretch_factor() exactly")
+    # [CP2 round 3, adv-round-02 fix X1] main() already snapshotted CP3_T21_RESULTS["test_hooks.py"] into the
+    # module-level CP2_T04_REAL_RESULT global right after CP3-T21's own block ran/skipped it, before any
+    # CP2-Txx case (including cp2_t02()'s stubbed call, which runs earlier in run_cp2_cases()'s call order)
+    # could overwrite CP3_T21_RESULTS with a canned result. Read that snapshot here instead of reading
+    # CP3_T21_RESULTS directly, which by now holds cp2_t02()'s stubbed result, not the genuine one.
+    real_result = CP2_T04_REAL_RESULT
+    # Guard: confirm the snapshot genuinely predates cp2_t02()'s overwrite. By the time this runs,
+    # CP3_T21_RESULTS["test_hooks.py"] holds cp2_t02()'s own stubbed object; the snapshot above must be a
+    # different object, not that same (later) one.
+    check("[CP2-T04] the snapshot read here is the genuine pre-CP2 result, not a later overwrite -- a "
+          "different object than what CP3_T21_RESULTS now holds after cp2_t02()'s stubbed call",
+          real_result is not None and real_result is not CP3_T21_RESULTS.get("test_hooks.py"),
+          "no snapshot captured" if real_result is None else "snapshot is identical to the current dict entry")
+    # CP2 round 2: reads the stubbed call's own `.timeout_limit` (run_all.run_with_stretched_timeout()'s own
+    # return value, via the immediate-success `popen` seam _patch_run(real=False) injects) instead of a
+    # captured subprocess.run(timeout=...) kwarg -- see cp2_t01()/cp2_t02() above.
+    for load, cpus in (("16", "4"), ("40", "4")):
+        saved = set_fake_load(load, cpus)
+        try:
+            expected_factor, _, _ = run_all.stretch_factor(run_all.DEFAULT_MAX_STRETCH)
+            expected = max(590.0, 590.0 * expected_factor)
+            _, fake_popen = _patch_run(real=False)
+            saved_env = _set_run_all_env({})
+            try:
+                ok, result = _try_call(lambda: cp3_t21_run_one("test_hooks.py", popen=fake_popen))
+            finally:
+                restore_env(saved_env)
+        finally:
+            restore_env(saved)
+        check(f"[CP2-T04] load {load} on {cpus} CPUs: the timeout used for test_hooks.py equals exactly "
+              f"590*run_all.stretch_factor(run_all.DEFAULT_MAX_STRETCH)[0] ({expected}), never less than 590",
+              ok and getattr(result, "timeout_limit", None) == expected,
+              result if not ok else getattr(result, "timeout_limit", None))
+
+    # Confirms the suite genuinely still runs and passes, without launching a second, independent real
+    # test_hooks.py subprocess here: CP3-T21's own block (main(), run once before run_cp2_cases()) already
+    # ran it for real (or skipped it, when run_all.py already covered it in this run -- the same
+    # skip-when-already-covered dedup this checkpoint exists to apply everywhere), and that is the result
+    # snapshotted above as `real_result`. A second, independent real invocation here would recreate exactly
+    # the doubled-suite-cost bug done-means 2 exists to eliminate.
+    check("[CP2-T04] the test_hooks.py result CP3-T21 already produced earlier in this run (real run, or "
+          "skip when already covered by run_all.py) finished and passed, with no second real invocation here",
+          real_result is not None and getattr(real_result, "returncode", None) == 0,
+          "no CP3-T21 result recorded for test_hooks.py" if real_result is None else
+          getattr(real_result, "stderr", "")[-300:] + getattr(real_result, "stdout", "")[-200:])
+
+
+def cp2_t05():
+    print("CP2-T05: RATCHET_RUN_ALL unset -- CP3-T21 runs both suites as real subprocesses regardless of "
+          "RATCHET_RUN_ALL_SUITES")
+    for label, suites_env in (("unset", None), ("empty", ""), ("naming both", "test_gates.py,test_hooks.py")):
+        env = {} if suites_env is None else {"RATCHET_RUN_ALL_SUITES": suites_env}
+        argvs, (ok, result), status_after = _run_cp3_t21_guarded(env)
+        names = sorted(Path(a[-1]).name for a in argvs if a)
+        check(f"[CP2-T05] RATCHET_RUN_ALL_SUITES {label}: both test_gates.py and test_hooks.py are run as "
+              "real subprocess calls (never skipped)",
+              ok and names == ["test_gates.py", "test_hooks.py"], result if not ok else names)
+        check(f"[CP2-T05] RATCHET_RUN_ALL_SUITES {label}: the block's check(...) call records a pass for each, "
+              "exactly as it did before this checkpoint",
+              ok and status_after is True, status_after if ok else result)
+
+
+def cp2_t06():
+    print("CP2-T06: RATCHET_RUN_ALL=1 and RATCHET_RUN_ALL_SUITES names both suites -- CP3-T21 skips the "
+          "subprocess re-run for both, through its one existing check(...) call")
+    env = {"RATCHET_RUN_ALL": "1", "RATCHET_RUN_ALL_SUITES": "test_gates.py,test_hooks.py,test_other.py"}
+    argvs, (ok, result), status_after = _run_cp3_t21_guarded(env)
+    check("[CP2-T06] no subprocess re-run of either suite happens", ok and argvs == [], result if not ok else argvs)
+    check("[CP2-T06] the SAME pre-existing check(...) call per suite still fires and records a pass for each "
+          "-- not a second check() call added for the skip path",
+          ok and status_after is True, status_after if ok else result)
+
+
+def cp2_t07():
+    print("CP2-T07: RATCHET_RUN_ALL=1 but RATCHET_RUN_ALL_SUITES names only test_gates.py -- the unnamed one "
+          "still runs in full")
+    env = {"RATCHET_RUN_ALL": "1", "RATCHET_RUN_ALL_SUITES": "test_gates.py"}
+    argvs, (ok, result), status_after = _run_cp3_t21_guarded(env)
+    names = sorted(Path(a[-1]).name for a in argvs if a)
+    check("[CP2-T07] test_gates.py is skipped (no subprocess call) but test_hooks.py is still run as a real "
+          "subprocess", ok and names == ["test_hooks.py"], result if not ok else names)
+    check("[CP2-T07] both suites are still proven pass/fail by the block's check(...) call",
+          ok and status_after is True, status_after if ok else result)
+
+
+def cp2_t08():
+    print("CP2-T08: RATCHET_RUN_ALL_SUITES alone, without RATCHET_RUN_ALL, changes nothing")
+    env = {"RATCHET_RUN_ALL_SUITES": "test_gates.py,test_hooks.py"}
+    argvs, (ok, result), status_after = _run_cp3_t21_guarded(env)
+    names = sorted(Path(a[-1]).name for a in argvs if a)
+    check("[CP2-T08] both suites still run as real subprocesses -- the suites list alone, without the flag, "
+          "never triggers a skip",
+          ok and names == ["test_gates.py", "test_hooks.py"], result if not ok else names)
+
+
+def cp2_t09():
+    print("CP2-T09: the new dedup helper (covered_suites) has the exact same shape and behavior as "
+          "test_trust_cp5_regression.run_all_covers()")
+    import test_trust_cp5_regression as cp5r
+    saved_universe = cp5r.REGRESSION_SUITES
+    # Compared on the SAME universe as CP2's own dedup ({"test_gates.py", "test_hooks.py"}, not CP5's
+    # {"test_gates.py", "test_hooks_waiver.py"}): this proves the two functions apply the identical dedup
+    # pattern to the identical inputs, not that they happen to agree on two different universes. Restored
+    # below no matter what.
+    cp5r.REGRESSION_SUITES = ("test_gates.py", "test_hooks.py")
+    matrix = [
+        {},
+        {"RATCHET_RUN_ALL": "1", "RATCHET_RUN_ALL_SUITES": "test_gates.py,test_hooks.py"},
+        {"RATCHET_RUN_ALL": "1", "RATCHET_RUN_ALL_SUITES": "test_gates.py"},
+        {"RATCHET_RUN_ALL": "1", "RATCHET_RUN_ALL_SUITES": "test_gates.py,test_hooks.py,test_other.py"},
+        {"RATCHET_RUN_ALL_SUITES": "test_gates.py,test_hooks.py"},
+        {"RATCHET_RUN_ALL": "1", "RATCHET_RUN_ALL_SUITES": ""},
+    ]
+    try:
+        for i, env in enumerate(matrix):
+            saved_env = _set_run_all_env(env)
+            try:
+                ok, mine = _try_call(lambda: covered_suites())
+                theirs = cp5r.run_all_covers()
+            finally:
+                restore_env(saved_env)
+            check(f"[CP2-T09] combo {i} ({env}): covered_suites() matches run_all_covers() computed on the "
+                  "same universe and environment",
+                  ok and mine == theirs, (env, mine if ok else mine, theirs))
+    finally:
+        cp5r.REGRESSION_SUITES = saved_universe
+
+
+class _ScriptedSpikeProc:
+    """Deterministic stand-in for subprocess.Popen used only to prove re-sampling (CP2-T10): raises
+    subprocess.TimeoutExpired on its first two polls (like a still-running call) while the caller spikes the
+    fake load file after the first poll and drops it back after the second, then finishes normally on the
+    third poll -- all without any real sleep. The same pattern tests/test_install.py's CP1-T07 uses directly
+    against run_all.run_with_stretched_timeout(); reused here against rx()/cp3_t21_run_one()'s own injected
+    `popen` seam so the SAME re-sampling is proven for both of this checkpoint's call sites."""
+
+    def __init__(self, argv, load_file):
+        self.argv = argv
+        self.pid = 5151
+        self.returncode = None
+        self._n = 0
+        self._load_file = load_file
+
+    def communicate(self, timeout=None):
+        self._n += 1
+        if self._n == 1:
+            self._load_file.write_text("32")  # spike: load/cpus=8 -> factor hits DEFAULT_MAX_STRETCH (4.0)
+            raise subprocess.TimeoutExpired(self.argv, timeout)
+        if self._n == 2:
+            self._load_file.write_text("1")  # falls back: the limit already granted must not shrink
+            raise subprocess.TimeoutExpired(self.argv, timeout)
+        self.returncode = 0
+        return "", ""
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def cp2_t10(project):
+    print("CP2-T10: the load-aware timeout formula used by rx() and CP3-T21 is exactly run_all.stretch_factor(), "
+          "not a separate formula")
+    # CP2 round 2: reads the real/stubbed call's own `.timeout_limit` instead of a captured
+    # subprocess.run(timeout=...) kwarg -- see cp2_t01()/cp2_t02() above.
+    for label, load, cpus in (("idle", None, None), ("borderline", "6", "4"), ("high", "16", "4"),
+                               ("unavailable", "unavailable", None)):
+        saved = set_fake_load(load, cpus)
+        # "idle" means to exercise read_load()'s env-unset fallback (os.getloadavg()/os.cpu_count()), not
+        # whatever the real host running this test happens to be doing right now -- fake that fallback idle
+        # so this sub-case's floor checks are deterministic on any host (CP4).
+        ctx = _tmp.idle_os_load() if load is None else contextlib.nullcontext()
+        try:
+            with ctx:
+                expected_factor, _, _ = run_all.stretch_factor(run_all.DEFAULT_MAX_STRETCH)
+                expected_rx = max(120.0, 120.0 * expected_factor)
+                expected_cp3 = max(590.0, 590.0 * expected_factor)
+
+                r = rx(project, "status")
+
+                _, fake_popen = _patch_run(real=False)
+                saved_env = _set_run_all_env({})
+                try:
+                    ok, result = _try_call(lambda: cp3_t21_run_one("test_hooks.py", popen=fake_popen))
+                finally:
+                    restore_env(saved_env)
+        finally:
+            restore_env(saved)
+        check(f"[CP2-T10] {label}: rx()'s effective timeout equals exactly "
+              f"120*run_all.stretch_factor(run_all.DEFAULT_MAX_STRETCH)[0] ({expected_rx})",
+              r.timeout_limit == expected_rx, r.timeout_limit)
+        check(f"[CP2-T10] {label}: CP3-T21's effective timeout (for a suite that actually runs) equals exactly "
+              f"590*run_all.stretch_factor(run_all.DEFAULT_MAX_STRETCH)[0] ({expected_cp3})",
+              ok and getattr(result, "timeout_limit", None) == expected_cp3,
+              result if not ok else getattr(result, "timeout_limit", None))
+
+    # CP2 round 2 (director-authorized addition, codex-correctness/X2): the property that distinguishes
+    # run_with_stretched_timeout() from a one-time stretch_factor() snapshot taken before the call -- the real
+    # flakiness vector this checkpoint exists to kill -- is that it is RE-SAMPLED on every poll, so a load
+    # spike mid-call still raises the effective limit, and a later drop never takes it back. Proven
+    # deterministically for both call sites, reusing tests/test_install.py's CP1-T07 pattern directly against
+    # rx()/cp3_t21_run_one()'s own injected popen/monotonic seams (no real sleep, no real clock read, no real
+    # hang).
+    for label, base, make_call, run_all_env in (
+        ("rx()", 120.0, lambda popen, monotonic: rx(project, "status", popen=popen, monotonic=monotonic), None),
+        ("CP3-T21", 590.0,
+         lambda popen, monotonic: cp3_t21_run_one("test_hooks.py", popen=popen, monotonic=monotonic), {}),
+    ):
+        load_file = Path(_tmp.mkdtemp(prefix="cp2-t10-spike-")) / "load.txt"
+        load_file.write_text("1")
+        saved = set_fake_load(f"@{load_file}", "4")
+        saved_env = _set_run_all_env(run_all_env) if run_all_env is not None else None
+        try:
+            expected_peak = base * run_all.DEFAULT_MAX_STRETCH
+
+            def fake_popen(argv, **kw):
+                return _ScriptedSpikeProc(argv, load_file)
+
+            clock = iter([0.0, 0.01, 0.02, 0.03])
+
+            def fake_monotonic():
+                return next(clock, 0.03)
+
+            ok, result = _try_call(lambda: make_call(fake_popen, fake_monotonic))
+        finally:
+            if saved_env is not None:
+                restore_env(saved_env)
+            restore_env(saved)
+        check(f"[CP2-T10] {label} spike: a load spike mid-call raises the effective timeout to the peak "
+              f"stretch_factor() reading reached ({base}*DEFAULT_MAX_STRETCH={expected_peak}), re-sampled on "
+              "every poll, never a one-time snapshot taken before the call and never a later lower reading "
+              "taken after the spike drops",
+              ok and getattr(result, "timeout_limit", None) == expected_peak,
+              result if not ok else getattr(result, "timeout_limit", None))
+        check(f"[CP2-T10] {label} spike: the call still finishes and reports success once the scripted "
+              "process exits",
+              ok and getattr(result, "returncode", None) == 0,
+              result if not ok else getattr(result, "returncode", None))
+
+
+def cp2_t11():
+    print("CP2-T11: static guard -- every check(...) call present before this checkpoint's fix is still "
+          "present, unreworded, with its original condition")
+    # CP2 round 2 (director-authorized, omp-glm-standards/X3): the pin now comes from a checked-in fixture
+    # (tests/cp2_t11_base_pairs.py's PAIRS, generated once from `git show STATUS_PLAIN_BASE_COMMIT:...`) instead
+    # of shelling out to git history at test time -- a shallow CI clone (fetch-depth 1, actions/checkout's
+    # default) has no access to that commit and would otherwise make this guard permanently and unrelatedly
+    # red. The multiset comparison logic and refusal on removal/reword/narrowing are unchanged.
+    check("[CP2-T11] setup: the checked-in base fixture (tests/cp2_t11_base_pairs.py) pins the exact base "
+          "commit this guard freezes",
+          cp2_t11_base_pairs.BASE_COMMIT == STATUS_PLAIN_BASE_COMMIT,
+          (cp2_t11_base_pairs.BASE_COMMIT, STATUS_PLAIN_BASE_COMMIT))
+    pinned_pairs = Counter(tuple(p) for p in cp2_t11_base_pairs.PAIRS)
+    check("[CP2-T11] setup: the pinned base file contains at least one check(...) call",
+          sum(pinned_pairs.values()) > 0, sum(pinned_pairs.values()))
+    current_src = Path(__file__).read_text()
+    current_pairs = Counter(collect_check_pairs(current_src, str(Path(__file__))))
+    missing = pinned_pairs - current_pairs
+    check("[CP2-T11] every check(...) call from before this checkpoint is still present, unreworded, with its "
+          "original condition (exact multiset match; new calls may be ADDED for this checkpoint's own new "
+          "cases, but none existing may be removed, reworded, or have its condition narrowed)",
+          not missing, list(missing.items())[:5])
+
+
+def cp2_t12():
+    print("CP2-T12: the CP3-T21 block still records through exactly one check(...) call site per suite name "
+          "after the fix")
+    current_src = Path(__file__).read_text()
+    tree = ast.parse(current_src, filename=str(Path(__file__)))
+    sites = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "check" and node.args:
+            name_src = ast.get_source_segment(current_src, node.args[0]) or ""
+            if "[CP3-T21]" in name_src:  # the exact bracket tag, never a loose substring match (a CP2 case's
+                                         # own name text may mention "CP3-T21" in prose without that tag)
+                sites.append(name_src)
+    check("[CP2-T12] exactly one check(...) call site in the source names CP3-T21 (folding the skip into the "
+          "pre-existing call, matching the test_trust_cp5_regression.py precedent, never a second call site "
+          "added)",
+          len(sites) == 1, sites)
+
+    before_gates = CHECK_NAME_COUNTS["[CP3-T21] test_gates.py exits 0"]
+    before_hooks = CHECK_NAME_COUNTS["[CP3-T21] test_hooks.py exits 0"]
+    argvs, (ok, result), status_after = _run_cp3_t21_guarded({})
+    after_gates = CHECK_NAME_COUNTS["[CP3-T21] test_gates.py exits 0"] - before_gates
+    after_hooks = CHECK_NAME_COUNTS["[CP3-T21] test_hooks.py exits 0"] - before_hooks
+    check("[CP2-T12] a fresh, uncovered CP3-T21 run fires that one call site exactly once for test_gates.py's "
+          "result and exactly once for test_hooks.py's result",
+          ok and after_gates == 1 and after_hooks == 1,
+          (result if not ok else None, after_gates, after_hooks))
+
+
+CP2_CASES = ("CP2-T01", "CP2-T02", "CP2-T03", "CP2-T04", "CP2-T05", "CP2-T06", "CP2-T07", "CP2-T08", "CP2-T09",
+             "CP2-T10", "CP2-T11", "CP2-T12")
+
+
+def run_cp2_cases(base_project):
+    """Runs every CP2-Txx case, each isolated so one crashing (a name the fix hasn't added yet, outside what
+    _try_call() already guards against) still lets every other case run and still reports a result instead of
+    silently dropping it."""
+    global FAIL
+    for cid, fn in (("CP2-T01", lambda: cp2_t01(base_project)), ("CP2-T02", cp2_t02),
+                    ("CP2-T03", lambda: cp2_t03(base_project)), ("CP2-T04", cp2_t04), ("CP2-T05", cp2_t05),
+                    ("CP2-T06", cp2_t06), ("CP2-T07", cp2_t07), ("CP2-T08", cp2_t08), ("CP2-T09", cp2_t09),
+                    ("CP2-T10", lambda: cp2_t10(base_project)), ("CP2-T11", cp2_t11), ("CP2-T12", cp2_t12)):
+        CASE_STATUS.setdefault(cid, True)
+        try:
+            fn()
+        except Exception as exc:  # pragma: no cover -- a crash here still counts as a result, never a silent drop
+            FAIL += 1
+            CASE_STATUS[cid] = False
+            CASE_MESSAGES.setdefault(cid, []).append(f"crashed: {type(exc).__name__}: {exc}")
+            print(f"  ✗ [{cid}] CRASHED: {exc}")
+            traceback.print_exc()
+
+
+def write_cp2_report():
+    """Writes {"cases": [{"id","status","message"}]} to $RATCHET_TEST_REPORT when that env var is set, one
+    entry per planned CP2-Txx case (a case whose check() never ran is reported as "error", never silently
+    dropped). Older bracketed ids already in this file (e.g. CP3-T21, from an earlier run) are harmless
+    extras this same mechanism also happens to tally, but only CP2-T* ids are required to resolve here."""
+    path = os.environ.get("RATCHET_TEST_REPORT")
+    if not path:
+        return
+    cases = []
+    for cid in CP2_CASES:
+        if cid in CASE_STATUS:
+            status = "passed" if CASE_STATUS[cid] else "failed"
+            msg = "" if status == "passed" else "; ".join(CASE_MESSAGES.get(cid, []))[:300]
+        else:
+            status, msg = "error", "no check() call tagged with this id ran"
+        cases.append({"id": cid, "status": status, "message": msg})
+    with open(path, "w") as f:
+        json.dump({"cases": cases}, f)
 
 
 def main():
@@ -584,9 +1217,14 @@ def main():
               sj.get("blocked_reason") == reason and sj.get("blocked_reason_plain") and not JARGON.search(sj["blocked_reason_plain"]), sj)
 
     print("[CP3-T21] existing engine suites stay green")
-    for t in ("test_gates.py", "test_hooks.py"):
-        r = subprocess.run([sys.executable, str(ROOT / "tests" / t)], capture_output=True, text=True, timeout=590)
-        check(f"[CP3-T21] {t} exits 0", r.returncode == 0, r.stdout[-300:] + r.stderr[-200:])
+    cp3_t21_engine_suites()
+
+    # [CP2 round 3, adv-round-02 fix X1] Snapshot CP3_T21_RESULTS["test_hooks.py"] now, once, before any
+    # CP2-Txx case runs -- cp2_t02()'s stubbed call (below, via run_cp2_cases()) would otherwise overwrite
+    # CP3_T21_RESULTS with a canned result before cp2_t04() gets a chance to read the genuine one. See
+    # CP2_T04_REAL_RESULT's own comment above.
+    global CP2_T04_REAL_RESULT
+    CP2_T04_REAL_RESULT = CP3_T21_RESULTS.get("test_hooks.py")
 
     # ------------------------------------------------------------ T24 (adv-round-06 fix: the per-checkpoint
     # round-limit branch must still offer a "change the step" option, alongside raise/stop, not just those two)
@@ -634,8 +1272,12 @@ def main():
     check("[CP3-T25] status prints no 'fresh look' or accept-finding line either",
           "fresh look" not in out25.lower() and "accept-finding" not in out25.lower(), out25)
 
+    # ------------------------------------------------------------ CP2-T01..T12
+    run_cp2_cases(base)
+
     for d in KEEP:
         shutil.rmtree(d, ignore_errors=True)
+    write_cp2_report()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
 

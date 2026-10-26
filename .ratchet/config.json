@@ -26,28 +26,17 @@
   },
   "review_depth": {
     "low": [
-      "host-both"
+      "any-both"
     ],
     "normal": [
-      [
-        "host-alt-standards"
-      ],
-      [
-        "codex-correctness",
-        "host-alt-correctness"
-      ]
+      "any-standards",
+      "any-correctness"
     ],
     "high": [
-      [
-        "host-standards"
-      ],
-      [
-        "codex-correctness",
-        "host-correctness"
-      ],
-      [
-        "host-alt-correctness"
-      ]
+      "any-standards",
+      "any-correctness",
+      "any-correctness",
+      "any-standards"
     ]
   },
   "providers": [
@@ -113,7 +102,7 @@
   "min_review_seconds": 20,
   "host_models": {
     "anthropic": {
-      "strong": "inherit",
+      "strong": "opus",
       "standard": "sonnet",
       "light": "haiku",
       "alternates": [
@@ -122,7 +111,6 @@
     }
   },
   "related_test_command": "python3 tests/run_all.py {files}",
-  "related_tests_max": 0,
   "related_always": [
     "tests/test_docs.py",
     "tests/test_brief.py",
