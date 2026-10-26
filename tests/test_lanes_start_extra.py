@@ -144,6 +144,12 @@ def write_fails():
     eng = t.th.cp5y_load_engine()
     real = eng._write_record
     real_require_director_session = eng.require_director_session
+    # _write_record's one real home is records.py since CP4; update_record's internal call resolves against
+    # records.py's own globals, not eng's -- patching eng._write_record alone never sees the enrolled.json write
+    # that goes through update_record. Patch whichever module(s) are really loaded, sharing one counter/index so
+    # "the Nth write fails" still means the Nth write across the whole call, not just to ratchet.py.
+    records_mod = sys.modules.get("records")
+    real_records_write = records_mod._write_record if records_mod is not None else None
     n = 0
     while True:
         n += 1
@@ -159,6 +165,8 @@ def write_fails():
                 raise OSError("disk full (injected)")
             return real(*a, **kw)
         eng._write_record = flaky
+        if records_mod is not None:
+            records_mod._write_record = flaky
         eng.require_director_session = lambda what: None
         args = argparse.Namespace(request=t.REQUEST, lane=list(t.TWO), name=None, json=True)
         old_env, old_cwd = dict(os.environ), os.getcwd()
@@ -173,6 +181,8 @@ def write_fails():
                     failed = True
         finally:
             eng._write_record = real
+            if records_mod is not None:
+                records_mod._write_record = real_records_write
             eng.require_director_session = real_require_director_session
             os.chdir(old_cwd)
             os.environ.clear()

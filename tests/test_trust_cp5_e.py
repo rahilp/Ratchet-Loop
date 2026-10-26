@@ -30,7 +30,7 @@ sys.path.insert(0, str(HERE))
 import _tmp
 import trust_helpers
 from trust_helpers import (
-    ENGINE, check, cp5v_until, cp5y_load_engine, engine_env, git, make_env, now_dt,
+    ENGINE, RECORDS, check, cp5v_until, cp5y_load_engine, engine_env, git, make_env, now_dt,
 )
 
 # ==================================================================================================================
@@ -265,6 +265,11 @@ def cp5r13_interleave(m, record, calls):
     barrier breaks for good) and the writes take turns. Returns the errors the calls raised."""
     import threading
     real = m._read_record
+    # _read_record's one real home is records.py since CP4; a writer defined there (record_chain, for the
+    # file-hashes.json race below) resolves the bare name `_read_record` against records.py's own globals, not
+    # m's -- patching m._read_record alone would never slow THAT writer down, so the race it's meant to force
+    # would never actually happen. Patch whichever module(s) are really loaded.
+    records_mod = sys.modules.get("records")
     barrier = threading.Barrier(len(calls), timeout=0.5)
     rec = Path(record).resolve()
 
@@ -284,6 +289,8 @@ def cp5r13_interleave(m, record, calls):
         except BaseException as e:  # noqa: BLE001 - reported by the check
             errs.append(repr(e))
     m._read_record = slow
+    if records_mod is not None:
+        records_mod._read_record = slow
     try:
         ts = [threading.Thread(target=run, args=(c,), name=f"cp5r13-{i}") for i, c in enumerate(calls)]
         for t in ts:
@@ -292,6 +299,8 @@ def cp5r13_interleave(m, record, calls):
             t.join(30)
     finally:
         m._read_record = real
+        if records_mod is not None:
+            records_mod._read_record = real
     return errs
 
 
@@ -317,6 +326,11 @@ def slow(path, *a, **k):
         time.sleep(0.4)  # widen the window between this read and the write after it
     return out
 m._read_record = slow
+# update_record's own `_read_record` call (every shared-record writer goes through update_record) resolves
+# against records.py's globals since CP4's split, not m's -- patch that module too, when it is loaded.
+_records_mod = sys.modules.get("records")
+if _records_mod is not None:
+    _records_mod._read_record = slow
 ready.write_text("1")
 while not start.exists():
     time.sleep(0.002)
@@ -383,7 +397,9 @@ def cp5_adv_round13_shared_record_lock():
     import contextlib
     import io
     m = cp5y_load_engine()
-    src = ENGINE.read_text(encoding="utf-8")
+    # [CP4] update_record/_read_record/_write_record/_RecordLock/_BreakerLock moved into records.py; the scans
+    # below (and the AST lookup of update_record's own def just below) need both files' source combined.
+    src = ENGINE.read_text(encoding="utf-8") + "\n" + RECORDS.read_text(encoding="utf-8")
 
     # --- X68: several `init`s in different projects at once: active-runs.json keeps every run ------------------
     env = make_env("claude")
@@ -663,7 +679,9 @@ def cp5r16_unconsumed_update_record_calls(src):
 
 def cp5_adv_round16_checked_add_busy_and_scan():
     print("CP5 adv round 16: providers --add (checked) dies when busy; every update_record result is consumed")
-    src = ENGINE.read_text(encoding="utf-8")
+    # [CP4] update_record's own def (and any call site inside it) now lives in records.py; combine both files'
+    # source so the bare-statement scan below still catches a violation wherever it is written.
+    src = ENGINE.read_text(encoding="utf-8") + "\n" + RECORDS.read_text(encoding="utf-8")
 
     # --- structural: no update_record call site throws its result away ------------------------------------------
     bad = cp5r16_unconsumed_update_record_calls(src)
@@ -907,7 +925,9 @@ def read_later(ctx):
 def cp5_adv_round17_wrapper_scan_and_all_or_nothing_add():
     print("CP5 adv round 17: no wrapper of update_record has its result thrown away; checked add is all-or-nothing")
     import shlex
-    src = ENGINE.read_text(encoding="utf-8")
+    # _record_chain_now (one of _CP5R17_DISCARD_OK's own allow-listed discards) moved into records.py in CP4;
+    # merge it in so that allow-list entry still matches a real discard, not a stale permission.
+    src = ENGINE.read_text(encoding="utf-8") + "\n" + RECORDS.read_text(encoding="utf-8")
 
     # --- structural: the wrapper scan, proven on the pre-fix shape first -----------------------------------------
     wr = cp5r17_result_wrappers(_CP5R17_PRE_FIX)

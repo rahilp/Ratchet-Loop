@@ -834,7 +834,10 @@ def cp5_adv_round11_damaged_record_class():
     # manifest cache the allow-lists above already name for them -- regardless of which file currently holds
     # them. Mirrors the engine_utils.py merge done for the facade check just below.
     fp_src = ENGINE.with_name("fingerprint.py").read_text(encoding="utf-8")
-    bad = cp5r11_io_violations(src + "\n" + fp_src)
+    # _read_record/_write_record/_append_record/update_record and their locks live in records.py since the
+    # modularize-engine run's CP4; merge it in too, for the same reason fp_src is merged in above.
+    rec_src = ENGINE.with_name("records.py").read_text(encoding="utf-8")
+    bad = cp5r11_io_violations(src + "\n" + fp_src + "\n" + rec_src)
     check("[CP5-X60] ratchet.py reads JSON files only through _read_record (read_json without `record=` only for "
           "files people or agents write) and writes files only through _write_record / _append_record, apart from "
           "a short allow-list of files that are not Ratchet's records",
@@ -1025,7 +1028,13 @@ def cp5_adv_round12_restrictions_breaker_and_order():
     print("CP5 adv round 12: restriction records are never written over, one stale-breaker winner, accept-state order")
     import threading
     m = cp5y_load_engine()
+    # CP3-T10 isolates and re-executes JUST this one assignment (ENGINE monkeypatched to a scratch file with no
+    # records.py sibling) to prove it reads live; it must keep reading ENGINE alone, so X65's own need for
+    # records.py's text (_BreakerLock/_remove_stale_breaker moved there in CP4) is merged separately, below.
     src = ENGINE.read_text(encoding="utf-8")
+    # _BreakerLock (and _remove_stale_breaker, X65 below) lives in records.py since the modularize-engine run's
+    # CP4; merge it in (as its own variable, not `src` above) so X65's text check still sees it.
+    src_with_records = src + "\n" + ENGINE.with_name("records.py").read_text(encoding="utf-8")
 
     # --- X63: a damaged enrolled.json is never replaced by a later enrollment, and keeps restricting ------------
     env = make_env("claude")
@@ -1156,8 +1165,12 @@ def cp5_adv_round12_restrictions_breaker_and_order():
         if name == "P1":
             p1_done.set()
 
-    real_os = m.os
-    m.os = _Cp5r12OsProxy(real_os, hook)
+    # _BreakerLock._take_breaker's own `os.lstat` resolves against whichever module it was DEFINED in (records.py
+    # since CP4's split, not ratchet.py), regardless of which module's attribute you reach the class through --
+    # so the proxy has to replace THAT module's `os`, or the hook below is never called at all.
+    os_owner = sys.modules.get("records", m)
+    real_os = os_owner.os
+    os_owner.os = _Cp5r12OsProxy(real_os, hook)
     try:
         t1 = threading.Thread(target=run, args=("P1", p1l, 2.0), name="P1")
         t2 = threading.Thread(target=run, args=("P2", p2l, 0.5), name="P2")
@@ -1166,7 +1179,7 @@ def cp5_adv_round12_restrictions_breaker_and_order():
         t1.join(15)
         t2.join(15)
     finally:
-        m.os = real_os
+        os_owner.os = real_os
     content = brk.read_text() if brk.exists() else None
     check("[CP5-X65] two waiters behind one stale breaker, both judging it stale before either acts: only one holds "
           "the breaker, and the fresh one stays in place",
@@ -1186,7 +1199,8 @@ def cp5_adv_round12_restrictions_breaker_and_order():
     p2l._drop_breaker()
     check("[CP5-X65] the stale-breaker removal checks identity (inode and modification time) after a rename, never "
           "unlinking the breaker by path",
-          "def _remove_stale_breaker" in src and "os.unlink(self.breaker)\n                        continue" not in src)
+          "def _remove_stale_breaker" in src_with_records
+          and "os.unlink(self.breaker)\n                        continue" not in src_with_records)
 
     # --- X66: accept-state refuses a damaged state.json before it asks for the code ---------------------------
     if not HAVE_PTY:

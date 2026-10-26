@@ -33,6 +33,9 @@ except ImportError:
     HAVE_PTY = False
 
 ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+# [CP4] update_record and the rest of the tamper-evidence chain moved out of ratchet.py into this sibling
+# module; a structural scan of "ratchet.py's source" for that machinery now needs both files' text.
+RECORDS = ENGINE.with_name("records.py")
 PASS = FAIL = 0
 VENDOR = {"claude": "anthropic", "codex": "openai", "gemini": "google", "copilot": "github"}
 
@@ -727,23 +730,41 @@ class InProcessCall:
 
     `lock_wait_cap`: none of either suite's check()s assert a MINIMUM wait on a busy per-record lock, only an
     upper bound or a plain refusal, so capping how long this class's own calls wait for one shortens the suite
-    without weakening what any check proves."""
+    without weakening what any check proves.
+
+    [CP4 fix] A handful of these per-call globals (_CHAIN_REBUILD, _NOTED_UNREADABLE) moved into records.py's
+    own module namespace when CP4 split the tamper-evidence chain out of ratchet.py: ratchet.py no longer keeps
+    its own copy of either (nothing there reads them as a bare name any more), so resetting `self.m`'s attribute
+    would silently create a throwaway one that the real, moved code never looks at. `_reset_module()` below
+    reaches whichever module actually owns the name right now -- self.m when it still has it (every global this
+    class ever reset before CP4, and anything a later checkpoint moves back), the already-loaded `records`
+    module when self.m does not (it is loaded exactly once per process too, via ratchet.py's own `import
+    records`, and cp5y_load_engine()'s memoization keeps returning the same pair) -- so a reset here always
+    reaches the live value the split code reads, not a dead copy."""
 
     def __init__(self, m, d, env, reset_globals, lock_wait_cap, reset_unreadable=False, stdin=None):
         self.m, self.d, self.env, self.stdin = m, Path(d), env, stdin
         self.reset_globals, self.lock_wait_cap, self.reset_unreadable = reset_globals, lock_wait_cap, reset_unreadable
         self.returncode, self.stdout, self.stderr = 0, "", ""
 
+    def _reset_module(self, name):
+        """[CP4 fix] self.m, unless CP4's records.py split moved `name` there and self.m no longer carries its
+        own copy -- see this class's own docstring above."""
+        if hasattr(self.m, name):
+            return self.m
+        records_mod = sys.modules.get("records")
+        return records_mod if records_mod is not None and hasattr(records_mod, name) else self.m
+
     def __enter__(self):
         self._cwd = os.getcwd()
         self._environ = dict(os.environ)
         self._streams = (sys.stdout, sys.stderr, sys.stdin)
-        missing = [k for k in self.reset_globals if not hasattr(self.m, k)]
+        missing = [k for k in self.reset_globals if not hasattr(self._reset_module(k), k)]
         assert not missing, f"ratchet.py no longer has module global(s) {missing!r} -- update the reset list"
         for k, v in self.reset_globals.items():
-            setattr(self.m, k, v)
+            setattr(self._reset_module(k), k, v)
         if self.reset_unreadable:
-            self.m._NOTED_UNREADABLE.clear()
+            self._reset_module("_NOTED_UNREADABLE")._NOTED_UNREADABLE.clear()
         self._record_lock_init = self.m._RecordLock.__init__
 
         def _fast_record_lock_init(rl_self, record, wait=5.0):
@@ -765,9 +786,9 @@ class InProcessCall:
         os.environ.update(self._environ)
         self.m._RecordLock.__init__ = self._record_lock_init
         for k, v in self.reset_globals.items():
-            setattr(self.m, k, v)
+            setattr(self._reset_module(k), k, v)
         if self.reset_unreadable:
-            self.m._NOTED_UNREADABLE.clear()
+            self._reset_module("_NOTED_UNREADABLE")._NOTED_UNREADABLE.clear()
         if exc_type is SystemExit:
             code = exc.code
             self.returncode = code if isinstance(code, int) else (0 if code is None else 1)

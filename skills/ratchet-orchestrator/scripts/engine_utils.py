@@ -7,10 +7,15 @@ tests/test_modularize_cp2.py, CP2-T01) so this one responsibility can be read an
 risking the rest of the 21,000+ line engine. ratchet.py imports these eight names explicitly
 (`from engine_utils import ...`); it never does a star import, and keeps no `def` of its own for any of them.
 
-Two of the eight still reach into ratchet.py for something not moved yet (CP4's records.py owns it):
+Two of the eight still reach, indirectly, for something that already moved out of ratchet.py: CP4 moved
+_read_record/_write_record/_note_unreadable verbatim into records.py, so these two names' own tamper-evidence
+calls now land on records.py's definitions, reached through the already-running ratchet.py module, which
+re-exports them by name (`from records import _read_record, _write_record, _note_unreadable`) -- not on any
+`def` of ratchet.py's own (it keeps none):
 
   * read_json/write_json call ratchet.py's tamper-evidence record chain (_read_record/_write_record/
-    _note_unreadable). The three wrapper functions below reach ratchet.py through _ratchet_module(), which
+    _note_unreadable), now records.py's definitions reached this way. The three wrapper functions below reach
+    ratchet.py through _ratchet_module(), which
     loads it BY FILE PATH (never a bare `import ratchet`, which would depend on sys.path -- a caller that loads
     this module directly, as this project's own tests do, may never have put ratchet.py's folder on sys.path
     at all) and only at call time, inside each wrapper's own body -- never at this module's load time -- so
@@ -33,9 +38,9 @@ Two of the eight still reach into ratchet.py for something not moved yet (CP4's 
     find_literal() helper recognizes this exact function-return + globals().update() idiom (CP2-T10), so no
     second, duplicate AST-visible literal is needed anywhere for tooling to find these two names.
 
-RATCHET_DIR is find_root()'s own copy of the one-line constant ratchet.py defines for itself; duplicating a
-single immutable string that never changes independently is lower risk than any import between the two files
-for this one case.
+RATCHET_DIR's one true home is this module now: ratchet.py no longer defines its own copy, and imports it by
+name instead (`from engine_utils import ..., RATCHET_DIR`), the same single-source-of-truth shape as
+DEFAULT_CONFIG/OLD_DEFAULT_REVIEW_DEPTH above. fingerprint.py imports it the same way.
 """
 from __future__ import annotations
 
@@ -201,8 +206,9 @@ globals().update(_default_config_literals())
 
 
 def _ratchet_module():
-    """The engine's own module, with its _read_record/_write_record/_note_unreadable (not yet moved here;
-    CP4's records.py owns them) -- loaded by file path, right beside this module, never via a bare `import
+    """The engine's own module, re-exporting _read_record/_write_record/_note_unreadable (CP4 already moved
+    their own `def`s into records.py; this reaches them through ratchet.py's re-export by name, not through a
+    `def` of ratchet.py's own) -- loaded by file path, right beside this module, never via a bare `import
     ratchet` that would depend on sys.path. Reuses an already-running ratchet.py (registered under "ratchet"
     in sys.modules -- including by ratchet.py itself when it runs as __main__) when there is one, so this never
     re-executes the file as a second, separate module instance in the normal case."""
@@ -219,20 +225,23 @@ def _ratchet_module():
 
 
 def _read_record(*args, **kwargs):
-    """Deferred, call-time-only reach into ratchet.py's one record reader (not yet moved here; CP4's
-    records.py owns it) -- see _ratchet_module() above."""
+    """Deferred, call-time-only reach into records.py's one record reader (CP4 already moved it there; this
+    reaches it through the already-running ratchet.py module, which re-exports it by name, not through a
+    `def` of ratchet.py's own) -- see _ratchet_module() above."""
     return _ratchet_module()._read_record(*args, **kwargs)
 
 
 def _write_record(*args, **kwargs):
-    """Deferred, call-time-only reach into ratchet.py's one record writer (not yet moved here; CP4's
-    records.py owns it) -- see _ratchet_module() above."""
+    """Deferred, call-time-only reach into records.py's one record writer (CP4 already moved it there; this
+    reaches it through the already-running ratchet.py module, which re-exports it by name, not through a
+    `def` of ratchet.py's own) -- see _ratchet_module() above."""
     return _ratchet_module()._write_record(*args, **kwargs)
 
 
 def _note_unreadable(*args, **kwargs):
-    """Deferred, call-time-only reach into ratchet.py's unreadable-record notice (not yet moved here; CP4's
-    records.py owns it) -- see _ratchet_module() above."""
+    """Deferred, call-time-only reach into records.py's unreadable-record notice (CP4 already moved it there;
+    this reaches it through the already-running ratchet.py module, which re-exports it by name, not through a
+    `def` of ratchet.py's own) -- see _ratchet_module() above."""
     return _ratchet_module()._note_unreadable(*args, **kwargs)
 
 

@@ -25,9 +25,9 @@ module directly, can itself contain the pattern strings as embedded constants an
 match; this doc's counts were taken right after `rm -rf tests/__pycache__
 tests/shortcuts/__pycache__`.)
 
-42 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
+43 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
 files the brief names explicitly (`test_quota_shared.py`, `test_discover_paid.py`, Kind 4 below)
-that carry the identical real obligation but don't literally match either regex today — **44
+that carry the identical real obligation but don't literally match either regex today — **45
 files total**, consistent with the brief's "43+".
 
 ## Kind 1 — module-load only (loads ratchet.py dynamically via `importlib.util.spec_from_file_location`,
@@ -132,7 +132,7 @@ tree, never loads it as a module itself): 5 files
   `git merge-base HEAD main` copy), walking for specific `FunctionDef`s to prove this lane didn't
   need to touch them. Never inspects ratchet.py itself or loads a module.
 
-## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 6 files
+## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 7 files
 
 - `test_trust_cp4.py` — trust-holes CP4: agent-set overrides no longer bypass checks. Loads
   ratchet.py dynamically (`ratchet_engine_slow_hook`) AND reads `ENGINE.read_text()` +
@@ -181,6 +181,19 @@ tree, never loads it as a module itself): 5 files
   pinned pre-move commit's text (via `git show`) to compare each name's body byte-for-byte, find
   leftover top-level `def`/`class`es, check for star imports and import cycles, and confirm no new
   module-level mutable registry was introduced.
+- `test_modularize_cp4.py` — CP4: the tamper-evidence and record-locking machinery (`_chain_path`/
+  `_read_record`/`_write_record`/`_append_record`/`_note_unreadable`/`_BreakerLock`/`_ChainLock`/
+  `_RecordLock`/`_record_lock_path`/`update_record`/`_chain_record`/`_record_chain_now`/
+  `record_chain`/`append_recorded`/`chain_problem`/`verify_chain`) move verbatim into `records.py`.
+  Loads ratchet.py dynamically inside two generated subprocess snippets (`ratchet_cp4r09`,
+  `ratchet_cp4r10`) for its real two-process lock-contention drills (a race to register an active
+  run, and a race to clear the same stale lock). Separately reads `ENGINE.read_text()` and
+  `ast.parse`/`ast.walk`s both that live text and the pinned pre-move commit's text (via
+  `git show`) to compare each of the 16 names' body byte-for-byte, find leftover top-level
+  `def`/`class`es, check for star imports and import cycles, confirm no new module-level mutable
+  registry beyond the two pre-existing ones (`_NOTED_UNREADABLE`/`_CHAIN_REBUILD`) was introduced,
+  and confirm the lock class hierarchy (`_ChainLock` < `_BreakerLock` < `_RecordLock` <
+  `_EngineNotesLock`, and `_StateLock`/`_IntegrateLock`, which stay in ratchet.py) is unchanged.
 
 ## Kind 4 — brief-named, but don't literally match either live-grep pattern today: 2 files
 
