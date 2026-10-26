@@ -13,7 +13,7 @@
       "codex"
     ]
   },
-  "regression_command": "python3 tests/run_all.py tests/test_trust_cp5_d.py tests/test_trust_cp5_e.py",
+  "regression_command": "python3 tests/run_all.py tests/test_quota_shared.py tests/test_gates.py tests/test_trust_cp5_d.py tests/test_trust_cp5_e.py tests/test_review_diff_large_files.py tests/test_review_diff_large_files_fixes.py --workers 1",
   "commit_per_checkpoint": true,
   "design_md": "DESIGN.md",
   "standards": [
@@ -134,7 +134,7 @@
       ]
     }
   },
-  "related_test_command": "python3 tests/run_all.py {files}",
+  "related_test_command": "python3 tests/run_all.py {files} --workers 1",
   "related_always": [
     "tests/test_docs.py",
     "tests/test_brief.py",

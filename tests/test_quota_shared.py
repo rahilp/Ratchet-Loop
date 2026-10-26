@@ -592,29 +592,17 @@ def main():
     # measured, with no second nested full-suite spawn. check() merges every call tagged with one id (an id only
     # passes if every call tagged with it does), so this still counts under {CP4-T02} even though it runs outside
     # that function's own scheduled turn in the loop above.
-    # Captured BEFORE the (cheap, ~1s) reference-workload measurement below, so that measurement's own cost is
-    # never counted against the budget it helps compute.
+    # [CP4 fix round N: codex-correctness/X2] no longer measured against anything live -- see
+    # CP4_T02_FIXED_BUDGET_SEC's own comment below for why.
     _cp4_real_elapsed = time.monotonic() - _CP4_PROCESS_START
-    idle_load_avg = 1.5  # same idle baseline _cp3_t02_budget() itself uses; a little background noise is free
-    _load_reading = read_load()
-    load_avg = _load_reading[0] if _load_reading is not None else idle_load_avg
-    cpus = os.cpu_count()
-    # [CP4 fix round 2: host-alt-correctness/C3] speed-aware on top of the existing load-aware term -- see the
-    # _CP4_REFERENCE_SPAWN_SEC / _cp4_speed_factor() block above for why and how.
-    _cp4_ref_measured = _cp4_measure_reference_workload()
-    _cp4_speed = _cp4_speed_factor(_cp4_ref_measured)
-    budget = min(CP4_T02_BUDGET_CEILING_SEC, _cp3_t02_budget(load_avg, cpus) * _cp4_speed)
+    budget = CP4_T02_FIXED_BUDGET_SEC
     _CUR_CASE = "CP4-T02"
     check("{CP4-T02} the REAL top-level solo invocation's own wall-clock (measured end-to-end in this very "
-          "process, from _CP4_PROCESS_START to right after every other TESTS case has run) is under its budget "
-          "(CP3's _cp3_t02_budget() formula -- a flat 90s ceiling plus an allowance for this box's own raw load "
-          f"average (read_load()[0] = {load_avg:.2f}) above an idle baseline of {idle_load_avg:.1f}) -- scaled by "
-          f"a speed factor of {_cp4_speed:.2f}x (a {3}-spawn reference workload took {_cp4_ref_measured:.2f}s here "
-          f"vs {_CP4_REFERENCE_SPAWN_SEC:.2f}s on the box that budget was calibrated on), capped at "
-          f"{CP4_T02_BUDGET_CEILING_SEC:.0f}s (well below CP1's own ~260-300s original baseline, so a real "
-          f"regression still goes red)) = {budget:.1f}s, measured the same way CP1's baseline harness measured "
-          "it -- down from the ~286-300s CP1 recorded before this checkpoint", _cp4_real_elapsed < budget,
-          (_cp4_real_elapsed, budget, load_avg, _cp4_speed, _cp4_ref_measured))
+          "process, from _CP4_PROCESS_START to right after every other TESTS case has run) is under a fixed "
+          f"ceiling of {budget:.1f}s (CP4_T02_FIXED_BUDGET_SEC -- well below CP1's own ~260-300s original "
+          f"baseline, so a real regression still goes red) = {budget:.1f}s, measured the same way CP1's "
+          "baseline harness measured it -- down from the ~286-300s CP1 recorded before this checkpoint",
+          _cp4_real_elapsed < budget, (_cp4_real_elapsed, budget))
     _CUR_CASE = None
     write_report()
     print(f"\n{PASS} passed, {FAIL} failed")
@@ -1025,11 +1013,6 @@ def x09_status_json_lists_a_provider_any_lane_benched():
 # {CP4-Txx} tag convention (never square [CP4-Txx]), so tests/test_split_check.py's and
 # tests/test_integrate_safety.py's square-bracket CP-group scans never see them.
 import ast                      # noqa: E402  (CP4-T03/T07: finds real fast=True call sites and add_parser() calls)
-from run_all import read_load   # noqa: E402  (CP4-T02: reuses run_all.py's own guarded os.getloadavg() read)
-# [CP4 fix round 1: codex-standards/X2, codex-correctness/X2, omp-glm-correctness/A3] CP4-T02's real top-level
-# budget reuses CP3's own formula rather than inventing a new one -- see _cp3_t02_budget()'s docstring in
-# test_trust_cp5_d.py for the constants it is built from.
-from test_trust_cp5_d import _cp3_t02_budget  # noqa: E402
 import measure_suite_baseline as _msb  # noqa: E402  (CP4-T09: REAL_SUITES, the schema it writes)
 
 CP4_ENGINE_REL = "skills/ratchet-orchestrator/scripts/ratchet.py"
@@ -1044,46 +1027,15 @@ CP4_MEASURE_REL = "tests/measure_suite_baseline.py"
 CP4_FIXTURES_DIR = HERE / "fixtures" / "cp4_base"
 CP4_EVIDENCE_PATH = CP4_FIXTURES_DIR / "baseline_timings_at_cp4_write_time.json"
 
-# [CP4 fix round 2: host-alt-correctness/C3] CP4-T02's real top-level budget used to scale only with THIS box's
-# own load average (_cp3_t02_budget's load term), never with how fast the box itself is: measured 82.1s solo
-# against a 90.0s budget at load_avg 0.97 (effectively idle, so no load allowance applied) -- only ~8s (9%)
-# margin. A correct implementation on a slower (not busier) machine could flake red on that alone. These add a
-# SPEED term on top of (never instead of) the existing load term: time a tiny, fixed, cheap reference workload
-# (3 cold `python3 ratchet.py --help` spawns -- representative because every real-subprocess case in this
-# suite, and CP4-T09's measure-harness subprocess, pay the same per-spawn interpreter-startup + 21k-line-file-
-# compile cost) and scale the whole load-aware budget by how much slower that reference measures here than on
-# the box this round's 82.1s/90.0s numbers were measured on (_CP4_REFERENCE_SPAWN_SEC, measured there the same
-# way). A machine at least as fast gets factor 1.0 (no extra allowance, same ~9% margin as today); a slower
-# machine's budget grows by the same ratio its own reference workload did, so the realized PERCENTAGE margin
-# is preserved rather than shrinking to zero. _CP4_SPEED_FACTOR_CAP and CP4_T02_BUDGET_CEILING_SEC bound how
-# far that can go: the final budget can never approach CP1's own recorded ~260-300s original baseline for this
-# suite, so a real regression (the suite genuinely getting slow again) still goes red regardless of what the
-# reference workload measures.
-_CP4_REFERENCE_SPAWN_SEC = 0.96  # 3 cold `ratchet.py --help` spawns, measured on the box the 82.1s/90.0s
-                                  # numbers above were measured on (host-alt-correctness/C3's own box)
-_CP4_SPEED_FACTOR_CAP = 3.0
-CP4_T02_BUDGET_CEILING_SEC = 220.0  # well below CP1's own ~260-300s original baseline (host-alt-correctness/C3)
-
-
-def _cp4_measure_reference_workload(n=3):
-    """Times `n` cold `python3 ratchet.py --help` spawns (well under a second total) -- a cheap, fixed proxy
-    for this box's own interpreter-startup + engine-compile speed, the same fixed cost every real-subprocess
-    case in this suite pays on every call."""
-    t0 = time.monotonic()
-    for _ in range(n):
-        subprocess.run([sys.executable, str(ROOT / CP4_ENGINE_REL), "--help"], capture_output=True)
-    return time.monotonic() - t0
-
-
-def _cp4_speed_factor(reference_measured_sec, reference_baseline_sec=_CP4_REFERENCE_SPAWN_SEC,
-                       cap=_CP4_SPEED_FACTOR_CAP):
-    """>=1.0: how much slower this machine measurably is than the box _CP4_REFERENCE_SPAWN_SEC was measured
-    on, via the tiny fixed reference workload above. Never below 1.0 (a faster machine does not shrink the
-    budget, it just passes with more margin) and capped at `cap` so a noisy or anomalous reference measurement
-    cannot inflate the budget without bound."""
-    if reference_baseline_sec <= 0:
-        return 1.0
-    return max(1.0, min(cap, reference_measured_sec / reference_baseline_sec))
+# [CP4 fix round 2: host-alt-correctness/C3] CP4-T02's real top-level budget used to scale with THIS box's own
+# load average, and [CP4 fix round N: codex-correctness/X2] a later round added a live-measured "speed factor"
+# (timing a tiny reference `ratchet.py --help` workload) on top of that. Both were removed: the speed factor
+# measured the startup cost of the very engine the budget is supposed to police, so an engine regression that
+# slowed startup also raised the budget meant to catch it, hiding the regression instead of failing on it.
+# Replaced with a single fixed ceiling tied directly to this checkpoint's own objective ("well under 120s"):
+# measured worst case so far is ~93.7s under heavy load and ~82.1s solo, so 115.0s stays comfortably above both
+# while staying under the 120s objective limit -- never self-calibrated, never scaled by anything live.
+CP4_T02_FIXED_BUDGET_SEC = 115.0
 
 
 _REPLACES_COMMENT_RE = re.compile(r"#.*fast-path replaces:", re.IGNORECASE)
