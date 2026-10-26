@@ -89,20 +89,17 @@
       "cost": "flat"
     },
     {
+      "id": "omp-glm",
+      "preset": "omp",
+      "model": "opencode-go/glm-5.3",
+      "cost": "flat"
+    },
+    {
       "id": "codex",
       "preset": "codex",
       "prefer_for": [
         "both"
       ]
-    },
-    {
-      "id": "omp-glm",
-      "preset": "omp",
-      "model": "opencode-go/glm-5.3",
-      "prefer_for": [
-        "both"
-      ],
-      "cost": "flat"
     }
   ],
   "test_timeout_sec": 3600,
@@ -124,6 +121,11 @@
       ]
     }
   },
-  "related_test_command": "python3 tests/run_all.py {files} --workers 1",
-  "related_tests_max": 0
+  "related_test_command": "python3 tests/run_all.py {files}",
+  "related_tests_max": 0,
+  "related_always": [
+    "tests/test_docs.py",
+    "tests/test_brief.py",
+    "tests/test_trust_cp5_d.py"
+  ]
 }
