@@ -355,7 +355,7 @@ def _pack_full_round(lead: str, groups: list[list[tuple[str, str]]]) -> str:
 def scoped_diff_parts(root: Path, since_tree: str, current_tree: str) -> tuple[str, list[str], list[str]]:
     """Lane H CP6: the diff for a SCOPED round (a fix round, or a small fix made after an approval) -- ONLY what
     changed since `since_tree` (the last round actually reviewed), never the whole checkpoint. Returns
-    (text, shown, omitted), in git's order, up to MAX_DIFF, never cut mid-file. `shown` is every file the
+    (text, shown, omitted), up to MAX_DIFF, never cut mid-file. `shown` is every file the
     reviewer saw either in full or, for a textbook pure delete only, as an honest summary; `omitted` is
     every file that is neither, named in the text. When the whole diff fits, it is returned exactly as git
     prints it with rename detection (-M) on (every file's whole diff, nothing summarized; a file moved with most
