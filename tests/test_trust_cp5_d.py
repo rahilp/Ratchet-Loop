@@ -593,7 +593,13 @@ def cp5_adv_round11_damaged_record_class():
                       ("record_director_folder", "json.loads"), ("record_director_folder", "open(w)"),
                       ("record_director_folder", "replace")], flagged)
     import ast
+    # read_json/write_json live in engine_utils.py since the modularize-engine run's CP2 (_read_record/
+    # _write_record stay in ratchet.py, `src`, until CP4's records.py); merge both files' top-level defs so this
+    # check keeps its actual invariant -- each is still a thin facade over the one reader/writer -- regardless of
+    # which file currently holds which name.
+    eu_src = ENGINE.with_name("engine_utils.py").read_text(encoding="utf-8")
     fns = {n.name: n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef)}
+    fns.update({n.name: n for n in ast.walk(ast.parse(eu_src)) if isinstance(n, ast.FunctionDef)})
     rr = fns.get("_read_record")
     calls = {getattr(c.func, "id", getattr(c.func, "attr", None)) for c in ast.walk(rr) if isinstance(c, ast.Call)} \
         if rr else set()

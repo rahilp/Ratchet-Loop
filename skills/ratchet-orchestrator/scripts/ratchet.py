@@ -53,9 +53,18 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 VIEWER_TEMPLATE = SKILL_DIR / "assets" / "viewer.html"
 sys.path.insert(0, str(SCRIPT_DIR))
+# Lets a deferred, call-time-only lookup from inside engine_utils.py (its _read_record/_write_record/
+# _note_unreadable wrappers -- see engine_utils.py's own docstring) reuse this already-running module instead
+# of loading this file as a second, separate module instance. Many of this project's own tests load this file
+# under a throwaway name via spec_from_file_location without registering it in sys.modules at all (__name__
+# itself then has no entry); only alias when there is an actual module object to alias, so that case is
+# untouched and such a test's own engine_utils.py calls simply load this file fresh, by path, once.
+if "ratchet" not in sys.modules and __name__ in sys.modules:
+    sys.modules["ratchet"] = sys.modules[__name__]
 _dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True  # never litter the installed plugin with __pycache__
 import spec_sources as specsrc  # noqa: E402
 import provider_health as phealth  # noqa: E402
+from engine_utils import now, die, ok, find_root, read_json, write_json, slugify, config_from_user  # noqa: E402
 sys.dont_write_bytecode = _dwb
 
 GATES = ["behavior", "ui", "adversarial", "human"]
@@ -216,80 +225,13 @@ FINGERPRINT_EXCLUDES = {
 
 
 # --------------------------------------------------------------------------- utils
-
-def now() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="microseconds")
-
-
-def die(msg: str, code: int = 1):
-    print(f"RATCHET ✗ {msg}", file=sys.stderr)
-    sys.exit(code)
-
-
-def ok(msg: str):
-    print(f"RATCHET ✓ {msg}")
-
-
-def find_root(start: Path | None = None) -> Path:
-    """Project root = nearest ancestor containing .ratchet, else git root, else cwd."""
-    if start is None and os.environ.get("RATCHET_ROOT"):
-        start = Path(os.environ["RATCHET_ROOT"])
-    p = (start or Path.cwd()).resolve()
-    for cand in [p, *p.parents]:
-        if (cand / RATCHET_DIR).is_dir():
-            return cand
-    try:
-        out = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=p,
-                             capture_output=True, text=True, timeout=10)
-        if out.returncode == 0 and out.stdout.strip():
-            return Path(out.stdout.strip())
-    except Exception:
-        pass
-    return p
-
-
-def read_json(path: Path, default=None, record=None):
-    """Read a JSON file through _read_record, the one reader.
-    Without `record`: a file a person or an agent writes (config.json, a plan, a test plan, a host's settings). A
-    damaged one stops the command with a plain message naming it, because only its author can fix it.
-    With `record` (a sentence saying what Ratchet does instead): one of Ratchet's own records. A missing, unreadable,
-    invalid or non-object file reads as `default`, the sentence goes to stderr, and this never exits."""
-    data, why = _read_record(path, kind=dict if record else None, missing=default)
-    if why is None:
-        return data
-    if record:
-        _note_unreadable(path, why, record if isinstance(record, str) else "Ratchet treats it as holding nothing")
-        return default
-    if why.startswith(("JSONDecodeError", "UnicodeDecodeError")):
-        die(f"{path} is not valid JSON: {why.split(': ', 1)[-1]}")
-    die(f"{path} can't be read ({why}). Check that it is a file you can read, then run this command again.")
-
-
-def write_json(path: Path, data):
-    """Write a JSON file people may read (indented), through _write_record, the one atomic writer."""
-    _write_record(path, data, pretty=True)
-
-
-def slugify(text: str) -> str:
-    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    return (s[:48].rstrip("-")) or "feature"
-
+#
+# now/die/ok/find_root/read_json/write_json/slugify/config_from_user now live in engine_utils.py, imported by
+# name above; see that module's docstring for how it resolves its two forward dependencies on this file
+# (the tamper-evidence record chain, and DEFAULT_CONFIG/OLD_DEFAULT_REVIEW_DEPTH) without a circular import.
 
 _SAFE_SLUG_RE = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]+$")  # a run folder name: no path separators, not . or ..
 _STATE_LOCK_HELD = False  # set by main() while this process holds the state lock for its whole command
-
-
-def config_from_user(user: dict) -> dict:
-    """The effective config for a config.json's content: the shipped defaults with the file's settings on top."""
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-    if user.get("review_depth") == OLD_DEFAULT_REVIEW_DEPTH:
-        user = {k: v for k, v in user.items() if k != "review_depth"}  # untouched old default: use the new one
-    for k, v in user.items():
-        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-            cfg[k].update(v)
-        else:
-            cfg[k] = v
-    return cfg
 
 
 class Ctx:

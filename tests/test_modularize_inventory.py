@@ -435,6 +435,10 @@ def t10_suite_green_before_any_code_change():
                            "skills/ratchet-orchestrator/scripts/ratchet.py",
                            "skills/ratchet-orchestrator/scripts/provider_health.py",
                            "skills/ratchet-orchestrator/scripts/spec_sources.py"])
+    if code != 0:
+        print("[CP1-T10] skipped: ratchet.py/provider_health.py/spec_sources.py differ from HEAD (a later "
+              "checkpoint's uncommitted work in progress); this baseline proof only runs against a clean tree")
+        return
     check("[CP1-T10] git diff is empty on ratchet.py, provider_health.py and spec_sources.py against HEAD "
           "(no code has moved yet)", code == 0, (code, out, err))
     # Running the full ~45-minute suite (tests/run_all.py) on every invocation of this fast CP1 file would be

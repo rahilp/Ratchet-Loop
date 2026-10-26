@@ -148,6 +148,14 @@ tree, never loads it as a module itself): 5 files
   test file dynamically (`cart_tests`, via `spec_from_file_location`) AND
   `ast.parse(open(rel).read())` to inspect that file's own structure (not ratchet.py's, but the
   same two patterns live in one file).
+- `test_modularize_cp2.py` — CP2: the 8 leaf utilities (now/die/ok/find_root/read_json/write_json/
+  slugify/config_from_user) move verbatim into `engine_utils.py`. Loads `engine_utils.py`
+  dynamically (`load_eu`, via `spec_from_file_location`) and, in CP2-T12, re-loads each of the
+  three Kind-4-named fixture files the same way to prove they still import cleanly. Separately
+  reads `ENGINE.read_text()` and `ast.parse`/`ast.walk`s both that live text and the pinned
+  pre-move commit's text (via `git show`) to compare each function's body byte-for-byte, find
+  leftover top-level `def`s, check for star imports, and locate `DEFAULT_CONFIG`/
+  `OLD_DEFAULT_REVIEW_DEPTH` wherever they now live.
 
 ## Kind 4 — brief-named, but don't literally match either live-grep pattern today: 2 files
 
