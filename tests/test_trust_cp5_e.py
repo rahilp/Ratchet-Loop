@@ -30,7 +30,7 @@ sys.path.insert(0, str(HERE))
 import _tmp
 import trust_helpers
 from trust_helpers import (
-    ENGINE, RECORDS, check, cp5v_until, cp5y_load_engine, engine_env, git, make_env, now_dt,
+    ENGINE, PROVIDER_DISCOVERY, RECORDS, check, cp5v_until, cp5y_load_engine, engine_env, git, make_env, now_dt,
 )
 
 # ==================================================================================================================
@@ -399,7 +399,8 @@ def cp5_adv_round13_shared_record_lock():
     m = cp5y_load_engine()
     # [CP4] update_record/_read_record/_write_record/_RecordLock/_BreakerLock moved into records.py; the scans
     # below (and the AST lookup of update_record's own def just below) need both files' source combined.
-    src = ENGINE.read_text(encoding="utf-8") + "\n" + RECORDS.read_text(encoding="utf-8")
+    src = ENGINE.read_text(encoding="utf-8") + "\n" + RECORDS.read_text(encoding="utf-8") + "\n" + \
+        PROVIDER_DISCOVERY.read_text(encoding="utf-8")
 
     # --- X68: several `init`s in different projects at once: active-runs.json keeps every run ------------------
     env = make_env("claude")
@@ -681,7 +682,8 @@ def cp5_adv_round16_checked_add_busy_and_scan():
     print("CP5 adv round 16: providers --add (checked) dies when busy; every update_record result is consumed")
     # [CP4] update_record's own def (and any call site inside it) now lives in records.py; combine both files'
     # source so the bare-statement scan below still catches a violation wherever it is written.
-    src = ENGINE.read_text(encoding="utf-8") + "\n" + RECORDS.read_text(encoding="utf-8")
+    src = ENGINE.read_text(encoding="utf-8") + "\n" + RECORDS.read_text(encoding="utf-8") + "\n" + \
+        PROVIDER_DISCOVERY.read_text(encoding="utf-8")
 
     # --- structural: no update_record call site throws its result away ------------------------------------------
     bad = cp5r16_unconsumed_update_record_calls(src)
@@ -927,7 +929,8 @@ def cp5_adv_round17_wrapper_scan_and_all_or_nothing_add():
     import shlex
     # _record_chain_now (one of _CP5R17_DISCARD_OK's own allow-listed discards) moved into records.py in CP4;
     # merge it in so that allow-list entry still matches a real discard, not a stale permission.
-    src = ENGINE.read_text(encoding="utf-8") + "\n" + RECORDS.read_text(encoding="utf-8")
+    src = ENGINE.read_text(encoding="utf-8") + "\n" + RECORDS.read_text(encoding="utf-8") + "\n" + \
+        PROVIDER_DISCOVERY.read_text(encoding="utf-8")
 
     # --- structural: the wrapper scan, proven on the pre-fix shape first -----------------------------------------
     wr = cp5r17_result_wrappers(_CP5R17_PRE_FIX)

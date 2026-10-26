@@ -25,9 +25,9 @@ module directly, can itself contain the pattern strings as embedded constants an
 match; this doc's counts were taken right after `rm -rf tests/__pycache__
 tests/shortcuts/__pycache__`.)
 
-43 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
+44 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
 files the brief names explicitly (`test_quota_shared.py`, `test_discover_paid.py`, Kind 4 below)
-that carry the identical real obligation but don't literally match either regex today — **45
+that carry the identical real obligation but don't literally match either regex today — **46
 files total**, consistent with the brief's "43+".
 
 ## Kind 1 — module-load only (loads ratchet.py dynamically via `importlib.util.spec_from_file_location`,
@@ -132,7 +132,7 @@ tree, never loads it as a module itself): 5 files
   `git merge-base HEAD main` copy), walking for specific `FunctionDef`s to prove this lane didn't
   need to touch them. Never inspects ratchet.py itself or loads a module.
 
-## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 7 files
+## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 8 files
 
 - `test_trust_cp4.py` — trust-holes CP4: agent-set overrides no longer bypass checks. Loads
   ratchet.py dynamically (`ratchet_engine_slow_hook`) AND reads `ENGINE.read_text()` +
@@ -194,6 +194,19 @@ tree, never loads it as a module itself): 5 files
   registry beyond the two pre-existing ones (`_NOTED_UNREADABLE`/`_CHAIN_REBUILD`) was introduced,
   and confirm the lock class hierarchy (`_ChainLock` < `_BreakerLock` < `_RecordLock` <
   `_EngineNotesLock`, and `_StateLock`/`_IntegrateLock`, which stay in ratchet.py) is unchanged.
+- `test_modularize_cp5.py` — CP5: provider discovery, probing, quota and fallback bookkeeping
+  (`probe_provider`/`_record_probe`/`quota_failure`/`quota_retest_minutes`/`provider_share`/
+  `bench_quota`/`record_round_failure`/`review_succeeded`/`probe_due`/`probe_shared`/
+  `update_review_starts`/`_reserve_under_lock`/`refund_review_start`/`provider_bench`/
+  `shared_unavailable`/`event_stream`) move verbatim into `provider_discovery.py`. Loads
+  ratchet.py dynamically inside two generated subprocess snippets (`ratchet_cp5t07`,
+  `ratchet_cp5t08`) for its real two-lane concurrency drills (a race to reserve a provider's
+  share, and a race to share one probe's result), plus `cp5y_load_engine`'s own dynamic load for
+  its in-process ranking/quota/idempotency checks. Separately reads `ENGINE.read_text()` and
+  `ast.parse`/`ast.walk`s both that live text and the pinned pre-move commit's text (via
+  `git show`) to compare each of the 16 names' body byte-for-byte, find leftover top-level
+  `def`s, check for star imports and import cycles, and confirm no new module-level mutable
+  registry was introduced.
 
 ## Kind 4 — brief-named, but don't literally match either live-grep pattern today: 2 files
 

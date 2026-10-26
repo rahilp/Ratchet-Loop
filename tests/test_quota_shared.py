@@ -896,9 +896,12 @@ def x11_the_health_record_is_only_written_under_its_lock_and_a_lockless_writer_l
     from trust_helpers import cp5y_load_engine, engine_env, make_env
     # [CP4] update_record's own def moved into records.py; combine both files' source so this scan still covers
     # update_record's own definition and helpers, not just ratchet.py's remaining callers.
+    # [CP5] provider_bench/bench_quota/update_review_starts/_reserve_under_lock/probe_provider (the functions
+    # that actually touch provider-health.json under lock) moved into provider_discovery.py; include it too.
     scripts_dir = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
     src = ((scripts_dir / "ratchet.py").read_text(encoding="utf-8") + "\n"
-          + (scripts_dir / "records.py").read_text(encoding="utf-8"))
+          + (scripts_dir / "records.py").read_text(encoding="utf-8") + "\n"
+          + (scripts_dir / "provider_discovery.py").read_text(encoding="utf-8"))
     probe = ("def stray(path):\n    write_json(_health_path(), {})\n"
              "def stray2():\n    q = _health_path()\n    _write_record(q, {})\n"
              "def fine():\n    update_record(_health_path(), lambda d: d)\n")

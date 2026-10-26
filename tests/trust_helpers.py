@@ -36,6 +36,10 @@ ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator"
 # [CP4] update_record and the rest of the tamper-evidence chain moved out of ratchet.py into this sibling
 # module; a structural scan of "ratchet.py's source" for that machinery now needs both files' text.
 RECORDS = ENGINE.with_name("records.py")
+# [CP5] probe_provider, provider_bench, bench_quota, update_review_starts, _reserve_under_lock and the rest of
+# provider discovery/quota moved out of ratchet.py into this sibling module; a structural scan of "ratchet.py's
+# source" for that machinery now needs this file's text too.
+PROVIDER_DISCOVERY = ENGINE.with_name("provider_discovery.py")
 PASS = FAIL = 0
 VENDOR = {"claude": "anthropic", "codex": "openai", "gemini": "google", "copilot": "github"}
 
