@@ -554,6 +554,7 @@ python3 tests/test_load_timeouts_fixes.py
 python3 tests/test_merge_guard.py
 python3 tests/test_merge_main.py
 python3 tests/test_modularize_cp2.py
+python3 tests/test_modularize_cp3.py
 python3 tests/test_modularize_inventory.py
 python3 tests/test_objective.py
 python3 tests/test_opencode_big.py

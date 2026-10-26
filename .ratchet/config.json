@@ -13,7 +13,7 @@
       "codex"
     ]
   },
-  "regression_command": "python3 tests/run_all.py tests/test_trust_cp5_d.py --workers 1 && python3 tests/run_all.py tests/test_modularize_inventory.py tests/test_modularize_cp2.py tests/test_hooks.py --workers 3 --timeout 1800",
+  "regression_command": "python3 tests/run_all.py tests/test_modularize_inventory.py tests/test_modularize_cp2.py tests/test_modularize_cp3.py tests/test_quick_path.py tests/test_hooks.py --workers 3 --timeout 1800",
   "commit_per_checkpoint": true,
   "design_md": "DESIGN.md",
   "standards": [
@@ -110,10 +110,9 @@
       ]
     }
   },
-  "related_test_command": "python3 tests/run_all.py {files}",
+  "related_test_command": "python3 tests/run_all.py {files} --workers 1",
   "related_always": [
     "tests/test_docs.py",
-    "tests/test_brief.py",
-    "tests/test_trust_cp5_d.py"
+    "tests/test_brief.py"
   ]
 }

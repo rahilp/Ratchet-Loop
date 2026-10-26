@@ -48,7 +48,6 @@ import time
 import webbrowser
 from pathlib import Path
 
-RATCHET_DIR = ".ratchet"
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 VIEWER_TEMPLATE = SKILL_DIR / "assets" / "viewer.html"
@@ -64,7 +63,10 @@ if "ratchet" not in sys.modules and __name__ in sys.modules:
 _dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True  # never litter the installed plugin with __pycache__
 import spec_sources as specsrc  # noqa: E402
 import provider_health as phealth  # noqa: E402
-from engine_utils import now, die, ok, find_root, read_json, write_json, slugify, config_from_user  # noqa: E402
+from engine_utils import (now, die, ok, find_root, read_json, write_json, slugify, config_from_user,  # noqa: E402
+                          RATCHET_DIR, DEFAULT_CONFIG, OLD_DEFAULT_REVIEW_DEPTH)
+from fingerprint import (_is_git, _LookFailed, _git_tree_id, fingerprint, _head_sha, _commit_reviewed,  # noqa: E402
+                          _head_commit_named, changed_files, touches_ui, JUNK_PATHSPECS, FINGERPRINT_EXCLUDES)
 sys.dont_write_bytecode = _dwb
 
 GATES = ["behavior", "ui", "adversarial", "human"]
@@ -81,135 +83,6 @@ STOPPABLE_PHASES = {
     "done",
 }
 
-DEFAULT_CONFIG = {
-    "human_review": "end",          # end | each | none   (plan approval is always required)
-    # Which model is running this loop ("host"): auto-detected from the environment, or set it
-    # explicitly (anthropic | openai | google | github | <any name>). Reviewers prefer a provider
-    # DIFFERENT from the host; when none is available the host's own sub-agents review.
-    "host_provider": "auto",
-    # Other agent CLIs that can review (an any-<lens> slot ranks them: any that is not per-use, flat-rate or with no cost
-    # label, before a per-use one with the developer's recorded OK; inside the first group the ones with "prefer_for"
-    # that lens, then the fewest recent starts, then flat-rate before unlabeled). Any agent CLI works: use a preset
-    # (claude, codex, gemini, copilot, cursor, opencode) or your own "command". "company" is whose model it runs
-    # (worked out from "model" when not given); a reviewer only counts as independent when its company differs
-    # from the host's. `ratchet.py providers --discover` checks what is installed and adds what works.
-    # Each provider gives three reviewers: <id>-correctness, <id>-standards and <id>-both.
-    "providers": [{"id": "codex", "preset": "codex"}, {"id": "gemini", "preset": "gemini"},
-                  {"id": "claude", "preset": "claude"}],
-    # Reviewers that run as the host's own sub-agents. host-alt-* use a DIFFERENT model from the host's company
-    # (see host_models.alternates), the fallback before the host reviews its own work with its own model.
-    "reviewers": {
-        "host-standards":   {"kind": "agent", "lens": "standards", "vendor": "host"},
-        "host-correctness": {"kind": "agent", "lens": "correctness", "vendor": "host"},
-        "host-both":        {"kind": "agent", "lens": "both", "vendor": "host"},
-        "host-alt-standards":   {"kind": "agent", "lens": "standards", "vendor": "host", "alt": True},
-        "host-alt-correctness": {"kind": "agent", "lens": "correctness", "vendor": "host", "alt": True},
-        "host-alt-both":        {"kind": "agent", "lens": "both", "vendor": "host", "alt": True},
-    },
-    # Review SLOTS by checkpoint risk; risk only changes how many reviewers look. "any-<lens>" means: the first
-    # available provider from a different company in ranked order (not per-use before per-use with the developer's OK;
-    # a provider that prefers the lens; the fewest recent review starts machine-wide; flat-rate before no cost label;
-    # a company not yet reviewing this round preferred within that cost group only), else the
-    # host's company on a different model (host-alt-<lens>), else the host itself (host-<lens>). A slot can also
-    # name reviewer ids, or a list of ids as ordered alternatives.
-    "review_depth": {
-        "low":    ["any-both"],
-        "normal": ["any-standards", "any-correctness"],
-        "high":   ["any-standards", "any-correctness", "any-correctness", "any-standards"],
-    },
-    # Models for the roles the host runs as sub-agents, by tier. The tiers map to model names per host company in
-    # host_models; "inherit" (or a host not listed) means the session's own model.
-    "role_models": {
-        "ratchet-checkpoint-planner": "strong", "ratchet-implementer": "strong", "ratchet-fixer": "strong",
-        "ratchet-adversary": "strong", "ratchet-visual-reviewer": "strong",
-        "ratchet-app-scout": "standard", "ratchet-test-planner": "standard", "ratchet-test-writer": "standard",
-        "ratchet-design-system": "standard", "ratchet-prototyper": "standard", "ratchet-behavior-reviewer": "standard",
-        "ratchet-test-runner": "light", "ratchet-variant-writer": "alternate",
-    },
-    "host_models": {
-        "anthropic": {"strong": "inherit", "standard": "sonnet", "light": "haiku", "alternates": ["sonnet", "opus"]},
-    },
-    # Automatic checks added by guardrail steps (lint rules, architecture tests...). They run with the tests at every
-    # behavior gate, in this run and later runs, so a mistake reviewers kept finding now fails in seconds.
-    # Each: {"kind": "<mistake label>", "command": "<shell command>", "title": "...", "added": "<date>"}
-    "checks": [],
-    "probe_providers": True,        # send a tiny test request before relying on a provider
-    "probe_ttl_minutes": 120,       # a provider that answered a test request this recently isn't tested again
-    "probe_timeout_sec": 120,
-    # Which finding severities block approval, by checkpoint risk. "all" = every finding must be fixed. On a low-risk
-    # checkpoint minor findings are recorded for later (`ratchet.py deferred`) instead of starting another round,
-    # except a finding that names a done-means line (`names_done_means`), which blocks at any severity.
-    "blocking_severities": {"low": ["blocker", "major"], "normal": "all", "high": "all"},
-    # From round 2 on, a minor finding only blocks if it is in code changed since the previous round, unless it
-    # names a done-means line (`names_done_means`); blocker and major findings block wherever they are. Stops each
-    # round from turning into a fresh review of everything.
-    "scope_later_rounds": True,
-    # From round converge_after_round + 1 on (default: round 3), a minor finding never blocks, even in code changed
-    # since the previous round, unless it names a done-means line (`names_done_means`); it is recorded for later
-    # instead (`ratchet.py deferred`). Blocker and major findings always block, at any round. Keeps reviews
-    # converging instead of chasing ever-narrower nits.
-    "converge_after_round": 2,
-    # After this many blocking adversarial rounds in a row (or a second round where an unseen finding kind shows
-    # up in a file an earlier round already flagged), pause for a check-in (`ratchet.py check-in CPn`) before
-    # opening another round: see "Check-in" in schemas.md section 7.
-    "checkin_round": 2,
-    "unavailable_ttl_hours": 6,     # an other-provider reviewer that failed (auth, quota, timeout) is skipped this long
-    "quota_retest_minutes": 20,     # a provider out of credits that gave no reset time (or one already past) is tried again after this
-    "provider_share": {"max": 3, "minutes": 15},  # at most this many review starts on one provider in any window of this many minutes, across every lane on the machine
-    "max_adversarial_rounds": 6,    # per checkpoint; after this the loop blocks and escalates
-    "max_adversarial_rounds_run": 30,  # across the whole run (quota guard); then blocks and escalates
-    "approver": "human",            # human | director | either  (see director-enroll)
-    "max_ui_rounds": 6,
-    "max_behavior_attempts": 8,
-    # UI gate reviewers, per role: other providers in order of preference; "host" (the host's own
-    # sub-agents in isolated folders) is always the final fallback.
-    "ui_reviewers": {"visual": ["gemini", "claude", "codex"], "behavior": ["claude", "gemini", "codex"]},
-    "ui_block_on_nits": True,       # every code-fixable difference is a blocker
-    "ui_globs": [
-        "*.tsx", "*.jsx", "*.vue", "*.svelte", "*.astro", "*.html", "*.css", "*.scss",
-        "*.sass", "*.less", "*.styl", "*.swift", "*.kt", "*.xml", "*.dart", "*.erb",
-        "*.blade.php", "*.hbs", "*.njk", "*.liquid", "tailwind.config.*", "*.svg",
-    ],
-    "spec_archive": True,
-    "spec_keep": None,              # no spec tool: keep a running spec (openspec/specs/<run>/spec.md)? None = not asked yet           # archive an OpenSpec change (merge its deltas into the specs) when the run is approved
-    "regression_command": None,     # full suite run before a checkpoint can complete
-    "lane_start_command": None,     # `lanes-start` prints this argument list ({worktree}, {brief}, {name}) per lane; never runs it
-    # The quick path (`ratchet.py changes CPn`): a file matching doc_globs and not doc_exclude_globs (plus the
-    # configured design_md and standards files) counts as a doc, not code. A test file matching test_globs "names"
-    # a doc when its text contains the doc's repo-relative path or file name. doc_test_command (with a {files}
-    # placeholder) runs just those files; unset, the docs quick path is off. small_edit_lines is the line-count
-    # ceiling (git diff --numstat, added+removed) for a one-reviewer small fix.
-    # .mdx is left out by default because it can hold real JSX code (Next.js pages, Docusaurus, Storybook);
-    # a project whose .mdx files are prose only can add "*.mdx" to its own doc_globs.
-    "doc_globs": ["*.md", "*.rst", "*.adoc"],
-    "doc_exclude_globs": ["SKILL.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", "agents/*.md"],
-    "test_globs": ["test_*", "*_test.*", "*.test.*", "*.spec.*"],
-    "doc_test_command": None,
-    # Related tests before the full suite (`complete`): related_test_command (with a {files} placeholder) runs
-    # the step's own planned test files, the test files it changed, and the test files (test_globs) that name a
-    # file it changed, ranked by the function names that changed, at most related_tests_max of them (a value that
-    # is not a whole number of 1 or more falls back to 8); unset, the step goes straight to the full suite.
-    # related_always lists test files that join that list outside the cap when the step adds a test file, changes
-    # a doc, or adds or changes a code line holding a quoted string (for Ratchet's own repo: tests/test_docs.py).
-    "related_test_command": None,
-    "related_tests_max": 8,
-    "related_always": [],
-    "small_edit_lines": 20,
-    "commit_per_checkpoint": True,
-    "design_md": "DESIGN.md",
-    "standards": [".ratchet/standards.md"],
-    "app": {"start_command": None, "url": None, "healthcheck": None},
-    "test_timeout_sec": 900,
-    "load_stretch_max": 4,          # a busy machine stretches test_timeout_sec by load average / CPUs, up to this many times
-    "suite_watch_seconds": 30,      # while a step's tests run, look this often for an edit to the code under them; a positive number
-    "max_stop_blocks": 40,         # safety valve for the Stop hook (reset whenever a gate makes progress)
-    "fingerprint_include": [],      # gitignored files that still matter to behaviour (e.g. ".env.test"); added to fingerprints
-    "ui_single_reviewer_ok": False, # allow a UI review with only one of visual/behaviour (human-set, locked at approval)
-    "min_review_timeout_sec": 120,  # other-provider reviewers can't be given a timeout short enough to knock them out
-    "verify_transcripts": True,     # approvals must appear as a real user turn in the agent CLI's own transcript
-    "min_review_seconds": 20,       # a review written faster than this after its round opened is rejected
-}
-
 PROGRESS_EVENTS = {"tests_written", "red", "implemented", "behavior_passed", "ui_passed", "adversarial_approved",
                    "checkpoint_complete", "plan_submitted", "plan_approved", "plan_extended", "reviewers_launched"}
 # A wait (`ratchet.py wait`) also ends when the run is paused, resumed or claimed, or cancelled.
@@ -217,18 +90,21 @@ WAIT_ENDING_EVENTS = {"paused", "resumed", "cancelled"}
 WAIT_DEFAULT_MINUTES = 30
 WAIT_MAX_MINUTES = 120
 
-FINGERPRINT_EXCLUDES = {
-    ".git", RATCHET_DIR, "node_modules", ".next", ".nuxt", "dist", "build", "out",
-    ".venv", "venv", "__pycache__", ".pytest_cache", ".turbo", ".cache", "coverage",
-    "target", ".gradle", "Pods", "DerivedData", ".idea", ".vscode",
-}
+# FINGERPRINT_EXCLUDES now lives in fingerprint.py, imported by name above.
 
 
 # --------------------------------------------------------------------------- utils
 #
 # now/die/ok/find_root/read_json/write_json/slugify/config_from_user now live in engine_utils.py, imported by
-# name above; see that module's docstring for how it resolves its two forward dependencies on this file
-# (the tamper-evidence record chain, and DEFAULT_CONFIG/OLD_DEFAULT_REVIEW_DEPTH) without a circular import.
+# name above; see that module's docstring for how it resolves its one remaining forward dependency on this
+# file (the tamper-evidence record chain). DEFAULT_CONFIG/OLD_DEFAULT_REVIEW_DEPTH also now live only in
+# engine_utils.py (imported by name above), as the single source of truth -- config_from_user's frozen body
+# reads them as bare module globals in whichever module it runs in, so engine_utils.py builds them itself,
+# from a literal written directly in its own source (see _default_config_literals() there), bound into its
+# globals via `globals().update(...)` rather than a bare top-level literal (CP2-T03/CP3-T01 flag any bare
+# top-level mutable literal here as a possible new registry). This file no longer keeps its own copy: a
+# hand-synced duplicate is a drift risk; tests/test_modularize_cp2.py's find_literal() instead recognizes
+# this function-return + globals().update() idiom directly, so no duplicate AST-visible literal is needed.
 
 _SAFE_SLUG_RE = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]+$")  # a run folder name: no path separators, not . or ..
 _STATE_LOCK_HELD = False  # set by main() while this process holds the state lock for its whole command
@@ -316,178 +192,10 @@ class Ctx:
 
 
 # --------------------------------------------------------------------------- fingerprint
-
-def _is_git(root: Path) -> bool:
-    r = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=root,
-                       capture_output=True, text=True)
-    return r.returncode == 0 and r.stdout.strip() == "true"
-
-
-# Interpreter caches and OS litter: never part of the reviewed code, never committed by Ratchet.
-JUNK_PATHSPECS = [":(exclude,glob)**/__pycache__/**", ":(exclude,glob)**/*.pyc", ":(exclude,glob)**/.DS_Store"]
-
-
-class _LookFailed(Exception):
-    """A look at the code could not be taken: git could not read the tree (a file the running command created and
-    removed between git's walk and its open, or one it cannot read) or could not list the files. The code watch
-    skips such a look and notes it; outside the watch the same failure dies."""
-
-
-def _git_tree_id(root: Path, env: dict, strict: bool = True, extra: list | None = None) -> str:
-    """The tree id of the working tree (tracked + untracked, respecting .gitignore, minus .ratchet and junk, plus
-    `extra`: the config's fingerprint_include, gitignored files that tests still depend on, read by the caller),
-    built in the index `env` names (GIT_INDEX_FILE), which must already be seeded. With `strict` a git failure
-    dies; otherwise it raises _LookFailed with the same message."""
-    def fail(msg):
-        if strict:
-            die(msg)
-        raise _LookFailed(msg)
-    r = subprocess.run(["git", "add", "-A", "--", ".", f":(exclude){RATCHET_DIR}", *JUNK_PATHSPECS],
-                       cwd=root, env=env, capture_output=True, text=True)
-    if r.returncode != 0:
-        fail(f"git add for fingerprint failed: {r.stderr.strip()}")
-    if extra:  # gitignored files that tests still depend on
-        subprocess.run(["git", "add", "-f", "--", *extra], cwd=root, env=env, capture_output=True, text=True)
-    t = subprocess.run(["git", "write-tree"], cwd=root, env=env,
-                       capture_output=True, text=True)
-    if t.returncode != 0:
-        fail(f"git write-tree failed: {t.stderr.strip()}")
-    return t.stdout.strip()
-
-
-def fingerprint(root: Path) -> dict:
-    """Hash of the working tree (tracked + untracked, respecting .gitignore, minus .ratchet)."""
-    if _is_git(root):
-        with tempfile.TemporaryDirectory() as td:
-            env = dict(os.environ, GIT_INDEX_FILE=str(Path(td) / "index"))
-            # seed from HEAD if it exists so the add is fast
-            subprocess.run(["git", "read-tree", "HEAD"], cwd=root, env=env,
-                           capture_output=True)
-            extra = (read_json(root / RATCHET_DIR / "config.json", {}) or {}).get("fingerprint_include") or []
-            return {"kind": "git-tree", "id": _git_tree_id(root, env, extra=extra)}
-    # non-git fallback: manifest of file hashes
-    manifest = {}
-    for dp, dns, fns in os.walk(root):
-        dns[:] = [d for d in dns if d not in FINGERPRINT_EXCLUDES and not d.startswith(".")]
-        for fn in fns:
-            fp = Path(dp) / fn
-            try:
-                if fp.stat().st_size > 5_000_000:
-                    continue
-                manifest[str(fp.relative_to(root))] = hashlib.sha1(fp.read_bytes()).hexdigest()
-            except OSError:
-                continue
-    blob = json.dumps(manifest, sort_keys=True).encode()
-    fid = hashlib.sha1(blob).hexdigest()
-    mdir = root / RATCHET_DIR / "manifests"
-    mdir.mkdir(parents=True, exist_ok=True)
-    (mdir / f"{fid}.json").write_text(json.dumps(manifest))
-    return {"kind": "manifest", "id": fid}
-
-
-def _head_sha(root: Path) -> str:
-    """HEAD's commit sha, or "" when there is none (no git, or no commit yet)."""
-    r = subprocess.run(["git", "rev-parse", "-q", "--verify", "HEAD"], cwd=root, capture_output=True, text=True)
-    return r.stdout.strip() if r.returncode == 0 else ""
-
-
-def _commit_reviewed(root: Path, base_tree, fp: dict, msg: str, extra: dict | None = None):
-    """Commit exactly what this checkpoint changed, byte for byte as reviewed: HEAD plus the difference between the
-    checkpoint's starting tree and the reviewed tree. Unrelated work already in the tree, and anything the user has
-    staged, stays out. Built with a private index, so renames, deletions, odd file names and fingerprint_include
-    files all work. Returns the short commit id, or None when the checkpoint changed nothing."""
-    if not base_tree:
-        die("This checkpoint has no recorded starting tree, so Ratchet can't tell which changes are its own. "
-            "Commit it by hand, or set commit_per_checkpoint to false.")
-    paths = changed_files(root, {"kind": "git-tree", "id": base_tree}, fp)
-    if not paths and not extra:
-        return None
-    # the index takes repo-root-relative paths; the project folder may sit below the git root
-    pre = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=root, capture_output=True, text=True).stdout.strip()
-    top = root.joinpath(*[".."] * pre.count("/"))
-    shared = []  # the .ratchet files people edit and share ride along with the checkpoint (never run state)
-    for name in (".gitignore", "config.json", "standards.md", "learnings.md"):
-        f = root / RATCHET_DIR / name
-        if f.is_file():
-            oid = subprocess.run(["git", "hash-object", "-w", "--", str(f)], cwd=root, capture_output=True,
-                                 text=True).stdout.strip()
-            if oid:
-                shared.append((f"{pre}{RATCHET_DIR}/{name}", oid))
-    for rel, text in (extra or {}).items():  # files Ratchet itself updated after review (spec task ticks), as given
-        oid = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=root, capture_output=True,
-                             input=text.encode("utf-8", "surrogateescape")).stdout.decode().strip()
-        if oid:
-            shared.append((rel, oid))
-    def git(*a, env=None, inp=None):
-        r = subprocess.run(["git", *a], cwd=root, capture_output=True, input=inp, env=env)
-        if r.returncode != 0:
-            die(f"git {a[0]} failed while committing the checkpoint: "
-                f"{r.stderr.decode('utf-8', 'replace').strip()[:400]}")
-        return r.stdout.decode("utf-8", "surrogateescape")
-    head = subprocess.run(["git", "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=root,
-                          capture_output=True, text=True).stdout.strip()
-    with tempfile.TemporaryDirectory() as td:
-        env = dict(os.environ, GIT_INDEX_FILE=str(Path(td) / "index"), GIT_LITERAL_PATHSPECS="1")
-        git("read-tree", *([head] if head else ["--empty"]), env=env)
-        listing = git("ls-tree", "-r", "-z", "--full-tree", fp["id"], env=env)
-        entries = {}
-        for rec in listing.split("\0"):
-            if rec:
-                meta, _, path = rec.partition("\t")
-                entries[path] = meta.split()  # mode, type, object id
-        info = []
-        for p in paths:
-            if p in entries:
-                mode, _, oid = entries[p]
-                info.append(f"{mode} {oid}\t{p}")
-            else:
-                info.append(f"0 {'0' * 40}\t{p}")  # mode 0 removes the path
-        info += [f"{(entries.get(rel) or ['100644'])[0]} {oid}\t{rel}" for rel, oid in shared]  # later lines win
-        git("update-index", "-z", "--index-info", env=env,
-            inp="\0".join(info).encode("utf-8", "surrogateescape") + b"\0")
-        tree = git("write-tree", env=env).strip()
-        if head and tree == git("rev-parse", f"{head}^{{tree}}").strip():
-            return None
-        new = git("commit-tree", tree, *(["-p", head] if head else []), "-m", msg).strip()
-    git("update-ref", "HEAD", new, *([head] if head else []))
-    # the real index now lags behind HEAD for these paths: bring just those entries up to date
-    subprocess.run(["git", "reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], cwd=top,
-                   capture_output=True, input="\0".join(paths + [r for r, _ in shared]).encode("utf-8", "surrogateescape"),
-                   env=dict(os.environ, GIT_LITERAL_PATHSPECS="1"))
-    return new[:7]
-
-
-def _head_commit_named(root: Path, msg: str) -> str | None:
-    """HEAD's short id when HEAD is a commit with exactly this message (a checkpoint commit already made by an
-    earlier run of `complete` that failed before it could save), else None."""
-    r = subprocess.run(["git", "log", "-1", "--format=%H%n%B", "HEAD"], cwd=root, capture_output=True)
-    if r.returncode != 0:
-        return None
-    sha, _, body = r.stdout.decode("utf-8", "surrogateescape").partition("\n")
-    return sha.strip()[:7] if sha.strip() and body.strip() == msg.strip() else None
-
-
-def changed_files(root: Path, fp_a: dict, fp_b: dict) -> list[str]:
-    if fp_a["id"] == fp_b["id"]:
-        return []
-    if fp_a["kind"] == fp_b["kind"] == "git-tree":
-        r = subprocess.run(["git", "diff-tree", "-r", "-z", "--no-renames", "--name-only", fp_a["id"], fp_b["id"]],
-                           cwd=root, capture_output=True)
-        if r.returncode == 0:
-            return [x for x in r.stdout.decode("utf-8", "surrogateescape").split("\0") if x]
-    mdir = root / RATCHET_DIR / "manifests"
-    a = read_json(mdir / f"{fp_a['id']}.json", {}) or {}
-    b = read_json(mdir / f"{fp_b['id']}.json", {}) or {}
-    return sorted({k for k in set(a) | set(b) if a.get(k) != b.get(k)})
-
-
-def touches_ui(files: list[str], globs: list[str]) -> list[str]:
-    hits = []
-    for f in files:
-        name = os.path.basename(f)
-        if any(fnmatch.fnmatch(name, g) or fnmatch.fnmatch(f, g) for g in globs):
-            hits.append(f)
-    return hits
+#
+# _is_git/_LookFailed/_git_tree_id/fingerprint/_head_sha/_commit_reviewed/_head_commit_named/changed_files/
+# touches_ui now live in fingerprint.py, imported by name above, along with JUNK_PATHSPECS and
+# FINGERPRINT_EXCLUDES; RATCHET_DIR lives in engine_utils.py. All are imported by name above.
 
 
 # --------------------------------------------------------------------------- quick path (`ratchet.py changes`)
@@ -5302,13 +5010,7 @@ OLD_DEFAULT_REVIEWERS = {
        for p, v in [("claude", "anthropic"), ("codex", "openai"), ("gemini", "google"), ("copilot", "github")]
        for lens in ("correctness", "standards")},
 }
-OLD_DEFAULT_REVIEW_DEPTH = {
-    "low": ["host-both"],
-    "normal": ["host-standards", ["codex-correctness", "gemini-correctness", "claude-correctness", "copilot-correctness"]],
-    "high": ["host-standards", "host-correctness",
-             ["codex-correctness", "gemini-correctness", "claude-correctness", "copilot-correctness"],
-             ["gemini-standards", "claude-standards", "codex-standards", "copilot-standards"]],
-}
+# OLD_DEFAULT_REVIEW_DEPTH now lives in engine_utils.py, imported by name above.
 
 # How to run each known agent CLI non-interactively. "company" is None for CLIs that can run several companies'
 # models: for those the company comes from the chosen model. Flags differ between CLI versions; a provider entry

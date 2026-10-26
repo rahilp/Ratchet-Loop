@@ -173,6 +173,14 @@ tree, never loads it as a module itself): 5 files
   `ast.parse`/`ast.walk` (lines ~642, ~725) to structurally compare `cmd_reviewers`'s body —
   masking only the span that sets `prev_round_tree` — against the pre-lane commit, to prove the
   rest of the function is untouched.
+- `test_modularize_cp3.py` — CP3: the fingerprint/git-tree helpers (`_is_git`/`_LookFailed`/
+  `_git_tree_id`/`fingerprint`/`_head_sha`/`_commit_reviewed`/`_head_commit_named`/`changed_files`/
+  `touches_ui`) move verbatim into `fingerprint.py`. Loads `fingerprint.py` dynamically
+  (`spec_from_file_location`) to call its functions directly against throwaway git fixtures.
+  Separately reads `ENGINE.read_text()` and `ast.parse`/`ast.walk`s both that live text and the
+  pinned pre-move commit's text (via `git show`) to compare each name's body byte-for-byte, find
+  leftover top-level `def`/`class`es, check for star imports and import cycles, and confirm no new
+  module-level mutable registry was introduced.
 
 ## Kind 4 — brief-named, but don't literally match either live-grep pattern today: 2 files
 

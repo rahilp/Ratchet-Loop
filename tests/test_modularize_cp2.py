@@ -113,26 +113,107 @@ def top_level_assigns(tree) -> dict:
     return out
 
 
+def _find_wired_function_return_dict_value(tree, fname, src, name):
+    """Second recognized shape (the sanctioned `_..._constants()`-idiom): a top-level FunctionDef whose body's
+    LAST statement is `return <dict literal>`, where that dict literal has a key equal to `name`, AND that
+    function is actually invoked via a top-level `globals().update(<fn>())` call (a bare `def` never wired
+    this way is dead code and must not count). Returns one of:
+      - (value, None)            -- found, and `name`'s value is a plain literal
+      - (None, "<reason>")       -- found (the key exists, inside a wired function) but its value is NOT a
+                                     plain literal (a comprehension, a Name reference, a call, string
+                                     concatenation, ...); this is "found but malformed", not "not found"
+      - (None, None)             -- `name` is not present via this shape in this source at all; the caller
+                                     should keep looking (fall through to the next candidate file)
+    Never reads anything off disk and never executes any code; the only evaluation performed is
+    ast.literal_eval on the single candidate value node."""
+    wired_fn_names = set()
+    for n in tree.body:
+        if not isinstance(n, ast.Expr):
+            continue
+        call = n.value
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "update"):
+            continue
+        globals_call = call.func.value
+        if not (isinstance(globals_call, ast.Call) and isinstance(globals_call.func, ast.Name)
+                and globals_call.func.id == "globals" and not globals_call.args and not globals_call.keywords):
+            continue
+        if len(call.args) != 1 or call.keywords:
+            continue
+        inner = call.args[0]
+        if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) and not inner.args and not inner.keywords:
+            wired_fn_names.add(inner.func.id)
+
+    for n in tree.body:
+        if not isinstance(n, ast.FunctionDef):
+            continue
+        if n.name not in wired_fn_names:
+            continue  # defined but never wired via globals().update(fn()): dead code, does not count
+        if not n.body:
+            continue
+        last = n.body[-1]
+        if not isinstance(last, ast.Return) or last.value is None or not isinstance(last.value, ast.Dict):
+            continue
+        d = last.value
+        for k, v in zip(d.keys, d.values):
+            if isinstance(k, ast.Constant) and k.value == name:
+                try:
+                    return ast.literal_eval(v), None
+                except ValueError as e:
+                    return None, f"{name} in {fname}'s {n.name}() is not a plain literal: {e}"
+    return None, None
+
+
+def _scan_source_for_literal(name: str, source_text: str, filename: str):
+    """Core scan, taking source text and a filename directly (no file I/O), so synthetic in-memory source
+    strings can be fed straight to it. Recognizes two shapes, bare-Assign checked first exactly as before,
+    then the wired-function-return idiom:
+      1. a top-level `name = <dict/list/... literal>` Assign.
+      2. a top-level FunctionDef whose body's last statement is `return <dict literal>` containing a key
+         equal to `name`, where that function is actually invoked via a top-level `globals().update(fn())`
+         call (not merely defined).
+    In both shapes the value is extracted with ast.literal_eval on that one candidate node ONLY -- never by
+    executing code, never by reading another file, never by re-parsing anything else. Anything whose value is
+    not a plain literal (a comprehension, a bare Name/variable reference, a call result, string concatenation
+    via BinOp, or anything else ast.literal_eval rejects) is "found but malformed": it returns (None, reason),
+    the same kind of result the bare-Assign case already produces, and never silently falls through as if
+    `name` were absent. Returns (value, None), (None, reason), or (None, None) if `name` is not defined via
+    either shape in this source at all (the caller moves on to the next candidate file)."""
+    try:
+        tree = ast.parse(source_text, filename=filename)
+    except SyntaxError as e:
+        return None, f"{filename} does not parse: {e}"
+    assigns = top_level_assigns(tree)
+    if name in assigns:
+        try:
+            return ast.literal_eval(assigns[name].value), None
+        except ValueError as e:
+            return None, f"{name} in {filename} is not a plain literal: {e}"
+    return _find_wired_function_return_dict_value(tree, filename, source_text, name)
+
+
 def find_literal(name: str):
-    """A top-level literal assignment named `name` (e.g. DEFAULT_CONFIG, OLD_DEFAULT_REVIEW_DEPTH), wherever it
-    currently lives: engine_utils.py (if it exists and defines it) takes priority, else ratchet.py's live
-    source. Returns (value, None) or (None, reason). Deliberately does not assume which file ends up holding
-    these supporting constants after CP2's move."""
+    """A top-level literal named `name` (e.g. DEFAULT_CONFIG, OLD_DEFAULT_REVIEW_DEPTH), wherever it currently
+    lives: engine_utils.py (if it exists and defines it) takes priority, else ratchet.py's live source.
+    Recognizes two shapes (see _scan_source_for_literal for the full description of both):
+      1. a bare top-level `name = <literal>` Assign.
+      2. the sanctioned `_..._constants()` idiom: a top-level function whose body's last statement is
+         `return <dict literal>` holding a key equal to `name`, wired in via a top-level
+         `globals().update(<fn>())` call (a function merely defined but never wired this way does not count).
+    Does NOT accept anything whose value is not a plain literal: a comprehension, a bare Name/variable
+    reference, a call result, string concatenation via BinOp, a disk read, an AST-parse of another file, or
+    any other non-literal expression -- ast.literal_eval naturally rejects all of these, so this relies on
+    that rather than hand-rolling extra detection. Returns (value, None) when found and literal, or
+    (None, reason) either when nothing recognizes `name` in either candidate file, or when it was found but
+    is malformed in one of the ways above (which short-circuits immediately -- it never silently falls
+    through to the next candidate file as if nothing were found there)."""
     candidates = []
     if ENGINE_UTILS.exists():
         candidates.append(("engine_utils.py", ENGINE_UTILS.read_text()))
     candidates.append(("ratchet.py", live_ratchet_source()))
     for fname, src in candidates:
-        try:
-            tree = ast.parse(src, filename=fname)
-        except SyntaxError as e:
-            return None, f"{fname} does not parse: {e}"
-        assigns = top_level_assigns(tree)
-        if name in assigns:
-            try:
-                return ast.literal_eval(assigns[name].value), None
-            except ValueError as e:
-                return None, f"{name} in {fname} is not a plain literal: {e}"
+        value, reason = _scan_source_for_literal(name, src, fname)
+        if value is not None or reason is not None:
+            return value, reason
     return None, f"{name} is not defined at top level in engine_utils.py or ratchet.py"
 
 
@@ -714,6 +795,93 @@ def t11_baseline_still_byte_identical():
               got == saved, (saved, got))
 
 
+# ============================================================================================ CP2-T14..T18
+#
+# Director-sanctioned guardrail (see the implementer brief): "prove the edited check BOTH ways, or it does
+# not count." These committed, permanent GOOD/BAD cases feed _scan_source_for_literal synthetic in-memory
+# source strings directly -- no temp files, no real file I/O -- so this exact loophole set (a comprehension,
+# a name-alias to another variable, a function defined but never wired, and the original disk-read/AST-parse
+# regression shape) can never silently regress if someone touches find_literal/_scan_source_for_literal later.
+
+
+_GOOD_WIRED_SRC = (
+    "def fn():\n"
+    "    return {\"SOME_NAME\": {\"a\": 1, \"b\": [2, 3]}}\n"
+    "\n"
+    "\n"
+    "globals().update(fn())\n"
+)
+
+
+def t14_good_wired_function_idiom_is_found():
+    print("CP2-T14: GOOD -- the sanctioned function-return + globals().update() idiom is found, with its "
+          "correct value, no error")
+    value, reason = _scan_source_for_literal("SOME_NAME", _GOOD_WIRED_SRC, "<synthetic>")
+    check("[CP2-T14] the wired idiom's SOME_NAME is found with the correct value and no error",
+          value == {"a": 1, "b": [2, 3]} and reason is None, (value, reason))
+
+
+def t15_bad_comprehension_value_is_rejected():
+    print("CP2-T15: BAD -- a dict/list comprehension as the target key's value is rejected, not accepted as "
+          "a plain literal")
+    src = (
+        "def fn():\n"
+        "    return {\"SOME_NAME\": {k: 1 for k in [\"a\", \"b\"]}}\n"
+        "\n"
+        "\n"
+        "globals().update(fn())\n"
+    )
+    value, reason = _scan_source_for_literal("SOME_NAME", src, "<synthetic>")
+    check("[CP2-T15] a comprehension value is NOT treated as a successfully found plain literal "
+          "(either falsy (None, ...) or an error string)", not value or reason is not None, (value, reason))
+
+
+def t16_bad_name_alias_value_is_rejected():
+    print("CP2-T16: BAD -- the target key's value being a bare Name that aliases another local variable is "
+          "rejected, not accepted as a plain literal")
+    src = (
+        "def fn():\n"
+        "    computed = {\"a\": 1}\n"
+        "    return {\"SOME_NAME\": computed}\n"
+        "\n"
+        "\n"
+        "globals().update(fn())\n"
+    )
+    value, reason = _scan_source_for_literal("SOME_NAME", src, "<synthetic>")
+    check("[CP2-T16] a Name-alias value is NOT treated as a successfully found plain literal "
+          "(either falsy (None, ...) or an error string)", not value or reason is not None, (value, reason))
+
+
+def t17_bad_unwired_function_is_dead_code_and_not_found():
+    print("CP2-T17: BAD -- the exact same good function body, but never wired via globals().update(fn()), "
+          "is dead code and must not count")
+    src = (
+        "def fn():\n"
+        "    return {\"SOME_NAME\": {\"a\": 1, \"b\": [2, 3]}}\n"
+    )
+    value, reason = _scan_source_for_literal("SOME_NAME", src, "<synthetic>")
+    check("[CP2-T17] an unwired function's SOME_NAME is not found at all (dead code does not count)",
+          value is None and reason is None, (value, reason))
+
+
+def t18_bad_disk_read_ast_parse_return_shape_is_rejected():
+    print("CP2-T18: BAD -- the original regression shape (return value built via a disk read/AST-parse, a "
+          "bare Name, not a dict literal at all) is rejected")
+    src = (
+        "def fn():\n"
+        "    import ast as _ast\n"
+        "    tree = _ast.parse(open(__file__).read())\n"
+        "    found = {}\n"
+        "    return found\n"
+        "\n"
+        "\n"
+        "globals().update(fn())\n"
+    )
+    value, reason = _scan_source_for_literal("SOME_NAME", src, "<synthetic>")
+    check("[CP2-T18] a bare-Name return (not `return <dict literal>`) is rejected, not accepted",
+          value is None and reason is None, (value, reason))
+
+
 # ============================================================================================ CP2-T12
 
 
@@ -830,6 +998,11 @@ TESTS = [
     ("CP2-T11", t11_baseline_still_byte_identical),
     ("CP2-T12", t12_no_repointing_needed_for_this_move),
     ("CP2-T13", t13_full_suite_passes),
+    ("CP2-T14", t14_good_wired_function_idiom_is_found),
+    ("CP2-T15", t15_bad_comprehension_value_is_rejected),
+    ("CP2-T16", t16_bad_name_alias_value_is_rejected),
+    ("CP2-T17", t17_bad_unwired_function_is_dead_code_and_not_found),
+    ("CP2-T18", t18_bad_disk_read_ast_parse_return_shape_is_rejected),
 ]
 
 

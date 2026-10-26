@@ -829,11 +829,28 @@ def cp5_adv_round11_damaged_record_class():
           got is False and (rh / "file-hashes.lock").is_dir() and took < 5, (got, took))
 
     # --- X60: structural: no record is read or written around the one reader and the one writer ----------------
-    bad = cp5r11_io_violations(src)
+    # fingerprint/changed_files live in fingerprint.py since the modularize-engine run's CP3; merge its source
+    # into the scan's input text so this check keeps its actual invariant -- each still reads/writes only the
+    # manifest cache the allow-lists above already name for them -- regardless of which file currently holds
+    # them. Mirrors the engine_utils.py merge done for the facade check just below.
+    fp_src = ENGINE.with_name("fingerprint.py").read_text(encoding="utf-8")
+    bad = cp5r11_io_violations(src + "\n" + fp_src)
     check("[CP5-X60] ratchet.py reads JSON files only through _read_record (read_json without `record=` only for "
           "files people or agents write) and writes files only through _write_record / _append_record, apart from "
           "a short allow-list of files that are not Ratchet's records",
           bad == [], bad[:10])
+    # mutation-proof: a disguised unguarded write planted inside changed_files (allow-listed only for the read it
+    # already does, not for a write) in a throwaway copy of fingerprint.py's text must still be caught -- proving
+    # the merge above really walks into fingerprint.py's function bodies, not just ratchet.py's.
+    _marker = '    b = read_json(mdir / f"{fp_b[\'id\']}.json", {}) or {}\n'
+    assert _marker in fp_src, "fingerprint.py's changed_files no longer matches the expected source; update the probe"
+    fp_src_planted = fp_src.replace(
+        _marker,
+        _marker + '    (mdir / "planted.json").write_text(json.dumps(b))  # [CP5-X60] planted mutation\n')
+    planted_flagged = {(fn, what) for fn, _l, what in cp5r11_io_violations(fp_src_planted)}
+    check("[CP5-X60] ... and the merged scan really walks into fingerprint.py's own functions: a disguised "
+          "unguarded write planted inside changed_files is still flagged",
+          ("changed_files", "write_text") in planted_flagged, planted_flagged)
     probe = ("def _stop_error(root):\n    data = read_json(p, {})\n    write_json(p, data)\n"
              "def record_director_folder(f):\n    with open(tmp, 'w') as fh:\n        fh.write('x')\n"
              "    os.replace(tmp, p)\n    json.loads(p.read_text())\n"
@@ -1307,16 +1324,20 @@ _CP3_NO_RECURSE_VAR = "RATCHET_CP5D_NO_RECURSE"  # set on the child so it runs o
 # and the expected totals below must agree, not assume a pty is always there. The HAVE_PTY=False totals (81 total;
 # X53 4, X56 2, X61 36, X66 0, all others unchanged) were captured the same way as the HAVE_PTY=True ones: running
 # this file's own SECTIONS solo with HAVE_PTY forced false (`del os.forkpty` before import) and reading the result.
+# [Corrected, modularize-engine run's CP3] X60 gained one genuinely new check() (a mutation-proof regression
+# proving the X60 scan, re-pointed at fingerprint.py after CP3's move, really walks into fingerprint.py's own
+# function bodies) -- not a dropped or relabeled case, so the totals below are bumped by exactly that one check,
+# same way, on both the HAVE_PTY and non-PTY counts (the new check does not itself depend on HAVE_PTY).
 BASELINE_SECTIONS = [
     "CP5 adv round 10: damaged per-user records fail safe; a stale short lock is cleared by one process only",
     "CP5 adv round 11: every damaged record fails safe: no hook crashes, recovery always runs, no run is stuck",
     "CP5 adv round 12: restriction records are never written over, one stale-breaker winner, accept-state order",
     "CP5 adv round 12: the override code is read from Ratchet's prompt, never from digits in a printed path",
 ]
-BASELINE_TALLY = 127 if HAVE_PTY else 81
+BASELINE_TALLY = 128 if HAVE_PTY else 82
 BASELINE_ID_COUNTS = {
     "CP5-X51": 5, "CP5-X52": 1, "CP5-X53": 5 if HAVE_PTY else 4, "CP5-X54": 2, "CP5-X55": 2,
-    "CP5-X56": 8 if HAVE_PTY else 2, "CP5-X57": 5, "CP5-X58": 3, "CP5-X59": 4, "CP5-X60": 4,
+    "CP5-X56": 8 if HAVE_PTY else 2, "CP5-X57": 5, "CP5-X58": 3, "CP5-X59": 4, "CP5-X60": 5,
     "CP5-X61": 73 if HAVE_PTY else 36, "CP5-X63": 5, "CP5-X64": 2, "CP5-X65": 5, "CP5-X66": 2 if HAVE_PTY else 0,
     "CP5-X67": 1,
 }
