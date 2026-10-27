@@ -1,0 +1,19 @@
+{
+  "_comment": "CP7 fixture (greenfield): files_likely are both brand-new paths, absent from this fixture tree, with zero references anywhere in it -- nothing monkeypatched, imported, or source-scanned by name. The composed pass must classify this greenfield-create and attach no spurious re-point/parity/hazard noise.",
+  "id": "CPx-GREENFIELD",
+  "files_likely": ["brand_new_module.py", "test_brand_new_module.py"],
+  "move": null,
+  "baseline": null,
+  "done_when": [
+    "brand_new_module.py exists and is covered by test_brand_new_module.py"
+  ],
+  "cases": [],
+  "notes": "",
+  "tests": {
+    "command": "python3 test_brand_new_module.py",
+    "report": "json"
+  },
+  "readme_list": null,
+  "inventory": null,
+  "new_test_file": null
+}

@@ -6,10 +6,10 @@ Called as a plain OS subprocess (never imported in-process) by the planner agent
 while it is writing a run's checkpoints.json, so it can tell a greenfield checkpoint (only new files)
 apart from a brownfield one (touches something that already exists) and, for brownfield/ambiguous
 checkpoints, enumerate the predictable re-point/registration/parity consequences of the change up
-front. This file is a small subcommand dispatcher; it currently implements `classify`, `repoint`,
-`registration`, `parity`, `hazard` and `merge`. Later checkpoints (CP6-CP7) add the planner's own
-wiring to these subcommands plus an end-to-end subcommand that composes them -- this module stays
-stdlib-only (standards.md #1) and out of skills/ratchet-orchestrator/scripts/, which lane M owns.
+front. This file is a small subcommand dispatcher; it implements `classify`, `repoint`,
+`registration`, `parity`, `hazard`, `merge` and `full` (a composed end-to-end subcommand that runs
+the other six for you in one call) -- this module stays stdlib-only (standards.md #1) and out of
+skills/ratchet-orchestrator/scripts/, which lane M owns.
 
 ------------------------------------------------------------------------------------------ `repoint`
 Usage:
@@ -232,6 +232,82 @@ It is never required for a normal merge (CP2-CP4's real scans never send it) and
 successful merge's output in any way; it only ever makes `merge` refuse instead of silently trusting
 a caller's claim about the existing content. See tests/test_impact_analysis_additive.py's module
 docstring for this subcommand's full CLI contract and the design reasoning behind this field.
+
+------------------------------------------------------------------------------------------------ `full`
+Usage:
+
+    python3 impact_analysis.py full <fixture_root> --checkpoint <checkpoint_json_path>
+
+No stdin is read. A composed end-to-end subcommand that runs `classify`, `repoint`, `registration`,
+`parity`, `hazard` and `merge` -- all of this module's other subcommands -- in one call, for the
+common case of a checkpoint describing at most one symbol move and at most one new test file. The
+planner MAY call this directly as a shortcut; it should still fall back to calling the individual
+subcommands above when it needs finer control (a checkpoint moving several symbols, several new test
+files, or anything else `full`'s simplifying assumptions don't fit).
+
+`<fixture_root>`: the root directory to scan, the same meaning `repoint`'s `<fixture_root>` and
+`classify`'s `<repo_root>` already carry. `--checkpoint <path>`: a path (absolute, or relative to the
+current working directory) to a checkpoint JSON file shaped like a real checkpoints.json entry, plus
+three extra optional keys this composed command alone reads:
+
+    {
+      "files_likely": [...],      // required; classify() input
+      "move": null | {"symbol": "...", "module_from": "...", "module_to": "..."},  // optional
+      "baseline": null | {"module": "...", "startup_ms": <num>, "threshold_pct": <num>},  // optional
+      "done_when": [...],         // required
+      "cases": [...],             // required
+      "tests": {"command": "..."},  // optional; omitted -> hazard skipped
+      "readme_list": null | "<fixture-root-relative path>",       // optional
+      "inventory": null | "<fixture-root-relative path>",         // optional
+      "new_test_file": null | "<fixture-root-relative path>"      // optional
+    }
+
+In this fixed order:
+
+  1. Runs `classify(<fixture_root>, files_likely)`, deciding `mode`/`reason`.
+  2. When `mode != "greenfield-create"` and `move` is not null: runs `repoint_scan` using
+     `move.module_from`/`move.module_to`/`move.symbol`. Otherwise `repoint` is `null` in the output
+     (never an empty-but-present dict, so a caller can tell "skipped" apart from "ran, found
+     nothing").
+  3. When `mode != "greenfield-create"` and `new_test_file` is non-null: runs `registration_check`,
+     passing `readme_list`'s and `inventory`'s fixture-root-relative paths when given, else `None`
+     for whichever is absent (registration_check's own README-item and inventory-item decisions each
+     already handle a missing path by emitting a manual-check-needed item in its place instead of
+     crashing or silently skipping). Otherwise `registration` is `null`.
+  4. Always runs `parity_check(move, done_when, baseline)`.
+  5. When `tests.command` is present: runs `hazard_check(tests.command)`. Otherwise `hazard` is
+     `{"hazard": false, "suites": [], "detail": ""}`.
+  6. Builds `enumerated_items.done_when` (and `enumerated_items.cases: []` -- this composed pass never
+     invents new planned cases, only done_when lines), using the same plain-language conversion
+     documented in agents/ratchet-checkpoint-planner.md: one line per repoint finding
+     (`f"Re-point {file}:{line} ({category}): {detail}"`), one line per registration item
+     (`f"Register in the README test list: {line}"` / `f"Register in the test-scan inventory:
+     {line}"` / `f"Manual check needed (registration): {detail}"`), one line per parity item
+     whose `already_present` is false (its own `line`, verbatim), and -- when step 5's `hazard` is
+     true -- one line converting it too (`f"Report-race hazard: {detail}"`), so a true hazard is not
+     only reported in this call's own stdout but also persisted into the approved checkpoint's
+     done_when list. Then calls
+     `merge_checkpoint({"done_when": done_when, "cases": cases}, enumerated_items)`.
+
+A successful merge OVERWRITES the `--checkpoint` file on disk, in place, replacing only its
+`done_when` and `cases` keys with the merge's result and leaving every other top-level key's VALUE
+unchanged -- the file itself is rewritten whole via `json.dumps`, so whitespace/formatting can
+differ even though no other field's value changes; this is not a literal byte-for-byte-unchanged
+file. This happens on every successful invocation, unconditionally. A merge refusal is propagated:
+exit 3, the refusal JSON on stderr, no stdout, and no write to disk.
+
+stdout on success: exit code 0, ONE JSON object: `{"mode", "reason", "repoint", "registration",
+"parity", "hazard", "merged"}`.
+
+Nonzero exit is reserved for a genuine CLI usage error (exit 2 -- missing `<fixture_root>`, missing
+`--checkpoint`, a `--checkpoint` file that cannot be read or does not parse as JSON, or one missing
+the required `files_likely`/`done_when`/`cases` keys), or a merge refusal (exit 3).
+
+Idempotent: running `full` twice in a row against the same `--checkpoint` path, with no change to the
+fixture tree in between, adds nothing new the second time -- the second run's repoint/registration
+findings regenerate the identical line text (merge's own exact-text dedup catches them), and the
+second run's parity items now report `already_present: true` for any item this pass's own first run
+already added.
 """
 from __future__ import annotations
 
@@ -995,13 +1071,20 @@ def _file_source_scans(tree: ast.AST) -> str:
     return "ambiguous"
 
 
-def registration_check(repo_root_arg: str, new_test_file_relpath: str, readme_list_path: str,
-                        inventory_path: str) -> dict:
+def registration_check(repo_root_arg: str, new_test_file_relpath: str, readme_list_path: "str | None",
+                        inventory_path: "str | None") -> dict:
     """Decides the README/inventory registration items a new test file needs. Never raises and
     never mutates `readme_list_path`/`inventory_path`; a file that cannot be read or parsed still
     gets its README item (the filename is known regardless of parsing) plus a single
     manual-check-needed item in place of a guess about inventory registration -- never an inventory
-    item for a file that could not be parsed."""
+    item for a file that could not be parsed. `readme_list_path` and `inventory_path` are each
+    independently optional (`None` when the checkpoint has no README-list/inventory fixture at all):
+    when `readme_list_path` is `None`, a manual-check-needed item is emitted in place of the README
+    item instead of guessing whether it is already registered; the README item is otherwise always
+    emitted regardless of parsing. `inventory_path` being `None` behaves the same way for the
+    inventory side: if the new test file turns out to scan source anyway with no inventory path
+    given, a manual-check-needed item is emitted in place of an inventory item instead of raising on
+    a missing path."""
     full_path = Path(repo_root_arg) / new_test_file_relpath
 
     source = None
@@ -1023,16 +1106,32 @@ def registration_check(repo_root_arg: str, new_test_file_relpath: str, readme_li
 
     items = []
 
-    readme_line = f"python3 {new_test_file_relpath}"
-    if not _line_already_present(readme_list_path, readme_line):
-        items.append({"kind": "readme", "line": readme_line})
+    if readme_list_path is None:
+        items.append({
+            "kind": "manual-check-needed",
+            "detail": f"{new_test_file_relpath} needs to be registered in the README test list, "
+                      "but no README-list fixture path was given; cannot determine whether it is "
+                      "already registered",
+        })
+    else:
+        readme_line = f"python3 {new_test_file_relpath}"
+        if not _line_already_present(readme_list_path, readme_line):
+            items.append({"kind": "readme", "line": readme_line})
 
     if tree is not None:
         scan_verdict = _file_source_scans(tree)
         if scan_verdict == "scan":
-            basename = Path(new_test_file_relpath).name
-            if not _line_already_present(inventory_path, basename):
-                items.append({"kind": "inventory", "line": basename})
+            if inventory_path is None:
+                items.append({
+                    "kind": "manual-check-needed",
+                    "detail": f"{new_test_file_relpath} scans another file's source, but no "
+                              "inventory fixture path was given; cannot determine whether it is "
+                              "already registered in the test-scan inventory",
+                })
+            else:
+                basename = Path(new_test_file_relpath).name
+                if not _line_already_present(inventory_path, basename):
+                    items.append({"kind": "inventory", "line": basename})
         elif scan_verdict == "ambiguous":
             items.append({
                 "kind": "manual-check-needed",
@@ -1515,6 +1614,181 @@ def cmd_merge(argv: list) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------------------------------
+# `full`: a composed end-to-end subcommand that runs classify/repoint/registration/parity/hazard/
+# merge in one call for the common case -- one `move`, one `new_test_file` (CP7).
+# ------------------------------------------------------------------------------------------------
+
+_FULL_REQUIRED_CHECKPOINT_KEYS = ("files_likely", "done_when", "cases")
+
+
+def _repoint_line(finding: dict) -> str:
+    return f"Re-point {finding['file']}:{finding['line']} ({finding['category']}): {finding['detail']}"
+
+
+def _registration_line(item: dict) -> "str | None":
+    kind = item.get("kind")
+    if kind == "readme":
+        return f"Register in the README test list: {item['line']}"
+    if kind == "inventory":
+        return f"Register in the test-scan inventory: {item['line']}"
+    if kind == "manual-check-needed":
+        return f"Manual check needed (registration): {item['detail']}"
+    return None
+
+
+def _hazard_line(hazard_result: dict) -> "str | None":
+    if not hazard_result.get("hazard"):
+        return None
+    return f"Report-race hazard: {hazard_result['detail']}"
+
+
+def full_scan(fixture_root: str, checkpoint: dict) -> dict:
+    """Runs classify -> repoint (skipped if greenfield or move is null) -> registration (skipped
+    unless new_test_file is given and not greenfield; readme_list and inventory are each
+    independently optional -- when either is absent, registration_check still runs and substitutes a
+    manual-check-needed item in its place instead of silently skipping that side, and still emits
+    the other side normally) -> parity (always) -> hazard (skipped if no tests.command) ->
+    builds enumerated done_when lines from the findings above -> calls `merge_checkpoint`. Returns a
+    dict carrying every intermediate result plus the raw `merge_checkpoint` result (under
+    "merge_result") so the caller can decide how to report a refusal and whether/what to write back
+    to disk. Never raises for a well-formed checkpoint dict (one already confirmed, by the caller, to
+    carry files_likely/done_when/cases)."""
+    files_likely = checkpoint.get("files_likely") or []
+    done_when = checkpoint.get("done_when") or []
+    cases = checkpoint.get("cases") or []
+    move = checkpoint.get("move")
+    baseline = checkpoint.get("baseline")
+    tests = checkpoint.get("tests")
+    tests_command = tests.get("command") if isinstance(tests, dict) else None
+    readme_list = checkpoint.get("readme_list")
+    inventory = checkpoint.get("inventory")
+    new_test_file = checkpoint.get("new_test_file")
+
+    classify_result = classify(fixture_root, files_likely)
+    mode = classify_result["mode"]
+    reason = classify_result["reason"]
+    is_greenfield = mode == "greenfield-create"
+
+    repoint_result = None
+    if not is_greenfield and move:
+        repoint_result = repoint_scan(
+            fixture_root, move.get("module_from"), move.get("module_to"), move.get("symbol")
+        )
+
+    registration_result = None
+    if not is_greenfield and new_test_file:
+        readme_list_full_path = str(Path(fixture_root) / readme_list) if readme_list else None
+        inventory_full_path = str(Path(fixture_root) / inventory) if inventory else None
+        registration_result = registration_check(
+            fixture_root,
+            new_test_file,
+            readme_list_full_path,
+            inventory_full_path,
+        )
+
+    parity_result = parity_check(move, done_when, baseline)
+
+    if tests_command:
+        hazard_result = hazard_check(tests_command)
+    else:
+        hazard_result = {"hazard": False, "suites": [], "detail": ""}
+
+    enumerated_done_when = []
+    if repoint_result is not None:
+        for finding in repoint_result.get("findings", []):
+            enumerated_done_when.append(_repoint_line(finding))
+    if registration_result is not None:
+        for item in registration_result.get("items", []):
+            line = _registration_line(item)
+            if line is not None:
+                enumerated_done_when.append(line)
+    for item in parity_result.get("items", []):
+        if not item.get("already_present"):
+            enumerated_done_when.append(item["line"])
+    hazard_line = _hazard_line(hazard_result)
+    if hazard_line is not None:
+        enumerated_done_when.append(hazard_line)
+
+    enumerated_items = {"done_when": enumerated_done_when, "cases": []}
+    merge_result = merge_checkpoint({"done_when": done_when, "cases": cases}, enumerated_items)
+
+    return {
+        "mode": mode,
+        "reason": reason,
+        "repoint": repoint_result,
+        "registration": registration_result,
+        "parity": parity_result,
+        "hazard": hazard_result,
+        "merge_result": merge_result,
+    }
+
+
+def cmd_full(argv: list) -> int:
+    if not argv or argv[0].startswith("--"):
+        _usage_error("full requires a <fixture_root> argument")
+        return 2  # unreachable; _usage_error exits
+    fixture_root, rest = argv[0], argv[1:]
+
+    checkpoint_path = None
+    i = 0
+    while i < len(rest):
+        flag = rest[i]
+        if flag == "--checkpoint" and i + 1 < len(rest):
+            checkpoint_path = rest[i + 1]
+            i += 2
+        else:
+            _usage_error(f"unrecognized or incomplete argument: {flag}")
+            return 2  # unreachable; _usage_error exits
+    if not checkpoint_path:
+        _usage_error("full requires --checkpoint <checkpoint_json_path>")
+        return 2  # unreachable; _usage_error exits
+
+    checkpoint_file = Path(checkpoint_path)
+    try:
+        raw = checkpoint_file.read_text()
+    except OSError as exc:
+        _usage_error(f"--checkpoint file '{checkpoint_path}' could not be read: {exc}")
+        return 2  # unreachable; _usage_error exits
+    try:
+        checkpoint_data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        _usage_error(f"--checkpoint file '{checkpoint_path}' is not valid JSON: {exc}")
+        return 2  # unreachable; _usage_error exits
+    if not isinstance(checkpoint_data, dict):
+        _usage_error(f"--checkpoint file '{checkpoint_path}' must contain a JSON object")
+        return 2  # unreachable; _usage_error exits
+    missing = [k for k in _FULL_REQUIRED_CHECKPOINT_KEYS if k not in checkpoint_data]
+    if missing:
+        _usage_error(
+            f"--checkpoint file '{checkpoint_path}' is missing required key(s): " + ", ".join(missing)
+        )
+        return 2  # unreachable; _usage_error exits
+
+    result = full_scan(fixture_root, checkpoint_data)
+    merge_result = result["merge_result"]
+    if not merge_result["ok"]:
+        print(json.dumps(merge_result["refused"]), file=sys.stderr)
+        return 3
+
+    merged = merge_result["merged"]
+    checkpoint_data["done_when"] = merged["done_when"]
+    checkpoint_data["cases"] = merged["cases"]
+    checkpoint_file.write_text(json.dumps(checkpoint_data, indent=2) + "\n")
+
+    output = {
+        "mode": result["mode"],
+        "reason": result["reason"],
+        "repoint": result["repoint"],
+        "registration": result["registration"],
+        "parity": result["parity"],
+        "hazard": result["hazard"],
+        "merged": merged,
+    }
+    print(json.dumps(output))
+    return 0
+
+
 SUBCOMMANDS = {
     "classify": cmd_classify,
     "repoint": cmd_repoint,
@@ -1522,6 +1796,7 @@ SUBCOMMANDS = {
     "parity": cmd_parity,
     "hazard": cmd_hazard,
     "merge": cmd_merge,
+    "full": cmd_full,
 }
 
 
