@@ -124,7 +124,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import traceback
 from pathlib import Path
 
@@ -132,6 +131,9 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 FIXTURES = HERE / "fixtures"
 PLANNER_DOC = ROOT / "agents" / "ratchet-checkpoint-planner.md"
+
+sys.path.insert(0, str(HERE))
+import _tmp  # noqa: E402
 
 IMPACT_SCRIPT = ROOT / "skills" / "ratchet-checkpoint-planner" / "scripts" / "impact_analysis.py"
 
@@ -157,7 +159,7 @@ def fresh_fixture(name: str):
     tree this file and every other test run shares. Returns (fixture_root, checkpoint_json_path,
     cleanup_callable)."""
     src = FIXTURES / f"impact_analysis_{name}"
-    tmp = Path(tempfile.mkdtemp(prefix=f"cp7_{name}_"))
+    tmp = Path(_tmp.mkdtemp(prefix=f"cp7_{name}_"))
     dest = tmp / "fixture"
     shutil.copytree(src, dest)
     checkpoint_path = dest / "checkpoint.json"
