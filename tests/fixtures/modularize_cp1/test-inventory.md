@@ -25,9 +25,9 @@ module directly, can itself contain the pattern strings as embedded constants an
 match; this doc's counts were taken right after `rm -rf tests/__pycache__
 tests/shortcuts/__pycache__`.)
 
-46 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
+47 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
 files the brief names explicitly (`test_quota_shared.py`, `test_discover_paid.py`, Kind 4 below)
-that carry the identical real obligation but don't literally match either regex today — **48
+that carry the identical real obligation but don't literally match either regex today — **49
 files total**, consistent with the brief's "43+".
 
 ## Kind 1 — module-load only (loads ratchet.py dynamically via `importlib.util.spec_from_file_location`,
@@ -148,7 +148,7 @@ tree, never loads it as a module itself): 6 files
   module dynamically via `spec_from_file_location` itself, so it matches only the source-text/AST
   pattern, not the module-load one.
 
-## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 9 files
+## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 10 files
 
 - `test_trust_cp4.py` — trust-holes CP4: agent-set overrides no longer bypass checks. Loads
   ratchet.py dynamically (`ratchet_engine_slow_hook`) AND reads `ENGINE.read_text()` +
@@ -239,6 +239,19 @@ tree, never loads it as a module itself): 6 files
   both that live text and the pinned pre-move commit's text (via `git show`) to compare each of
   the 25 names' body byte-for-byte, find leftover top-level `def`s, check for star imports and
   import cycles, and confirm no new module-level mutable registry was introduced.
+- `test_modularize_cp8.py` — CP8: the plain-language status/next-action/blocked-options rendering
+  (`plain_reason`/`blocked_options`/`plain_now`/`waiting_question`/`question_line`/
+  `exit_code_only_line`/`exit_code_only_note`/the done-means-link helpers — `_lines_word`/
+  `done_means_table`/`_finish_block_lines`/`_finish_blockers`/`_finish_held`/`_finish_legacy_note`/
+  `_finish_integrity_lines`/`_unproven_finish_lines`/`_accepted_lines`/`_apply_accepted_lines`)
+  move verbatim into `status_text.py`; `cmd_status_text`/`cmd_plan_summary`/`next_action` stay thin
+  handlers in ratchet.py. Loads ratchet.py dynamically inside a generated `REBASELINE` snippet
+  (`spec_from_file_location`, the same `record_chain`-rebaselining fixture pattern
+  `test_dm_table.py`/`test_dm_finish.py` already establish) to re-baseline throwaway projects'
+  integrity chain after a hand-edited state.json fixture. Separately reads `ENGINE.read_text()` and
+  `ast.parse`/`ast.walk`s both that live text and the pinned pre-move commit's text (via `git show`)
+  to compare each of the 17 names' body byte-for-byte, find leftover top-level `def`s, check for
+  star imports and import cycles, and confirm no new module-level mutable registry was introduced.
 
 ## Kind 4 — brief-named, but don't literally match either live-grep pattern today: 2 files
 
