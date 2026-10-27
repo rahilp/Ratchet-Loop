@@ -503,9 +503,12 @@ def cp1_adv_round3_fixes():
 
 
 class deny_writes:
-    """The OS refusing writes (still allowing reads) to some crash-state paths, on every OS: every crash-state write in
-    the engine goes through its module-level open(), which this replaces for the duration. Applies to the hook and
-    to readers in this process alike, as a real permission problem would."""
+    """The OS refusing writes (still allowing reads) to some crash-state paths, on every OS: the crash MARKER write
+    (_record_hook_run, still in ratchet.py) goes through its module-level open(), which this replaces for the
+    duration. The "unsaved log" and "error log" writes go through records.py's own _append_record instead, whose
+    bare `open(path, "a", ...)` call resolves against records.py's own globals, not `m`'s, so that module's own
+    open() is patched too. Applies to the hook and to readers in this process alike, as a real permission problem
+    would."""
 
     def __init__(self, m, paths):
         self.m, self.paths = m, [Path(p).resolve() for p in paths]
@@ -521,10 +524,15 @@ class deny_writes:
                     raise PermissionError(13, "Permission denied (test)", str(file))
             return real(file, mode, *a, **k)
         self.m.open = fake
+        self.records_mod = sys.modules.get("records")
+        if self.records_mod is not None:
+            self.records_mod.open = fake
         return self
 
     def __exit__(self, *exc):
         del self.m.open
+        if self.records_mod is not None:
+            del self.records_mod.open
 
 
 def crash_in_process(m, d):
@@ -675,8 +683,13 @@ def cp1_adv_round4_fixes():
 
 def heartbeat_with_interleaved_crash(m, root, host, event, during):
     """Run one _heartbeat (a hook's read-modify-write of hook-heartbeat.json) and, right after it reads the file and
-    before it writes its stale copy back, run `during()`: the exact race in round 5's finding."""
+    before it writes its stale copy back, run `during()`: the exact race in round 5's finding.
+    _heartbeat calls update_record with a string `damaged`, so update_record (records.py, since CP4) does the
+    actual read itself, as the bare name `read_json` resolved against records.py's own globals, not `m`'s --
+    patching `m.read_json` alone would never see it. Patch both `m.read_json` and records.py's own `read_json`."""
     real, fired, hb = m.read_json, [], (Path(root) / ".ratchet" / "hook-heartbeat.json").resolve()
+    records_mod = sys.modules.get("records")
+    real_records_read_json = records_mod.read_json if records_mod is not None else None
 
     def wrapped(p, *a, **k):
         out = real(p, *a, **k)
@@ -685,10 +698,14 @@ def heartbeat_with_interleaved_crash(m, root, host, event, during):
             during()
         return out
     m.read_json = wrapped
+    if records_mod is not None:
+        records_mod.read_json = wrapped
     try:
         m._heartbeat(Path(root), event, host)
     finally:
         m.read_json = real
+        if records_mod is not None:
+            records_mod.read_json = real_records_read_json
     return bool(fired)
 
 
@@ -705,6 +722,11 @@ _CHILD_HOOK = (
     "            raise PermissionError(13, 'Permission denied (test)', str(file))\n"
     "        return real(file, mode, *a, **k)\n"
     "    m.open = fake\n"
+    # the 'unsaved log'/'error log' writes go through records.py's own _append_record, whose bare open(...)
+    # resolves against records.py's own globals, not m's -- patch that module's open() too, when it is loaded.
+    "    _rm = sys.modules.get('records')\n"
+    "    if _rm is not None:\n"
+    "        _rm.open = fake\n"
     "sys.stdin = io.StringIO(payload)\n"
     "Path(ready).touch()\n"
     "while not os.path.exists(go):\n"
@@ -794,6 +816,8 @@ def cp1_adv_round6_heartbeat_atomic():
     # --- X17: the X16 flake's root cause, made deterministic: at the moment _heartbeat opens a file to write, the
     # heartbeat another hook would read must still be whole JSON (open(p, "w") truncated it to empty, and a
     # concurrent stop hook's read of that empty file died and crashed it) -------------------------------------------
+    # the actual write goes through records.py's own _write_record (update_record's write, since CP4), whose bare
+    # `open(...)` call resolves against records.py's own globals, not `m`'s -- patch that module's `open` too.
     import builtins
     env = make_env("claude")
     d = project(env)
@@ -801,6 +825,7 @@ def cp1_adv_round6_heartbeat_atomic():
     with engine_env(env):
         m._heartbeat(root, "guard", "claude")
     real, seen = builtins.open, []
+    records_mod = sys.modules.get("records")
 
     def watching(file, mode="r", *a, **k):
         f = real(file, mode, *a, **k)
@@ -811,11 +836,15 @@ def cp1_adv_round6_heartbeat_atomic():
                 seen.append(False)
         return f
     m.open = watching
+    if records_mod is not None:
+        records_mod.open = watching
     try:
         with engine_env(env):
             m._heartbeat(root, "stop", "claude")
     finally:
         del m.open
+        if records_mod is not None:
+            del records_mod.open
     hb = json.loads(hb_path(d).read_text())
     leftovers = [n for n in os.listdir(root / ".ratchet") if n.startswith("hook-heartbeat.json.")]
     check("[CP1-X17] a hook rewriting hook-heartbeat.json never leaves it truncated or half-written for a concurrent "

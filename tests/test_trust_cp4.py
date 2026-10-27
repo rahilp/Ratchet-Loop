@@ -456,25 +456,33 @@ SECTIONS.append(("CP4", cp4_adv_round1_role_backstop))
 class cp4y_deny_hook_env:
     """The OS refusing writes of .ratchet/hook-env.json (and its temp file) only, through the engine's own
     _write_record (record_hook_env's writes), as deny_writes does for the crash-state paths.
-    record_hook_env lives in ratchet.py and calls _write_record by the name it imported from records.py, so
-    patching that name on the engine module `m` intercepts those calls regardless of which file _write_record's
-    own body now lives in -- the same pattern write_fails() uses in test_lanes_start_extra.py."""
+    record_hook_env moved into run_records.py in CP6 and calls _write_record as the bare name it imported
+    from records.py, so that call resolves against run_records.py's own globals, not `m`'s -- patching `m`
+    alone would never see it. Patch both `m._write_record` and run_records.py's own `_write_record`, the same
+    dual-patch pattern write_fails() uses in test_lanes_start_extra.py."""
 
     def __init__(self, m):
         self.m = m
 
     def __enter__(self):
         self.real = self.m._write_record
+        run_records_mod = sys.modules.get("run_records")
+        self.real_run_records = run_records_mod._write_record if run_records_mod is not None else None
 
         def fake(path, *a, **k):
             if Path(path).name.startswith("hook-env.json"):
                 raise PermissionError(13, "Permission denied (test)", str(path))
             return self.real(path, *a, **k)
         self.m._write_record = fake
+        if run_records_mod is not None:
+            run_records_mod._write_record = fake
         return self
 
     def __exit__(self, *exc):
         self.m._write_record = self.real
+        run_records_mod = sys.modules.get("run_records")
+        if run_records_mod is not None:
+            run_records_mod._write_record = self.real_run_records
 
 
 def cp4y_guard_in_process(m, d, command):

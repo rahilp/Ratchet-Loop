@@ -40,6 +40,11 @@ RECORDS = ENGINE.with_name("records.py")
 # provider discovery/quota moved out of ratchet.py into this sibling module; a structural scan of "ratchet.py's
 # source" for that machinery now needs this file's text too.
 PROVIDER_DISCOVERY = ENGINE.with_name("provider_discovery.py")
+# [CP6] register_active, hook_env_problem, require_hook_env, approval_snapshot, integrity_problems,
+# verify_integrity and the rest of run bookkeeping/hook-env trust/integrity verification moved out of
+# ratchet.py into this sibling module; a structural scan of "ratchet.py's source" for that machinery now needs
+# this file's text too.
+RUN_RECORDS = ENGINE.with_name("run_records.py")
 PASS = FAIL = 0
 VENDOR = {"claude": "anthropic", "codex": "openai", "gemini": "google", "copilot": "github"}
 

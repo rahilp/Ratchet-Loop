@@ -25,9 +25,9 @@ module directly, can itself contain the pattern strings as embedded constants an
 match; this doc's counts were taken right after `rm -rf tests/__pycache__
 tests/shortcuts/__pycache__`.)
 
-44 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
+45 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
 files the brief names explicitly (`test_quota_shared.py`, `test_discover_paid.py`, Kind 4 below)
-that carry the identical real obligation but don't literally match either regex today — **46
+that carry the identical real obligation but don't literally match either regex today — **47
 files total**, consistent with the brief's "43+".
 
 ## Kind 1 — module-load only (loads ratchet.py dynamically via `importlib.util.spec_from_file_location`,
@@ -132,7 +132,7 @@ tree, never loads it as a module itself): 5 files
   `git merge-base HEAD main` copy), walking for specific `FunctionDef`s to prove this lane didn't
   need to touch them. Never inspects ratchet.py itself or loads a module.
 
-## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 8 files
+## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 9 files
 
 - `test_trust_cp4.py` — trust-holes CP4: agent-set overrides no longer bypass checks. Loads
   ratchet.py dynamically (`ratchet_engine_slow_hook`) AND reads `ENGINE.read_text()` +
@@ -207,6 +207,22 @@ tree, never loads it as a module itself): 5 files
   `git show`) to compare each of the 16 names' body byte-for-byte, find leftover top-level
   `def`s, check for star imports and import cycles, and confirm no new module-level mutable
   registry was introduced.
+- `test_modularize_cp6.py` — CP6: run bookkeeping, hook-env and integrity checks (`_set_blocked`/
+  `ratchet_home`/the hook-env path & record helpers — `_hook_env_path`/`_same_path`/
+  `_current_hook_env`/`_hook_role`/`_hook_env_records`/`_combined_hook_env` —/`record_hook_env`/
+  `hooks_installed_anywhere`/`hooks_in_use`/`hook_env_problem`/`require_hook_env`/the active-run
+  marker helpers — `_markers_path`/`_restriction_record_damaged`/`_active_runs_repair`/
+  `_active_marker` —/`register_active`/the reply classifiers — `choice_letter`/`message_intent`/
+  `hooks_waive_intent`/`is_listed_yes` —/the integrity helpers — `approval_snapshot`/
+  `integrity_problems`/`verify_integrity`) move verbatim into `run_records.py`. Loads ratchet.py
+  dynamically both directly (`spec_from_file_location`, CP6-T16's module-attribute check) and
+  via `cp5y_load_engine`/a pinned-source equivalent (`_pinned_module`, its own
+  `spec_from_file_location` call against a throwaway copy of the pinned pre-move source written
+  into the real scripts folder) for its in-process `record_hook_env`/`register_active`/reply-
+  classifier/busy-lock checks. Separately reads `ENGINE.read_text()` and `ast.parse`/`ast.walk`s
+  both that live text and the pinned pre-move commit's text (via `git show`) to compare each of
+  the 25 names' body byte-for-byte, find leftover top-level `def`s, check for star imports and
+  import cycles, and confirm no new module-level mutable registry was introduced.
 
 ## Kind 4 — brief-named, but don't literally match either live-grep pattern today: 2 files
 

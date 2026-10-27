@@ -356,7 +356,7 @@ def t04_providers_output_unchanged():
         return
     d_pinned = Path(_tmp.mkdtemp(prefix="cp5-t04-pinned-"))
     shutil.copytree(d_current, d_pinned, dirs_exist_ok=True)
-    pinned_script = SCRIPT_DIR / f"_cp5_t04_pinned_{os.getpid()}.py"
+    pinned_script = SCRIPT_DIR / f"_cp5_t04_pinned_{os.getpid()}.py.tmp"
     pinned_script.write_text(pinned_src)
     try:
         current_out = _run_providers_fixture(ENGINE, d_current, env, log_path)
@@ -491,7 +491,7 @@ def t05_help_status_hook_exit_codes_unchanged():
             d_pin = Path(_tmp.mkdtemp(prefix="cp5-t05-status-pin-"))
             shutil.copytree(d_base, d_cur, dirs_exist_ok=True)
             shutil.copytree(d_base, d_pin, dirs_exist_ok=True)
-            pinned_script_t05 = SCRIPT_DIR / f"_cp5_t05_pinned_{os.getpid()}.py"
+            pinned_script_t05 = SCRIPT_DIR / f"_cp5_t05_pinned_{os.getpid()}.py.tmp"
             pinned_script_t05.write_text(pinned_src_t05)
             try:
                 r_cur = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(d_cur),

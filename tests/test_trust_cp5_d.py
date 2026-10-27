@@ -840,7 +840,11 @@ def cp5_adv_round11_damaged_record_class():
     # probe_provider, event_stream and the rest of provider discovery/quota live in provider_discovery.py since
     # the modularize-engine run's CP5; merge it in too, for the same reason fp_src and rec_src are merged in above.
     pd_src = ENGINE.with_name("provider_discovery.py").read_text(encoding="utf-8")
-    bad = cp5r11_io_violations(src + "\n" + fp_src + "\n" + rec_src + "\n" + pd_src)
+    # register_active, hook_env_problem and the rest of run bookkeeping/hook-env trust/integrity verification
+    # live in run_records.py since the modularize-engine run's CP6; merge it in too, for the same reason
+    # fp_src/rec_src/pd_src are merged in above.
+    rr_src = ENGINE.with_name("run_records.py").read_text(encoding="utf-8")
+    bad = cp5r11_io_violations(src + "\n" + fp_src + "\n" + rec_src + "\n" + pd_src + "\n" + rr_src)
     check("[CP5-X60] ratchet.py reads JSON files only through _read_record (read_json without `record=` only for "
           "files people or agents write) and writes files only through _write_record / _append_record, apart from "
           "a short allow-list of files that are not Ratchet's records",
