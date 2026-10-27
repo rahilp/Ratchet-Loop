@@ -16,10 +16,11 @@ ratchet.py as the stable, thin entry point.
   `touches_ui`, `_head_commit_named`, `_commit_reviewed`) used by `behavior`, `complete`, `approve-plan`,
   `changes`, `human-approve`, `reviewers`, `spec`, `guardrail`, `mark-fixed` and every other command that must
   tell whether a checkpoint's reviewed code still matches the code on disk.
-- **`records.py`** -- tamper-evidence record read/write/append and the per-record lock (`_read_record`,
-  `_write_record`, `update_record`, `record_chain`, `append_recorded`, `chain_problem`, `verify_chain`) used by
-  `accept-state` directly, and reached from almost every other command through `engine_utils.py`'s
-  `read_json`/`write_json` wrappers whenever a run record is touched.
+- **`records.py`** -- owns tamper-evidence record read/write/append and the per-record lock, through its own
+  dedicated path (`_read_record`, `_write_record`, `update_record`, `record_chain`, `append_recorded`,
+  `chain_problem`, `verify_chain`), used by `accept-state` directly and by almost every other command whenever
+  a run record is touched. This is separate from `engine_utils.py`'s plain `read_json`/`write_json`, which
+  handle ordinary (non-tamper-evidence) JSON files such as config and checkpoint data.
 - **`provider_discovery.py`** -- reviewer-provider discovery, probing, quota and fallback bookkeeping
   (`probe_provider`, `provider_bench`, `quota_failure`, `review_succeeded`, `shared_unavailable`,
   `event_stream`) used by the `providers` command and by the reviewer-selection path every adversarial review
