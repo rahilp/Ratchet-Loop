@@ -6,9 +6,9 @@ Called as a plain OS subprocess (never imported in-process) by the planner agent
 while it is writing a run's checkpoints.json, so it can tell a greenfield checkpoint (only new files)
 apart from a brownfield one (touches something that already exists) and, for brownfield/ambiguous
 checkpoints, enumerate the predictable re-point/registration/parity consequences of the change up
-front. This file is a small subcommand dispatcher; it currently implements `classify`, `repoint`
-and `registration`. Later checkpoints (CP4-CP7) add `parity`, `merge` and an end-to-end subcommand
-that composes them -- this module stays stdlib-only (standards.md #1) and out of
+front. This file is a small subcommand dispatcher; it currently implements `classify`, `repoint`,
+`registration`, `parity` and `hazard`. Later checkpoints (CP5-CP7) add `merge` and an end-to-end
+subcommand that composes them -- this module stays stdlib-only (standards.md #1) and out of
 skills/ratchet-orchestrator/scripts/, which lane M owns.
 
 ------------------------------------------------------------------------------------------ `repoint`
@@ -117,6 +117,50 @@ Exit code 0 for every successful run, including every file that could not be par
 reserved for a genuine usage error (missing positional argument, or a missing
 --readme-list/--inventory flag). Read-only and idempotent: never writes to --readme-list/--inventory,
 and two runs against the same unchanged inputs produce identical items.
+
+----------------------------------------------------------------------------------------- `parity`
+Usage:
+
+    python3 impact_analysis.py parity
+
+No positional arguments. stdin: a single JSON object `{"move": null|{"symbol",
+"module_from", "module_to"}, "done_when": [...], "baseline": null|{"module", "startup_ms",
+"threshold_pct"}}`. A checkpoint is an extraction only when `move` is present and
+`module_from != module_to` (both non-empty) -- a same-module rename or a null move is not. stdout:
+`{"is_extraction": bool, "items": [...]}`; `items` is always `[]` when not an extraction, else always
+exactly one `"startup-parity"` item and one `"behavior-parity"` item, each carrying a human-readable
+`line` and an `already_present` flag set by a case-insensitive substring match against `done_when`
+("startup"+"parity" for the first, "byte-identical"+("parity"|"behavior") for the second) -- never
+duplicated or dropped. See tests/test_impact_analysis_parity_hazard.py's module docstring for this
+subcommand's full CLI contract.
+
+----------------------------------------------------------------------------------------- `hazard`
+Usage:
+
+    python3 impact_analysis.py hazard
+
+No positional arguments. stdin: `{"tests_command": "<string>"}`. A pure text-pattern count of
+`python3`/`python <path>.py` suite invocations in the string (split on `&&`/`;`/`||`); stdout:
+`{"hazard": bool, "suites": [...], "detail": str}`, where `hazard` is true exactly when two or more
+suite invocations are found (so a lone suite, including `tests/run_all.py` alone, never hazards, but
+pairing it with one more suite still does). Never raises, including on an empty or suite-less
+string. See tests/test_impact_analysis_parity_hazard.py's module docstring for this subcommand's
+full CLI contract.
+
+Interpreter recognition covers bare `python`/`python3`, a versioned form (`python3.12`), and an
+absolute/relative path-prefixed form (`/usr/bin/python3`). Each shell segment is tokenized with
+`shlex.split` (falling back to a plain whitespace split on a `ValueError` from unbalanced quotes,
+etc., so this never raises). After the interpreter token, `-W`/`-X` each consume the next token as
+their own argument; `-m`/`-c` mean no script path follows in this invocation at all (the scan for
+that segment ends with no suite found); every other dash-prefixed token is a bare flag with no
+argument. The first non-dash token reached after all flags are consumed is the candidate script
+path, counted as a suite only when it ends in `.py`.
+
+Known limits (intentionally out of scope, so a reviewer judges against this stated bar instead of
+finding another untested spelling): an environment-variable prefix on the invocation (e.g. `FOO=bar
+python3 ...`); an alternate launcher (`env python3 ...`, `uv run ...`, `py -3 ...`); a subshell or a
+pipe; and `-m pytest`-style module invocation -- already excluded by the `-m`/`-c` handling above,
+called out here explicitly as intentional rather than an oversight.
 """
 from __future__ import annotations
 
@@ -124,6 +168,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -960,10 +1005,205 @@ def cmd_registration(argv: list) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------------------------------
+# `parity`: attach standing startup-parity/behavior-parity gate items to an extraction checkpoint
+# (CP4).
+# ------------------------------------------------------------------------------------------------
+
+_DEFAULT_STARTUP_THRESHOLD_PCT = 10
+
+
+def _is_extraction_move(move: "dict | None") -> bool:
+    """True only when `move` names a symbol leaving one module for a DIFFERENT one -- a same-module
+    rename (module_from == module_to) or a null move (no move at all, e.g. an in-place edit or a
+    greenfield-create checkpoint) is never an extraction."""
+    if not move:
+        return False
+    module_from = move.get("module_from") or ""
+    module_to = move.get("module_to") or ""
+    return bool(module_from) and bool(module_to) and module_from != module_to
+
+
+def _startup_threshold_pct(baseline: "dict | None") -> int:
+    """The stated percent threshold the emitted startup-parity item's line names: the baseline's own
+    `threshold_pct` when a baseline was supplied, else this module's fixed default -- the pass never
+    silently omits a number."""
+    if isinstance(baseline, dict) and "threshold_pct" in baseline:
+        try:
+            return int(baseline["threshold_pct"])
+        except (TypeError, ValueError):
+            return _DEFAULT_STARTUP_THRESHOLD_PCT
+    return _DEFAULT_STARTUP_THRESHOLD_PCT
+
+
+def _done_when_already_asks_for(done_when: list, required_substrings: tuple) -> bool:
+    """True when some done_when line, case-insensitively, contains every substring in
+    `required_substrings` -- the shared rule both parity items' `already_present` flags use."""
+    for line in done_when or []:
+        lowered = str(line).lower()
+        if all(sub in lowered for sub in required_substrings):
+            return True
+    return False
+
+
+def parity_check(move: "dict | None", done_when: "list | None", baseline: "dict | None") -> dict:
+    """Decides whether a checkpoint description is an extraction and, if so, the standing
+    startup-parity and behavior-parity items it must always carry -- attached fresh on every run,
+    never duplicated when done_when already asks for one and never dropped when it doesn't. Never
+    raises; every input shape produces a verdict dict."""
+    done_when = list(done_when or [])
+    if not _is_extraction_move(move):
+        return {"is_extraction": False, "items": []}
+
+    module_from = move.get("module_from") or ""
+    module_to = move.get("module_to") or ""
+    symbol = move.get("symbol") or "the moved symbol"
+    threshold_pct = _startup_threshold_pct(baseline)
+
+    startup_line = (
+        f"Startup-parity: importing {module_to} costs within {threshold_pct}% of the baseline "
+        f"import/startup time previously recorded for {module_from}."
+    )
+    behavior_line = (
+        f"Behavior-parity: {symbol}'s behavior after moving from {module_from} to {module_to} is "
+        f"verified byte-identical across the existing test inputs."
+    )
+
+    items = [
+        {
+            "kind": "startup-parity",
+            "line": startup_line,
+            "already_present": _done_when_already_asks_for(done_when, ("startup", "parity")),
+        },
+        {
+            "kind": "behavior-parity",
+            "line": behavior_line,
+            "already_present": _done_when_already_asks_for(
+                done_when, ("byte-identical", "parity")
+            ) or _done_when_already_asks_for(done_when, ("byte-identical", "behavior")),
+        },
+    ]
+    return {"is_extraction": True, "items": items}
+
+
+def cmd_parity(argv: list) -> int:
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as exc:
+        _usage_error(f"parity requires valid JSON on stdin: {exc}")
+        return 2  # unreachable; _usage_error exits
+    if not isinstance(data, dict):
+        data = {}
+    result = parity_check(data.get("move"), data.get("done_when"), data.get("baseline"))
+    print(json.dumps(result))
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------
+# `hazard`: flag a planned tests.command that would combine two or more report-writing suites in
+# one invocation, risking a shared RATCHET_TEST_REPORT file race (CP4).
+# ------------------------------------------------------------------------------------------------
+
+_HAZARD_SPLIT_PATTERN = re.compile(r"&&|\|\||;")
+# Bare python/python3, a versioned form (python3.12), or a path-prefixed form (/usr/bin/python3,
+# ./venv/bin/python). Anchored at both ends so e.g. "python-config" is correctly excluded.
+_HAZARD_INTERPRETER_PATTERN = re.compile(r"(?:.*/)?python(?:\d+(?:\.\d+)*)?$")
+
+# Flags that consume the NEXT token as their own argument (not a script path).
+_HAZARD_ARG_TAKING_FLAGS = {"-W", "-X"}
+# Flags that mean this invocation launches a module or inline code, not a .py file: no script path
+# follows at all, so the scan for this segment ends here with no suite found.
+_HAZARD_NO_SCRIPT_FLAGS = {"-m", "-c"}
+
+
+def _tokenize_segment(segment: str) -> list:
+    """Tokenizes one shell segment with `shlex.split` (so a quoted argument stays one token);
+    falls back to a plain whitespace split on a `ValueError` (unbalanced quotes, etc.) so this
+    helper never raises regardless of input, per the module docstring's never-raises contract."""
+    try:
+        return shlex.split(segment)
+    except ValueError:
+        return segment.split()
+
+
+def _hazard_suites_in_segment(segment: str) -> list:
+    """Token-aware scan of one shell segment for `python`/`python3`/`python3.12`/path-prefixed
+    suite invocations. After an interpreter token, each remaining token is classified by a small
+    flag table (see `_HAZARD_ARG_TAKING_FLAGS`/`_HAZARD_NO_SCRIPT_FLAGS`): `-W`/`-X` each consume
+    the next token as their own argument and are skipped along with it; `-m`/`-c` end the scan for
+    this segment with no suite found; every other dash-prefixed token is a bare flag with no
+    argument and is skipped on its own. The first non-dash token reached after all flags are
+    consumed is the candidate script path, counted as a suite only when it ends in `.py`."""
+    tokens = _tokenize_segment(segment)
+    suites = []
+    i = 0
+    while i < len(tokens):
+        if _HAZARD_INTERPRETER_PATTERN.match(tokens[i]):
+            j = i + 1
+            script = None
+            while j < len(tokens):
+                tok = tokens[j]
+                if tok in _HAZARD_ARG_TAKING_FLAGS:
+                    j += 2
+                    continue
+                if tok in _HAZARD_NO_SCRIPT_FLAGS:
+                    j = len(tokens)
+                    break
+                if tok.startswith("-"):
+                    j += 1
+                    continue
+                script = tok
+                j += 1
+                break
+            if script is not None and script.endswith(".py"):
+                suites.append(script)
+            i = j
+        else:
+            i += 1
+    return suites
+
+
+def hazard_check(tests_command: "str | None") -> dict:
+    """Pure text-pattern count of `python3`/`python <path>.py` suite invocations in
+    `tests_command`, after splitting it on the shell list separators `&&`/`;`/`||`. Never executes
+    the command, never touches the filesystem, and never raises -- an empty or suite-less string
+    simply yields zero suites. `hazard` is true exactly when two or more suite invocations are
+    found, including a lone fixed multi-suite runner (e.g. tests/run_all.py) paired with one more
+    suite beside it; a single invocation (one suite alone, or the runner alone) is never a hazard."""
+    tests_command = tests_command or ""
+    suites = []
+    for segment in _HAZARD_SPLIT_PATTERN.split(tests_command):
+        suites.extend(_hazard_suites_in_segment(segment))
+    hazard = len(suites) >= 2
+    detail = (
+        "This tests.command invokes more than one report-writing suite in a single run, risking a "
+        "shared RATCHET_TEST_REPORT file race: " + ", ".join(suites)
+    ) if hazard else ""
+    return {"hazard": hazard, "suites": suites, "detail": detail}
+
+
+def cmd_hazard(argv: list) -> int:
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as exc:
+        _usage_error(f"hazard requires valid JSON on stdin: {exc}")
+        return 2  # unreachable; _usage_error exits
+    if not isinstance(data, dict) or "tests_command" not in data:
+        _usage_error("hazard requires stdin JSON with a 'tests_command' key")
+        return 2  # unreachable; _usage_error exits
+    result = hazard_check(data.get("tests_command"))
+    print(json.dumps(result))
+    return 0
+
+
 SUBCOMMANDS = {
     "classify": cmd_classify,
     "repoint": cmd_repoint,
     "registration": cmd_registration,
+    "parity": cmd_parity,
+    "hazard": cmd_hazard,
 }
 
 

@@ -1,0 +1,7 @@
+{
+  "_comment": "CP4 fixture: foo is renamed/moved within pkg.module_a itself -- a local move, never leaving that module -- so this must NOT be classified as an extraction.",
+  "move": {"symbol": "foo", "module_from": "pkg.module_a", "module_to": "pkg.module_a"},
+  "done_when": [
+    "foo (renamed from _legacy_foo) is used by every caller inside pkg.module_a"
+  ]
+}

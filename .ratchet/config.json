@@ -13,7 +13,7 @@
       "codex"
     ]
   },
-  "regression_command": "python3 tests/run_all.py tests/test_impact_analysis_mode.py tests/test_impact_analysis_repoint.py tests/test_impact_analysis_registration.py tests/test_docs.py --workers 2",
+  "regression_command": "python3 tests/run_all.py tests/test_impact_analysis_mode.py tests/test_impact_analysis_repoint.py tests/test_impact_analysis_registration.py tests/test_impact_analysis_parity_hazard.py tests/test_docs.py --workers 2",
   "commit_per_checkpoint": true,
   "design_md": "DESIGN.md",
   "standards": [

@@ -1,0 +1,11 @@
+{
+  "_comment": "CP4 fixture: a greenfield-create checkpoint -- files_likely are all brand-new paths, nothing existing touched, and there is no symbol move at all.",
+  "move": null,
+  "done_when": [
+    "the new pkg/widget_thing.py module exposes a working create_widget() function"
+  ],
+  "files_likely": [
+    "pkg/widget_thing.py",
+    "tests/test_widget_thing.py"
+  ]
+}
