@@ -6,9 +6,9 @@ Called as a plain OS subprocess (never imported in-process) by the planner agent
 while it is writing a run's checkpoints.json, so it can tell a greenfield checkpoint (only new files)
 apart from a brownfield one (touches something that already exists) and, for brownfield/ambiguous
 checkpoints, enumerate the predictable re-point/registration/parity consequences of the change up
-front. This file is a small subcommand dispatcher; CP1 implements only the `classify` subcommand.
-Later checkpoints (CP2-CP7) add `repoint`, `registration`, `parity`, `merge` and an end-to-end
-subcommand that composes them -- this module stays stdlib-only (standards.md #1) and out of
+front. This file is a small subcommand dispatcher; it currently implements `classify`, `repoint`
+and `registration`. Later checkpoints (CP4-CP7) add `parity`, `merge` and an end-to-end subcommand
+that composes them -- this module stays stdlib-only (standards.md #1) and out of
 skills/ratchet-orchestrator/scripts/, which lane M owns.
 
 ------------------------------------------------------------------------------------------ `repoint`
@@ -65,6 +65,58 @@ never used just because the repo root could not be read or the list was empty.
 Fail-safe rule: "greenfield-create" is reported only when every path in files_likely is confirmed
 absent from the repo root. Any doubt at all (a path exists, the repo root can't be read, the list is
 empty) reports "brownfield-modify" with a non-empty `reason`, never silently defaulting to greenfield.
+
+------------------------------------------------------------------------------------- `registration`
+Usage:
+
+    python3 impact_analysis.py registration <repo_root> <new_test_file_relpath> \
+        --readme-list <fixture_readme_file> --inventory <fixture_inventory_file>
+
+No stdin is read. Decides whether a brownfield checkpoint's new test file needs to be registered in
+the README's "Running the tests" list and, if it itself does an AST- or text-based source scan of
+another project file (reads another file's content, then either `ast.parse`s it or runs a
+text-based check -- an `in`/`not in` containment check, `re.search`/`re.match`/`re.findall`,
+`assertIn`/`assertNotIn` -- against that content), in the inventory/source-scan fixture too -- so
+that registration never gets discovered one at a time at `complete`. `<repo_root>`/
+`<new_test_file_relpath>` are used only to read the new test file's own source text (`repo_root /
+new_test_file_relpath`); `--readme-list`/`--inventory` point at the plain-text fixture files to
+check against (never the real README.md or a real inventory file, which callers are expected to
+supply copies of).
+
+stdout: one JSON object, nothing else:
+
+    {"test_file": "<new_test_file_relpath, exactly as given>",
+     "items": [{"kind": "readme"|"inventory", "line": "..."},
+               {"kind": "manual-check-needed", "detail": "..."}, ...]}
+
+`items[*].line` is the exact text to add (present for `"readme"`/`"inventory"`, absent for
+`"manual-check-needed"`, which carries `detail` instead). A README/inventory line counts as already
+registered only on an exact match (after stripping surrounding whitespace); a substring match, a
+missing `python3 ` prefix, or a different runner never counts. When the new test file cannot be
+parsed, a single `manual-check-needed` item is emitted instead of guessing whether it source-scans --
+the README item (whose line never depends on parsing) is still emitted, and no inventory item is
+ever emitted for a file that could not be parsed. The same applies when the file reads another
+file's content but pairs it with no recognized scan/check shape (neither `ast.parse` nor a
+recognized text-based check): a `manual-check-needed` item is emitted instead of silently deciding
+it doesn't source-scan.
+
+A text-based check (as opposed to `ast.parse`, which is unambiguous evidence of source-level
+inspection regardless of what it's reading) only counts as a source scan when the thing being read
+looks like Python source: a string-literal read target ending in `.py` (directly or through one hop
+of a simple variable assignment), reusing the same literal-path tracking the AST-based detection
+already does. A read target whose literal extension is an obviously-data one (`.json`, `.md`,
+`.txt`, `.log`) is "no-scan", not ambiguous -- e.g. a behavior test that reads a generated JSON
+report and checks `"CP1-X01" in results` is not a project-source scan. A text-based check paired
+with a read target that can't be confirmed either way (an unresolved expression, a computed path,
+an unrecognized extension -- e.g. a loop variable bound by `for path in ROOT.rglob('*.py')`) is
+"ambiguous", surfacing a `manual-check-needed` item -- this is exactly the dynamic/unresolvable
+reference the module's precision bar (above) requires to surface, never guessed or silently
+dropped.
+
+Exit code 0 for every successful run, including every file that could not be parsed. Nonzero is
+reserved for a genuine usage error (missing positional argument, or a missing
+--readme-list/--inventory flag). Read-only and idempotent: never writes to --readme-list/--inventory,
+and two runs against the same unchanged inputs produce identical items.
 """
 from __future__ import annotations
 
@@ -676,9 +728,242 @@ def cmd_repoint(argv: list) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------------------------------
+# `registration`: flag a brownfield checkpoint's new test file as needing README/inventory
+# registration (CP3).
+# ------------------------------------------------------------------------------------------------
+
+def _line_already_present(list_path: str, target_line: str) -> bool:
+    """True when some line of the fixture file at `list_path`, stripped of surrounding whitespace,
+    is EXACTLY equal to `target_line` -- a substring match (missing the "python3 " prefix, a
+    different runner) never counts, per the module docstring."""
+    text = Path(list_path).read_text()
+    return any(raw.strip() == target_line for raw in text.splitlines())
+
+
+def _has_text_based_source_check(tree: ast.AST) -> bool:
+    """True when the file contains a text-based containment/search check anywhere: an `in`/`not in`
+    Compare (e.g. `'old_module' not in source`), a `re.search`/`re.match`/`re.findall`-style call (an
+    attribute access named one of those, regardless of receiver -- covers both the `re` module and a
+    compiled pattern object), or an `assertIn`/`assertNotIn` call (bare or as an attribute, e.g.
+    `self.assertIn(...)`). Deliberately does not try to confirm the checked value is the same object
+    the file read from disk (that would be real data-flow analysis, out of scope per the module
+    docstring) -- the same best-effort approach `_file_source_scans` already used for the
+    `ast.parse` case."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare) and any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops):
+            return True
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in (
+                    "search", "match", "findall", "assertIn", "assertNotIn"):
+                return True
+            if isinstance(func, ast.Name) and func.id in ("assertIn", "assertNotIn"):
+                return True
+    return False
+
+
+_PY_SOURCE_EXTENSION = ".py"
+_OBVIOUSLY_DATA_EXTENSIONS = (".json", ".md", ".txt", ".log")
+
+
+def _collect_read_target_path_vars(tree: ast.AST) -> "tuple[set, set]":
+    """First pass over the whole file: a bare-name variable assigned from string-literal path
+    components (e.g. `TARGET = HERE / "plain_fixture.py"`, or a single combined literal) is
+    classified by its literal path's extension as looking like Python source (`.py`) or an
+    obviously-data file (`.json`/`.md`/`.txt`/`.log`), mirroring `_collect_module_a_file_vars`'s
+    shallow one-hop tracking. Returns (py_path_vars, data_path_vars)."""
+    py_vars, data_vars = set(), set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        consts = _string_consts_in_order(node.value)
+        if not consts:
+            continue
+        joined = "/".join(consts)
+        if joined.endswith(_PY_SOURCE_EXTENSION):
+            bucket = py_vars
+        elif joined.endswith(_OBVIOUSLY_DATA_EXTENSIONS):
+            bucket = data_vars
+        else:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                bucket.add(target.id)
+    return py_vars, data_vars
+
+
+def _read_target_looks_like_py(node, py_vars: set, data_vars: set) -> "bool | None":
+    """Classifies a read call's target expression per the module docstring's narrowed
+    precision/recall tradeoff: True when it looks like Python source (a string-literal path ending
+    in `.py`, directly or through one hop of a tracked variable assignment), False when it looks
+    like an obviously-data file (`.json`/`.md`/`.txt`/`.log`), None when it can't be confirmed
+    either way (an unresolved expression, a computed path, an unrecognized extension)."""
+    if isinstance(node, ast.Name):
+        if node.id in py_vars:
+            return True
+        if node.id in data_vars:
+            return False
+        return None
+    consts = _string_consts_in_order(node)
+    if not consts:
+        return None
+    joined = "/".join(consts)
+    if joined.endswith(_PY_SOURCE_EXTENSION):
+        return True
+    if joined.endswith(_OBVIOUSLY_DATA_EXTENSIONS):
+        return False
+    return None
+
+
+def _file_source_scans(tree: ast.AST) -> str:
+    """Best-effort classification of whether this file reads some other file's text (a
+    `.read_text()`/`.read()`/`.read_bytes()` method call, or `open(...)`) and inspects it, returning
+    one of:
+
+    - "scan": either an `ast.parse(...)`-style call on any read target (an AST source scan is
+      unambiguous evidence of source-level inspection regardless of what it's reading -- unchanged
+      by the extension narrowing below), or a text-based check (see `_has_text_based_source_check`)
+      paired with a read target that looks like Python source (see `_read_target_looks_like_py`) --
+      i.e. this test file itself does a source-inspection scan of another project file.
+    - "no-scan": no read of another file's content at all; or a text-based check whose read
+      target(s) are confirmed to be an obviously-data extension (`.json`/`.md`/`.txt`/`.log`) and
+      none looks like Python source.
+    - "ambiguous": reads another file's content but pairs it with no recognized scan/check shape at
+      all (neither `ast.parse` nor any text-based check); or a text-based check whose read target(s)
+      include at least one genuinely unresolved reference (a computed path, an unrecognized
+      extension, a loop variable such as `for path in ROOT.rglob('*.py')`) and none confirmed to
+      look like Python source. Per the no-false-precision rule (the same one `repoint` already
+      follows), neither shape is ever silently decided as "no-scan" -- the caller emits a
+      manual-check-needed item for both.
+
+    Deliberately does not try to confirm the read and the check operate on the very same path (real
+    data-flow analysis, out of scope per the module docstring)."""
+    has_read = False
+    has_ast_scan = False
+    any_py_read = False
+    any_unresolved_read = False
+    py_vars, data_vars = _collect_read_target_path_vars(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr in ("read_text", "read", "read_bytes"):
+            has_read = True
+            verdict = _read_target_looks_like_py(func.value, py_vars, data_vars)
+            if verdict is True:
+                any_py_read = True
+            elif verdict is None:
+                any_unresolved_read = True
+        elif isinstance(func, ast.Name) and func.id == "open" and node.args:
+            has_read = True
+            verdict = _read_target_looks_like_py(node.args[0], py_vars, data_vars)
+            if verdict is True:
+                any_py_read = True
+            elif verdict is None:
+                any_unresolved_read = True
+        if isinstance(func, ast.Attribute) and func.attr == "parse":
+            has_ast_scan = True
+        elif isinstance(func, ast.Name) and func.id == "parse":
+            has_ast_scan = True
+    if not has_read:
+        return "no-scan"
+    if has_ast_scan:
+        return "scan"
+    if _has_text_based_source_check(tree):
+        if any_py_read:
+            return "scan"
+        if any_unresolved_read:
+            return "ambiguous"
+        return "no-scan"
+    return "ambiguous"
+
+
+def registration_check(repo_root_arg: str, new_test_file_relpath: str, readme_list_path: str,
+                        inventory_path: str) -> dict:
+    """Decides the README/inventory registration items a new test file needs. Never raises and
+    never mutates `readme_list_path`/`inventory_path`; a file that cannot be read or parsed still
+    gets its README item (the filename is known regardless of parsing) plus a single
+    manual-check-needed item in place of a guess about inventory registration -- never an inventory
+    item for a file that could not be parsed."""
+    full_path = Path(repo_root_arg) / new_test_file_relpath
+
+    source = None
+    read_error = None
+    try:
+        source = full_path.read_text()
+    except OSError as exc:
+        read_error = str(exc)
+
+    tree = None
+    parse_error = None
+    if source is not None:
+        try:
+            tree = ast.parse(source, filename=new_test_file_relpath)
+        except SyntaxError as exc:
+            parse_error = f"syntax error: {exc.msg}"
+    else:
+        parse_error = read_error or "could not be read"
+
+    items = []
+
+    readme_line = f"python3 {new_test_file_relpath}"
+    if not _line_already_present(readme_list_path, readme_line):
+        items.append({"kind": "readme", "line": readme_line})
+
+    if tree is not None:
+        scan_verdict = _file_source_scans(tree)
+        if scan_verdict == "scan":
+            basename = Path(new_test_file_relpath).name
+            if not _line_already_present(inventory_path, basename):
+                items.append({"kind": "inventory", "line": basename})
+        elif scan_verdict == "ambiguous":
+            items.append({
+                "kind": "manual-check-needed",
+                "detail": f"{new_test_file_relpath} reads another file's content but its check "
+                          "shape could not be confidently classified as a source scan or not; "
+                          "cannot determine whether it needs inventory registration",
+            })
+    else:
+        items.append({
+            "kind": "manual-check-needed",
+            "detail": f"{new_test_file_relpath} could not be parsed ({parse_error}); cannot "
+                       "determine whether it scans another file's source, so inventory "
+                       "registration cannot be decided automatically",
+        })
+
+    return {"test_file": new_test_file_relpath, "items": items}
+
+
+def cmd_registration(argv: list) -> int:
+    if len(argv) < 2 or argv[0].startswith("--") or argv[1].startswith("--"):
+        _usage_error("registration requires <repo_root> and <new_test_file_relpath> arguments")
+        return 2  # unreachable; _usage_error exits
+    repo_root_arg, new_test_file_relpath, rest = argv[0], argv[1], argv[2:]
+    flags = {"--readme-list": None, "--inventory": None}
+    i = 0
+    while i < len(rest):
+        flag = rest[i]
+        if flag in flags and i + 1 < len(rest):
+            flags[flag] = rest[i + 1]
+            i += 2
+        else:
+            _usage_error(f"unrecognized or incomplete argument: {flag}")
+            return 2  # unreachable; _usage_error exits
+    missing = [k for k, v in flags.items() if not v]
+    if missing:
+        _usage_error("registration requires " + ", ".join(missing))
+        return 2  # unreachable; _usage_error exits
+    result = registration_check(repo_root_arg, new_test_file_relpath, flags["--readme-list"],
+                                 flags["--inventory"])
+    print(json.dumps(result))
+    return 0
+
+
 SUBCOMMANDS = {
     "classify": cmd_classify,
     "repoint": cmd_repoint,
+    "registration": cmd_registration,
 }
 
 
