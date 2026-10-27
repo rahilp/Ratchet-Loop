@@ -25,9 +25,9 @@ module directly, can itself contain the pattern strings as embedded constants an
 match; this doc's counts were taken right after `rm -rf tests/__pycache__
 tests/shortcuts/__pycache__`.)
 
-45 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
+46 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
 files the brief names explicitly (`test_quota_shared.py`, `test_discover_paid.py`, Kind 4 below)
-that carry the identical real obligation but don't literally match either regex today — **47
+that carry the identical real obligation but don't literally match either regex today — **48
 files total**, consistent with the brief's "43+".
 
 ## Kind 1 — module-load only (loads ratchet.py dynamically via `importlib.util.spec_from_file_location`,
@@ -104,7 +104,7 @@ never inspects its on-disk text directly): 31 files
   directly. Never touches ratchet.py itself, but matches the same module-load pattern.
 
 ## Kind 2 — source-text/AST only (reads ratchet.py's literal on-disk text and/or walks its parsed
-tree, never loads it as a module itself): 5 files
+tree, never loads it as a module itself): 6 files
 
 - `test_quick_path.py` — CP2 (quick-path change classification). Source-text known fixture
   (CP1-T03's own `SOURCE_TEXT_EXAMPLE`): line 478-480, `src = g.ENGINE.read_text(encoding="utf-8")`;
@@ -116,8 +116,11 @@ tree, never loads it as a module itself): 5 files
   isn't ratchet.py itself, but it is a real source/AST reader by the same grep pattern, so a
   module split must not break this scan's own assumptions about which files it walks.
 - `test_digest_docstring.py` — CP3: `_related_spec_items`'s docstring states the exact BMAD "done"
-  rule; `ast.parse(ENGINE.read_text(encoding="utf-8"))` + `ast.walk` to find that one `FunctionDef`
-  and check its docstring text word for word.
+  rule. Originally `ast.parse(ENGINE.read_text(encoding="utf-8"))` + `ast.walk` against ratchet.py
+  directly; CP7 moved `_related_spec_items` into `plan_support.py` (see `test_modularize_cp7.py`'s
+  CP7-T12), and this file's own helper was re-pointed along with it, so it now does
+  `ast.parse(PLAN_SUPPORT.read_text(encoding="utf-8"))` + `ast.walk` against `plan_support.py`
+  instead, to find that one `FunctionDef` and check its docstring text word for word.
 - `test_shortcuts_guard.py` — CP7: Ratchet's own guard gets a shortcut table;
   `ast.walk(ast.parse(src))` collects every string constant in the given source to check the
   shortcut table's commands against the guard's own literals.
@@ -131,6 +134,19 @@ tree, never loads it as a module itself): 5 files
   (line ~950) over `tests/test_flaky.py`'s on-disk text (both the live working tree and the pinned
   `git merge-base HEAD main` copy), walking for specific `FunctionDef`s to prove this lane didn't
   need to touch them. Never inspects ratchet.py itself or loads a module.
+- `test_modularize_cp7.py` — CP7: plan/objective validation (`objective_problems`/`_proves_values`/
+  `proves_problems`/`objective_brief`/`_normalize_role`) and the planner's "What earlier work says"
+  digest (`_digest_words`/`_learnings_bullets`/`_related_spec_items`/`_earlier_work_lines`/etc.) move
+  verbatim into `plan_support.py`. Drives plan-submit/brief black-box through `test_gates.py`'s
+  subprocess helpers for most of its own behavior cases, which hold identically whether these names
+  still live inline in ratchet.py or have already moved; the move itself is proven structurally in
+  CP7-T11 and CP7-T12, which read `ENGINE.read_text()` and `ast.parse`/`ast.walk` both the live text
+  and `plan_support.py`'s own source to compare each moved name's presence, confirm `plan_support.py`
+  is reached by explicit `from plan_support import ...` (no star import) with no circular import back
+  into ratchet.py and no new module-level mutable registry, and confirm `_related_spec_items` moved
+  there with its docstring intact and no leftover top-level `def` in ratchet.py. Never loads either
+  module dynamically via `spec_from_file_location` itself, so it matches only the source-text/AST
+  pattern, not the module-load one.
 
 ## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 9 files
 

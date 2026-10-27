@@ -558,6 +558,7 @@ python3 tests/test_modularize_cp3.py
 python3 tests/test_modularize_cp4.py
 python3 tests/test_modularize_cp5.py
 python3 tests/test_modularize_cp6.py
+python3 tests/test_modularize_cp7.py
 python3 tests/test_modularize_inventory.py
 python3 tests/test_objective.py
 python3 tests/test_opencode_big.py
