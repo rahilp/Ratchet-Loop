@@ -1,0 +1,3 @@
+This file never mentions the moved symbol by its exact name, only decoy words like foobar and
+barfoo -- it must produce no finding at all now that non-Python files are only flagged when the
+symbol appears as a whole word.
