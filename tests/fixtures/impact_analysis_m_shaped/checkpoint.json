@@ -1,0 +1,30 @@
+{
+  "_comment": "CP7 fixture (M-shaped): shaped after lane M's own CP3-CP5 extraction of `_load_state` out of pkg.module_a into a new sibling pkg.module_b. files_likely mixes a genuinely new path (pkg/module_b.py, which does not exist in this fixture tree) with an already-existing one (pkg/module_a.py), so classify() must fail safe to brownfield-modify rather than being read as greenfield-create. done_when has no parity wording at all. tests.command runs test_moved_helper.py as the ONLY suite, so it must never trip the CP4 report-race hazard.",
+  "id": "CPx-M-SHAPED",
+  "files_likely": ["pkg/module_b.py", "pkg/module_a.py"],
+  "move": {"symbol": "_load_state", "module_from": "pkg.module_a", "module_to": "pkg.module_b"},
+  "baseline": null,
+  "done_when": [
+    "_load_state is callable from pkg.module_b and every caller imports it from there",
+    "the extraction does not change _load_state's return value for any existing input"
+  ],
+  "cases": [
+    {
+      "id": "CPx-M01",
+      "title": "pre-existing planned case, must survive the merge untouched",
+      "given": "a path that already exists on disk",
+      "when": "_load_state(path) runs",
+      "then": "it returns the same dict shape as before the move",
+      "layer": "code",
+      "edge": false
+    }
+  ],
+  "notes": "Pre-existing note, must survive the full pass byte-for-byte unchanged.",
+  "tests": {
+    "command": "python3 test_moved_helper.py",
+    "report": "json"
+  },
+  "readme_list": "readme_list.txt",
+  "inventory": "inventory.txt",
+  "new_test_file": "test_moved_helper.py"
+}

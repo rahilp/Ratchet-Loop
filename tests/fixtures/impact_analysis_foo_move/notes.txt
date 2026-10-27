@@ -1,0 +1,2 @@
+Reminder: don't forget to check foo before the release.
+This file is plain prose, not Python, and is never executed.

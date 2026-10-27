@@ -1,0 +1,8 @@
+{
+  "_comment": "CP4 fixture: an ordinary brownfield-modify checkpoint that edits an existing function's body in place; no symbol moves from one module into another.",
+  "move": null,
+  "done_when": [
+    "foo's validation logic also rejects the new malformed-input shape",
+    "the existing callers of foo keep passing with no change on their side"
+  ]
+}

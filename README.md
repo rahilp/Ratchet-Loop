@@ -537,6 +537,13 @@ python3 tests/test_guardrails.py
 python3 tests/test_hooks.py
 python3 tests/test_hooks_status.py
 python3 tests/test_hooks_waiver.py
+python3 tests/test_impact_analysis_additive.py
+python3 tests/test_impact_analysis_docs.py
+python3 tests/test_impact_analysis_e2e.py
+python3 tests/test_impact_analysis_mode.py
+python3 tests/test_impact_analysis_parity_hazard.py
+python3 tests/test_impact_analysis_repoint.py
+python3 tests/test_impact_analysis_registration.py
 python3 tests/test_install.py
 python3 tests/test_integrate_check.py
 python3 tests/test_integrate_files.py

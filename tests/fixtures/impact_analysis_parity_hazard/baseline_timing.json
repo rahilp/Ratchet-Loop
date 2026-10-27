@@ -1,0 +1,6 @@
+{
+  "_comment": "CP4 fixture: a CP1-style baseline timing figure for the extraction's source module, used as the 'baseline' field the parity subcommand's stdin may carry so the startup-parity item it emits can echo back a concrete, stated threshold percentage instead of a vague one.",
+  "module": "pkg.module_a",
+  "startup_ms": 42.0,
+  "threshold_pct": 10
+}

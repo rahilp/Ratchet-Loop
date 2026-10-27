@@ -24,6 +24,7 @@ You write the standard that Gate 1 (Behavior) holds the implementation to. The t
    - **State transitions:** doing it twice, doing it after it was cancelled, concurrent edits
    - **Side effects:** what else must change (balances, audit log, notifications), and what must NOT change on failure
    - **Earlier checkpoints:** does this slice break what CP1…CPn-1 established? Add one guard case if there's a risk
+   - **Brownfield re-point items:** a brownfield checkpoint's re-point items (the ones impact_analysis.py enumerates in checkpoints.json's `notes`/`done_when`) may need their own test-edit cases, so plan one whenever a re-point site changes observable behavior, rather than rediscovering that need from scratch.
    Mark these `edge: true`. Aim for depth over count. 6–15 cases per checkpoint is typical, and a skeleton checkpoint may have 3.
 3. **Choose the layer for each case.**
    - `code`: provable without a browser, via service/API/CLI/component tests. *Example: "a manager may approve their report's leave" is a function call plus an assertion, not a click.* Prefer this layer. Most behavior belongs here, and it's fast enough to iterate on dozens of times.

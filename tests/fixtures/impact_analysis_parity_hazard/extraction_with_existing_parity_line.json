@@ -1,0 +1,8 @@
+{
+  "_comment": "CP4 fixture: the same foo-moves-pkg.module_a-to-pkg.module_b extraction, but its done_when already contains one line asking for a startup-parity check, so the parity pass must not duplicate it.",
+  "move": {"symbol": "foo", "module_from": "pkg.module_a", "module_to": "pkg.module_b"},
+  "done_when": [
+    "foo is callable from pkg.module_b and every caller imports it from there",
+    "Startup-parity: importing pkg.module_b costs about the same as importing pkg.module_a used to"
+  ]
+}
