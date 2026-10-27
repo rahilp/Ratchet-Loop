@@ -307,7 +307,7 @@ def t03_fingerprint_matches_manual_write_tree():
     if fp.get("kind") != "git-tree":
         return
 
-    with tempfile.TemporaryDirectory() as td:
+    with _tmp.mkdtemp(prefix="cp3-t03-index-") as td:
         env = dict(os.environ, GIT_INDEX_FILE=str(Path(td) / "index"))
         subprocess.run(["git", "read-tree", "HEAD"], cwd=d, env=env, capture_output=True)
         subprocess.run(["git", "add", "-A", "--", ".", ":(exclude).ratchet"], cwd=d, env=env,
