@@ -7,9 +7,9 @@ while it is writing a run's checkpoints.json, so it can tell a greenfield checkp
 apart from a brownfield one (touches something that already exists) and, for brownfield/ambiguous
 checkpoints, enumerate the predictable re-point/registration/parity consequences of the change up
 front. This file is a small subcommand dispatcher; it currently implements `classify`, `repoint`,
-`registration`, `parity` and `hazard`. Later checkpoints (CP5-CP7) add `merge` and an end-to-end
-subcommand that composes them -- this module stays stdlib-only (standards.md #1) and out of
-skills/ratchet-orchestrator/scripts/, which lane M owns.
+`registration`, `parity`, `hazard` and `merge`. Later checkpoints (CP6-CP7) add the planner's own
+wiring to these subcommands plus an end-to-end subcommand that composes them -- this module stays
+stdlib-only (standards.md #1) and out of skills/ratchet-orchestrator/scripts/, which lane M owns.
 
 ------------------------------------------------------------------------------------------ `repoint`
 Usage:
@@ -161,6 +161,77 @@ finding another untested spelling): an environment-variable prefix on the invoca
 python3 ...`); an alternate launcher (`env python3 ...`, `uv run ...`, `py -3 ...`); a subshell or a
 pipe; and `-m pytest`-style module invocation -- already excluded by the `-m`/`-c` handling above,
 called out here explicitly as intentional rather than an oversight.
+
+------------------------------------------------------------------------------------------------ `merge`
+Usage:
+
+    python3 impact_analysis.py merge
+
+No positional arguments. stdin: a single JSON object `{"checkpoint": {"done_when": [...],
+"cases": [...]}, "enumerated_items": {"done_when": [...], "cases": [...],
+"existing_done_when_override": null|[...]}}`. This is the single most safety-critical subcommand in
+this module (CP5): it folds CP2-CP4's enumerated findings into an already-approved checkpoint's
+existing done_when/cases, and it must never drop, reword or reorder anything already approved.
+
+Before any of that merging logic runs, `merge` validates the SHAPE of its input strictly (this runs
+first, before even the `existing_done_when_override` check below): `checkpoint` must be a JSON
+object; its `done_when` key must be PRESENT (never silently defaulted when missing) and a list whose
+every element is a string; its `cases` key must be PRESENT and a list whose every element is an
+object carrying a non-empty string `id`. `enumerated_items` must be a JSON object whose keys are
+EXACTLY `done_when`, `cases` and `existing_done_when_override` -- any other key (a typo like
+"done-when", or a stale field name like "test_cases") refuses rather than being read as "nothing to
+add" and silently dropped. Its `done_when` key, when present and not null, must be a list of strings;
+its `cases` key, when present and not null, must be a list of objects, each one using only the known
+case keys (`id`, `title`, `given`, `when`, `then`, `layer`, `edge`, `proves`) and carrying non-empty,
+non-whitespace string values for `id`, `given`, `when` and `then` -- stricter than `checkpoint.cases`
+on purpose, since a newly enumerated case is new content a builder must be able to act on immediately,
+unlike an existing case which passes through unchanged no matter what it carries. Its
+`existing_done_when_override`, when present and not null, must be a list of strings (never a plain
+string, which would otherwise compare character-by-character against `checkpoint.done_when` and
+could pass by coincidence). Any shape violation refuses (see below) with reason "invalid_shape" and a
+`detail` naming exactly which field had the wrong shape and what was expected -- this is a controlled
+refusal, never a bare Python traceback, and it is why a bare `list(...)` coercion is never used on any
+of this input: `list("one line")` would silently shred a one-line `done_when` authored unwrapped into
+one entry per character, and `list({"id": "x", ...})` would silently replace a `cases` dict's values
+with its own key names. Catching that shape up front, before any appending logic runs, is what makes
+the "never drop or reword an already-approved line" guarantee hold for a malformed caller too, not
+just a well-behaved one.
+
+stdout on SUCCESS: exit code 0, ONE JSON object and nothing else: `{"merged": {"done_when": [...],
+"cases": [...]}}`. The existing `checkpoint.done_when` lines come out byte-for-byte, in their
+original order; every enumerated `done_when` string not already verbatim-present is appended after
+them, in the order given, skipping exact duplicates (so re-running `merge` on its own prior output
+with the same enumerated_items is idempotent). Every existing `checkpoint.cases` dict passes through
+completely unchanged; each enumerated case is appended when its `id` is new, skipped when an
+existing case with that `id` and every field already matches it verbatim (a duplicate), or refused
+when its `id` matches an existing case whose content differs in any field.
+
+stdout on REFUSAL: exit code 3 -- reserved exclusively for "merge refused due to corruption or a
+malformed shape", distinct from exit code 2 (a plain CLI usage error: malformed stdin JSON, or stdin
+missing the top-level "checkpoint" or "enumerated_items" key entirely). On a refusal, stdout is EMPTY
+(no partial or speculative output is ever produced -- refusal is all-or-nothing for the whole call,
+even when the same enumerated_items also carries a genuinely new, non-colliding item), and stderr
+carries ONE JSON object: `{"refused": true, "reason":
+"invalid_shape"|"done_when_override_mismatch"|"case_id_collision", "detail": "<human-readable message
+naming the offending field, done_when index/text, or case id>"}`. A case dict with no `id` field at
+all is always an "invalid_shape" refusal (caught by the shape validation above), never misreported as
+a "case_id_collision" against some unrelated existing case. A "case_id_collision" detail distinguishes
+the two ways an id can collide: when the id already existed in `checkpoint.cases` before this call,
+the detail says so; when the id is only shared between two of the NEW `enumerated_items.cases` (a
+sibling collision within the same call, with no such id in `checkpoint.cases` at all), the detail says
+that instead, so the caller is never sent looking for an existing case that never existed.
+
+The optional `enumerated_items.existing_done_when_override` field is a real, optional production
+feature: a defense-in-depth guard rail any caller (not just a test) may use to assert what it
+believes `checkpoint.done_when` currently looks like. When present (not null), BEFORE doing anything
+else (after shape validation), `merge` compares it element-by-element against the real
+`checkpoint.done_when`. Any divergence at any index (a reworded line, a dropped line, two lines
+swapped) refuses with reason "done_when_override_mismatch", naming the first diverging index and the
+expected vs. actual text there -- one equality check catches all three corruption shapes uniformly.
+It is never required for a normal merge (CP2-CP4's real scans never send it) and never changes a
+successful merge's output in any way; it only ever makes `merge` refuse instead of silently trusting
+a caller's claim about the existing content. See tests/test_impact_analysis_additive.py's module
+docstring for this subcommand's full CLI contract and the design reasoning behind this field.
 """
 from __future__ import annotations
 
@@ -1198,12 +1269,259 @@ def cmd_hazard(argv: list) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------------------------------
+# `merge`: fold CP2-CP4's enumerated findings into an already-approved checkpoint's done_when/cases,
+# guaranteed to only ever add -- never drop, reword or reorder anything already approved (CP5).
+# ------------------------------------------------------------------------------------------------
+
+def _find_done_when_divergence(existing_done_when: list, override: list):
+    """Compares `override` against the real `existing_done_when` element-by-element and returns the
+    first (index, expected, actual) triple where they diverge, or None when every element at every
+    index (up to the longer list's length) matches exactly. A single uniform comparison -- not a
+    per-corruption-type special case -- is what catches a reworded line, a dropped line and two
+    swapped lines alike: all three make the lists stop matching at some position."""
+    length = max(len(existing_done_when), len(override))
+    for i in range(length):
+        expected = existing_done_when[i] if i < len(existing_done_when) else None
+        actual = override[i] if i < len(override) else None
+        if expected != actual:
+            return i, expected, actual
+    return None
+
+
+def _shape_error_for_done_when_list(value, owner: str) -> "str | None":
+    """None when `value` is a valid done_when list (every element a string); else a detail string
+    naming exactly what was wrong -- never used to coerce, only to decide whether to refuse."""
+    if not isinstance(value, list):
+        return f"{owner}.done_when must be a list of strings, got {type(value).__name__}"
+    for i, item in enumerate(value):
+        if not isinstance(item, str):
+            return f"{owner}.done_when[{i}] must be a string, got {type(item).__name__}"
+    return None
+
+
+def _shape_error_for_cases_list(value, owner: str) -> "str | None":
+    """None when `value` is a valid cases list (every element a dict carrying a non-empty string
+    'id'); else a detail string naming exactly what was wrong. Requiring 'id' up front here is what
+    lets a case dict with no id at all be reported as a shape violation, never misreported later as
+    colliding with some unrelated existing case. Used for `checkpoint.cases` only: existing,
+    already-approved cases pass through unchanged regardless of which other fields they carry, so
+    this stays deliberately lenient beyond the 'id' check."""
+    if not isinstance(value, list):
+        return f"{owner}.cases must be a list of case objects, got {type(value).__name__}"
+    for i, item in enumerate(value):
+        if not isinstance(item, dict):
+            return f"{owner}.cases[{i}] must be an object, got {type(item).__name__}"
+        case_id = item.get("id")
+        if not isinstance(case_id, str) or not case_id:
+            return f"{owner}.cases[{i}] must have a non-empty string 'id' field"
+    return None
+
+
+_KNOWN_CASE_KEYS = frozenset({"id", "title", "given", "when", "then", "layer", "edge", "proves"})
+_REQUIRED_ENUMERATED_CASE_STRING_FIELDS = ("id", "given", "when", "then")
+
+
+def _shape_error_for_enumerated_case(item, index: int) -> "str | None":
+    """None when `item` (one element of `enumerated_items.cases`) is a dict using only the known
+    case keys and carrying non-empty, non-whitespace string values for 'id', 'given', 'when' and
+    'then'; else a detail string naming exactly what was wrong. Unlike `checkpoint.cases` (existing,
+    already-approved content that must pass through untouched no matter what it carries), a NEWLY
+    enumerated case is new content a builder must be able to act on immediately, so it is validated
+    strictly up front rather than merged with holes a builder can't implement. The required-field
+    check runs before the unexpected-key check, so a case missing 'id' entirely is always reported
+    as missing 'id' (never as merely having an unexpected key), matching the existing 'id'-first
+    reporting a case with no id at all already got before this closed schema was added."""
+    if not isinstance(item, dict):
+        return f"enumerated_items.cases[{index}] must be an object, got {type(item).__name__}"
+    for field in _REQUIRED_ENUMERATED_CASE_STRING_FIELDS:
+        value = item.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return f"enumerated_items.cases[{index}] must have a non-empty string '{field}' field"
+    unexpected = sorted(set(item) - _KNOWN_CASE_KEYS)
+    if unexpected:
+        return (
+            f"enumerated_items.cases[{index}] has unexpected key(s) {unexpected}; expected only "
+            f"{sorted(_KNOWN_CASE_KEYS)}"
+        )
+    return None
+
+
+def _shape_error_for_enumerated_cases_list(value) -> "str | None":
+    """None when `value` is a valid `enumerated_items.cases` list (see
+    `_shape_error_for_enumerated_case`); else a detail string naming the first violation found."""
+    if not isinstance(value, list):
+        return f"enumerated_items.cases must be a list of case objects, got {type(value).__name__}"
+    for i, item in enumerate(value):
+        err = _shape_error_for_enumerated_case(item, i)
+        if err:
+            return err
+    return None
+
+
+def _shape_error_for_override(value) -> "str | None":
+    """None when `value` is None (absent) or a valid list of strings; else a detail string. A plain
+    string is explicitly rejected here (not accepted as a list), since comparing it element-by-element
+    against checkpoint.done_when would otherwise compare characters, not lines, and could pass by
+    coincidence."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        return (
+            "enumerated_items.existing_done_when_override must be null or a list of strings, got "
+            f"{type(value).__name__}"
+        )
+    return None
+
+
+_ENUMERATED_ITEMS_ALLOWED_KEYS = frozenset({"done_when", "cases", "existing_done_when_override"})
+
+
+def _validate_merge_shapes(checkpoint, enumerated_items) -> "str | None":
+    """Strict shape validation for `merge`'s whole input, run BEFORE any merging logic (including
+    the existing_done_when_override divergence check). Returns None when every shape is valid, else
+    a detail string naming the first violation found, in a fixed checking order so the message is
+    stable. Never coerces anything -- a bare `list(...)` on a string or dict would silently shred a
+    one-line done_when into characters, or a cases dict into its own key names, instead of being
+    caught and refused."""
+    if not isinstance(checkpoint, dict):
+        return f"checkpoint must be a JSON object, got {type(checkpoint).__name__}"
+    if "done_when" not in checkpoint:
+        return "checkpoint.done_when is required (a list of strings) and was missing entirely"
+    if "cases" not in checkpoint:
+        return "checkpoint.cases is required (a list of case objects) and was missing entirely"
+    err = _shape_error_for_done_when_list(checkpoint["done_when"], "checkpoint")
+    if err:
+        return err
+    err = _shape_error_for_cases_list(checkpoint["cases"], "checkpoint")
+    if err:
+        return err
+
+    if not isinstance(enumerated_items, dict):
+        return f"enumerated_items must be a JSON object, got {type(enumerated_items).__name__}"
+    unexpected = sorted(set(enumerated_items) - _ENUMERATED_ITEMS_ALLOWED_KEYS)
+    if unexpected:
+        # A closed schema, not an open one: an unrecognized key (e.g. a typo like "done-when" or a
+        # stale field name like "test_cases") must never be read as "nothing to add" and silently
+        # dropped -- it is refused instead, so the re-point/registration/parity items the planner
+        # meant to add can never disappear without any signal.
+        return (
+            f"enumerated_items has unexpected key(s) {unexpected}; expected only "
+            f"{sorted(_ENUMERATED_ITEMS_ALLOWED_KEYS)}"
+        )
+    if enumerated_items.get("done_when") is not None:
+        err = _shape_error_for_done_when_list(enumerated_items["done_when"], "enumerated_items")
+        if err:
+            return err
+    if enumerated_items.get("cases") is not None:
+        err = _shape_error_for_enumerated_cases_list(enumerated_items["cases"])
+        if err:
+            return err
+    return _shape_error_for_override(enumerated_items.get("existing_done_when_override"))
+
+
+def _refusal(reason: str, detail: str) -> dict:
+    """The single shared builder for every `merge` refusal shape, so all three reasons
+    (invalid_shape, done_when_override_mismatch, case_id_collision) produce exactly the same JSON
+    structure by construction, rather than three separately hand-built dicts that could drift."""
+    return {
+        "ok": False,
+        "refused": {"refused": True, "reason": reason, "detail": detail},
+    }
+
+
+def merge_checkpoint(checkpoint: "dict | None", enumerated_items: "dict | None") -> dict:
+    """Merges `enumerated_items` into `checkpoint`, guaranteed additive-only. Returns either
+    `{"ok": True, "merged": {"done_when": [...], "cases": [...]}}` or
+    `{"ok": False, "refused": {"refused": True, "reason": ..., "detail": ...}}`. Never raises for
+    any input -- a malformed shape is refused (reason "invalid_shape") by strict validation before
+    any merging logic runs, rather than crashing with a bare traceback or silently coercing it (a
+    bare `list(...)` on a string/dict would shred an unwrapped done_when/cases field). Never
+    partially applies a payload that is only partly safe -- a refusal anywhere in the computation
+    discards the whole result, including any genuinely new, non-colliding item the same payload
+    also carried.
+
+    Checking order: (1) strict shape validation of checkpoint/enumerated_items/override, (2) the
+    existing_done_when_override divergence guard, when present, (3) append new done_when lines
+    (skipping verbatim duplicates), (4) append new cases (skipping verbatim duplicates, refusing on
+    any id collision whose content differs)."""
+    shape_error = _validate_merge_shapes(checkpoint, enumerated_items)
+    if shape_error is not None:
+        return _refusal("invalid_shape", shape_error)
+
+    existing_done_when = list(checkpoint["done_when"])
+    existing_cases = list(checkpoint["cases"])
+
+    override = enumerated_items.get("existing_done_when_override")
+    if override is not None:
+        divergence = _find_done_when_divergence(existing_done_when, override)
+        if divergence is not None:
+            index, expected, actual = divergence
+            return _refusal(
+                "done_when_override_mismatch",
+                f"existing_done_when_override diverges from checkpoint.done_when at index "
+                f"{index}: expected {expected!r}, override had {actual!r}",
+            )
+
+    merged_done_when = list(existing_done_when)
+    for line in enumerated_items.get("done_when") or []:
+        if line not in merged_done_when:
+            merged_done_when.append(line)
+
+    # ids already in checkpoint.cases, captured BEFORE this call appends anything, so a collision's
+    # refusal message can tell "already existed" apart from "duplicated within this same call".
+    existing_case_ids = {c["id"] for c in existing_cases}
+
+    merged_cases = list(existing_cases)
+    for case in enumerated_items.get("cases") or []:
+        case_id = case["id"]  # presence/non-empty/str already guaranteed by shape validation above
+        collision = next((c for c in merged_cases if c.get("id") == case_id), None)
+        if collision is None:
+            merged_cases.append(case)
+            continue
+        if collision == case:
+            continue  # verbatim duplicate -- already present, never appended a second time
+        if case_id in existing_case_ids:
+            detail = (
+                f"case id {case_id!r} already exists in checkpoint.cases with different "
+                "content; refusing rather than overwriting or renumbering it"
+            )
+        else:
+            detail = (
+                f"case id {case_id!r} appears more than once in enumerated_items.cases with "
+                "different content (duplicate id within enumerated_items, not an existing "
+                "checkpoint.cases entry); refusing rather than silently keeping only the first one"
+            )
+        return _refusal("case_id_collision", detail)
+
+    return {"ok": True, "merged": {"done_when": merged_done_when, "cases": merged_cases}}
+
+
+def cmd_merge(argv: list) -> int:
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as exc:
+        _usage_error(f"merge requires valid JSON on stdin: {exc}")
+        return 2  # unreachable; _usage_error exits
+    if not isinstance(data, dict) or "checkpoint" not in data or "enumerated_items" not in data:
+        _usage_error("merge requires stdin JSON with 'checkpoint' and 'enumerated_items' keys")
+        return 2  # unreachable; _usage_error exits
+    result = merge_checkpoint(data.get("checkpoint"), data.get("enumerated_items"))
+    if not result["ok"]:
+        print(json.dumps(result["refused"]), file=sys.stderr)
+        return 3
+    print(json.dumps({"merged": result["merged"]}))
+    return 0
+
+
 SUBCOMMANDS = {
     "classify": cmd_classify,
     "repoint": cmd_repoint,
     "registration": cmd_registration,
     "parity": cmd_parity,
     "hazard": cmd_hazard,
+    "merge": cmd_merge,
 }
 
 
