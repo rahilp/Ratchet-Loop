@@ -17,13 +17,14 @@ This suite writes a per-test JSON report to $RATCHET_TEST_REPORT when that env v
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import os
 import re
 import subprocess
 import sys
 import traceback
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -162,6 +163,135 @@ def collect_check_call_texts(source: str, filename: str = "<src>"):
     return texts
 
 
+def parse_check_call_parts(call_text: str):
+    """Parse one `check(...)` call's exact source text into (case_id_or_None, message_text,
+    cond_node). `case_id` is the `[CPn-Txx]`/`[CPn-Xxx]` prefix pulled out of the message, when
+    there is one. `message_text` is the verbatim source of the first argument (the whole thing,
+    including every concatenated string literal), used together with `case_id` as the matching
+    key: two check(...) calls are "the same case" only when both their id (or, lacking one, their
+    whole message) AND their message text line up, so CP5-X60's four distinct sub-checks are
+    never compared against each other's condition. Returns None if `call_text` isn't a bare
+    `check(...)` call (should not happen -- collect_check_call_texts only ever yields those)."""
+    try:
+        tree = ast.parse(call_text, mode="eval")
+    except SyntaxError:
+        return None
+    call = tree.body
+    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "check"):
+        return None
+    if not call.args:
+        return None
+    msg_node = call.args[0]
+    msg_text = (ast.get_source_segment(call_text, msg_node) or "").strip()
+    m = re.search(r"\[(CP\d+-[TX]\d+)\]", msg_text)
+    case_id = m.group(1) if m else None
+    cond_node = call.args[1] if len(call.args) > 1 else None
+    return case_id, msg_text, cond_node
+
+
+def _cond_shape(node):
+    """An ast.dump() of `node` with every bare Name blanked out to one placeholder, so a cosmetic
+    rename of a local variable (e.g. `src` -> `src_with_records`) compares equal while every
+    other piece of structure -- operators, boolop clause count, constants, attribute names,
+    call targets -- still has to match exactly. Returns None for a missing condition."""
+    if node is None:
+        return None
+
+    class _Blank(ast.NodeTransformer):
+        def visit_Name(self, n):
+            return ast.copy_location(ast.Name(id="_VAR_", ctx=ast.Load()), n)
+
+    shadow = copy.deepcopy(node)
+    _Blank().visit(shadow)
+    return ast.dump(shadow, annotate_fields=False)
+
+
+def _literal_set(node):
+    """The set of constant values in a List/Set/Tuple-of-constants literal, or None if `node`
+    isn't one. Used only to notice a comparator literal that grew wider (more values accepted)."""
+    if isinstance(node, (ast.List, ast.Set, ast.Tuple)) and all(isinstance(e, ast.Constant) for e in node.elts):
+        return {e.value for e in node.elts}
+    return None
+
+
+def _looks_weakened(pinned_node, current_node):
+    """True when `current_node`'s condition looks like a real loosening of `pinned_node`'s --
+    more inputs now make it pass -- not just a cosmetic rename (ruled out already by the caller
+    via _cond_shape before this runs). Three concrete, auditable signals, chosen so a renamed
+    identifier never trips them: an `and` turned into `or`, an `and`-chain losing one of its
+    operands, an `==` broadened into an `in`, a `not` dropped from around an otherwise-unchanged
+    expression, or an `in`-comparator's literal set growing to accept more values. Anything else
+    that merely differs structurally is deliberately left unflagged -- this guard only chases the
+    specific loosening shapes above, not every possible rewrite (see the CP5 brief)."""
+    if isinstance(pinned_node, ast.BoolOp) and isinstance(current_node, ast.BoolOp):
+        if isinstance(pinned_node.op, ast.And) and isinstance(current_node.op, ast.Or):
+            return True
+        if isinstance(pinned_node.op, ast.And) and isinstance(current_node.op, ast.And):
+            if len(current_node.values) < len(pinned_node.values):
+                return True
+    if isinstance(pinned_node, ast.UnaryOp) and isinstance(pinned_node.op, ast.Not):
+        if not (isinstance(current_node, ast.UnaryOp) and isinstance(current_node.op, ast.Not)):
+            if _cond_shape(pinned_node.operand) == _cond_shape(current_node):
+                return True
+    if isinstance(pinned_node, ast.Compare) and isinstance(current_node, ast.Compare):
+        if len(pinned_node.ops) == 1 and len(current_node.ops) == 1:
+            pop, cop = pinned_node.ops[0], current_node.ops[0]
+            if isinstance(pop, ast.Eq) and isinstance(cop, ast.In):
+                return True
+            if isinstance(pop, ast.In) and isinstance(cop, ast.In):
+                p_set = _literal_set(pinned_node.comparators[0])
+                c_set = _literal_set(current_node.comparators[0])
+                if p_set is not None and c_set is not None and p_set < c_set:
+                    return True
+    return False
+
+
+def find_weakened_checks(pinned_calls: Counter, combined: Counter):
+    """The real integrity property this file's softened [CP2-T01] "extra" assertion enforces: no
+    ORIGINAL check(...) call was dropped or weakened. A pinned call with no same-id/same-message
+    counterpart anywhere in `combined` is not this function's job -- the "missing" assertion right
+    above it in t01 already catches a call that vanished with nothing resembling it left behind.
+    This function instead pairs up pinned and current calls that share the same case id (or, when
+    there is none, the same message text) AND the same message text, and flags only the pairs
+    whose condition looks structurally loosened per _looks_weakened -- a brand-new check with no
+    pinned counterpart, or a reviewed re-point whose condition is the pinned one modulo a renamed
+    identifier, are both left alone. Returns a list of (case_id_or_message, pinned_cond_dump)."""
+    def _group(calls: Counter):
+        grouped = defaultdict(list)
+        for text, n in calls.items():
+            parsed = parse_check_call_parts(text)
+            if parsed is None:
+                continue
+            case_id, msg_text, cond_node = parsed
+            key = (case_id, msg_text) if case_id else (None, msg_text)
+            grouped[key].extend([cond_node] * n)
+        return grouped
+
+    pinned_by_key = _group(pinned_calls)
+    current_by_key = _group(combined)
+
+    findings = []
+    for key, pinned_nodes in pinned_by_key.items():
+        current_nodes = current_by_key.get(key)
+        if not current_nodes:
+            continue  # no same-id/same-message counterpart at all: "missing" above already covers this
+        remaining = list(current_nodes)
+        for p in pinned_nodes:
+            if p is None:
+                continue
+            p_shape = _cond_shape(p)
+            match_idx = next((i for i, c in enumerate(remaining) if _cond_shape(c) == p_shape), None)
+            if match_idx is not None:
+                remaining.pop(match_idx)  # identical modulo renames: unchanged, or a safe re-point
+                continue
+            if not remaining:
+                continue
+            candidate = remaining.pop(0)
+            if _looks_weakened(p, candidate):
+                findings.append((key[0] or key[1], ast.dump(p, annotate_fields=False)[:120]))
+    return findings
+
+
 def t01_every_check_call_moves_once():
     print("CP2-T01: every check() call from the old file shows up once, word for word, in the new files")
     try:
@@ -194,7 +324,6 @@ def t01_every_check_call_moves_once():
         combined += c
 
     missing = pinned_calls - combined
-    extra = combined - pinned_calls
     owners = {}
     for fname, c in per_file.items():
         for text in c:
@@ -203,8 +332,15 @@ def t01_every_check_call_moves_once():
 
     check("[CP2-T01] no check(...) call from the pinned original is missing from the new files",
           not missing, list(missing.keys())[:5])
-    check("[CP2-T01] no check(...) call appears extra or reworded in the new files (none duplicated/added)",
-          not extra, list(extra.keys())[:5])
+    # Softened on purpose (see the CP5 brief): a brand-new check(...) call, or a reviewed re-point
+    # of an existing one (e.g. a renamed local variable inside an otherwise-equivalent condition),
+    # must not fail this guard -- only a check that was dropped (already caught by "missing" above)
+    # or silently weakened (same id/message, an easier-to-pass condition) should.
+    weakened = find_weakened_checks(pinned_calls, combined)
+    check("[CP2-T01] no original check(...) call was silently weakened in the new files (brand-new "
+          "checks and reviewed re-points are fine; a clause dropped or an operator loosened under "
+          "the same id/message is not)",
+          not weakened, weakened[:5])
     check("[CP2-T01] no single-occurrence check(...) call landed in more than one new file",
           not split_across, list(split_across.items())[:5])
 
@@ -531,6 +667,72 @@ def t09_openspec_points_at_new_files():
           not still_old, still_old[:10])
 
 
+# ---- CP2-T10: the softened [CP2-T01] "extra" guard still has teeth -------------------------------------------
+#
+# CP2-T01's "extra" assertion was softened (see the CP5 brief) from "no check(...) call appears
+# extra or reworded at all" to "no original check(...) call was dropped or weakened" via
+# find_weakened_checks(). This proves that softening did not remove the guard's teeth: it is fed
+# small synthetic pinned/current Counters (never the real pinned source) built to look like real
+# check(...) call text, one scenario at a time.
+
+
+def _counter_of(call_texts):
+    return Counter(call_texts)
+
+
+def t10_softened_extra_check_still_has_teeth():
+    print("CP2-T10: the softened [CP2-T01] guard still catches a drop or a weakening, and still "
+          "lets a new check or a reviewed re-point through")
+
+    # (a) DROPPED: an original check with nothing resembling it left behind in the current files.
+    # Caught by the "missing" assertion right above the softened one in t01 -- not by
+    # find_weakened_checks() itself, which has no same-id/same-message counterpart to compare
+    # against and correctly stays silent on it (see its own docstring).
+    dropped_text = 'check("[CP99-T01] alpha holds", cond_a and cond_b, "d")'
+    pinned_a = _counter_of([dropped_text])
+    current_a = _counter_of([])  # nothing resembling it survives the split
+    missing_a = pinned_a - current_a
+    check("[CP2-T10] (a) a dropped original check with no counterpart anywhere is still caught, by "
+          "the 'missing' assertion", bool(missing_a), dict(missing_a))
+    check("[CP2-T10] (a) find_weakened_checks() itself does not try to judge a check with no "
+          "same-id/same-message counterpart at all (that is 'missing'\\'s job, not this one's)",
+          find_weakened_checks(pinned_a, current_a) == [], find_weakened_checks(pinned_a, current_a))
+
+    # (b) WEAKENED: same id and message, a condition that now accepts strictly more inputs.
+    pinned_b = _counter_of([
+        'check("[CP99-T02] beta holds", cond_a and cond_b, "d")',
+        'check("[CP99-T03] gamma holds", cond_a and cond_b and cond_c, "d")',
+    ])
+    current_b = _counter_of([
+        'check("[CP99-T02] beta holds", cond_a or cond_b, "d")',          # and -> or
+        'check("[CP99-T03] gamma holds", cond_a and cond_b, "d")',        # an AND-ed clause dropped
+    ])
+    found_b = find_weakened_checks(pinned_b, current_b)
+    check("[CP2-T10] (b) an `and` silently turned into an `or` under the same id/message is caught "
+          "as weakened", any(cid == "CP99-T02" for cid, _ in found_b), found_b)
+    check("[CP2-T10] (b) an AND-ed clause silently dropped under the same id/message is caught as "
+          "weakened", any(cid == "CP99-T03" for cid, _ in found_b), found_b)
+
+    # (c) NEW: a brand-new check added with no original counterpart must pass cleanly.
+    pinned_c = _counter_of(['check("[CP99-T04] delta holds", cond_a and cond_b, "d")'])
+    current_c = _counter_of([
+        'check("[CP99-T04] delta holds", cond_a and cond_b, "d")',          # unchanged
+        'check("[CP99-T05] epsilon holds", cond_x or cond_y, "d")',         # wholly new, no pinned counterpart
+    ])
+    found_c = find_weakened_checks(pinned_c, current_c)
+    check("[CP2-T10] (c) a brand-new check(...) call with no pinned counterpart passes cleanly "
+          "(is never flagged as weakened)", found_c == [], found_c)
+
+    # (d) RE-POINT: same id/message, a condition that is the pinned one modulo a renamed identifier
+    # (e.g. a reviewed rename of a local variable the condition mentions), same operator/clause
+    # structure otherwise -- must also pass cleanly.
+    pinned_d = _counter_of(['check("[CP99-T06] zeta holds", src.value == 1 and other, "d")'])
+    current_d = _counter_of(['check("[CP99-T06] zeta holds", src_with_records.value == 1 and other, "d")'])
+    found_d = find_weakened_checks(pinned_d, current_d)
+    check("[CP2-T10] (d) a reviewed re-point (same id/message, a renamed identifier inside an "
+          "otherwise-equivalent condition) passes cleanly", found_d == [], found_d)
+
+
 TESTS = [
     ("CP2-T01", t01_every_check_call_moves_once),
     ("CP2-T02", t02_shared_helpers_move_once),
@@ -541,6 +743,7 @@ TESTS = [
     ("CP2-T07", t07_test_signing_still_passes),
     ("CP2-T08", t08_readme_names_new_files),
     ("CP2-T09", t09_openspec_points_at_new_files),
+    ("CP2-T10", t10_softened_extra_check_still_has_teeth),
 ]
 
 
