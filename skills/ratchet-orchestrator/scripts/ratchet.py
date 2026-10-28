@@ -15148,12 +15148,17 @@ PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* M
 def _hook_input():
     try:
         raw = sys.stdin.read()
-        return json.loads(raw) if raw.strip() else {}
+        data = json.loads(raw) if raw.strip() else {}
+        if not isinstance(data, dict):
+            return {}
+        return data
     except Exception:
         return {}
 
 
 def detect_hook_host(data: dict, explicit: str | None = None) -> str:
+    if not isinstance(data, dict):
+        data = {}
     if explicit and explicit != "auto":
         return explicit
     if any(k in data for k in ("toolName", "toolArgs", "sessionId", "stopReason")):
@@ -15176,6 +15181,8 @@ def _tool_kind(name: str) -> str:
 
 
 def normalize_hook(data: dict, host: str) -> dict:
+    if not isinstance(data, dict):
+        data = {}
     tool = data.get("tool_name") or data.get("toolName") or ""
     ti = data.get("tool_input", data.get("toolArgs", {}))
     if isinstance(ti, str):

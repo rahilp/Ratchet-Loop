@@ -60,6 +60,8 @@ never inspects its on-disk text directly): 31 files
   dynamically twice (`eng_rm` via a `probs` alias, `eng_g` via an `iu` alias).
 - `test_hooks_waiver.py` — CP2: the hooks-waive choice is recorded only from a real reply; loads
   ratchet.py dynamically inside a generated snippet.
+- `test_hook_list_payload.py` — CP1 fix: hook entrypoint must not crash on JSON array payload; loads
+  ratchet.py dynamically via spec_from_file_location to test detect_hook_host and normalize_hook directly.
 - `test_integrate_files.py` — CP3: `integrate <lane>` merges Ratchet's own shared files by
   Ratchet's rules; loads ratchet.py dynamically (`ratchet_engine_for_cp3`).
 - `test_integrate_safety.py` — CP2 safety tests for `integrate <lane>`; loads ratchet.py
