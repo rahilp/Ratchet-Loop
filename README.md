@@ -534,6 +534,7 @@ python3 tests/test_guard_reads.py
 python3 tests/test_guard_reserved_names.py
 python3 tests/test_guard_writes.py
 python3 tests/test_guardrails.py
+python3 tests/test_hook_list_payload.py
 python3 tests/test_hooks.py
 python3 tests/test_hooks_status.py
 python3 tests/test_hooks_waiver.py

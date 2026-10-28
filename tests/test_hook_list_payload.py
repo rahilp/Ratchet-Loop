@@ -7,8 +7,11 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import _tmp  # noqa: E402
 
 ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
 PASS = FAIL = 0
@@ -61,7 +64,8 @@ def main():
     # (c) End-to-end: run engine as subprocess with JSON array on stdin
     print("Case (c): end-to-end subprocess with JSON array stdin")
     for host_arg in ("auto", "codex"):
-        with tempfile.TemporaryDirectory(prefix="ratchet-list-test-") as td:
+        td = _tmp.mkdtemp(prefix="ratchet-list-test-")
+        try:
             r = subprocess.run(
                 [sys.executable, str(ENGINE), "hook", "stop", "--host", host_arg],
                 cwd=td, input='["a","b"]', capture_output=True, text=True,
@@ -69,6 +73,8 @@ def main():
             )
             check(f"subprocess --host {host_arg} exit code is 0 (fail-open)", r.returncode == 0, f"rc={r.returncode} stderr={r.stderr[:200]}")
             check(f"subprocess --host {host_arg} no AttributeError in stderr", "AttributeError" not in r.stderr and "has no attribute 'get'" not in r.stderr, r.stderr[:300])
+        finally:
+            pass  # _tmp.mkdtemp cleans up automatically via atexit
 
     # (d) Regression: normal Codex stop dict payload still works
     print("Case (d): regression - normal Codex stop dict payload")
@@ -93,7 +99,8 @@ def main():
     except Exception as e:
         check("normal Codex payload does not raise in normalize_hook", False, f"{type(e).__name__}: {e}")
 
-    with tempfile.TemporaryDirectory(prefix="ratchet-regression-") as td:
+    td = _tmp.mkdtemp(prefix="ratchet-regression-")
+    try:
         subprocess.run(["git", "init", "-q"], cwd=td, check=True)
         r = subprocess.run(
             [sys.executable, str(ENGINE), "hook", "stop", "--host", "auto"],
@@ -102,6 +109,8 @@ def main():
         )
         check("regression subprocess exit code 0", r.returncode == 0, f"rc={r.returncode} stderr={r.stderr[:200]}")
         check("regression subprocess no AttributeError", "AttributeError" not in r.stderr, r.stderr[:300])
+    finally:
+        pass  # _tmp.mkdtemp cleans up automatically via atexit
 
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
