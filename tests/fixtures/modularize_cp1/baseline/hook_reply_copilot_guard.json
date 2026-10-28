@@ -1,0 +1,1 @@
+{"permissionDecision": "deny", "permissionDecisionReason": "RATCHET GUARD: gate state, evidence, approvals and config under .ratchet/ are written by ratchet.py only (you may write reviews/, states/, tests/, reference/, checkpoints.json, app-scout.json, standards.md, learnings.md). Blocked: /tmp/ratchet-cp1-hookcap-9fx9v2ss/.ratchet/runs/hk/state.json"}

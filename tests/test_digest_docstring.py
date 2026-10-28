@@ -2,15 +2,16 @@
 """
 CP3 tests: the spec-digest helper's docstring states the exact BMAD done rule.   python3 tests/test_digest_docstring.py
 
-`_related_spec_items` in skills/ratchet-orchestrator/scripts/ratchet.py already decides a BMAD story is "done"
-with an exact, case/space-tolerant comparison (`str(status).strip().lower() == "done"`), but its docstring still
-said a story counts when its status text "contains" done -- a wider rule than the code actually applies. This
-checkpoint only fixes the docstring (and lists this file in README.md's test list); the runtime rule does not
-change.
+`_related_spec_items` (originally in skills/ratchet-orchestrator/scripts/ratchet.py, moved verbatim by CP7 of
+the modularization run into skills/ratchet-orchestrator/scripts/plan_support.py -- see
+tests/test_modularize_cp7.py, CP7-T12) already decides a BMAD story is "done" with an exact, case/space-tolerant
+comparison (`str(status).strip().lower() == "done"`), but its docstring still said a story counts when its
+status text "contains" done -- a wider rule than the code actually applies. This checkpoint only fixes the
+docstring (and lists this file in README.md's test list); the runtime rule does not change.
 
 T01/T02 read the docstring straight off disk with `ast` (no subprocess, no project/`.ratchet` setup needed):
-parse skills/ratchet-orchestrator/scripts/ratchet.py, find the `_related_spec_items` FunctionDef, and read its
-docstring with `ast.get_docstring`.
+parse skills/ratchet-orchestrator/scripts/plan_support.py, find the `_related_spec_items` FunctionDef, and read
+its docstring with `ast.get_docstring`.
 
 T03 checks (a) the runtime rule is unchanged, by importing the engine module directly (`import ratchet as rt`,
 the same direct-call style tests/test_objective.py uses) and calling `_related_spec_items` on a plain temp
@@ -35,6 +36,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+# CP7 moved _related_spec_items out of ratchet.py into plan_support.py (see tests/test_modularize_cp7.py,
+# CP7-T12); _func_docstring now reads it there instead, same rule, same docstring, new home only.
+PLAN_SUPPORT = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "plan_support.py"
 README = ROOT / "README.md"
 
 sys.path.insert(0, str(HERE))
@@ -62,12 +66,13 @@ def check(name, cond, detail=""):
 # ------------------------------------------------------------------------------------------------ fixtures / helpers
 
 def _func_docstring(name: str) -> str:
-    """The docstring of the top-level function `name` in ratchet.py, read with ast (no import, no subprocess)."""
-    tree = ast.parse(ENGINE.read_text(encoding="utf-8"), filename=str(ENGINE))
+    """The docstring of the top-level function `name` in plan_support.py (where CP7 moved _related_spec_items
+    out of ratchet.py to), read with ast (no import, no subprocess)."""
+    tree = ast.parse(PLAN_SUPPORT.read_text(encoding="utf-8"), filename=str(PLAN_SUPPORT))
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return ast.get_docstring(node) or ""
-    raise AssertionError(f"function {name!r} not found in {ENGINE}")
+    raise AssertionError(f"function {name!r} not found in {PLAN_SUPPORT}")
 
 
 def _bmad_clause(doc: str) -> str:

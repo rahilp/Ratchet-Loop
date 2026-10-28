@@ -1,0 +1,412 @@
+{
+  "root": "/home/user/project",
+  "slug": "behavior-preserving-modularization-of-skills-rat",
+  "feature": "Behavior-preserving modularization of skills/ratchet-orchestrator/scripts/ratchet.py into coherent modules, keeping ratchet.py as the stable CLI entry point",
+  "phase": "building",
+  "current": "CP1",
+  "step": "implement",
+  "next": "CP1: spawn ratchet-implementer for this checkpoint only, then run: ratchet.py implemented CP1",
+  "stop_ok": false,
+  "objective": {
+    "users": "Rahil and the AI agents he directs, who read, review and extend Ratchet's own engine code in skills/ratchet-orchestrator/scripts/ratchet.py",
+    "goal": "Find and safely change any one responsibility of the engine (config, locks, provider discovery, run bookkeeping, plan/status reporting) without reading or risking the rest of a 21,000+ line file, while every existing command, test and tamper/lock guarantee keeps behaving exactly as before",
+    "done_means": [
+      "ratchet.py --help, status --json, hook replies and failure exit codes are provably unchanged after every extraction in this run",
+      "Utility, fingerprint, tamper-evidence/locking, provider-discovery, run-bookkeeping/hook-env/integrity, and plan-validation/digest/plain-language-status code each move into their own module with explicit non-star imports, no circular imports and no new global mutable registry",
+      "Locking, tamper evidence, provider fallback and gate-support decisions keep their exact current behavior; nothing is weakened to make a move easier",
+      "Every source-inspection or module-loading test that reads ratchet.py's text or AST (43+ files found by grep, including the 5 named in the brief) is re-pointed to the new module locations in the same checkpoint that moves the code it inspects, keeping its actual invariant",
+      "The complete local suite (tests/run_all.py under the director's suite lock) passes after every checkpoint",
+      "A concise module map doc lists what moved and where, cross-referenced from README/SKILL.md"
+    ],
+    "out_of_scope": [
+      "Moving the hooks section (~2,465 lines: prompt/stop hook handlers, guard/command-safety checks, hook installation) \u2014 too large for one reviewable checkpoint; left for a dedicated follow-up feature",
+      "Moving the three giant single-function command handlers cmd_init (~825 lines), cmd_lanes_start + cmd_integrate (~1,527 lines), and cmd_ask (~571 lines) \u2014 each needs its own focused feature",
+      "Moving director approvals/signing (director-signed approvals, director_policy, director_sign, director_key/enroll, ~900 lines) \u2014 large and security-sensitive; deferred to its own feature so it gets full attention",
+      "Moving receipts, spec tools (OpenSpec/Spec Kit/BMAD import), shortcut tables, viewer/dashboard, CI export, reviewers/reviewer_status, guardrail/scoped-diff/occurrences/repeats, review-signing, and the _Watch/cmd_red/cmd_behavior gate-running machinery \u2014 all deferred to follow-up features",
+      "Extracting main()'s argparse setup and dispatch, and the top-level _StateLock/_IntegrateLock \u2014 these intentionally stay in ratchet.py as the stable, thin entry point, per done-means #1",
+      "Any behavior change not explicitly called out and approved as a scope decision",
+      "New user configuration, reviewer-policy changes, or OpenCode hook behavior changes",
+      "Refactoring the internals of any giant function being moved (e.g. splitting cmd_init's body into smaller functions) \u2014 this run moves code verbatim only"
+    ]
+  },
+  "waiting_on": null,
+  "blocked_reason": null,
+  "blocked_reason_plain": null,
+  "accept_note": null,
+  "awaiting_since": null,
+  "approval_mode": "director",
+  "wait": null,
+  "question": null,
+  "adv_rounds_used": 0,
+  "unavailable_reviewers": {
+    "gemini-correctness": {
+      "reason": "test request failed: exit 41: Please set an Auth method in your /home/user/.gemini/settings.json or specify one of the following environment variables before running: GEMINI_API_KEY, GOOGLE_GENAI_USE_VERTEXAI, GOOGLE_GENAI_USE_GC",
+      "since": "2026-10-19T14:48:58.405736+00:00",
+      "until": "2026-10-19T20:48:58.405736+00:00"
+    },
+    "gemini-standards": {
+      "reason": "test request failed: exit 41: Please set an Auth method in your /home/user/.gemini/settings.json or specify one of the following environment variables before running: GEMINI_API_KEY, GOOGLE_GENAI_USE_VERTEXAI, GOOGLE_GENAI_USE_GC",
+      "since": "2026-10-19T14:48:58.405736+00:00",
+      "until": "2026-10-19T20:48:58.405736+00:00"
+    },
+    "gemini-both": {
+      "reason": "test request failed: exit 41: Please set an Auth method in your /home/user/.gemini/settings.json or specify one of the following environment variables before running: GEMINI_API_KEY, GOOGLE_GENAI_USE_VERTEXAI, GOOGLE_GENAI_USE_GC",
+      "since": "2026-10-19T14:48:58.405736+00:00",
+      "until": "2026-10-19T20:48:58.405736+00:00"
+    },
+    "copilot-correctness": {
+      "reason": "test request failed: exit 1: Resume     copilot --resume=01364d8b-4485-49e4-9c80-bbf64225fed8",
+      "since": "2026-10-19T14:49:00.824702+00:00",
+      "until": "2026-10-19T20:49:00.824702+00:00"
+    },
+    "copilot-standards": {
+      "reason": "test request failed: exit 1: Resume     copilot --resume=01364d8b-4485-49e4-9c80-bbf64225fed8",
+      "since": "2026-10-19T14:49:00.824702+00:00",
+      "until": "2026-10-19T20:49:00.824702+00:00"
+    },
+    "copilot-both": {
+      "reason": "test request failed: exit 1: Resume     copilot --resume=01364d8b-4485-49e4-9c80-bbf64225fed8",
+      "since": "2026-10-19T14:49:00.824702+00:00",
+      "until": "2026-10-19T20:49:00.824702+00:00"
+    },
+    "opencode-glm-correctness": {
+      "reason": "test request failed: exit 1: This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key.",
+      "since": "2026-10-19T14:49:05.417725+00:00",
+      "until": "2026-10-19T20:49:05.417725+00:00"
+    },
+    "opencode-glm-standards": {
+      "reason": "test request failed: exit 1: This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key.",
+      "since": "2026-10-19T14:49:05.417725+00:00",
+      "until": "2026-10-19T20:49:05.417725+00:00"
+    },
+    "opencode-glm-both": {
+      "reason": "test request failed: exit 1: This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key.",
+      "since": "2026-10-19T14:49:05.417725+00:00",
+      "until": "2026-10-19T20:49:05.417725+00:00"
+    },
+    "opencode-kimi-correctness": {
+      "reason": "test request failed: exit 1: This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key.",
+      "since": "2026-10-19T14:49:10.020802+00:00",
+      "until": "2026-10-19T20:49:10.020802+00:00"
+    },
+    "opencode-kimi-standards": {
+      "reason": "test request failed: exit 1: This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key.",
+      "since": "2026-10-19T14:49:10.020802+00:00",
+      "until": "2026-10-19T20:49:10.020802+00:00"
+    },
+    "opencode-kimi-both": {
+      "reason": "test request failed: exit 1: This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key.",
+      "since": "2026-10-19T14:49:10.020802+00:00",
+      "until": "2026-10-19T20:49:10.020802+00:00"
+    },
+    "longcat-free-correctness": {
+      "reason": "test request failed: exit 1: This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key.",
+      "since": "2026-10-19T14:49:14.457610+00:00",
+      "until": "2026-10-19T20:49:14.457610+00:00"
+    },
+    "longcat-free-standards": {
+      "reason": "test request failed: exit 1: This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key.",
+      "since": "2026-10-19T14:49:14.457610+00:00",
+      "until": "2026-10-19T20:49:14.457610+00:00"
+    },
+    "longcat-free-both": {
+      "reason": "test request failed: exit 1: This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key.",
+      "since": "2026-10-19T14:49:14.457610+00:00",
+      "until": "2026-10-19T20:49:14.457610+00:00"
+    },
+    "step5-free-correctness": {
+      "reason": "test request failed: exit 1: Unexpected server error. Check server logs for details.",
+      "since": "2026-10-19T14:49:16.462526+00:00",
+      "until": "2026-10-19T20:49:16.462526+00:00"
+    },
+    "step5-free-standards": {
+      "reason": "test request failed: exit 1: Unexpected server error. Check server logs for details.",
+      "since": "2026-10-19T14:49:16.462526+00:00",
+      "until": "2026-10-19T20:49:16.462526+00:00"
+    },
+    "step5-free-both": {
+      "reason": "test request failed: exit 1: Unexpected server error. Check server logs for details.",
+      "since": "2026-10-19T14:49:16.462526+00:00",
+      "until": "2026-10-19T20:49:16.462526+00:00"
+    }
+  },
+  "host_provider": "anthropic",
+  "hooks_warning": null,
+  "hook_heartbeat": {
+    "prompt": {
+      "at": "2026-10-19T16:11:34.011035+00:00",
+      "host": "claude"
+    },
+    "guard": {
+      "at": "2026-10-19T16:20:59.255914+00:00",
+      "host": "claude"
+    },
+    "agent_marks": {
+      "at": "2026-10-19T16:20:59.257824+00:00",
+      "host": "claude"
+    },
+    "stop": {
+      "at": "2026-10-19T15:59:58.776224+00:00",
+      "host": "claude"
+    }
+  },
+  "hooks": {
+    "host": "claude",
+    "installed": true,
+    "heartbeat_seen": true,
+    "fresh": true,
+    "enforcing": true,
+    "prompt_hook": true,
+    "missing": false
+  },
+  "hook_errors": [],
+  "viewer_url": "file:///home/user/project/.ratchet/runs/behavior-preserving-modularization-of-skills-rat/viewer.html",
+  "viewer_live": false,
+  "done": 0,
+  "total": 9,
+  "done_means_table": null,
+  "shortcuts": {
+    "tables": []
+  },
+  "finish_blockers": null,
+  "small_fix_reviews": [],
+  "fix_rounds": [],
+  "docs_only_review_skips": [],
+  "checkpoints": [
+    {
+      "id": "CP1",
+      "title": "Inventory source-inspecting tests and snapshot behavior",
+      "risk": "low",
+      "status": "in_progress",
+      "step": "implement",
+      "commit": null,
+      "gates": {
+        "behavior": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "ui": {
+          "status": "skipped",
+          "attempts": 0
+        },
+        "adversarial": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "human": {
+          "status": "pending",
+          "attempts": 0
+        }
+      }
+    },
+    {
+      "id": "CP2",
+      "title": "Extract leaf utilities into engine_utils.py",
+      "risk": "low",
+      "status": "pending",
+      "step": "tests",
+      "commit": null,
+      "gates": {
+        "behavior": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "ui": {
+          "status": "skipped",
+          "attempts": 0
+        },
+        "adversarial": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "human": {
+          "status": "pending",
+          "attempts": 0
+        }
+      }
+    },
+    {
+      "id": "CP3",
+      "title": "Extract fingerprint/git-tree logic into fingerprint.py",
+      "risk": "normal",
+      "status": "pending",
+      "step": "tests",
+      "commit": null,
+      "gates": {
+        "behavior": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "ui": {
+          "status": "skipped",
+          "attempts": 0
+        },
+        "adversarial": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "human": {
+          "status": "pending",
+          "attempts": 0
+        }
+      }
+    },
+    {
+      "id": "CP4",
+      "title": "Extract tamper-evidence and record locking into records.py",
+      "risk": "high",
+      "status": "pending",
+      "step": "tests",
+      "commit": null,
+      "gates": {
+        "behavior": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "ui": {
+          "status": "skipped",
+          "attempts": 0
+        },
+        "adversarial": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "human": {
+          "status": "pending",
+          "attempts": 0
+        }
+      }
+    },
+    {
+      "id": "CP5",
+      "title": "Extract provider discovery and quota logic",
+      "risk": "normal",
+      "status": "pending",
+      "step": "tests",
+      "commit": null,
+      "gates": {
+        "behavior": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "ui": {
+          "status": "skipped",
+          "attempts": 0
+        },
+        "adversarial": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "human": {
+          "status": "pending",
+          "attempts": 0
+        }
+      }
+    },
+    {
+      "id": "CP6",
+      "title": "Extract run bookkeeping, hook-env and integrity checks",
+      "risk": "high",
+      "status": "pending",
+      "step": "tests",
+      "commit": null,
+      "gates": {
+        "behavior": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "ui": {
+          "status": "skipped",
+          "attempts": 0
+        },
+        "adversarial": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "human": {
+          "status": "pending",
+          "attempts": 0
+        }
+      }
+    },
+    {
+      "id": "CP7",
+      "title": "Extract plan validation and earlier-work digest",
+      "risk": "normal",
+      "status": "pending",
+      "step": "tests",
+      "commit": null,
+      "gates": {
+        "behavior": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "ui": {
+          "status": "skipped",
+          "attempts": 0
+        },
+        "adversarial": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "human": {
+          "status": "pending",
+          "attempts": 0
+        }
+      }
+    },
+    {
+      "id": "CP8",
+      "title": "Extract plain-language status and next-action text",
+      "risk": "normal",
+      "status": "pending",
+      "step": "tests",
+      "commit": null,
+      "gates": {
+        "behavior": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "ui": {
+          "status": "skipped",
+          "attempts": 0
+        },
+        "adversarial": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "human": {
+          "status": "pending",
+          "attempts": 0
+        }
+      }
+    },
+    {
+      "id": "CP9",
+      "title": "Write the module map for maintainers",
+      "risk": "low",
+      "status": "pending",
+      "step": "tests",
+      "commit": null,
+      "gates": {
+        "behavior": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "ui": {
+          "status": "skipped",
+          "attempts": 0
+        },
+        "adversarial": {
+          "status": "pending",
+          "attempts": 0
+        },
+        "human": {
+          "status": "pending",
+          "attempts": 0
+        }
+      }
+    }
+  ],
+  "updated_at": "2026-10-19T16:11:14.775241+00:00"
+}

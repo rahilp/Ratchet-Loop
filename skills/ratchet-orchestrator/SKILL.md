@@ -46,7 +46,7 @@ The user talks in plain words; you turn what they say into engine commands. Any 
 RATCHET="python3 <this skill's base directory>/scripts/ratchet.py"
 ```
 
-Use the absolute path of this skill's folder. Pass the same `RATCHET` line into every sub-agent prompt. Sub-agents cannot see this skill.
+Use the absolute path of this skill's folder. Pass the same `RATCHET` line into every sub-agent prompt. Sub-agents cannot see this skill. `ratchet.py` imports several smaller modules from the same `scripts/` folder; see the Module map in `references/modules.md` for what each one owns.
 
 **Right after install.** When the user has just installed Ratchet and restarted (they say "Set up Ratchet" and there is no active run), check the hooks with `$RATCHET doctor --json` as Phase A step 2 describes. Once they work, tell the user in one line that Ratchet is ready and ask what they'd like built. Don't start a run until they describe a feature. If a run is active, pick it up from `$RATCHET next` instead.
 

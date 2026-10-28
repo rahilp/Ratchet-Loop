@@ -375,7 +375,7 @@ On Codex, Gemini and Copilot, the agent should still start every sub-agent's pro
 
 ## Reference (commands the agent runs)
 
-Everything above is done by talking to your agent. This section is for people typing at a terminal, and it lists what the agent runs on your behalf. `ratchet.py` lives in `skills/ratchet-orchestrator/scripts/`.
+Everything above is done by talking to your agent. This section is for people typing at a terminal, and it lists what the agent runs on your behalf. `ratchet.py` lives in `skills/ratchet-orchestrator/scripts/`, alongside seven smaller modules it imports from; see the Module map in `skills/ratchet-orchestrator/references/modules.md` for what each one owns.
 
 ### What's inside
 
@@ -560,6 +560,15 @@ python3 tests/test_load_timeouts.py
 python3 tests/test_load_timeouts_fixes.py
 python3 tests/test_merge_guard.py
 python3 tests/test_merge_main.py
+python3 tests/test_modularize_cp2.py
+python3 tests/test_modularize_cp3.py
+python3 tests/test_modularize_cp4.py
+python3 tests/test_modularize_cp5.py
+python3 tests/test_modularize_cp6.py
+python3 tests/test_modularize_cp7.py
+python3 tests/test_modularize_cp8.py
+python3 tests/test_modularize_cp9.py
+python3 tests/test_modularize_inventory.py
 python3 tests/test_objective.py
 python3 tests/test_opencode_big.py
 python3 tests/test_plan_change.py

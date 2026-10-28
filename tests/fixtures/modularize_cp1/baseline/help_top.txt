@@ -1,0 +1,93 @@
+usage: ratchet.py [-h] [--root ROOT]
+                  {init,plan-submit,approve-plan,tests-written,red,implemented,behavior,ui-record,adv-record,complete,merged,human-approve,feedback,plan-extend,learn,pause,wait,resume,ask,accept-state,accept-finding,accept-line,raise-limit,hooks-waive,cancel,set-review,choice,ui-respec,approve-changes,providers,models,guardrail,occurrences,repeats,spec,deferred,mark-fixed,shortcuts,receipt,next,status,changes,plan-summary,brief,reviewers,check-in,triage,reviewer-status,lanes,director-key,director-enroll,lanes-start,integrate,director-policy,director-sign,fingerprint,config,view,hook,hook-stop,hook-prompt,hook-guard,install-hooks,doctor,ci-export} ...
+
+Ratchet loop state engine
+
+positional arguments:
+  {init,plan-submit,approve-plan,tests-written,red,implemented,behavior,ui-record,adv-record,complete,merged,human-approve,feedback,plan-extend,learn,pause,wait,resume,ask,accept-state,accept-finding,accept-line,raise-limit,hooks-waive,cancel,set-review,choice,ui-respec,approve-changes,providers,models,guardrail,occurrences,repeats,spec,deferred,mark-fixed,shortcuts,receipt,next,status,changes,plan-summary,brief,reviewers,check-in,triage,reviewer-status,lanes,director-key,director-enroll,lanes-start,integrate,director-policy,director-sign,fingerprint,config,view,hook,hook-stop,hook-prompt,hook-guard,install-hooks,doctor,ci-export}
+    merged              between steps, after merging main into the lane: re-
+                        check earlier steps and accept the merge
+    wait                end your turn while background reviewers or sub-agents
+                        run, without a blocked stop
+    resume              resume a paused run; --claim moves the run to this
+                        chat (after `ask claim`)
+    ask                 record and print the question you're about to ask the
+                        user (needed before approve-plan, human-approve,
+                        cancel, set-review, approve-changes, hooks-waive,
+                        resume --claim, ui-respec, accept-finding, paid-
+                        provider, accept-line)
+    accept-state        ==SUPPRESS==
+    accept-finding      record the open findings the user accepted (after `ask
+                        accept-finding` and their 'accept: <reason>' reply, or
+                        a director token)
+    accept-line         record the unproven done-means lines the user accepted
+                        (after `ask accept-line <n,..>` and their 'accept:
+                        <reason>' reply, or a director token with --reason)
+    raise-limit         raise one checkpoint's review-round limit by one round
+                        (after `ask raise-limit` and the owning chat's own
+                        'raise: <reason>' reply, or a director token with
+                        --reason); offered at most once per step, ever
+    hooks-waive         record the user's choice to build without hooks (after
+                        `ask hooks-waive`)
+    cancel              abandon the active run (needs the user's confirmation)
+    set-review          change how often the user reviews (needs their
+                        confirmation)
+    choice              after `ask choice`: record which option the user
+                        picked (or, with a director token, the letter the
+                        director signed)
+    ui-respec           after `ask ui-respec CPn` and the user's yes: allow
+                        one change to a frozen UI check
+    approve-changes     accept a user-confirmed change to the approved
+                        plan/tests/rules
+    providers           list, test (--check/--discover) and register (--add)
+                        other agent CLIs
+    models              which model each role's sub-agent uses on this host
+    guardrail           after the user picks a guardrail option: add a step
+                        that builds an automatic check
+    occurrences         the real code where reviewers found a kind of mistake
+    repeats             kinds of review finding seen twice or more, not yet
+                        guarded or asked about
+    spec                build from an OpenSpec change, Spec Kit feature or
+                        BMAD story
+    deferred            findings recorded for later instead of blocking
+                        (minor, or no user_impact)
+    mark-fixed          record that a deferred finding was really fixed and
+                        reviewed again
+    shortcuts           run the shortcut tables (tests/shortcuts/*.json) whose
+                        watched files this run changed against the code the
+                        run started from and the current code
+    receipt             one proof receipt to paste into the pull request:
+                        steps, time, reviewers, accepted/left-for-later/fixed-
+                        later findings
+    changes             which changes since a checkpoint's start are docs, how
+                        many code lines changed, which test files name a doc,
+                        and whether the docs quick path is on
+    plan-summary        plain per-step summary of the plan, to show the user
+                        before they approve
+    brief               print a sub-agent's opening text: the plan's
+                        objective, then that role's own standing rules; start
+                        every spawn prompt with this instead of writing it by
+                        hand
+    check-in            print (or decide) the check-in opened when reviews
+                        drag
+    triage              record fix-or-rebut decisions for a blocked round's
+                        open findings
+    lanes-start         director only: start several lanes (branch, worktree,
+                        enrollment, brief) from one request
+    integrate           director only: merge a finished lane into main (suite
+                        first), or check it with --dry-run
+    director-policy     director only: show, set or clear the developer's
+                        rules for routine approvals
+    view                print/open the viewer link; --serve starts a live
+                        server in the background
+    hook                entry point for agent-CLI hooks
+    install-hooks       write Ratchet's hooks into an agent CLI's config
+    doctor              which hosts have Ratchet hooks, and are they firing?
+    ci-export           write (or, with --stdout, print) the GitHub Actions
+                        workflow that keeps running the regression command and
+                        saved checks after the run ends
+
+options:
+  -h, --help            show this help message and exit
+  --root ROOT           operate on the project/lane at this path (default:
+                        current folder)

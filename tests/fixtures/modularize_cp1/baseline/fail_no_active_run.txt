@@ -1,0 +1,1 @@
+RATCHET ✗ No active Ratchet run. Start one with: ratchet.py init "<feature>"

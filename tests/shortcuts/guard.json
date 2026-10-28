@@ -1,7 +1,7 @@
 {
  "name": "guard",
  "description": "Covers the guard's shell check (_guard_shell) only. Refusals of commands that set reserved variables (RATCHET_HUMAN_OVERRIDE, RATCHET_ROLE, RATCHET_HOME, RATCHET_DIRECTOR_KEY_FILE) come from the hook layer (decide_guard), which this table does not run, so a clean result does not show they hold. Watches spec_sources.py and provider_health.py as well as ratchet.py because the engine imports both and the comparison copy cannot load without them.",
- "watches": ["skills/ratchet-orchestrator/scripts/ratchet.py", "skills/ratchet-orchestrator/scripts/spec_sources.py", "skills/ratchet-orchestrator/scripts/provider_health.py"],
+ "watches": ["skills/ratchet-orchestrator/scripts/ratchet.py", "skills/ratchet-orchestrator/scripts/spec_sources.py", "skills/ratchet-orchestrator/scripts/provider_health.py", "skills/ratchet-orchestrator/scripts/engine_utils.py", "skills/ratchet-orchestrator/scripts/fingerprint.py", "skills/ratchet-orchestrator/scripts/records.py", "skills/ratchet-orchestrator/scripts/provider_discovery.py", "skills/ratchet-orchestrator/scripts/run_records.py", "skills/ratchet-orchestrator/scripts/plan_support.py", "skills/ratchet-orchestrator/scripts/status_text.py"],
  "runner": "python3 tests/shortcuts/guard_runner.py",
  "rows": [
   {"id": "probe-plain-redirect", "command": "echo x > .ratchet/runs/hk/state.json", "expect": "refused", "source": "director probe"},

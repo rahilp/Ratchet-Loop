@@ -829,11 +829,38 @@ def cp5_adv_round11_damaged_record_class():
           got is False and (rh / "file-hashes.lock").is_dir() and took < 5, (got, took))
 
     # --- X60: structural: no record is read or written around the one reader and the one writer ----------------
-    bad = cp5r11_io_violations(src)
+    # fingerprint/changed_files live in fingerprint.py since the modularize-engine run's CP3; merge its source
+    # into the scan's input text so this check keeps its actual invariant -- each still reads/writes only the
+    # manifest cache the allow-lists above already name for them -- regardless of which file currently holds
+    # them. Mirrors the engine_utils.py merge done for the facade check just below.
+    fp_src = ENGINE.with_name("fingerprint.py").read_text(encoding="utf-8")
+    # _read_record/_write_record/_append_record/update_record and their locks live in records.py since the
+    # modularize-engine run's CP4; merge it in too, for the same reason fp_src is merged in above.
+    rec_src = ENGINE.with_name("records.py").read_text(encoding="utf-8")
+    # probe_provider, event_stream and the rest of provider discovery/quota live in provider_discovery.py since
+    # the modularize-engine run's CP5; merge it in too, for the same reason fp_src and rec_src are merged in above.
+    pd_src = ENGINE.with_name("provider_discovery.py").read_text(encoding="utf-8")
+    # register_active, hook_env_problem and the rest of run bookkeeping/hook-env trust/integrity verification
+    # live in run_records.py since the modularize-engine run's CP6; merge it in too, for the same reason
+    # fp_src/rec_src/pd_src are merged in above.
+    rr_src = ENGINE.with_name("run_records.py").read_text(encoding="utf-8")
+    bad = cp5r11_io_violations(src + "\n" + fp_src + "\n" + rec_src + "\n" + pd_src + "\n" + rr_src)
     check("[CP5-X60] ratchet.py reads JSON files only through _read_record (read_json without `record=` only for "
           "files people or agents write) and writes files only through _write_record / _append_record, apart from "
           "a short allow-list of files that are not Ratchet's records",
           bad == [], bad[:10])
+    # mutation-proof: a disguised unguarded write planted inside changed_files (allow-listed only for the read it
+    # already does, not for a write) in a throwaway copy of fingerprint.py's text must still be caught -- proving
+    # the merge above really walks into fingerprint.py's function bodies, not just ratchet.py's.
+    _marker = '    b = read_json(mdir / f"{fp_b[\'id\']}.json", {}) or {}\n'
+    assert _marker in fp_src, "fingerprint.py's changed_files no longer matches the expected source; update the probe"
+    fp_src_planted = fp_src.replace(
+        _marker,
+        _marker + '    (mdir / "planted.json").write_text(json.dumps(b))  # [CP5-X60] planted mutation\n')
+    planted_flagged = {(fn, what) for fn, _l, what in cp5r11_io_violations(fp_src_planted)}
+    check("[CP5-X60] ... and the merged scan really walks into fingerprint.py's own functions: a disguised "
+          "unguarded write planted inside changed_files is still flagged",
+          ("changed_files", "write_text") in planted_flagged, planted_flagged)
     probe = ("def _stop_error(root):\n    data = read_json(p, {})\n    write_json(p, data)\n"
              "def record_director_folder(f):\n    with open(tmp, 'w') as fh:\n        fh.write('x')\n"
              "    os.replace(tmp, p)\n    json.loads(p.read_text())\n"
@@ -845,7 +872,13 @@ def cp5_adv_round11_damaged_record_class():
                       ("record_director_folder", "json.loads"), ("record_director_folder", "open(w)"),
                       ("record_director_folder", "replace")], flagged)
     import ast
+    # read_json/write_json live in engine_utils.py since the modularize-engine run's CP2 (_read_record/
+    # _write_record stay in ratchet.py, `src`, until CP4's records.py); merge both files' top-level defs so this
+    # check keeps its actual invariant -- each is still a thin facade over the one reader/writer -- regardless of
+    # which file currently holds which name.
+    eu_src = ENGINE.with_name("engine_utils.py").read_text(encoding="utf-8")
     fns = {n.name: n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef)}
+    fns.update({n.name: n for n in ast.walk(ast.parse(eu_src)) if isinstance(n, ast.FunctionDef)})
     rr = fns.get("_read_record")
     calls = {getattr(c.func, "id", getattr(c.func, "attr", None)) for c in ast.walk(rr) if isinstance(c, ast.Call)} \
         if rr else set()
@@ -1002,7 +1035,13 @@ def cp5_adv_round12_restrictions_breaker_and_order():
     print("CP5 adv round 12: restriction records are never written over, one stale-breaker winner, accept-state order")
     import threading
     m = cp5y_load_engine()
+    # CP3-T10 isolates and re-executes JUST this one assignment (ENGINE monkeypatched to a scratch file with no
+    # records.py sibling) to prove it reads live; it must keep reading ENGINE alone, so X65's own need for
+    # records.py's text (_BreakerLock/_remove_stale_breaker moved there in CP4) is merged separately, below.
     src = ENGINE.read_text(encoding="utf-8")
+    # _BreakerLock (and _remove_stale_breaker, X65 below) lives in records.py since the modularize-engine run's
+    # CP4; merge it in (as its own variable, not `src` above) so X65's text check still sees it.
+    src_with_records = src + "\n" + ENGINE.with_name("records.py").read_text(encoding="utf-8")
 
     # --- X63: a damaged enrolled.json is never replaced by a later enrollment, and keeps restricting ------------
     env = make_env("claude")
@@ -1133,8 +1172,12 @@ def cp5_adv_round12_restrictions_breaker_and_order():
         if name == "P1":
             p1_done.set()
 
-    real_os = m.os
-    m.os = _Cp5r12OsProxy(real_os, hook)
+    # _BreakerLock._take_breaker's own `os.lstat` resolves against whichever module it was DEFINED in (records.py
+    # since CP4's split, not ratchet.py), regardless of which module's attribute you reach the class through --
+    # so the proxy has to replace THAT module's `os`, or the hook below is never called at all.
+    os_owner = sys.modules.get("records", m)
+    real_os = os_owner.os
+    os_owner.os = _Cp5r12OsProxy(real_os, hook)
     try:
         t1 = threading.Thread(target=run, args=("P1", p1l, 2.0), name="P1")
         t2 = threading.Thread(target=run, args=("P2", p2l, 0.5), name="P2")
@@ -1143,7 +1186,7 @@ def cp5_adv_round12_restrictions_breaker_and_order():
         t1.join(15)
         t2.join(15)
     finally:
-        m.os = real_os
+        os_owner.os = real_os
     content = brk.read_text() if brk.exists() else None
     check("[CP5-X65] two waiters behind one stale breaker, both judging it stale before either acts: only one holds "
           "the breaker, and the fresh one stays in place",
@@ -1163,7 +1206,8 @@ def cp5_adv_round12_restrictions_breaker_and_order():
     p2l._drop_breaker()
     check("[CP5-X65] the stale-breaker removal checks identity (inode and modification time) after a rename, never "
           "unlinking the breaker by path",
-          "def _remove_stale_breaker" in src and "os.unlink(self.breaker)\n                        continue" not in src)
+          "def _remove_stale_breaker" in src_with_records
+          and "os.unlink(self.breaker)\n                        continue" not in src_with_records)
 
     # --- X66: accept-state refuses a damaged state.json before it asks for the code ---------------------------
     if not HAVE_PTY:
@@ -1301,16 +1345,20 @@ _CP3_NO_RECURSE_VAR = "RATCHET_CP5D_NO_RECURSE"  # set on the child so it runs o
 # and the expected totals below must agree, not assume a pty is always there. The HAVE_PTY=False totals (81 total;
 # X53 4, X56 2, X61 36, X66 0, all others unchanged) were captured the same way as the HAVE_PTY=True ones: running
 # this file's own SECTIONS solo with HAVE_PTY forced false (`del os.forkpty` before import) and reading the result.
+# [Corrected, modularize-engine run's CP3] X60 gained one genuinely new check() (a mutation-proof regression
+# proving the X60 scan, re-pointed at fingerprint.py after CP3's move, really walks into fingerprint.py's own
+# function bodies) -- not a dropped or relabeled case, so the totals below are bumped by exactly that one check,
+# same way, on both the HAVE_PTY and non-PTY counts (the new check does not itself depend on HAVE_PTY).
 BASELINE_SECTIONS = [
     "CP5 adv round 10: damaged per-user records fail safe; a stale short lock is cleared by one process only",
     "CP5 adv round 11: every damaged record fails safe: no hook crashes, recovery always runs, no run is stuck",
     "CP5 adv round 12: restriction records are never written over, one stale-breaker winner, accept-state order",
     "CP5 adv round 12: the override code is read from Ratchet's prompt, never from digits in a printed path",
 ]
-BASELINE_TALLY = 127 if HAVE_PTY else 81
+BASELINE_TALLY = 128 if HAVE_PTY else 82
 BASELINE_ID_COUNTS = {
     "CP5-X51": 5, "CP5-X52": 1, "CP5-X53": 5 if HAVE_PTY else 4, "CP5-X54": 2, "CP5-X55": 2,
-    "CP5-X56": 8 if HAVE_PTY else 2, "CP5-X57": 5, "CP5-X58": 3, "CP5-X59": 4, "CP5-X60": 4,
+    "CP5-X56": 8 if HAVE_PTY else 2, "CP5-X57": 5, "CP5-X58": 3, "CP5-X59": 4, "CP5-X60": 5,
     "CP5-X61": 73 if HAVE_PTY else 36, "CP5-X63": 5, "CP5-X64": 2, "CP5-X65": 5, "CP5-X66": 2 if HAVE_PTY else 0,
     "CP5-X67": 1,
 }

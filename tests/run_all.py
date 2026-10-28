@@ -221,6 +221,7 @@ class Result:
         self.tail: list = []
         self.error = ""
         self.stretch = ""  # a summary line when this suite ran past its --timeout or was stopped at a stretched one
+        self.report_text = None  # this suite's own isolated $RATCHET_TEST_REPORT content, if any (see Runner.run)
 
     @property
     def passed(self) -> bool:
@@ -399,8 +400,18 @@ class Runner:
         tmp.mkdir(parents=True)
         tag = f"{os.getpid()}-{suite.stem}-{secrets.token_hex(8)}"
         outer = os.environ.get(TAG_VAR, "").strip()
+        # When the parent process (this run_all.py invocation) itself was given a $RATCHET_TEST_REPORT, do not
+        # hand that SAME shared path to every suite unchanged: each suite's own report-writing helper does a
+        # destructive overwrite, so whichever suite finishes last would destroy every other suite's results.
+        # Instead give each suite its own isolated report path inside its own tmp folder; main() merges every
+        # suite's isolated report back into the one real path after all suites finish. When the parent process
+        # has no $RATCHET_TEST_REPORT at all, this is a no-op: no isolated path is set, nothing new is created.
+        orig_report = os.environ.get("RATCHET_TEST_REPORT")
+        isolated_report = (tmp / "report.json") if orig_report else None
         env = dict(os.environ, TMPDIR=str(tmp), TEMP=str(tmp), TMP=str(tmp), PYTHONUNBUFFERED="1",
                    **{TAG_VAR: f"{outer} {tag}".strip(), RUN_ALL_VAR: "1", SUITES_VAR: self.suite_names})
+        if isolated_report is not None:
+            env["RATCHET_TEST_REPORT"] = str(isolated_report)
         t0 = time.monotonic()
         try:
             with open(log, "wb") as out:
@@ -424,6 +435,15 @@ class Runner:
         except OSError as e:
             res.error = f"could not start: {e}"
         res.duration = time.monotonic() - t0
+        if isolated_report is not None and isolated_report.exists():
+            try:
+                res.report_text = isolated_report.read_text(encoding="utf-8")
+            except OSError:
+                res.report_text = None
+            try:
+                isolated_report.unlink()  # read before the leftover check below, so it is never reported as one
+            except OSError:
+                pass
         try:
             res.leftovers = sorted(os.listdir(tmp))
         except OSError:
@@ -520,6 +540,37 @@ def parse_args(argv):
     return args
 
 
+def merge_reports(results: list) -> None:
+    """After every suite has finished, union every suite's own isolated $RATCHET_TEST_REPORT (see Runner.run)
+    into the ONE real path named by this process's own $RATCHET_TEST_REPORT, if that was set at all. Merge
+    means: every suite's "cases" list, concatenated in `results` order (ids are not deduplicated: different
+    suites use disjoint id namespaces in practice). A suite with no isolated report (most suites: they never
+    looked at $RATCHET_TEST_REPORT), or one whose isolated report is missing or not valid JSON, contributes
+    nothing. When $RATCHET_TEST_REPORT is not set, or no suite contributed any cases, this does nothing: no
+    file is written and none of this run's behavior changes (the common case: a developer running this
+    directly, with no report path set at all)."""
+    orig_report = os.environ.get("RATCHET_TEST_REPORT")
+    if not orig_report:
+        return
+    merged_cases: list = []
+    for r in results:
+        if not r.report_text:
+            continue
+        try:
+            data = json.loads(r.report_text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("cases"), list):
+            merged_cases.extend(data["cases"])
+    if not merged_cases:
+        return
+    try:
+        with open(orig_report, "w", encoding="utf-8") as f:
+            json.dump({"cases": merged_cases}, f)
+    except OSError:
+        pass
+
+
 def _interrupt(_signum, _frame):
     raise KeyboardInterrupt
 
@@ -608,6 +659,8 @@ def main(argv=None) -> int:
     if interrupted:
         print(f"\nInterrupted after {wall:.1f}s; {len(results)} of {len(order)} suites had finished.", flush=True)
         return 130
+
+    merge_reports(results)
 
     save_timings(folder, {r.name: r.duration for r in results if not r.error})
 

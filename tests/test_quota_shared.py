@@ -894,7 +894,17 @@ def x10_lanes_opening_rounds_at_the_same_moment_while_the_provider_fails_send_on
 def x11_the_health_record_is_only_written_under_its_lock_and_a_lockless_writer_loses_an_entry():
     import test_trust_cp5_e as tt               # the shared-record scan and the forced-interleave race live there
     from trust_helpers import cp5y_load_engine, engine_env, make_env
-    src = (ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py").read_text(encoding="utf-8")
+    # [CP4] update_record's own def moved into records.py; combine both files' source so this scan still covers
+    # update_record's own definition and helpers, not just ratchet.py's remaining callers.
+    # [CP5] provider_bench/bench_quota/update_review_starts/_reserve_under_lock/probe_provider (the functions
+    # that actually touch provider-health.json under lock) moved into provider_discovery.py; include it too.
+    # [CP6] register_active and the rest of run bookkeeping/hook-env trust/integrity verification moved into
+    # run_records.py; include it too.
+    scripts_dir = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+    src = ((scripts_dir / "ratchet.py").read_text(encoding="utf-8") + "\n"
+          + (scripts_dir / "records.py").read_text(encoding="utf-8") + "\n"
+          + (scripts_dir / "provider_discovery.py").read_text(encoding="utf-8") + "\n"
+          + (scripts_dir / "run_records.py").read_text(encoding="utf-8"))
     probe = ("def stray(path):\n    write_json(_health_path(), {})\n"
              "def stray2():\n    q = _health_path()\n    _write_record(q, {})\n"
              "def fine():\n    update_record(_health_path(), lambda d: d)\n")
