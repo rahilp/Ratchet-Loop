@@ -90,9 +90,12 @@ def _live_grep(pattern: str) -> set:
     own name is dropped from the result: see the module docstring for why. `__pycache__` is excluded so a stale
     compiled `.pyc` left over from an earlier import (which can embed pattern strings like
     `spec_from_file_location` as literal bytecode constants) never gets falsely reported as a source-inspecting
-    file."""
-    r = subprocess.run(["grep", "-rlE", "--exclude-dir=__pycache__", pattern, "."], cwd=str(HERE),
-                        capture_output=True, text=True, timeout=30)
+    file. The impact-analyzer sample-data fixture dirs (`tests/fixtures/impact_analysis_*/`) are excluded for the
+    SAME CP1-X01 reason: those files embed the scan-pattern strings (`ast.parse`, `ENGINE.read_text`, ...) as the
+    analyzer's own test INPUTS, with zero references to ratchet.py -- they do not inspect ratchet.py's source, so
+    they are not source-inspecting dependencies, exactly as embedded bytecode constants are not."""
+    r = subprocess.run(["grep", "-rlE", "--exclude-dir=__pycache__", "--exclude-dir=impact_analysis_*",
+                        pattern, "."], cwd=str(HERE), capture_output=True, text=True, timeout=30)
     if r.returncode not in (0, 1):
         raise RuntimeError(f"grep failed: exit {r.returncode}: {r.stderr[-300:]}")
     names = set()
@@ -169,6 +172,28 @@ def t01_inventory_covers_live_grep():
     missing = sorted({Path(f).name for f in live if not mentions(Path(f).name, text)})
     check("[CP1-T01] every file the live grep finds is named in the inventory (live-grep minus inventory is "
           "empty)", not missing, missing)
+
+    # Teeth (same plant-and-clean-up technique as CP1-X01): a brand-new, non-excluded test file under
+    # tests/ that inspects ratchet.py's source MUST still be caught by the assertion above -- both found
+    # by the live grep (proving the impact_analysis_* exclusion is a narrow sample-data carve-out, never
+    # a blanket tests/ suppression) and flagged as not-yet-inventoried (proving the oracle keeps its bite
+    # for a real new source-inspecting dependency).
+    probe = HERE / "_cp1_t01_teeth_probe.py"
+    try:
+        probe.write_text("# planted CP1-T01 teeth probe; carries the source-inspection pattern below\n"
+                         "_ = 'ENGINE.read_text()'  # matches SOURCE_TEXT_PATTERN, like a real source scan\n")
+        live_with_probe = live_all_source_inspecting_files()
+        probe_found = any(Path(f).name == probe.name for f in live_with_probe)
+        check("[CP1-T01] teeth: a newly-planted source-inspecting test file directly under tests/ is still "
+              "found by the live grep (the impact_analysis_* exclusion does not suppress real new files)",
+              probe_found, sorted(Path(f).name for f in live_with_probe)[-5:])
+        missing_with_probe = sorted({Path(f).name for f in live_with_probe
+                                     if not mentions(Path(f).name, text)})
+        check("[CP1-T01] teeth: that planted, un-inventoried source-inspecting file is flagged by the "
+              "live-grep-minus-inventory assertion (a genuinely new dependency is still caught)",
+              probe.name in missing_with_probe, missing_with_probe[:5])
+    finally:
+        probe.unlink(missing_ok=True)
 
 
 # ---- CP1-T02: the 5 brief-named files are present, each with a real description -------------------------------
@@ -431,6 +456,13 @@ def _git(args):
 
 def t10_suite_green_before_any_code_change():
     print("CP1-T10: the complete local suite passed with zero code changes made yet")
+    # This case verifies lane M's OWN run context: its run-state file (app-scout.json) and the clean
+    # starting tree of M's own run. Those only exist inside M's own worktree/run, under RUN_DIR. On
+    # integrated main RUN_DIR is gone, so skip cleanly rather than false-fail; inside M's run it runs
+    # exactly as before.
+    if not RUN_DIR.exists():
+        print("[CP1-T10] skipped: not running inside lane M's own run context")
+        return
     code, out, err = _git(["diff", "--quiet", "HEAD", "--",
                            "skills/ratchet-orchestrator/scripts/ratchet.py",
                            "skills/ratchet-orchestrator/scripts/provider_health.py",

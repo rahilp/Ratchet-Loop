@@ -246,29 +246,53 @@ def _looks_weakened(pinned_node, current_node):
     return False
 
 
+def _group_by_key(calls: Counter):
+    """Group a Counter of check(...) call source texts by their (id-or-message) pairing key: the
+    case id when there is one, else the whole message text, always paired with the message text so
+    two same-id sub-checks with different messages (e.g. CP5-X60's four) stay distinct. The value is
+    the list of each call's condition AST node, one per occurrence. Shared by both the "missing"
+    sub-check (find_missing_checks) and the "weakened" sub-check (find_weakened_checks) so the two
+    pair pinned-vs-current the exact same way -- a reworded-but-present check must look the same to
+    both. A call that does not parse as a bare check(...) is skipped."""
+    grouped = defaultdict(list)
+    for text, n in calls.items():
+        parsed = parse_check_call_parts(text)
+        if parsed is None:
+            continue
+        case_id, msg_text, cond_node = parsed
+        key = (case_id, msg_text) if case_id else (None, msg_text)
+        grouped[key].extend([cond_node] * n)
+    return grouped
+
+
+def find_missing_checks(pinned_calls: Counter, combined: Counter):
+    """The ORIGINAL check(...) calls that were genuinely dropped: a pinned call whose (id-or-message)
+    key has NO counterpart anywhere in the current files. Pairs pinned-vs-current by the SAME key
+    find_weakened_checks uses (via _group_by_key), rather than by exact call text, so a check that
+    still exists under the same id/message but with a renamed identifier / reworded condition (e.g.
+    CP5-X65's `src` -> `src_with_records` rename) is NOT a false drop -- it is present, and
+    find_weakened_checks already guards it against being loosened. Only a key with no current
+    counterpart at all is a real drop. Returns a sorted list of the dropped checks' id-or-message
+    strings."""
+    pinned_by_key = _group_by_key(pinned_calls)
+    current_by_key = _group_by_key(combined)
+    missing = [key for key in pinned_by_key if key not in current_by_key]
+    return sorted(str(key[0] or key[1]) for key in missing)
+
+
 def find_weakened_checks(pinned_calls: Counter, combined: Counter):
     """The real integrity property this file's softened [CP2-T01] "extra" assertion enforces: no
     ORIGINAL check(...) call was dropped or weakened. A pinned call with no same-id/same-message
     counterpart anywhere in `combined` is not this function's job -- the "missing" assertion right
-    above it in t01 already catches a call that vanished with nothing resembling it left behind.
-    This function instead pairs up pinned and current calls that share the same case id (or, when
-    there is none, the same message text) AND the same message text, and flags only the pairs
-    whose condition looks structurally loosened per _looks_weakened -- a brand-new check with no
-    pinned counterpart, or a reviewed re-point whose condition is the pinned one modulo a renamed
-    identifier, are both left alone. Returns a list of (case_id_or_message, pinned_cond_dump)."""
-    def _group(calls: Counter):
-        grouped = defaultdict(list)
-        for text, n in calls.items():
-            parsed = parse_check_call_parts(text)
-            if parsed is None:
-                continue
-            case_id, msg_text, cond_node = parsed
-            key = (case_id, msg_text) if case_id else (None, msg_text)
-            grouped[key].extend([cond_node] * n)
-        return grouped
-
-    pinned_by_key = _group(pinned_calls)
-    current_by_key = _group(combined)
+    above it in t01 (find_missing_checks) already catches a call that vanished with nothing
+    resembling it left behind. This function instead pairs up pinned and current calls that share the
+    same case id (or, when there is none, the same message text) AND the same message text, and flags
+    only the pairs whose condition looks structurally loosened per _looks_weakened -- a brand-new
+    check with no pinned counterpart, or a reviewed re-point whose condition is the pinned one modulo
+    a renamed identifier, are both left alone. Returns a list of (case_id_or_message,
+    pinned_cond_dump)."""
+    pinned_by_key = _group_by_key(pinned_calls)
+    current_by_key = _group_by_key(combined)
 
     findings = []
     for key, pinned_nodes in pinned_by_key.items():
@@ -323,15 +347,17 @@ def t01_every_check_call_moves_once():
     for c in per_file.values():
         combined += c
 
-    missing = pinned_calls - combined
+    missing = find_missing_checks(pinned_calls, combined)
     owners = {}
     for fname, c in per_file.items():
         for text in c:
             owners.setdefault(text, set()).add(fname)
     split_across = {t: fs for t, fs in owners.items() if len(fs) > 1 and pinned_calls.get(t, 0) <= 1}
 
-    check("[CP2-T01] no check(...) call from the pinned original is missing from the new files",
-          not missing, list(missing.keys())[:5])
+    check("[CP2-T01] no check(...) call from the pinned original is missing from the new files "
+          "(paired by id/message, so a check reworded via a renamed identifier under the same "
+          "id/message is present, not a false drop; a wholly-dropped id/message is still caught)",
+          not missing, missing[:5])
     # Softened on purpose (see the CP5 brief): a brand-new check(...) call, or a reviewed re-point
     # of an existing one (e.g. a renamed local variable inside an otherwise-equivalent condition),
     # must not fail this guard -- only a check that was dropped (already caught by "missing" above)
@@ -685,18 +711,38 @@ def t10_softened_extra_check_still_has_teeth():
           "lets a new check or a reviewed re-point through")
 
     # (a) DROPPED: an original check with nothing resembling it left behind in the current files.
-    # Caught by the "missing" assertion right above the softened one in t01 -- not by
-    # find_weakened_checks() itself, which has no same-id/same-message counterpart to compare
+    # Caught by the "missing" assertion (find_missing_checks) right above the softened one in t01 --
+    # not by find_weakened_checks() itself, which has no same-id/same-message counterpart to compare
     # against and correctly stays silent on it (see its own docstring).
     dropped_text = 'check("[CP99-T01] alpha holds", cond_a and cond_b, "d")'
     pinned_a = _counter_of([dropped_text])
     current_a = _counter_of([])  # nothing resembling it survives the split
-    missing_a = pinned_a - current_a
-    check("[CP2-T10] (a) a dropped original check with no counterpart anywhere is still caught, by "
-          "the 'missing' assertion", bool(missing_a), dict(missing_a))
+    check("[CP2-T10] (a) a dropped original check with no id/message counterpart anywhere is still "
+          "caught, by the 'missing' assertion (find_missing_checks)",
+          find_missing_checks(pinned_a, current_a) == ["CP99-T01"], find_missing_checks(pinned_a, current_a))
     check("[CP2-T10] (a) find_weakened_checks() itself does not try to judge a check with no "
           "same-id/same-message counterpart at all (that is 'missing'\\'s job, not this one's)",
           find_weakened_checks(pinned_a, current_a) == [], find_weakened_checks(pinned_a, current_a))
+
+    # (a2) DROPPED vs REWORDED, side by side: a wholly-dropped check (no id/message counterpart) is
+    # still flagged missing, while a check that survives under the SAME id/message with only a
+    # renamed identifier in its condition (the real CP5-X65 `src` -> `src_with_records` case that
+    # made the old exact-text "missing" sub-check false-fail on merged main) is NOT a drop.
+    pinned_a2 = _counter_of([
+        'check("[CP99-T07] eta holds", cond_a and cond_b, "d")',           # wholly dropped below
+        'check("[CP99-T08] theta holds", "def f" in src and other, "d")',  # survives, identifier renamed
+    ])
+    current_a2 = _counter_of([
+        # CP99-T07 gone entirely -- no id/message counterpart survives
+        'check("[CP99-T08] theta holds", "def f" in src_with_records and other, "d")',  # same id/msg, renamed
+    ])
+    missing_a2 = find_missing_checks(pinned_a2, current_a2)
+    check("[CP2-T10] (a2) a wholly-dropped check (no id/message counterpart) is still caught as "
+          "missing", "CP99-T07" in missing_a2, missing_a2)
+    check("[CP2-T10] (a2) a check reworded via a renamed identifier (same id/message, changed "
+          "condition) is NOT flagged missing -- it is present", "CP99-T08" not in missing_a2, missing_a2)
+    check("[CP2-T10] (a2) and find_weakened_checks() does not read that pure rename as a weakening",
+          find_weakened_checks(pinned_a2, current_a2) == [], find_weakened_checks(pinned_a2, current_a2))
 
     # (b) WEAKENED: same id and message, a condition that now accepts strictly more inputs.
     pinned_b = _counter_of([

@@ -72,6 +72,11 @@ THIN_HANDLERS = ["cmd_status_text", "cmd_plan_summary", "next_action"]
 BASELINE_DIR = ROOT / "tests" / "fixtures" / "modularize_cp1" / "baseline"
 MANIFEST = BASELINE_DIR / "manifest.json"
 
+# Lane M's own run directory. It exists only inside M's own worktree/run; on integrated main it is
+# gone. CP8-T17's diff-scope check is meaningful only inside M's own run (it diffs against CP7's
+# landing commit assuming HEAD is still M's run tip), so it keys off this directory's existence.
+RUN_DIR = ROOT / ".ratchet" / "runs" / "behavior-preserving-modularization-of-skills-rat"
+
 PASS = FAIL = 0
 CASE_STATUS: dict[str, bool] = {}
 CASE_MESSAGES: dict[str, list] = {}
@@ -919,6 +924,13 @@ def t16_named_regression_files_still_pass():
 def t17_full_suite_and_diff_scope():
     print("CP8-T17: the complete local suite passes under the suite lock, and this checkpoint's diff touches "
           "only the expected files")
+    # This case verifies lane M's OWN run context: a `git diff` against CP7's landing commit assuming
+    # HEAD is still M's own run tip. On integrated main the diff legitimately includes other lanes'
+    # merged work, so skip cleanly rather than false-fail; inside M's run (RUN_DIR present) it runs
+    # exactly as before.
+    if not RUN_DIR.exists():
+        print("[CP8-T17] skipped: not running inside lane M's own run context")
+        return
     if os.environ.get("RATCHET_CP8_T17_FULL_SUITE") == "1":
         child_env = {k: v for k, v in os.environ.items() if k != "RATCHET_CP8_T17_FULL_SUITE"}
         r = subprocess.run([sys.executable, "tests/run_all.py"], cwd=str(ROOT), capture_output=True, text=True,

@@ -46,6 +46,11 @@ MODULES_MD = ROOT / "skills" / "ratchet-orchestrator" / "references" / "modules.
 README = ROOT / "README.md"
 SKILL_MD = ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md"
 
+# Lane M's own run directory. It exists only inside M's own worktree/run; on integrated main it is
+# gone. CP9-T08's diff-scope check is meaningful only inside M's own run (it diffs against CP8's
+# landing commit assuming HEAD is still M's run tip), so it keys off this directory's existence.
+RUN_DIR = ROOT / ".ratchet" / "runs" / "behavior-preserving-modularization-of-skills-rat"
+
 # This run's own base commit, before CP2's first extraction out of ratchet.py (CP1 only inventoried
 # and snapshotted; it moved no code). Confirmed by hand (git ls-tree) that at this commit
 # skills/ratchet-orchestrator/scripts/ held only ratchet.py, spec_sources.py and provider_health.py.
@@ -322,6 +327,13 @@ def t07_skill_md_points_to_module_map():
 def t08_full_suite_and_diff_scope():
     print("CP9-T08: the complete local suite passes under the suite lock, and this checkpoint's diff "
           "touches only docs")
+    # This case verifies lane M's OWN run context: a `git diff` against CP8's landing commit assuming
+    # HEAD is still M's own run tip. On integrated main the diff legitimately includes other lanes'
+    # merged work, so skip cleanly rather than false-fail; inside M's run (RUN_DIR present) it runs
+    # exactly as before.
+    if not RUN_DIR.exists():
+        print("[CP9-T08] skipped: not running inside lane M's own run context")
+        return
     if os.environ.get("RATCHET_CP9_T08_FULL_SUITE") == "1":
         child_env = {k: v for k, v in os.environ.items() if k != "RATCHET_CP9_T08_FULL_SUITE"}
         r = subprocess.run([sys.executable, "tests/run_all.py"], cwd=str(ROOT), capture_output=True,

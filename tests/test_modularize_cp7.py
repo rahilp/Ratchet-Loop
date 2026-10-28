@@ -55,6 +55,11 @@ sys.path.insert(0, str(SCRIPT_DIR))  # lets CP7-T12 import `ratchet` directly, t
 BASELINE_DIR = ROOT / "tests" / "fixtures" / "modularize_cp1" / "baseline"
 MANIFEST = BASELINE_DIR / "manifest.json"
 
+# Lane M's own run directory. It exists only inside M's own worktree/run; on integrated main it is
+# gone. CP7-T15's diff-scope check is meaningful only inside M's own run (it diffs against CP6's
+# landing commit assuming HEAD is still M's run tip), so it keys off this directory's existence.
+RUN_DIR = ROOT / ".ratchet" / "runs" / "behavior-preserving-modularization-of-skills-rat"
+
 # The pre-move commit for this checkpoint is simply the current HEAD (CP6's own landing commit): confirmed by
 # hand that `git status` shows no uncommitted change to ratchet.py and that nothing in this checkpoint's move has
 # landed yet -- the same "pin note" CP6's own suite documents for itself.
@@ -736,6 +741,13 @@ def t14_help_status_hook_and_exit_codes_byte_identical():
 def t15_full_suite_and_diff_scope():
     print("CP7-T15: the complete local suite passes under the suite lock, and this checkpoint's diff touches "
           "only the expected files")
+    # This case verifies lane M's OWN run context: a `git diff` against CP6's landing commit assuming
+    # HEAD is still M's own run tip. On integrated main the diff legitimately includes other lanes'
+    # merged work, so skip cleanly rather than false-fail; inside M's run (RUN_DIR present) it runs
+    # exactly as before.
+    if not RUN_DIR.exists():
+        print("[CP7-T15] skipped: not running inside lane M's own run context")
+        return
     if os.environ.get("RATCHET_CP7_T15_FULL_SUITE") == "1":
         # Strip the opt-in flag from the child's environment: tests/run_all.py's own run reaches this same
         # test_modularize_cp7.py again, and if it inherited the flag it would take this same full-suite branch

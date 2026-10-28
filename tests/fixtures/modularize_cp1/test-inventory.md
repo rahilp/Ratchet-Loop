@@ -147,6 +147,15 @@ tree, never loads it as a module itself): 6 files
   there with its docstring intact and no leftover top-level `def` in ratchet.py. Never loads either
   module dynamically via `spec_from_file_location` itself, so it matches only the source-text/AST
   pattern, not the module-load one.
+- `test_impact_analysis_registration.py` — lane X: the impact-analyzer's `registration` entry point
+  (`skills/ratchet-checkpoint-planner/scripts/impact_analysis.py`) flags new test files that need
+  inventory registration. It matches the source-text/AST grep only because it carries the scan-pattern
+  strings (`ast.parse`, `read_text`/`read_bytes`) as its OWN subject matter — assertions and comments
+  about what the analyzer must recognize — and because it reads its own throwaway sample fixtures. It
+  does NOT inspect ratchet.py's on-disk source at all (its target is `impact_analysis.py`); a split of
+  ratchet.py cannot affect it. Listed here only because it lives directly under `tests/` (so, unlike the
+  analyzer's `tests/fixtures/impact_analysis_*/` sample-data files — excluded from the live grep for the
+  same CP1-X01 reason that excludes embedded bytecode constants — it stays inside the oracle's scope).
 
 ## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 10 files
 
