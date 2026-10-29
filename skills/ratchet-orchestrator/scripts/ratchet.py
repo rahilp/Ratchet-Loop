@@ -166,9 +166,25 @@ class Ctx:
         host_models (with alternates), ui_reviewers and agents ('model' or 'provider/model', split at the first '/' so a model may hold more) name-to-value maps, and
         host_provider."""
         p = self.global_config_path
-        if not p.exists():
+        absent = object()  # not p.exists(): that reads a file in an unreadable folder as "no file"
+        g = read_json(p, absent)
+        if g is absent:
             return {}
-        g = read_json(p, {})
+        return self.check_global_config(g)
+
+    def check_project_config(self, p):
+        """What read_json returned for the project's settings file: valid JSON that is not an object stops naming it."""
+        if not isinstance(p, dict):
+            die(f"{self.config_path} must hold a JSON object of settings (got {type(p).__name__}). Fix or delete that "
+                "file, then run this command again.")
+        return p
+
+    def check_global_config(self, g, path=None, project=False):
+        """The rules global_config() applies to what it read, also applied by `config --global --set` to what it is
+        about to write, so a file Ratchet writes always loads. Returns g, or stops naming the file and the setting.
+        `config --set` / `--unset` on the project's file passes its own `path` and the provider-and-model part of the
+        candidate with project=True (the same shape rules; the project's providers may carry paid consent)."""
+        p = path or self.global_config_path
         if not isinstance(g, dict):
             die(f"{p} must hold a JSON object of settings (got {type(g).__name__}). Fix or delete that file, then run "
                 "this command again.")
@@ -204,7 +220,7 @@ class Ctx:
             if not isinstance(prov, dict):
                 die(f"{p} 'providers[{i}]' must be an object describing one provider (got {type(prov).__name__}). "
                     "Fix that entry in the file, then run this command again.")
-            if "paid_ok_at" in prov:
+            if "paid_ok_at" in prov and not project:
                 die(f"{p} can't hold paid consent (providers[].paid_ok_at): approving paid use is per project. "
                     "Remove that field from the file.")
             if not name_ok(prov.get("id")):
@@ -273,13 +289,136 @@ class Ctx:
             bad("host_provider", "a non-empty string", g["host_provider"])
         return g
 
-    def user_config(self, project=None):
+    def validate_candidate(self, user, project):
+        """The one validation of a settings layer: `user` is the content of the project's file (project=True) or the
+        machine-wide file (project=False), as about to be written or as just read. It is merged over/under the other
+        layer exactly as the loader does (user_config, then config_from_user), then every setting present is checked;
+        the first wrong one stops the command naming the file it came from, the setting, the expected type and how to
+        repair it. Called before every write (`config --set/--unset`, both files) and by the read paths that show a
+        layer (`--scope`, `--sources`). Returns user. Keeps check_global_config's rules for the provider and model
+        settings and uses the typed readers (quota_retest_minutes, provider_share, _suite_watch_seconds,
+        _lanes_start_template, related_test_command's {files} rule) where a setting has one. Every other
+        DEFAULT_CONFIG setting must have the type family its consumers need, taken from its shipped default (a bool is
+        not a number; an int default accepts an int or a float; null only where the default is null). Unknown
+        settings are not checked. The check is on the top-level value (what a consumer first meets); entries inside a
+        list or map are checked only where noted.
+
+        What a wrong-typed value does today (read from the consumers), which is why each is enforced:
+          crash (TypeError / AttributeError / ValueError on first use):
+            max_adversarial_rounds, max_adversarial_rounds_run, max_ui_rounds, max_behavior_attempts, test_timeout_sec,
+            max_stop_blocks, small_edit_lines, min_review_seconds (compared or passed to min()); converge_after_round,
+            checkin_round, probe_timeout_sec (int()), probe_ttl_minutes, unavailable_ttl_hours (float());
+            regression_command, doc_test_command, related_test_command (.replace or shell on a non-string);
+            ui_globs, doc_globs, doc_exclude_globs, test_globs, standards, fingerprint_include, related_always (matched
+            or joined as strings); checks, providers; reviewers, review_depth, role_models, host_models,
+            blocking_severities, ui_reviewers, app, provider_share (.get/.items on a non-map).
+          silently misread (a non-empty string such as "false" counts as on): probe_providers, scope_later_rounds,
+            ui_block_on_nits, spec_archive, commit_per_checkpoint, verify_transcripts, ui_single_reviewer_ok, spec_keep.
+            On/off settings must be real JSON booleans (true or false); a string such as "false" is refused.
+          silently ignored or defaulted: human_review, approver (an unknown value acts as the default), host_provider
+            (strings, so only the string type is enforced).
+        Numbers that a consumer coerces (the int()/float() group above) also accept a numeric string, as they do today.
+        Whole numbers only: a setting whose shipped default is an int is a count (rounds, attempts, blocks, lines), so
+        it must be an int (an integral float such as 6.0 is accepted, a fraction such as 1.5 is refused), except these
+        four, which a consumer takes as a duration and so also accept a fraction (the test CP2-X10 pins this list):
+          test_timeout_sec   seconds passed to the command timeout
+          min_review_seconds  seconds compared with the review time
+          suite_watch_seconds  seconds between tree comparisons (a float reader)
+          quota_retest_minutes  minutes read by its own typed reader
+        Deliberately left unchecked, and why (the test CP2-X09 pins this list):
+          related_tests_max   the engine itself falls back to 8 (with a note) on any bad value
+          load_stretch_max    the engine itself falls back to 4 on any bad value
+          min_review_timeout_sec  no consumer reads it, so nothing can crash
+          design_md   the design-file reader tolerates any value and falls back to the default DESIGN.md
+        Entries inside review_depth, blocking_severities (a word or a list per risk), app, checks and the host model
+        maps are not type-checked: they accept several shapes and are resolved where used."""
+        mine = self.config_path if project else self.global_config_path
+        other = self.global_config_path if project else self.config_path
+        if project:
+            user = self.check_project_config(user)
+            self.check_global_config({k: v for k, v in user.items() if k in GLOBAL_ALLOWED_KEYS}, path=mine, project=True)
+            glob, proj = self.global_config(), user
+        else:
+            self.check_global_config(user)
+            glob, proj = user, None  # user_config reads the project's file itself
+        merged = self.user_config(project=proj, glob=glob)
+        cfg = config_from_user(merged)
+
+        def bad(key, want):
+            where = mine if key in user else other
+            die(f"{where} sets '{key}' to {json.dumps(cfg[key])[:60]}, but it must be {want}. Fix that setting in the "
+                f"file (`ratchet.py config --set {key}=<value>`, or `--unset {key}` to go back to the default), then "
+                "run this command again.")
+
+        def named(key, fn):  # a typed reader that stops by itself: say which file the value came from
+            buf, failed = io.StringIO(), False
+            with contextlib.redirect_stderr(buf):
+                try:
+                    fn(cfg)
+                except SystemExit:
+                    failed = True
+            if failed:
+                die(f"{buf.getvalue().replace('RATCHET ✗ ', '').strip()} (set in {mine if key in user else other})")
+
+        coerce = {"converge_after_round": int, "checkin_round": int, "probe_timeout_sec": int,
+                  "probe_ttl_minutes": float, "unavailable_ttl_hours": float}
+        fractional_ok = {"test_timeout_sec", "min_review_seconds", "suite_watch_seconds", "quota_retest_minutes"}
+        skip = {"related_tests_max", "load_stretch_max", "min_review_timeout_sec", "design_md", "lane_start_command"}
+        strs = {"ui_globs", "doc_globs", "doc_exclude_globs", "test_globs", "standards", "fingerprint_include",
+                "related_always"}
+        for key in merged:
+            if key not in DEFAULT_CONFIG or key in skip:
+                continue
+            val, base = cfg[key], DEFAULT_CONFIG[key]
+            if key in coerce:
+                try:
+                    if isinstance(val, bool):
+                        raise TypeError
+                    coerce[key](val)
+                except (TypeError, ValueError, OverflowError):
+                    bad(key, "a number")
+            elif key == "spec_keep":
+                if val is not None and not isinstance(val, bool):
+                    bad(key, "true, false or null")
+            elif base is None:  # regression_command, doc_test_command, related_test_command
+                if val is not None and not isinstance(val, str):
+                    bad(key, "a command string or null")
+            elif isinstance(base, bool):
+                if not isinstance(val, bool):
+                    bad(key, "true or false")
+            elif isinstance(base, (int, float)):
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    bad(key, "a number")
+                if isinstance(base, int) and key not in fractional_ok and isinstance(val, float) and not val.is_integer():
+                    bad(key, "a whole number")
+            elif isinstance(base, str):
+                if not isinstance(val, str):
+                    bad(key, "a string")
+            elif isinstance(base, list):
+                if not isinstance(val, list) or (key in strs and not all(isinstance(x, str) for x in val)):
+                    bad(key, "a list of strings" if key in strs else "a list")
+            elif isinstance(base, dict) and not isinstance(val, dict):
+                bad(key, "a JSON object")
+        if "quota_retest_minutes" in merged:
+            named("quota_retest_minutes", quota_retest_minutes)
+        if "provider_share" in merged:
+            named("provider_share", provider_share)
+        if "suite_watch_seconds" in merged and _suite_watch_seconds(cfg) is None:
+            bad("suite_watch_seconds", "a number of seconds above 0")
+        if "lane_start_command" in merged:
+            named("lane_start_command", _lanes_start_template)
+        if merged.get("related_test_command") and "{files}" not in str(merged["related_test_command"]):
+            bad("related_test_command", "a command containing the {files} placeholder")
+        return user
+
+    def user_config(self, project=None, glob=None):
         """The raw settings in effect before defaults: the global file with the project's file over it, key by key.
         One rule for both layers: a dict value merges one level deep (its sub-entries replace whole, so a partial
         host_models.anthropic replaces the shipped entry), anything else replaces whole. An untouched old default
-        review_depth is dropped (only the project level can carry one: the global file refuses the key)."""
+        review_depth is dropped (only the project level can carry one: the global file refuses the key). `glob` and
+        `project` stand in for the files' content (a candidate about to be written)."""
         out = {}
-        for layer in (self.global_config(), (read_json(self.config_path, {}) if project is None else project) or {}):
+        for layer in (self.global_config() if glob is None else glob, (self.check_project_config(read_json(self.config_path, {})) if project is None else project) or {}):
             for k, v in layer.items():
                 if k == "review_depth" and v == OLD_DEFAULT_REVIEW_DEPTH:
                     continue
@@ -14822,12 +14961,53 @@ def cmd_fingerprint(args):
     print(json.dumps(fingerprint(find_root())))
 
 
+_CONFIG_KEY_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+
+def _config_unset(layer, key):
+    """Remove the dotted key from a settings dict (and any parent it leaves empty); False when it was not set."""
+    parts = key.split(".")
+    chain, cur = [], layer
+    for part in parts[:-1]:
+        if not isinstance(cur, dict) or not isinstance(cur.get(part), dict):
+            return False
+        chain.append((cur, part))
+        cur = cur[part]
+    if not isinstance(cur, dict) or parts[-1] not in cur:
+        return False
+    del cur[parts[-1]]
+    for parent, part in reversed(chain):
+        if parent[part]:
+            break
+        del parent[part]
+    return True
+
+
 def cmd_config(args):
+    """Show or change the settings. No flag: the merged settings, as ever. --scope global|project|effective shows one
+    level (effective is the merged view); --sources says, per top-level key, which level it came from (builtin,
+    global or project). --set key=value / --unset key change the project's file, or with --global the machine-wide
+    file (checked by the same rules as loading it, written atomically, never as a Ratchet record); removing a key
+    returns that setting to the next level down. Anything refused is refused before a file is written."""
     ctx = Ctx(find_root())
-    if args.set:
-        ctx.global_config()  # a damaged per-user file stops the command before anything is saved
-        user = read_json(ctx.config_path, {}) or {}
-        for kv in args.set:
+    sets, unsets = args.set or [], args.unset or []
+    scope = args.scope or ("global" if args.glob and not (sets or unsets or args.sources) else "effective")
+    if scope not in ("global", "project", "effective"):
+        die(f"--scope must be one of global, project, effective (got {scope!r}).", 2)
+    for kv in sets:
+        k = kv.partition("=")[0]
+        if "=" not in kv or not _CONFIG_KEY_RE.match(k) or "" in k.split("."):
+            die(f"--set takes key=value (got {kv!r}); a key is a setting name, with dots for a nested one, such as "
+                "related_tests_max=6 or role_models.ratchet-fixer=sonnet. Nothing was changed.", 2)
+    if sets or unsets:
+        glob_cfg = ctx.global_config()  # a damaged per-user file stops the command before anything is saved
+        path = ctx.global_config_path if args.glob else ctx.config_path
+        before = glob_cfg if args.glob else ctx.check_project_config(read_json(ctx.config_path, {}))
+        user = json.loads(json.dumps(before))
+        removed, absent = [], []  # both reported only once the candidate passed its checks and the write succeeded
+        for k in unsets:
+            (removed if _config_unset(user, k) else absent).append(k)
+        for kv in sets:
             k, _, v = kv.partition("=")
             try:
                 val = json.loads(v)
@@ -14839,24 +15019,52 @@ def cmd_config(args):
                 die(_NO_FILES_PLACEHOLDER_MSG, 2)
             if k == "suite_watch_seconds" and _suite_watch_seconds({k: val}) is None:
                 die(f"suite_watch_seconds must be a number of seconds above 0 (got {v!r}); the value was not changed.", 2)
-            cur = user
             parts = k.split(".")
+            if args.glob and "paid_ok_at" in parts:
+                die(f"{path} can't hold paid consent (providers[].paid_ok_at): approving paid use is per project. "
+                    "Nothing was changed.")
+            cur = user
             for p in parts[:-1]:
-                cur = cur.setdefault(p, {})
+                if not isinstance(cur.setdefault(p, {}), dict):
+                    die(f"Can't set {k}: {p} is not a settings group in {path}. Nothing was changed.", 2)
+                cur = cur[p]
             cur[parts[-1]] = val
-        if any(kv.partition("=")[0].split(".")[0] == "provider_share" for kv in args.set):
+        if any(kv.partition("=")[0].split(".")[0] == "provider_share" for kv in sets):
             share = user.get("provider_share")  # as it will read once merged over the defaults
             provider_share({"provider_share": {**DEFAULT_CONFIG["provider_share"], **share} if isinstance(share, dict) else share})
-        write_json(ctx.config_path, user)
+        ctx.validate_candidate(user, project=not args.glob)  # what is written must load: refused before the write
+        if sets or user != before:
+            write_json(path, user)
+        for k in absent:
+            print(f"RATCHET nothing to remove: {k} is not set in {path}")
+        for k in removed:
+            ok(f"Removed {k} from {path}")
         cfg = ctx.config()
-        for kv in args.set:
+        for kv in sets:
             k = kv.partition("=")[0]
             cur = cfg
             for part in k.split("."):
                 cur = cur.get(part) if isinstance(cur, dict) else None
             ok(f"Set {k} = {json.dumps(cur)}")
         return
-    print(json.dumps(ctx.config(), indent=2))
+    if args.sources:
+        g = ctx.global_config()
+        p = ctx.check_project_config(read_json(ctx.config_path, {}))
+        ctx.validate_candidate(p, project=True)
+        src = {}
+        for k in ctx.config():
+            if k in p and not (k == "review_depth" and p[k] == OLD_DEFAULT_REVIEW_DEPTH):
+                src[k] = "project"
+            else:
+                src[k] = "global" if k in g else "builtin"
+        print(json.dumps(src, indent=2))
+    elif scope == "global":
+        print(json.dumps(ctx.validate_candidate(ctx.global_config(), project=False), indent=2))
+    elif scope == "project":
+        ctx.global_config()
+        print(json.dumps(ctx.validate_candidate(read_json(ctx.config_path, {}), project=True), indent=2))
+    else:
+        print(json.dumps(ctx.config(), indent=2))
 
 
 # --------------------------------------------------------------------------- viewer
@@ -19160,7 +19368,13 @@ def main(argv=None):
                         "in one call (under one hold of the lane's state lock)")
     a.set_defaults(fn=cmd_director_sign)
     sp.add_parser("fingerprint").set_defaults(fn=cmd_fingerprint)
-    a = sp.add_parser("config"); a.add_argument("--set", nargs="*"); a.set_defaults(fn=cmd_config)
+    a = sp.add_parser("config")
+    a.add_argument("--set", nargs="*", action="extend")
+    a.add_argument("--unset", nargs="+", action="extend")
+    a.add_argument("--global", dest="glob", action="store_true")
+    a.add_argument("--scope")
+    a.add_argument("--sources", action="store_true")
+    a.set_defaults(fn=cmd_config)
     a = sp.add_parser("view", help="print/open the viewer link; --serve starts a live server in the background")
     a.add_argument("--open", action="store_true"); a.add_argument("--serve", action="store_true")
     a.add_argument("--stop", action="store_true"); a.add_argument("--port", type=int)

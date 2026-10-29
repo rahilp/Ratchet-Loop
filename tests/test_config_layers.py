@@ -560,7 +560,7 @@ def x13_no_direct_project_config_read_of_layered_keys():
     never used for a key the machine-wide file may set, or the global layer would be bypassed."""
     files = sorted((ROOT / "skills").glob("*/scripts/*.py"))
     check("[CP1-X13] the scan sees the engine sources", any(f.name == "ratchet.py" for f in files))
-    read_re = re.compile(r"(\w+)\s*=\s*\(?\s*(?:read_json|json\.loads)\([^\n]*(?:config_path|config\.json)")
+    read_re = re.compile(r"(\w+)\s*=\s*\(?\s*(?:[\w.]+\(\s*)?(?:read_json|json\.loads)\([^\n]*(?:config_path|config\.json)")
     for f in files:
         src = f.read_text()
         for m in read_re.finditer(src):

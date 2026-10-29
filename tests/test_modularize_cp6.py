@@ -203,7 +203,8 @@ def _plant_crash_marker(root: Path, host="claude", event="guard", at=None) -> "d
 
 
 def t01_module_byte_identical_and_explicit_imports():
-    print("CP6-T01: run_records.py's 25 moved definitions are byte-identical to before the move, and ratchet.py "
+    print("CP6-T01: run_records.py's 25 moved definitions are byte-identical to before the move (the one exception: "
+          "integrity_problems, whose single CP1 line reads the layered config), and ratchet.py "
           "imports each one by its own explicit name")
     try:
         pinned_src = pinned_ratchet_source()
@@ -244,7 +245,8 @@ def t01_module_byte_identical_and_explicit_imports():
                   pinned_seg.count(_old_line) == 1, pinned_seg.count(_old_line))
             pinned_seg = pinned_seg.replace(_old_line, _new_line)
         rr_seg = ast.get_source_segment(rr_src, rr_defs[name])
-        check(f"[CP6-T01] {name}'s body in run_records.py is byte-for-byte identical to its pre-move body",
+        check(f"[CP6-T01] {name}'s body in run_records.py matches its pre-move body byte for byte"
+              + (" apart from the one CP1 line (user = ctx.user_config())" if name == "integrity_problems" else ""),
               rr_seg == pinned_seg, "" if rr_seg == pinned_seg else (pinned_seg, rr_seg))
 
     live_src = live_ratchet_source()
