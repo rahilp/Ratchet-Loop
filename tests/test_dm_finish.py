@@ -46,6 +46,27 @@ import test_dm_plan as dp        # noqa: E402  (_names_line, _mentions_line_numb
 import test_limits as tl         # noqa: E402  (_drive_to_cap: the review-limit block)
 import trust_helpers as th       # noqa: E402  (make_env, rx, git, now_dt: the director lane)
 
+# [perf, standard #30] test_gates.rx/say/approve_plan already carry an opt-in in-process fast path (a serialized
+# lock around one shared, memoized engine module -- the same mechanism test_quota_shared.py's conversion uses).
+# Every call this suite drives through them is the engine's own command logic (never a genuine subprocess
+# boundary -- the director lane uses trust_helpers.rx, left untouched), so these thin wrappers default fast=True.
+# fast-path replaces the per-call `python3 ratchet.py ...` subprocess; a call needing a real subprocess (none
+# here) would pass fast=False.
+def rx(d, *a, **k):
+    k.setdefault("fast", True)
+    return g.rx(d, *a, **k)
+
+
+def say(d, *a, **k):
+    k.setdefault("fast", True)
+    return g.say(d, *a, **k)
+
+
+def approve_plan(d, *a, **k):
+    k.setdefault("fast", True)
+    return g.approve_plan(d, *a, **k)
+
+
 PASS = FAIL = 0
 CASE_STATUS: dict[str, bool] = {}
 CASE_MESSAGES: dict[str, list] = {}
@@ -160,11 +181,11 @@ def _init_project(name, human_review="end", branch=None, extra_files=None, confi
         p.write_text(content)
     g.git(d, "add", "-A")
     g.git(d, "commit", "-qm", "init")
-    g.say(d, "please build the feature")
+    say(d, "please build the feature")
     args = ["init", "feature", "--slug", "f"] + (["--human-review", human_review] if human_review != "end" else [])
-    r = g.rx(d, *args)
+    r = rx(d, *args)
     assert r.returncode == 0, _out(r)
-    r = g.rx(d, "config", "--set", "min_review_seconds=0", "providers=[]", "checkin_round=99", *(config or []))
+    r = rx(d, "config", "--set", "min_review_seconds=0", "providers=[]", "checkin_round=99", *(config or []))
     assert r.returncode == 0, _out(r)
     run = d / ".ratchet/runs/f"
     (run / "app-scout.json").write_text("{}")
@@ -184,9 +205,9 @@ def _approved(name, steps=FIN2_STEPS, dm=DM2, human_review="end", branch=None, e
     """A project whose plan (every done-means line linked) is submitted through the real plan-submit and approved."""
     d, run = _init_project(name, human_review=human_review, branch=branch, extra_files=extra_files, config=config)
     _write_plan(run, steps, dm, cps=cps)
-    r = g.rx(d, "plan-submit")
+    r = rx(d, "plan-submit")
     assert r.returncode == 0, _out(r)
-    g.approve_plan(d)
+    approve_plan(d)
     return d
 
 
@@ -203,24 +224,24 @@ def _build(d, i, cases, report=None, findings=None, complete=True):
     finish is decided. Returns complete's result, or None when complete=False."""
     cp = f"CP{i}"
     _write_step_tests(d, i, cases)
-    r = g.rx(d, "tests-written", cp)
+    r = rx(d, "tests-written", cp)
     assert r.returncode == 0, _out(r)
-    r = g.rx(d, "red", cp)
+    r = rx(d, "red", cp)
     assert r.returncode == 0, _out(r)
     (d / "src/f.js").write_text(f"export const f = () => {i};\n")
-    r = g.rx(d, "implemented", cp)
+    r = rx(d, "implemented", cp)
     assert r.returncode == 0, _out(r)
-    r = g.rx(d, "behavior", cp)
+    r = rx(d, "behavior", cp)
     assert r.returncode == 0, _out(r)
     rnd = g.open_round(d, cp)
     p = g.write_review(d, rnd, g.R0(rnd), list(findings or []))
-    r = g.rx(d, "adv-record", cp, "--reviews", p)
+    r = rx(d, "adv-record", cp, "--reviews", p)
     assert r.returncode == 0, _out(r)
     if report is not None:
         rp._write_report(d, cp, report)
     if not complete:
         return None
-    return g.rx(d, "complete", cp)
+    return rx(d, "complete", cp)
 
 
 def _fin2(name, failed=True, human_review="end", **kw):
@@ -255,14 +276,14 @@ def _make_legacy(d):
 
 def _ask_yes_approve(d):
     """What the agent does to finish: ask human-approve, the user's yes, human-approve. Returns (ask, approve)."""
-    ask = g.rx(d, "ask", "human-approve")
-    g.say(d, YES)
-    return ask, g.rx(d, "human-approve")
+    ask = rx(d, "ask", "human-approve")
+    say(d, YES)
+    return ask, rx(d, "human-approve")
 
 
 def _feedback(d, text="please also let me delete a note"):
-    g.say(d, text)
-    return g.rx(d, "feedback", "--text", text)
+    say(d, text)
+    return rx(d, "feedback", "--text", text)
 
 
 def _extend_plan(run, dm, cp2_cases):
@@ -422,19 +443,19 @@ def _docs_run(name, human_review="end", cp2_failed=True):
     r = _build(d, 1, steps[0], report=PASSED2)
     assert r.returncode == 0, _out(r)
     assert _state(d)["phase"] == "building" and _state(d)["current"] == "CP2", _state(d)["phase"]
-    r = g.rx(d, "tests-written", "CP2")
+    r = rx(d, "tests-written", "CP2")
     assert r.returncode == 0, _out(r)
-    r = g.rx(d, "red", "CP2")
+    r = rx(d, "red", "CP2")
     assert r.returncode == 0, _out(r)
     (d / "docs/NOTES.md").write_text(f"# notes\n\n{NOTES_PHRASE}: a note over 200 characters gets a message.\n")
-    assert g.rx(d, "implemented", "CP2").returncode == 0
-    r = g.rx(d, "behavior", "CP2")
+    assert rx(d, "implemented", "CP2").returncode == 0
+    r = rx(d, "behavior", "CP2")
     assert r.returncode == 0, _out(r)
     rp._write_report(d, "CP2", [{"id": "CP2-T01", "status": "failed" if cp2_failed else "passed"}])
-    rv = g.rx(d, "reviewers", "CP2")
+    rv = rx(d, "reviewers", "CP2")
     gate = _state(d)["checkpoints"]["CP2"]["gates"]["adversarial"]
     assert rv.returncode == 0 and gate.get("status") == "passed" and "skipped" in _out(rv), _out(rv) + repr(gate)
-    return d, g.rx(d, "complete", "CP2")
+    return d, rx(d, "complete", "CP2")
 
 
 # ---- a merge of main into the lane ---------------------------------------------------------------
@@ -481,12 +502,12 @@ def cp4_t01_failed_line_cannot_be_approved_as_done():
 def cp4_t02_yes_given_before_the_line_went_unproven_does_not_finish():
     """[CP4-T02] A yes given before the line went unproven does not finish the run."""
     d, _ = _fin2("t02", failed=False)
-    ask = g.rx(d, "ask", "human-approve")
+    ask = rx(d, "ask", "human-approve")
     check("[CP4-T02] fixture: with everything proven the question is asked", _clean(ask) and "ASK THE USER" in ask.stdout,
           _out(ask))
-    g.say(d, YES)
+    say(d, YES)
     _add_open_finding(d, "CP1", "S2", [2])   # after the yes, before human-approve
-    ha = g.rx(d, "human-approve")
+    ha = rx(d, "human-approve")
     hout = _refused("[CP4-T02]", ha, "human-approve")
     _names("[CP4-T02]", hout, 2, LINE2, "the refusal")
     check("[CP4-T02] the refusal names the open finding (step and finding id)",
@@ -536,11 +557,11 @@ def cp4_t05_status_and_next_name_the_lines_and_the_ways_forward():
     tell the agent to ask for approval."""
     d, _ = _fin2("t05")
     for cmd in ("status", "next"):
-        r = g.rx(d, cmd)
+        r = rx(d, cmd)
         out = _out(r)
         check(f"[CP4-T05] (failed test) {cmd} exits 0 with no traceback", _clean(r), out[-600:])
         _blocked_wording("[CP4-T05] (failed test)", out, cmd)
-    sout = _out(g.rx(d, "status"))
+    sout = _out(rx(d, "status"))
     check("[CP4-T05] (failed test) status prints no waiting-for-the-user's-answer line",
           "Waiting for the user's answer" not in sout and "Waiting for the director's answer" not in sout, sout[-900:])
     check("[CP4-T05] (failed test) status says plainly that nothing is waiting on a reply",
@@ -549,7 +570,7 @@ def cp4_t05_status_and_next_name_the_lines_and_the_ways_forward():
     d2, _ = _fin2("t05f", failed=False)
     _add_open_finding(d2, "CP1", "S2", [2])
     for cmd in ("status", "next"):
-        r = g.rx(d2, cmd)
+        r = rx(d2, cmd)
         out = _out(r)
         check(f"[CP4-T05] (open finding) {cmd} exits 0 with no traceback", _clean(r), out[-600:])
         _blocked_wording("[CP4-T05] (open finding)", out, cmd, reason_id=None)
@@ -561,7 +582,7 @@ def cp4_t05_status_and_next_name_the_lines_and_the_ways_forward():
 def cp4_t06_status_json_carries_the_block_for_director_and_agent():
     """[CP4-T06] status --json carries the block so the director and the agent read one source."""
     d, _ = _fin2("t06")
-    rj = g.rx(d, "status", "--json")
+    rj = rx(d, "status", "--json")
     j = json.loads(rj.stdout) if _clean(rj) else {}
     check("[CP4-T06] (user lane) status --json exits 0 and parses", _clean(rj) and isinstance(j, dict), _out(rj)[-400:])
     check("[CP4-T06] (user lane) the old keys are still present",
@@ -575,7 +596,7 @@ def cp4_t06_status_json_carries_the_block_for_director_and_agent():
     q = j.get("question")
     check("[CP4-T06] (user lane) no waiting human-approve question is reported",
           q is None or (isinstance(q, dict) and q.get("kind") != "human-approve"), q)
-    rn = g.rx(d, "next")
+    rn = rx(d, "next")
     check("[CP4-T06] (user lane) `next` says the same, with no ask instruction",
           _clean(rn) and BLOCKED_RE.search(_out(rn)) is not None and ASK_INSTRUCTION_RE.search(_out(rn)) is None,
           _out(rn)[-900:])
@@ -604,10 +625,10 @@ def cp4_t06_status_json_carries_the_block_for_director_and_agent():
 def cp4_t07_proven_run_approval_works_as_before():
     """[CP4-T07] When every line is proven, the approval question and the approval work as before."""
     d, _ = _fin2("t07", failed=False)
-    nout = _out(g.rx(d, "next"))
+    nout = _out(rx(d, "next"))
     check("[CP4-T07] before approval, next still tells the agent to run ask human-approve", "ask human-approve" in nout,
           nout[-900:])
-    sout = _out(g.rx(d, "status"))
+    sout = _out(rx(d, "status"))
     check("[CP4-T07] before approval, status still asks for the final review (approve or ask for changes)",
           re.search(r"final review", sout, re.I) is not None and "approve" in sout, sout[-900:])
     for cmd, out in (("next", nout), ("status", sout)):
@@ -634,7 +655,7 @@ def cp4_t08_no_final_review_mode_stops_at_the_final_review_when_a_line_is_unprov
           str(Path(d).resolve()) in active, list(active))
     check("[CP4-T08] no CI-export hint and no spec-finish note is printed",
           "ci-export" not in out and "Spec:" not in out, out[-900:])
-    sout = _out(g.rx(d, "status"))
+    sout = _out(rx(d, "status"))
     _blocked_wording("[CP4-T08]", sout, "status")
 
 
@@ -667,9 +688,9 @@ def cp4_t10_each_mode_blocks_only_the_last_steps_approval():
     st = _state(d)
     check("[CP4-T10] fixture: CP2 waits for its review", _clean(r2) and st.get("phase") == "awaiting_checkpoint_review"
           and st.get("review_target") == "CP2", (st.get("phase"), st.get("review_target")))
-    g.rx(d, "ask", "human-approve")
-    g.say(d, YES)
-    ha2 = g.rx(d, "human-approve")
+    rx(d, "ask", "human-approve")
+    say(d, YES)
+    ha2 = rx(d, "human-approve")
     out = _refused("[CP4-T10]", ha2, "CP2's approval (which would finish the run)")
     _names("[CP4-T10]", out, 3, LINE3, "the refusal")
     _not_named("[CP4-T10]", out, 1, LINE1, "the refusal")
@@ -690,7 +711,7 @@ def cp4_t11_editing_the_done_means_lines_after_approval_does_not_clear_the_block
         hout = _refused(f"[CP4-T11] {tag}", ha, "human-approve")
         _names(f"[CP4-T11] {tag}", hout, 2, LINE2, "the refusal")
         check(f"[CP4-T11] {tag} the reworded text never appears as the blocking line", REWORDED not in hout, hout[-900:])
-        sr = g.rx(d, "status")
+        sr = rx(d, "status")
         sout = _out(sr)
         check(f"[CP4-T11] {tag} status exits 0 with no traceback", _clean(sr), sout[-600:])
         _names(f"[CP4-T11] {tag}", sout, 2, LINE2, "status")
@@ -715,7 +736,7 @@ def cp4_t12_feedback_cannot_remove_reword_or_reorder_an_approved_line():
         check(f"[CP4-T12] {tag} fixture: feedback is taken (phase planning_feedback)",
               _clean(rf) and _state(d).get("phase") == "planning_feedback", _out(rf))
         _extend_plan(run, dm, [_case("CP2-T01", [1])])
-        r = g.rx(d, "plan-extend")
+        r = rx(d, "plan-extend")
         out = _refused(f"[CP4-T12] {tag}", r, "plan-extend")
         check(f"[CP4-T12] {tag} the refusal names the changed line by number and its approved text",
               any(dp._names_line(out, n, t) for n, t in named), out[-900:])
@@ -728,7 +749,7 @@ def cp4_t12_feedback_cannot_remove_reword_or_reorder_an_approved_line():
     rf = _feedback(d)
     check("[CP4-T12] (d) fixture: feedback is taken", _clean(rf) and _state(d).get("phase") == "planning_feedback", _out(rf))
     _extend_plan(run, DM2, [_case("CP2-T01", [1])])
-    r = g.rx(d, "plan-extend")
+    r = rx(d, "plan-extend")
     check("[CP4-T12] (d) with the objective untouched, plan-extend succeeds", _clean(r), _out(r))
     st = _state(d)
     check("[CP4-T12] (d) CP2 is registered and building",
@@ -742,7 +763,7 @@ def _extended_with_line3(name, cp2_failed):
     rf = _feedback(d)
     assert _clean(rf), _out(rf)
     _extend_plan(run, DM3, [_case("CP2-T01", [3])])
-    re_ = g.rx(d, "plan-extend")
+    re_ = rx(d, "plan-extend")
     r2 = _build(d, 2, [_case("CP2-T01", [3])],
                 report=[{"id": "CP2-T01", "status": "failed" if cp2_failed else "passed"}]) if _clean(re_) else None
     return d, re_, r2
@@ -762,7 +783,7 @@ def cp4_t13_feedback_may_append_a_line_held_to_the_finish_rule():
         check("[CP4-T13] line 3 is proven by CP2-T01's passed case",
               tbl[2].get("text") == LINE3 and tbl[2].get("verdict") == "proven"
               and dt._case_result(tbl[2], "CP2-T01") == "passed", tbl[2])
-    sout = _out(g.rx(d, "status"))
+    sout = _out(rx(d, "status"))
     check("[CP4-T13] status carries no blocked wording", BLOCKED_RE.search(sout) is None, sout[-900:])
     ask, ha = _ask_yes_approve(d)
     check("[CP4-T13] the finish is not blocked on line 3: human-approve exits 0", _clean(ask) and _clean(ha), _out(ha))
@@ -782,16 +803,16 @@ def cp4_t14_approving_another_plan_change_cannot_sneak_in_an_edited_line():
     d, _ = _fin2("t14")
     run = d / ".ratchet/runs/f"
     _edit_done_means(run, [LINE1, REWORDED])
-    r = g.rx(d, "config", "--set", "max_adversarial_rounds=5")
+    r = rx(d, "config", "--set", "max_adversarial_rounds=5")
     assert r.returncode == 0, _out(r)
-    ask = g.rx(d, "ask", "approve-changes")
+    ask = rx(d, "ask", "approve-changes")
     check("[CP4-T14] fixture: ask approve-changes has something to show", _clean(ask) and "ASK THE USER" in ask.stdout, _out(ask))
-    g.say(d, YES)
-    ac = g.rx(d, "approve-changes")
+    say(d, YES)
+    ac = rx(d, "approve-changes")
     check("[CP4-T14] approve-changes succeeds for the rule change", _clean(ac), _out(ac))
     approved_dm = ((_state(d).get("approved") or {}).get("objective") or {}).get("done_means")
     check("[CP4-T14] the approved done-means lines are still the original ones", approved_dm == DM2, approved_dm)
-    sout = _out(g.rx(d, "status"))
+    sout = _out(rx(d, "status"))
     _names("[CP4-T14]", sout, 2, LINE2, "status")
     check("[CP4-T14] status does not show the reworded text as a line", REWORDED not in sout, sout[-900:])
     _, ha = _ask_yes_approve(d)
@@ -810,14 +831,14 @@ def cp4_t15_closing_the_open_finding_is_a_way_forward():
     (d / "docs/NOTES.md").write_text("notes\nthe length message is documented now\n")
     g.git(d, "add", "-A")
     g.git(d, "commit", "-qm", "document the message")
-    rb = g.rx(d, "behavior", "CP1")
+    rb = rx(d, "behavior", "CP1")
     assert rb.returncode == 0, _out(rb)
     rnd2 = g.open_round(d, "CP1")
     paths = [g.write_review(d, rnd2, rid, []) for rid in {rv["id"] for rv in rnd2["reviewers"]}]
-    ra = g.rx(d, "adv-record", "CP1", "--reviews", *paths)
+    ra = rx(d, "adv-record", "CP1", "--reviews", *paths)
     assert ra.returncode == 0, _out(ra)
     rp._write_report(d, "CP1", PASSED2)
-    rc = g.rx(d, "complete", "CP1")
+    rc = rx(d, "complete", "CP1")
     assert rc.returncode == 0 and _state(d)["phase"] == "awaiting_final_review", _out(rc)
 
     def name_line(st):
@@ -825,17 +846,17 @@ def cp4_t15_closing_the_open_finding_is_a_way_forward():
             if f.get("id") == "S1":
                 f["done_means"] = [2]
     dt.mutate(d, name_line)
-    rows = json.loads(g.rx(d, "deferred", "--json").stdout or "[]")
+    rows = json.loads(rx(d, "deferred", "--json").stdout or "[]")
     check("[CP4-T15] fixture: S1 is left for later, naming line 2",
           any(f.get("id") == "S1" and f.get("done_means") == [2] and not f.get("fixed") for f in rows), rows)
-    sout = _out(g.rx(d, "status"))
+    sout = _out(rx(d, "status"))
     check("[CP4-T15] before mark-fixed, status says the run cannot be marked done and names S1",
           BLOCKED_RE.search(sout) is not None and re.search(r"(?<![A-Za-z0-9])S1(?![0-9])", sout) is not None, sout[-1200:])
-    early = g.rx(d, "ask", "human-approve")
+    early = rx(d, "ask", "human-approve")
     check("[CP4-T15] before mark-fixed, ask human-approve is refused", early.returncode != 0, _out(early))
-    mf = g.rx(d, "mark-fixed", "CP1", 'S1="documented the message, confirmed by the later clean round"')
+    mf = rx(d, "mark-fixed", "CP1", 'S1="documented the message, confirmed by the later clean round"')
     check("[CP4-T15] mark-fixed closes S1 (exit 0)", _clean(mf), _out(mf))
-    sout2 = _out(g.rx(d, "status"))
+    sout2 = _out(rx(d, "status"))
     check("[CP4-T15] after mark-fixed, status shows no blocked wording", BLOCKED_RE.search(sout2) is None, sout2[-1200:])
     ask, ha = _ask_yes_approve(d)
     check("[CP4-T15] ask human-approve prints the question", _clean(ask) and FINISH_QUESTION in ask.stdout, _out(ask))
@@ -853,7 +874,7 @@ def cp4_t16_feedback_is_open_while_blocked_and_does_not_clear_the_block():
     if _state(d).get("phase") != "planning_feedback":
         return
     _extend_plan(run, DM2, [_case("CP2-T01", [1])])
-    re_ = g.rx(d, "plan-extend")
+    re_ = rx(d, "plan-extend")
     check("[CP4-T16] plan-extend with the objective unchanged succeeds", _clean(re_), _out(re_))
     if not _clean(re_):
         return
@@ -903,7 +924,7 @@ def cp4_x01_refused_approval_leaves_every_counter_untouched():
     _build(dn, 1, FIN2_STEPS[0], report=FAILED2, complete=False)
     nbefore = _counters(_state(dn))
     nn0 = len(_state(dn).get("history") or [])
-    rc = g.rx(dn, "complete", "CP1")
+    rc = rx(dn, "complete", "CP1")
     check("[CP4-X01] (none mode) complete CP1 exits 0 and the run is held at the final review",
           _clean(rc) and _state(dn).get("phase") == "awaiting_final_review", (_out(rc)[-400:], _state(dn).get("phase")))
     nst = _state(dn)
@@ -918,20 +939,20 @@ def cp4_x02_review_limit_block_can_still_be_unblocked():
     finishing."""
     d = _approved("x02", config=["max_adversarial_rounds=2"])
     _write_step_tests(d, 1, FIN2_STEPS[0])
-    assert g.rx(d, "tests-written", "CP1").returncode == 0
-    assert g.rx(d, "red", "CP1").returncode == 0
+    assert rx(d, "tests-written", "CP1").returncode == 0
+    assert rx(d, "red", "CP1").returncode == 0
     (d / "src/f.js").write_text("export const f = () => 1;\n")
-    assert g.rx(d, "implemented", "CP1").returncode == 0
-    r = g.rx(d, "behavior", "CP1")
+    assert rx(d, "implemented", "CP1").returncode == 0
+    r = rx(d, "behavior", "CP1")
     assert r.returncode == 0, _out(r)
     tl._drive_to_cap(d, "CP1")
     st = _state(d)
     check("[CP4-X02] fixture: the run is blocked at the review limit, mid-build", st.get("phase") == "blocked"
           and st.get("current") == "CP1", (st.get("phase"), st.get("blocked_reason")))
-    ask = g.rx(d, "ask", "human-approve")
+    ask = rx(d, "ask", "human-approve")
     check("[CP4-X02] ask human-approve prints the carry-on question", _clean(ask) and "carry on" in ask.stdout, _out(ask))
-    g.say(d, YES)
-    ha = g.rx(d, "human-approve")
+    say(d, YES)
+    ha = rx(d, "human-approve")
     out = _out(ha)
     check("[CP4-X02] human-approve unblocks the run (exit 0)", _clean(ha), out[-600:])
     st = _state(d)
@@ -947,11 +968,11 @@ def cp4_x03_finding_naming_no_line_and_a_fixed_one_never_block():
     r = _build(d, 1, FIN2_STEPS[0], report=PASSED2, findings=[n1])
     assert _clean(r) and _state(d)["phase"] == "awaiting_final_review", _out(r)
     _add_open_finding(d, "CP1", "F2", [2], fixed={"round": 1, "how": "showed the message"})
-    rows = json.loads(g.rx(d, "deferred", "--json").stdout or "[]")
+    rows = json.loads(rx(d, "deferred", "--json").stdout or "[]")
     check("[CP4-X03] fixture: N1 (no line) is left for later; F2 (line 2) is fixed later",
           any(f.get("id") == "N1" and not f.get("fixed") and f.get("done_means") is None for f in rows)
           and any(f.get("id") == "F2" and f.get("fixed") for f in rows), rows)
-    sout = _out(g.rx(d, "status"))
+    sout = _out(rx(d, "status"))
     check("[CP4-X03] status still prints the left-for-later count", "1 finding(s) were left for later" in sout, sout[-900:])
     check("[CP4-X03] status carries no blocked wording", BLOCKED_RE.search(sout) is None, sout[-900:])
     ask, ha = _ask_yes_approve(d)
@@ -967,7 +988,7 @@ def cp4_x04_older_plan_finishes_as_before_with_a_plain_note():
     r = _build(d, 1, FIN2_STEPS[0], report=FAILED2)
     assert _clean(r) and _state(d)["phase"] == "awaiting_final_review", _out(r)
     _add_open_finding(d, "CP1", "S2", [2])
-    sr = g.rx(d, "status")
+    sr = rx(d, "status")
     sout = _out(sr)
     check("[CP4-X04] status exits 0 with no traceback", _clean(sr), sout[-600:])
     check("[CP4-X04] status shows the done-means lines", LINE1 in sout and LINE2 in sout, sout[-900:])
@@ -995,7 +1016,7 @@ def cp4_x05_older_none_mode_run_and_no_objective_run_still_finish():
     dt._step(d2, 1, [{"id": "CP1-T01", "layer": "code"}])
     check("[CP4-X05] (b) fixture: the no-objective run reached the final review",
           _state(d2).get("phase") == "awaiting_final_review", _state(d2).get("phase"))
-    sr = g.rx(d2, "status")
+    sr = rx(d2, "status")
     check("[CP4-X05] (b) status prints the existing 'no objective was stated' note, no traceback",
           _clean(sr) and "no objective was stated" in sr.stdout, _out(sr)[-600:])
     ask, ha = _ask_yes_approve(d2)
@@ -1014,13 +1035,13 @@ def cp4_x06_legacy_run_stays_legacy_through_feedback_plan_extend_and_approve_cha
     rf = _feedback(d)
     check("[CP4-X06] feedback is taken", _clean(rf), _out(rf))
     _extend_plan(run, DM2, [_case("CP2-T01", [2])])
-    re_ = g.rx(d, "plan-extend")
+    re_ = rx(d, "plan-extend")
     check("[CP4-X06] plan-extend succeeds", _clean(re_), _out(re_))
     r2 = _build(d, 2, [_case("CP2-T01", [2])], report=[{"id": "CP2-T01", "status": "passed"}]) if _clean(re_) else None
     check("[CP4-X06] CP2 completes and the run is at the final review again",
           r2 is not None and _clean(r2) and _state(d).get("phase") == "awaiting_final_review",
           (_out(r2)[-400:] if r2 else "", _state(d).get("phase")))
-    sout = _out(g.rx(d, "status"))
+    sout = _out(rx(d, "status"))
     check("[CP4-X06] status carries the plain note and no blocked wording (line 2's CP1-T02 is still failed)",
           LEGACY_NOTE_RE.search(sout) is not None and BLOCKED_RE.search(sout) is None, sout[-900:])
     ask, ha = _ask_yes_approve(d)
@@ -1032,12 +1053,12 @@ def cp4_x06_legacy_run_stays_legacy_through_feedback_plan_extend_and_approve_cha
     _make_legacy(d2)
     r = _build(d2, 1, FIN2_STEPS[0], report=FAILED2)
     assert _clean(r) and _state(d2)["phase"] == "awaiting_final_review", _out(r)
-    assert g.rx(d2, "config", "--set", "max_adversarial_rounds=5").returncode == 0
-    g.rx(d2, "ask", "approve-changes")
-    g.say(d2, YES)
-    ac = g.rx(d2, "approve-changes")
+    assert rx(d2, "config", "--set", "max_adversarial_rounds=5").returncode == 0
+    rx(d2, "ask", "approve-changes")
+    say(d2, YES)
+    ac = rx(d2, "approve-changes")
     check("[CP4-X06] (approve-changes copy) approve-changes succeeds", _clean(ac), _out(ac))
-    sout2 = _out(g.rx(d2, "status"))
+    sout2 = _out(rx(d2, "status"))
     check("[CP4-X06] (approve-changes copy) status still carries the plain note and no block",
           LEGACY_NOTE_RE.search(sout2) is not None and BLOCKED_RE.search(sout2) is None, sout2[-900:])
     ask2, ha2 = _ask_yes_approve(d2)
@@ -1180,18 +1201,18 @@ def cp4_t18_merging_main_between_steps_does_not_change_the_lines_the_finish_read
         before_counts = _counters(before_st)
         before_rule = (before_st.get("approved") or {}).get("rules", {}).get("max_adversarial_rounds")
         _merge_main_in(d)
-        rm = g.rx(d, "merged")
+        rm = rx(d, "merged")
         check(f"[CP4-T18] {tag} merged accepts the merge", _clean(rm), _out(rm)[-600:])
         st = _state(d)
         check(f"[CP4-T18] {tag} the config rule from main moved into the approved baseline",
               (st.get("approved") or {}).get("rules", {}).get("max_adversarial_rounds") != before_rule
-              and "Nothing has changed" in _out(g.rx(d, "ask", "approve-changes")), (st.get("approved") or {}).get("rules"))
+              and "Nothing has changed" in _out(rx(d, "ask", "approve-changes")), (st.get("approved") or {}).get("rules"))
         check(f"[CP4-T18] {tag} the approved done-means lines are the same before and after merged",
               before_dm == DM2 and (st.get("approved") or {}).get("objective", {}).get("done_means") == DM2,
               (before_dm, (st.get("approved") or {}).get("objective")))
         check(f"[CP4-T18] {tag} every review counter is the same before and after merged", _counters(st) == before_counts,
               (before_counts, _counters(st)))
-        sout = _out(g.rx(d, "status"))
+        sout = _out(rx(d, "status"))
         _names(f"[CP4-T18] {tag}", sout, 2, LINE2, "status")
         check(f"[CP4-T18] {tag} status says the run cannot be marked done", BLOCKED_RE.search(sout) is not None, sout[-900:])
         check(f"[CP4-T18] {tag} status never shows the reworded text", REWORDED not in sout, sout[-900:])
@@ -1202,7 +1223,7 @@ def cp4_t18_merging_main_between_steps_does_not_change_the_lines_the_finish_read
         _still_waiting(f"[CP4-T18] {tag}", d)
     dp_, _ = _fin2("t18c", failed=False, branch="lane")
     _merge_main_in(dp_)
-    rm = g.rx(dp_, "merged")
+    rm = rx(dp_, "merged")
     check("[CP4-T18] (proven copy) merged accepts the merge", _clean(rm), _out(rm)[-600:])
     ask, ha = _ask_yes_approve(dp_)
     check("[CP4-T18] (proven copy) the run still approves and finishes after merged", _clean(ask) and _clean(ha), _out(ha))

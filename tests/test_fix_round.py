@@ -113,6 +113,38 @@ import test_providers as tp     # noqa: E402  (EXT: external_review.py)
 # case measures. g.ENV is the env test_gates.py's own helpers pass, so this covers them too.
 g.ENV["RATCHET_FAKE_LOADAVG"] = "0"
 
+# [perf, standard #30] test_gates.rx/say/project/approve_plan/to_adversarial already carry an opt-in in-process
+# fast path (a serialized lock around one shared, memoized engine module -- the same mechanism
+# test_quota_shared.py's conversion uses). Every call this suite drives through them is the engine's own command
+# logic; the real other-company reviews go through external_review.py as their own subprocess (_ext_review),
+# which is left untouched, and no case here turns on a genuine subprocess boundary. So these thin wrappers default
+# fast=True. fast-path replaces the per-call `python3 ratchet.py ...` subprocess; a call needing a real subprocess
+# would pass fast=False. **k carries env= (the fake-CLI PATH / own-home cases) straight through.
+def rx(d, *a, **k):
+    k.setdefault("fast", True)
+    return g.rx(d, *a, **k)
+
+
+def say(d, *a, **k):
+    k.setdefault("fast", True)
+    return g.say(d, *a, **k)
+
+
+def project(*a, **k):
+    k.setdefault("fast", True)
+    return g.project(*a, **k)
+
+
+def approve_plan(*a, **k):
+    k.setdefault("fast", True)
+    return g.approve_plan(*a, **k)
+
+
+def to_adversarial(*a, **k):
+    k.setdefault("fast", True)
+    return g.to_adversarial(*a, **k)
+
+
 PLANNED = [f"CP5-T{i:02d}" for i in range(1, 30)]
 PASS = FAIL = 0
 CASE_STATUS: dict = {}
@@ -189,7 +221,7 @@ def _after_approval(rnd):
 
 
 def _reviewers(d, *extra, env=None):
-    return g.rx(d, "reviewers", "CP1", *extra, env=env)
+    return rx(d, "reviewers", "CP1", *extra, env=env)
 
 
 def _open(d, env=None):
@@ -205,7 +237,7 @@ def _write_code(d, lines, tag, env=None):
     tag = re.sub(r"[^a-z0-9_]", "_", tag.lower())
     body = "".join(f"export const pad_{tag}_{i} = {i};\n" for i in range(max(lines - 1, 0)))
     (Path(d) / "src/f.js").write_text(body + f"export const f = () => 1; // {tag}\n")
-    r = g.rx(d, "behavior", "CP1", env=env)
+    r = rx(d, "behavior", "CP1", env=env)
     assert r.returncode == 0, _out(r)
 
 
@@ -218,7 +250,7 @@ def _append_lines(path: Path, n: int, tag: str):
 
 
 def _record(d, rnd, paths, env=None):
-    return g.rx(d, "adv-record", "CP1", "--reviews", *paths, env=env)
+    return rx(d, "adv-record", "CP1", "--reviews", *paths, env=env)
 
 
 def _block(d, rnd, by, decision="fix", env=None):
@@ -234,7 +266,7 @@ def _block(d, rnd, by, decision="fix", env=None):
 
 def _triage(d, keys, decision="fix", env=None):
     for k in keys:
-        t = g.rx(d, "triage", "CP1", f'{k}={decision}:"a developer really hits this"', env=env)
+        t = rx(d, "triage", "CP1", f'{k}={decision}:"a developer really hits this"', env=env)
         assert t.returncode == 0, _out(t)
 
 
@@ -251,9 +283,9 @@ def _start(name, risk="normal", config=None, extra_cp=None):
     extra = {"risk": risk}
     if extra_cp:
         extra.update(extra_cp)
-    d = g.project(name, extra_cp=extra, config=config or [])
-    g.approve_plan(d)
-    g.to_adversarial(d)
+    d = project(name, extra_cp=extra, config=config or [])
+    approve_plan(d)
+    to_adversarial(d)
     return d
 
 
@@ -282,13 +314,13 @@ def _text_says(text, *tokens):
 
 
 def _status_json(d, env=None):
-    r = g.rx(d, "status", "--json", env=env)
+    r = rx(d, "status", "--json", env=env)
     assert r.returncode == 0, _out(r)
     return _json_strings(json.loads(r.stdout))
 
 
 def _status_text(d, env=None):
-    return g.rx(d, "status", env=env).stdout or ""
+    return rx(d, "status", env=env).stdout or ""
 
 
 def _commit_message(d):
@@ -386,14 +418,14 @@ def _ext_project(name, depth, provs, risk="normal", config=(), replies=None):
     replies = replies or {}
     b = _fake_clis({pid: replies.get(pid, (_NO_FINDINGS, _NO_FINDINGS)) for pid, _c, _m in provs})
     env = dict(g.ENV, PATH=str(b))
-    d = g.project(name, extra_cp={"risk": risk},
+    d = project(name, extra_cp={"risk": risk},
                   config=["review_depth=" + json.dumps(depth), "provider_share.max=9", *config])
     for pid, company, model in provs:
-        r = g.rx(d, "providers", "--add", pid, "--command", json.dumps([str(b / pid)]), "--stdin",
+        r = rx(d, "providers", "--add", pid, "--command", json.dumps([str(b / pid)]), "--stdin",
                  "--company", company, "--model", model, env=env)
         assert r.returncode == 0, _out(r)
-    g.approve_plan(d)
-    g.to_adversarial(d)
+    approve_plan(d)
+    to_adversarial(d)
     return d, env
 
 
@@ -530,7 +562,7 @@ def t07_lane_bs_small_fix_after_approval_is_labelled_after_approval():
     rnd1 = _open(d)
     _approve(d, rnd1)
     _append_lines(Path(d) / "src/f.js", 5, "c07")
-    b = g.rx(d, "behavior", "CP1")
+    b = rx(d, "behavior", "CP1")
     assert b.returncode == 0, _out(b)
     rnd2 = _open(d)
     check("[CP5-T07] a 5-line fix after approval still opens with exactly one reviewer",
@@ -548,10 +580,10 @@ def t08_an_accepted_finding_is_not_a_blocked_round():
              for rv in rnd1["reviewers"]]
     r = _record(d, rnd1, paths)
     assert r.returncode == 2, _out(r)
-    a = g.rx(d, "ask", "accept-finding", "CP1", "S1")
+    a = rx(d, "ask", "accept-finding", "CP1", "S1")
     assert a.returncode == 0, _out(a)
-    g.say(d, "accept: no real developer can reach this path in our product")
-    r = g.rx(d, "accept-finding", "CP1")
+    say(d, "accept: no real developer can reach this path in our product")
+    r = rx(d, "accept-finding", "CP1")
     assert r.returncode == 0, _out(r)
     check("[CP5-T08] (fixture) the gate passed on the user's acceptance",
           _gate(d).get("status") == "passed", _gate(d).get("status"))
@@ -674,9 +706,9 @@ def t14_an_approved_raise_grants_exactly_one_more_fix_round():
     _block(d, rnd2, {rid: [_finding("S2")]})
     check("[CP5-T14] (fixture) the step is blocked on its round limit", _state(d).get("phase") == "blocked",
           _state(d).get("blocked_reason"))
-    g.rx(d, "ask", "raise-limit", "CP1")
-    g.say(d, "raise: one more look at this fix is worth it")
-    rr = g.rx(d, "raise-limit", "CP1")
+    rx(d, "ask", "raise-limit", "CP1")
+    say(d, "raise: one more look at this fix is worth it")
+    rr = rx(d, "raise-limit", "CP1")
     assert rr.returncode == 0, _out(rr)
     cap = _gate(d).get("cap_raised_to")
     _write_code(d, 33, "c14b")
@@ -710,7 +742,7 @@ def t15_a_blocking_fix_round_goes_to_the_usual_check_in():
           r.returncode != 0 and "check-in is open" in out, out)
     third = Path(d) / ".ratchet/runs/f/reviews/CP1/adv-round-03"
     check("[CP5-T15] no round 3 opened while the check-in was open", not third.exists(), str(third))
-    ci = g.rx(d, "check-in", "CP1", "--decision", "simplify", "--why", "keep the fix as small as it can be")
+    ci = rx(d, "check-in", "CP1", "--decision", "simplify", "--why", "keep the fix as small as it can be")
     assert ci.returncode == 0, _out(ci)
     rnd3 = _open(d)
     _check_fix_round("CP5-T15", d, rnd3, rid, "round 3, once the check-in was answered")
@@ -740,10 +772,10 @@ def t17_the_gate_passes_and_the_suite_still_runs():
     rid = _pick(rnd1, "standards")
     _block(d, rnd1, {rid: [_finding("S1")]})
     (Path(d) / "src/f.js").write_text("export const f = () => 1; // c17 fixed\n")
-    rc = g.rx(d, "complete", "CP1")
+    rc = rx(d, "complete", "CP1")
     check("[CP5-T17] `complete` right after the fixer's edit is refused: the gates are stale",
           rc.returncode != 0, _out(rc))
-    b = g.rx(d, "behavior", "CP1")
+    b = rx(d, "behavior", "CP1")
     assert b.returncode == 0, _out(b)
     rnd2 = _open(d)
     check("[CP5-T17] (fixture) round 2 is a one-reviewer fix round",
@@ -751,7 +783,7 @@ def t17_the_gate_passes_and_the_suite_still_runs():
     r = _record(d, rnd2, [g.write_review(d, rnd2, rnd2["reviewers"][0]["id"], [])])
     check("[CP5-T17] adv-record accepts the single review and the adversarial gate passes",
           r.returncode == 0 and _gate(d).get("status") == "passed", _out(r))
-    rc = g.rx(d, "complete", "CP1")
+    rc = rx(d, "complete", "CP1")
     out = _out(rc)
     check("[CP5-T17] `complete` fails on the failing regression suite, naming it",
           rc.returncode != 0 and re.search(r"regression", out, re.I) is not None, out)
@@ -759,7 +791,7 @@ def t17_the_gate_passes_and_the_suite_still_runs():
     check("[CP5-T17] the regression command really ran (its own line is in the log)",
           log.exists() and "cp5-suite-ran" in log.read_text(), str(log))
     marker.write_text("x")
-    rc = g.rx(d, "complete", "CP1")
+    rc = rx(d, "complete", "CP1")
     check("[CP5-T17] with a passing regression command the step completes", rc.returncode == 0, _out(rc))
 
 
@@ -784,7 +816,7 @@ def t18_status_and_the_commit_name_each_fix_round():
               _text_says(txt, f"round {n}", rid, "fix round", "block"), txt)
     check("[CP5-T18] round 1 is never called a fix round",
           not _any_says(sj, "round 1", "fix round") and not _text_says(txt, "round 1", "fix round"), (sj, txt))
-    rc = g.rx(d, "complete", "CP1")
+    rc = rx(d, "complete", "CP1")
     assert rc.returncode == 0, _out(rc)
     msg = _commit_message(d)
     for n in (2, 3):
@@ -826,7 +858,7 @@ def t20_a_fix_round_approval_is_not_the_full_review_baseline():
           _cps(d).get("last_full_review_fingerprint") == baseline,
           (baseline, _cps(d).get("last_full_review_fingerprint")))
     _append_lines(Path(d) / "src/f.js", 3, "c20b")
-    b = g.rx(d, "behavior", "CP1")
+    b = rx(d, "behavior", "CP1")
     assert b.returncode == 0, _out(b)
     rnd3 = _open(d)
     check("[CP5-T20] the 3-line edit after it opens the step's full two-reviewer set",
@@ -864,7 +896,7 @@ def t22_a_mid_round_failure_hands_the_slot_to_the_same_lens():
         rnd2 = _open(d, env=env)
         check("[CP5-T22] (fixture) round 2 is a one-reviewer fix round for codex-standards",
               _ids(rnd2) == ["codex-standards"] and _after_block(rnd2), (_ids(rnd2), _kind(rnd2)))
-        m = g.rx(d, "reviewer-status", "--mark", "codex-standards", "--reason", "auth expired mid-round", env=env)
+        m = rx(d, "reviewer-status", "--mark", "codex-standards", "--reason", "auth expired mid-round", env=env)
         assert m.returncode == 0, _out(m)
         rnd2b = _open(d, env=env)
         check("[CP5-T22] the same round is refilled, not replaced by a new one",
@@ -882,7 +914,7 @@ def t22_a_mid_round_failure_hands_the_slot_to_the_same_lens():
         check("[CP5-T22] status names the stand-in as round 2's reviewer, not codex-standards",
               _any_says(sj, "round 2", got, "fix round") and not _any_says(sj, "round 2", "codex-standards",
                                                                            "fix round"), sj)
-        rc = g.rx(d, "complete", "CP1", env=env)
+        rc = rx(d, "complete", "CP1", env=env)
         assert rc.returncode == 0, _out(rc)
         msg = _commit_message(d)
         check("[CP5-T22] the commit message names the stand-in as round 2's reviewer, not codex-standards",
@@ -982,7 +1014,7 @@ def t26_an_unavailable_choice_falls_back_within_its_own_lens():
         _ext_record(d, rnd1, env)
         _triage(d, ["codex-standards/S1"], env=env)
         _write_code(d, 30, "c26a", env=env)
-        m = g.rx(d, "reviewer-status", "--mark", "codex-standards", "--reason", "quota exceeded", env=env)
+        m = rx(d, "reviewer-status", "--mark", "codex-standards", "--reason", "quota exceeded", env=env)
         assert m.returncode == 0, _out(m)
         bench_path = Path(d) / ".ratchet/unavailable-reviewers.json"
         bench_before = json.loads(bench_path.read_text()).get("codex-standards")
@@ -1050,22 +1082,22 @@ def t27_the_fix_reviewer_always_comes_from_the_blocked_round():
     with _own_home():
         b = _fake_clis({"codex": (_NO_FINDINGS, _NO_FINDINGS)})
         env = dict(g.ENV, PATH=str(b))
-        d = g.project("c27b", extra_cp={"risk": "normal"}, config=["provider_share.max=9"])
-        g.approve_plan(d)
-        g.to_adversarial(d)
+        d = project("c27b", extra_cp={"risk": "normal"}, config=["provider_share.max=9"])
+        approve_plan(d)
+        to_adversarial(d)
         rnd1 = _open(d)
         check("[CP5-T27] (fixture) round 1 is host-only", all(i.startswith("host-") for i in _ids(rnd1)),
               _ids(rnd1))
         rid = _pick(rnd1, "correctness")
         _block(d, rnd1, {rid: [_finding("C1")]})
-        r = g.rx(d, "providers", "--add", "codex", "--command", json.dumps([str(b / "codex")]), "--stdin",
+        r = rx(d, "providers", "--add", "codex", "--command", json.dumps([str(b / "codex")]), "--stdin",
                  "--company", "openai", "--model", "gpt-5", env=env)
         assert r.returncode == 0, _out(r)
         # a provider added mid-run is a rule change: the user's own approval re-snapshots it before the gates run
-        a = g.rx(d, "ask", "approve-changes", env=env)
+        a = rx(d, "ask", "approve-changes", env=env)
         assert a.returncode == 0, _out(a)
-        g.say(d, "yes, go ahead")
-        a = g.rx(d, "approve-changes", env=env)
+        say(d, "yes, go ahead")
+        a = rx(d, "approve-changes", env=env)
         assert a.returncode == 0, _out(a)
         _write_code(d, 30, "c27b", env=env)
         rnd2 = _open(d, env=env)
@@ -1121,7 +1153,7 @@ def t29_only_a_reviewer_whose_finding_is_being_fixed_is_chosen():
                               replies={"codex": (json.dumps({"findings": [_finding("S1")]}), _NO_FINDINGS)})
         rnd1 = _open(d, env=env)
         _ext_record(d, rnd1, env, host_findings={"host-correctness": [_finding("C1")]})
-        t = g.rx(d, "triage", "CP1", 'codex-standards/S1=rebut:"no developer can reach this path"', env=env)
+        t = rx(d, "triage", "CP1", 'codex-standards/S1=rebut:"no developer can reach this path"', env=env)
         assert t.returncode == 0, _out(t)
         _triage(d, ["host-correctness/C1"], env=env)
         _write_code(d, 30, "c29", env=env)
@@ -1145,7 +1177,7 @@ def f15_a_blocked_and_an_approved_fix_round_are_both_named_and_told_apart():
     rnd3 = _open(d)
     _approve(d, rnd3)
     sj, txt = _status_json(d), _status_text(d)
-    rc = g.rx(d, "complete", "CP1")
+    rc = rx(d, "complete", "CP1")
     assert rc.returncode == 0, _out(rc)
     msg = _commit_message(d)
     lines2 = [s for s in sj if "round 2" in s.lower() and "fix round" in s.lower()]
@@ -1173,7 +1205,7 @@ def f16_the_evidence_names_the_reviewer_that_actually_ran():
         rnd2 = _open(d, env=env)
         check("[CP5-F16] (fixture) round 2 is a one-reviewer fix round for codex-standards",
               _ids(rnd2) == ["codex-standards"], _ids(rnd2))
-        m = g.rx(d, "reviewer-status", "--mark", "codex-standards", "--reason", "auth expired mid-round", env=env)
+        m = rx(d, "reviewer-status", "--mark", "codex-standards", "--reason", "auth expired mid-round", env=env)
         assert m.returncode == 0, _out(m)
         rnd2b = _open(d, env=env)
         got = _ids(rnd2b)[0]
@@ -1186,7 +1218,7 @@ def f16_the_evidence_names_the_reviewer_that_actually_ran():
               (_cps(d).get("adv_round") or {}).get("substitutions"))
         r = _record(d, rnd2b, [g.write_review(d, rnd2b, got, [])], env=env)
         assert r.returncode == 0, _out(r)
-        rc = g.rx(d, "complete", "CP1", env=env)
+        rc = rx(d, "complete", "CP1", env=env)
         assert rc.returncode == 0, _out(rc)
         msg = _commit_message(d)
         check("[CP5-F16] the commit message names the reviewer that really ran and never the benched one as "

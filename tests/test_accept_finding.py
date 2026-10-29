@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import traceback
 from pathlib import Path
 import importlib.util
@@ -36,6 +37,61 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "skills" / "ratchet-orchestrator" / "scripts"))
 import _tmp  # noqa: E402
 import trust_helpers as th  # noqa: E402
+
+# [slow-suite speed-up, standard #30] Every engine call in this suite goes through trust_helpers.rx(d, env, ...):
+# both the direct th.rx(...) calls in the cases below and the ones inside the shared th.cp3_* fixtures this suite
+# reuses (cp3_project, cp3_pass_behavior, cp3_open_round, cp3_reviewer_writes, cp3_fp, cp4_say_yes). Each used to
+# spawn a fresh `python3 ratchet.py ...` subprocess, paying the ~21k-line engine's interpreter-startup-plus-recompile
+# cost ~712 times (~328s). Following standard #30 and the three already-converted suites (test_gates.py's _FastCall,
+# test_trust_cp5_d.py's _Cp3Call, test_trust_cp5_e.py's _Cp2Call), every one of those calls now runs in-process
+# against trust_helpers.cp5y_load_engine()'s one memoized module object, through trust_helpers.InProcessCall (chdir
+# to the project, swap os.environ for the call's env, redirect stdout/stderr/stdin, reset the engine's per-call
+# module globals both BEFORE and AFTER each call, cap per-record lock waits, capture SystemExit as the returncode)
+# -- so r.returncode/r.stdout/r.stderr read exactly as the subprocess.CompletedProcess's did. No case ID, assertion
+# or returncode/stdout/stderr contract changes.
+#
+# Rather than hand-copy every th.cp3_* fixture into an in-process mirror (test_trust_cp5_d/_e did that, and the
+# adversarial review kept flagging the resulting copies for drift), this suite rebinds trust_helpers.rx to an
+# in-process driver OF THE SAME SIGNATURE. The fixtures call `rx` as a module global, so the rebind reaches them
+# too, converting the fixture spawns as well as the direct ones in one place with zero duplication.
+#
+# CRITICAL: the rebind happens ONLY when this file is run as the main suite (inside `if __name__ == "__main__"`
+# below), never at import time. Other suites import THIS module for its fixtures (test_director_sign_more directly;
+# test_dm_finish / test_dm_accept / test_limits transitively), and those suites deliberately keep trust_helpers.rx
+# as a real `python3 ratchet.py` subprocess -- especially for their director/token lane, whose separate-process
+# boundary is itself under test. A module-level rebind would silently convert their rx too and break that isolation,
+# so the swap is confined to direct execution. trust_helpers.py on disk is never edited; `python3
+# tests/test_accept_finding.py` (how both a standalone run and run_all invoke this suite) still gets the full
+# fixture conversion and the speed-up, while merely importing this module leaves trust_helpers.rx untouched.
+#
+# PRESERVED AS REAL SUBPROCESSES (genuine separate-process boundaries, explicitly out of scope for #30): the
+# fault-injection cases CP3-X02 / X05 / X09 (_CP3X02_FAIL_SAVE_STATE etc.) load the engine in a SEPARATE `python3 -c`
+# process and monkeypatch it to fail mid-write; they MUST stay separate so that corruption never touches this
+# process's shared, memoized engine module. They already call subprocess.run directly (never th.rx), so the rebind
+# leaves them untouched. CP3-X23b's _dedupe_finding_ids probe deliberately loads its own fresh engine module and is
+# also left as-is.
+_ENGINE_CALL_LOCK = threading.Lock()  # mirrors _FastCall's lock; this suite's runner is single-threaded, so it never contends
+
+
+class _Cp3Call(th.InProcessCall):
+    """`with _Cp3Call(m, d, env) as r: m.main([...])` -- this suite's thin constructor over
+    trust_helpers.InProcessCall, matching test_trust_cp5_d.py's _Cp3Call / test_gates.py's _FastCall. reset_unreadable
+    is False: no case in this suite asserts a second damaged-record warning about the same path across two calls."""
+
+    def __init__(self, m, d, env, stdin=None):
+        super().__init__(m, d, env, th.DEFAULT_RESET_GLOBALS, th.DEFAULT_LOCK_WAIT_CAP, reset_unreadable=False,
+                         stdin=stdin)
+
+
+def _inprocess_rx(d, env, *args, stdin=None):
+    """In-process stand-in for trust_helpers.rx(d, env, *args, stdin=...): same signature, same CompletedProcess-
+    shaped return (.returncode/.stdout/.stderr). Reuses the one memoized engine module instead of spawning
+    `python3 ratchet.py` per call -- the whole point of standard #30's conversion."""
+    m = th.cp5y_load_engine()
+    with _ENGINE_CALL_LOCK, _Cp3Call(m, d, env, stdin=stdin) as r:
+        m.main(list(args))
+    return r
+
 
 ROOT = HERE.parent
 PASS = FAIL = 0
@@ -1483,4 +1539,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # Rebind trust_helpers.rx to the in-process driver ONLY for a direct run of this suite (see the note at the top
+    # of the file): this converts the direct th.rx(...) calls and the shared th.cp3_* fixtures' own spawns alike,
+    # without leaking the swap to any suite that merely imports this module for its fixtures.
+    th.rx = _inprocess_rx
     main()

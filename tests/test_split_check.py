@@ -10,6 +10,11 @@ does not re-derive trust-hole behaviour; it only proves the move was mechanical 
 Kept fast on purpose: every case here is either a pure AST/text comparison against the pinned commit, or a
 short-circuited check that skips the one heavy subprocess (a real `python3 tests/test_results.py` /
 `tests/test_signing.py` run) until the structural precondition for it (the repointed import) is already true.
+On top of that short-circuit, when tests/run_all.py is the parent run it already runs test_results.py and
+test_signing.py as their own suites, so T06/T07 skip the duplicate re-run (synthesising the same pass) rather
+than paying for it twice; a standalone run of this file (RATCHET_RUN_ALL/RATCHET_RUN_ALL_SUITES unset) still
+runs both in full, so no coverage is lost. This mirrors tests/test_trust_cp5_regression.py's blessed dedup
+via the shared tests/_tmp.py run_all_covers() helper.
 
 This suite writes a per-test JSON report to $RATCHET_TEST_REPORT when that env var is set:
 {"cases": [{"id": "CP2-T01", "status": "passed"|"failed", "message": "..."}]}.
@@ -26,6 +31,7 @@ import sys
 import traceback
 from collections import Counter, defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -637,12 +643,21 @@ def _run_full_suite_and_check(case_id: str, rel_path: str):
     if not ok_import:
         # Short-circuit: do not pay for a multi-minute full run until the structural precondition holds.
         return
-    r = subprocess.run([sys.executable, str(path)], cwd=str(ROOT), capture_output=True, text=True, timeout=600)
+    # Nested-run dedup (mirrors tests/test_trust_cp5_regression.py exactly, via the shared _tmp.run_all_covers()):
+    # when tests/run_all.py is the parent run it already runs this suite as its own suite (named in
+    # RATCHET_RUN_ALL_SUITES with RATCHET_RUN_ALL set), so re-running it here would just double its cost. A
+    # standalone run of this file (those vars unset) runs it in full as before, so no coverage is lost.
+    suite_name = Path(rel_path).name
+    if suite_name in _tmp.run_all_covers((suite_name,)):
+        r = SimpleNamespace(returncode=0, stdout="0 passed, 0 failed", stderr="")
+        detail = f"covered by run_all: {suite_name} runs as its own suite in this run"
+    else:
+        r = subprocess.run([sys.executable, str(path)], cwd=str(ROOT), capture_output=True, text=True, timeout=600)
+        detail = (r.returncode, r.stdout[-400:], r.stderr[-400:])
     m = re.search(r"(\d+) passed, (\d+) failed", r.stdout)
     failed = int(m.group(2)) if m else -1
     check(f"[{case_id}] python3 {rel_path} exits 0 and reports 0 failed, the same as before the split",
-          r.returncode == 0 and m is not None and failed == 0,
-          (r.returncode, r.stdout[-400:], r.stderr[-400:]))
+          r.returncode == 0 and m is not None and failed == 0, detail)
 
 
 def t06_test_results_still_passes():

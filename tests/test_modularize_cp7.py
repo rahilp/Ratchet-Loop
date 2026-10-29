@@ -18,7 +18,9 @@ by CP7-T11 (explicit named imports, no circular import, no new module-level muta
 test, test_digest_docstring.py, that reads ratchet.py's literal source text for a function this checkpoint
 relocates, re-pointed to plan_support.py) and CP7-T15 (the diff touches only the expected files). CP7-T13 runs
 the four regression files (test_dm_table.py/test_dm_accept.py/test_digest_docstring.py/test_brief_guard.py) for
-real, unedited, against the post-move tree.
+real, unedited, against the post-move tree -- except that when tests/run_all.py is the parent run it already runs
+each of those as its own suite, so CP7-T13 skips the duplicate re-run then (synthesising the same pass, guarded by
+RATCHET_RUN_ALL_SUITES exactly like tests/test_trust_cp5_regression.py); a standalone run still runs all four.
 
 Heavily reuses tests/test_digest.py (as `td`: HEADING/LEARN_HEAD/OPEN_HEAD/ACCEPTED_HEAD/_section/
 _project_with_feature/_write_earlier_run/_append_learning_lines/_finding/rich) and tests/test_digest_specs.py (as
@@ -38,6 +40,7 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -564,15 +567,24 @@ def t13_four_named_regression_files_still_pass():
     print("CP7-T13: test_dm_table.py, test_dm_accept.py, test_digest_docstring.py and test_brief_guard.py pass "
           "unmodified after the move")
     files = ["test_dm_table.py", "test_dm_accept.py", "test_digest_docstring.py", "test_brief_guard.py"]
+    # Nested-run dedup (mirrors tests/test_trust_cp5_regression.py exactly, via the shared _tmp.run_all_covers()):
+    # when tests/run_all.py is the parent run it already runs each of these as its own suite (named in
+    # RATCHET_RUN_ALL_SUITES with RATCHET_RUN_ALL set), so re-running them here would just double their cost. A
+    # standalone run of this file (those vars unset) runs each in full as before, so no coverage is lost.
+    covered = _tmp.run_all_covers(files)
     for fname in files:
         p = ROOT / "tests" / fname
         check(f"[CP7-T13] tests/{fname} exists", p.exists())
         if not p.exists():
             continue
-        r = subprocess.run([sys.executable, str(p)], cwd=str(ROOT), capture_output=True, text=True, timeout=600)
+        if fname in covered:
+            r = SimpleNamespace(returncode=0)
+            detail = f"covered by run_all: {fname} runs as its own suite in this run"
+        else:
+            r = subprocess.run([sys.executable, str(p)], cwd=str(ROOT), capture_output=True, text=True, timeout=600)
+            detail = (r.returncode, r.stdout[-1500:], r.stderr[-800:])
         check(f"[CP7-T13] tests/{fname} exits 0 (every one of its own cases passes) against the post-move tree, "
-              "with no edits made to the file itself", r.returncode == 0,
-              (r.returncode, r.stdout[-1500:], r.stderr[-800:]))
+              "with no edits made to the file itself", r.returncode == 0, detail)
 
 
 # ============================================================================================ CP7-T14

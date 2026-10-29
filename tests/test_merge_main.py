@@ -87,8 +87,12 @@ def ours(r) -> str:
     return said(r) if known(r) else ""
 
 
-def rx(d, *a):
-    return tg.rx(d, *a)
+def rx(d, *a, **k):
+    # Opt into test_gates.rx's in-process fast path (standard #30): every engine call this suite drives is
+    # command logic, so default it on. fast-path replaces: python3 ratchet.py <args> as a real subprocess.
+    # A call whose point were a genuine subprocess boundary would pass fast=False; none here are.
+    k.setdefault("fast", True)
+    return tg.rx(d, *a, **k)
 
 
 def git(d, *a):
@@ -186,7 +190,7 @@ def build(name, human_review="end", regression=None, cp2="js"):
     (d / ".ratchet/standards.md").write_text("Keep functions short\n")
     (d / "tests/py_runner.py").write_text(PY_RUNNER)
     commit_all(d, "init")
-    tg.say(d, "please build the feature")
+    tg.say(d, "please build the feature", fast=True)  # fast-path replaces: python3 ratchet.py hook prompt --host claude
     args = ["init", "feature", "--slug", "f"] + (["--human-review", "each"] if human_review == "each" else [])
     r = rx(d, *args)
     assert r.returncode == 0, r.stderr + r.stdout
@@ -217,7 +221,7 @@ def build(name, human_review="end", regression=None, cp2="js"):
         (run / "tests" / f"{cid}.json").write_text(json.dumps({"cases": [{"id": f"{cid}-T01", "layer": "code", "proves": [1]}]}))
     r = rx(d, "plan-submit")
     assert r.returncode == 0, r.stderr + r.stdout
-    tg.approve_plan(d)
+    tg.approve_plan(d, fast=True)  # fast-path replaces: python3 ratchet.py ask approve-plan / approve-plan
     (d / "tests/cp1.test.js").write_text(CP1_TEST.replace("{marker!r}", repr(str(marker2))))
     for step in ("tests-written", "red"):
         r = rx(d, step, "CP1")
@@ -683,7 +687,7 @@ def t11_merged_while_a_step_review_waits():
           st["checkpoints"]["CP1"]["gates"]["human"]["status"] != "passed", st["checkpoints"]["CP1"]["gates"]["human"])
     check("[CP5-T11] a merged_main event was logged", len(history(d, "merged_main")) == 1, history(d, "merged_main"))
     need("[CP5-T11] (setup) asking for the review works", rx(d, "ask", "human-approve").returncode == 0, "")
-    tg.say(d, "yes, go ahead")
+    tg.say(d, "yes, go ahead", fast=True)  # fast-path replaces: python3 ratchet.py hook prompt --host claude
     r = rx(d, "human-approve")
     st = sj(d)
     check("[CP5-T11] the user's yes then moves the run on to CP2",

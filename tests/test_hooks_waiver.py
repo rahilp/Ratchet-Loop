@@ -13,7 +13,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import _tmp
+import trust_helpers
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
@@ -29,6 +31,30 @@ PASS = FAIL = 0
 
 GO = "yes, go ahead without hooks"
 
+# [slow-suite speed-up, standard #30] This suite drives the engine (skills/ratchet-orchestrator/scripts/ratchet.py)
+# through its own rx()/say()/guard()/fire_stop() below, each of which used to spawn a fresh `python3 ratchet.py ...`
+# subprocess -- paying the ~21k-line engine's interpreter-startup-plus-recompile cost ~1124 times (~495s, ~65% of
+# it pure recompile). Following standard #30 and the three already-converted suites (tests/test_gates.py's
+# _FastCall, tests/test_trust_cp5_d.py's _Cp3Call, tests/test_trust_cp5_e.py's _Cp2Call), every such call now runs
+# in-process against trust_helpers.cp5y_load_engine()'s one memoized module object, through a small context manager
+# that chdir()s to the test project, swaps os.environ for the call's own env, redirects stdout/stderr/stdin, resets
+# the engine's per-call module globals both BEFORE and AFTER the call, caps per-record lock waits, and captures
+# SystemExit as the returncode -- so r.returncode/r.stdout/r.stderr read exactly as a subprocess.CompletedProcess's
+# did. No case ID, assertion or returncode/stdout/stderr contract changes. There is no genuine subprocess boundary
+# under test in this suite (no real pty, no cross-process file-lock contention, no separate-process exit code), so
+# every engine call converts; the one remaining real subprocess, put_waiver()'s record_chain `python3 -c` helper,
+# is a plain module-function call (not a `python3 ratchet.py` CLI call) and is left as-is.
+_FAST_LOCK = threading.Lock()  # mirrors _FastCall's usage; this suite's main() is single-threaded, so it never contends
+
+
+class _FastCall(trust_helpers.InProcessCall):
+    """`with _FastCall(m, d, env) as r: m.main([...])` -- this file's thin constructor over
+    trust_helpers.InProcessCall, matching test_gates.py's _FastCall / test_trust_cp5_d.py's _Cp3Call."""
+
+    def __init__(self, m, d, env, stdin=None):
+        super().__init__(m, d, env, trust_helpers.DEFAULT_RESET_GLOBALS, trust_helpers.DEFAULT_LOCK_WAIT_CAP,
+                         reset_unreadable=False, stdin=stdin)
+
 
 def check(name, cond, detail=""):
     global PASS, FAIL
@@ -37,8 +63,10 @@ def check(name, cond, detail=""):
 
 
 def rx(d, *args, env=None):
-    return subprocess.run([sys.executable, str(ENGINE), *args], cwd=d, capture_output=True, text=True,
-                          env=env or ENV)
+    m = trust_helpers.cp5y_load_engine()
+    with _FAST_LOCK, _FastCall(m, d, env or ENV) as r:
+        m.main(list(args))  # fast-path replaces: python3 ratchet.py <args> as a real subprocess
+    return r
 
 
 def git(d, *a):
@@ -61,23 +89,27 @@ def say(d, text, session="s-owner"):
     with tp.open("a") as f:
         f.write(json.dumps({"type": "user", "message": {"role": "user", "content": text},
                             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
-    r = subprocess.run([sys.executable, str(ENGINE), "hook", "prompt", "--host", "claude"], cwd=d, text=True,
-                       capture_output=True, env=ENV,
-                       input=json.dumps({"cwd": str(d), "prompt": text, "session_id": session,
-                                         "transcript_path": str(tp)}))
+    payload = json.dumps({"cwd": str(d), "prompt": text, "session_id": session, "transcript_path": str(tp)})
+    m = trust_helpers.cp5y_load_engine()
+    with _FAST_LOCK, _FastCall(m, d, ENV, stdin=payload) as r:
+        m.main(["hook", "prompt", "--host", "claude"])  # fast-path replaces: python3 ratchet.py hook prompt --host claude
     return r
 
 
 def guard(d, tool, tool_input):
-    return subprocess.run([sys.executable, str(ENGINE), "hook", "guard", "--host", "claude"], cwd=d, text=True,
-                          capture_output=True, env=ENV,
-                          input=json.dumps({"cwd": str(d), "tool_name": tool, "tool_input": tool_input}))
+    payload = json.dumps({"cwd": str(d), "tool_name": tool, "tool_input": tool_input})
+    m = trust_helpers.cp5y_load_engine()
+    with _FAST_LOCK, _FastCall(m, d, ENV, stdin=payload) as r:
+        m.main(["hook", "guard", "--host", "claude"])  # fast-path replaces: python3 ratchet.py hook guard --host claude
+    return r
 
 
 def fire_stop(d, session="s-owner"):
-    return subprocess.run([sys.executable, str(ENGINE), "hook", "stop", "--host", "claude"], cwd=d, text=True,
-                          capture_output=True, env=ENV,
-                          input=json.dumps({"cwd": str(d), "session_id": session, "hook_event_name": "Stop"}))
+    payload = json.dumps({"cwd": str(d), "session_id": session, "hook_event_name": "Stop"})
+    m = trust_helpers.cp5y_load_engine()
+    with _FAST_LOCK, _FastCall(m, d, ENV, stdin=payload) as r:
+        m.main(["hook", "stop", "--host", "claude"])  # fast-path replaces: python3 ratchet.py hook stop --host claude
+    return r
 
 
 def project(name="p", approved=True) -> Path:
