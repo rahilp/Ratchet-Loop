@@ -25,9 +25,9 @@ module directly, can itself contain the pattern strings as embedded constants an
 match; this doc's counts were taken right after `rm -rf tests/__pycache__
 tests/shortcuts/__pycache__`.)
 
-47 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
+53 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
 files the brief names explicitly (`test_quota_shared.py`, `test_discover_paid.py`, Kind 4 below)
-that carry the identical real obligation but don't literally match either regex today — **49
+that carry the identical real obligation but don't literally match either regex today — **55
 files total**, consistent with the brief's "43+".
 
 ## Kind 1 — module-load only (loads ratchet.py dynamically via `importlib.util.spec_from_file_location`,
@@ -106,7 +106,7 @@ never inspects its on-disk text directly): 31 files
   directly. Never touches ratchet.py itself, but matches the same module-load pattern.
 
 ## Kind 2 — source-text/AST only (reads ratchet.py's literal on-disk text and/or walks its parsed
-tree, never loads it as a module itself): 6 files
+tree, never loads it as a module itself): 9 files
 
 - `test_quick_path.py` — CP2 (quick-path change classification). Source-text known fixture
   (CP1-T03's own `SOURCE_TEXT_EXAMPLE`): line 478-480, `src = g.ENGINE.read_text(encoding="utf-8")`;
@@ -149,6 +149,9 @@ tree, never loads it as a module itself): 6 files
   there with its docstring intact and no leftover top-level `def` in ratchet.py. Never loads either
   module dynamically via `spec_from_file_location` itself, so it matches only the source-text/AST
   pattern, not the module-load one.
+- `test_config_layers.py` — CP1: machine-wide config file under the project's; its structural cases read
+  ratchet.py's source with `ENGINE.read_text`/`ast` (layered keys go through the layered reader; every provider
+  field the engine reads is validated). It does not load ratchet.py as a module itself.
 - `test_impact_analysis_registration.py` — lane X: the impact-analyzer's `registration` entry point
   (`skills/ratchet-checkpoint-planner/scripts/impact_analysis.py`) flags new test files that need
   inventory registration. It matches the source-text/AST grep only because it carries the scan-pattern
@@ -159,7 +162,7 @@ tree, never loads it as a module itself): 6 files
   analyzer's `tests/fixtures/impact_analysis_*/` sample-data files — excluded from the live grep for the
   same CP1-X01 reason that excludes embedded bytecode constants — it stays inside the oracle's scope).
 
-## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 10 files
+## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 13 files
 
 - `test_trust_cp4.py` — trust-holes CP4: agent-set overrides no longer bypass checks. Loads
   ratchet.py dynamically (`ratchet_engine_slow_hook`) AND reads `ENGINE.read_text()` +

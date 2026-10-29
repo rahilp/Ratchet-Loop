@@ -192,6 +192,9 @@ _CP5R13_SHARED_NAMES = {"active-runs.json", "enrolled.json", "director-folders.j
                         "file-hashes.json", "engine-call-sessions.json", "provider-status.json",
                         "unavailable-reviewers.json", "hook-heartbeat.json", "hook-env.json",
                         "provider-health.json"}
+# Files in RATCHET_HOME that are NOT Ratchet's records: the user writes them, Ratchet only reads them (never
+# writes, locks, tracks or quarantines them), so they are exempt from shared-record tracking.
+_CP5R13_USER_WRITTEN = {"config.json": "the machine-wide settings file, written by the user"}
 _CP5R13_WRITE_OK = {
     "update_record": "the one read-modify-write of a shared record, under its lock",
     "write_json": "a facade over _write_record",
@@ -536,10 +539,10 @@ def cp5_adv_round13_shared_record_lock():
         if ur else set()
     check("[CP5-X71] every JSON record in RATCHET_HOME is on the scan's list of shared records, and update_record "
           "reads with _read_record and writes with _write_record inside a `with` over a _BreakerLock-based lock",
-          home_names and home_names <= _CP5R13_SHARED_NAMES and ur is not None
+          home_names and home_names <= (_CP5R13_SHARED_NAMES | set(_CP5R13_USER_WRITTEN)) and ur is not None
           and any(isinstance(n, ast.With) for n in ast.walk(ur)) and {"_read_record", "_write_record"} <= calls
           and issubclass(m._RecordLock, m._BreakerLock),
-          (sorted(home_names - _CP5R13_SHARED_NAMES), sorted(calls)))
+          (sorted(home_names - _CP5R13_SHARED_NAMES - set(_CP5R13_USER_WRITTEN)), sorted(calls)))
 
     # --- X72: when the lock is held, nothing is written over it, and the person is told -----------------------
     lane = projects[3]

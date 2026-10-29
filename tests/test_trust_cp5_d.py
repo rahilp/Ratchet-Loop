@@ -514,6 +514,9 @@ _CP5R11_STRICT_READS = {
     "cmd_spec": "config.json",
     "_finish_guardrail": "config.json",
     "cmd_config": "config.json",
+    "Ctx.global_config": "the machine-wide config.json in the per-user folder, a file the user writes (Ratchet never does)",
+    "Ctx.user_config": "config.json, the user's settings (the project file laid over the machine-wide one)",
+    "cmd_providers": "config.json (the project's own providers list, to tell it from the machine-wide one)",
     "spec_source": "reference/spec-source.json, in the agent-writable reference folder",
     "cmd_install_hooks": "an agent CLI's own settings file",
 }

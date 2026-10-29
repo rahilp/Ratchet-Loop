@@ -116,5 +116,6 @@
     "tests/test_docs.py",
     "tests/test_brief.py",
     "tests/test_trust_cp5_d.py"
-  ]
+  ],
+  "{\"strong\":\"opus\",\"standard\":\"sonnet\",\"light\":\"haiku\",\"alternates\":[\"sonnet\",\"opus\"]}": ""
 }

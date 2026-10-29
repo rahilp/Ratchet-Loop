@@ -138,6 +138,11 @@ _SAFE_SLUG_RE = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]+$")  # a run folder name:
 _STATE_LOCK_HELD = False  # set by main() while this process holds the state lock for its whole command
 
 
+# The only settings the machine-wide file may hold: provider/model choices. Everything else (reviewer counts, review
+# depth, checks, commands, standards, ...) is a project's own policy and is refused there, loudly.
+GLOBAL_ALLOWED_KEYS = ("role_models", "host_models", "providers", "agents", "host_provider", "ui_reviewers")
+
+
 class Ctx:
     def __init__(self, root: Path):
         self.root = root
@@ -148,8 +153,144 @@ class Ctx:
     def config_path(self):
         return self.ratchet / "config.json"
 
+    @property
+    def global_config_path(self):
+        return ratchet_home() / "config.json"
+
+    def global_config(self):
+        """The machine-wide settings file (config.json in the per-user folder), {} when absent. A damaged one, a
+        non-object, paid consent (providers[].paid_ok_at), a key outside GLOBAL_ALLOWED_KEYS, or a wrong-shaped
+        value stops the command naming the file and the key. The nested shapes checked: each providers[] entry
+        (id unique and non-empty, a known preset or a command, model/company/cost non-empty strings, variant a
+        string, for_risk a list of low/normal/high, prefer_for a list of lenses, stdin a boolean), role_models,
+        host_models (with alternates), ui_reviewers and agents ('model' or 'provider/model', split at the first '/' so a model may hold more) name-to-value maps, and
+        host_provider."""
+        p = self.global_config_path
+        if not p.exists():
+            return {}
+        g = read_json(p, {})
+        if not isinstance(g, dict):
+            die(f"{p} must hold a JSON object of settings (got {type(g).__name__}). Fix or delete that file, then run "
+                "this command again.")
+        for key in g:
+            if key not in GLOBAL_ALLOWED_KEYS:
+                die(f"{p} can't set '{key}': the machine-wide file only holds {', '.join(GLOBAL_ALLOWED_KEYS)}. "
+                    f"'{key}' belongs in the project's {RATCHET_DIR}/config.json instead.")
+        for key in GLOBAL_ALLOWED_KEYS:  # a structured setting must have the shape the shipped one has
+            base = DEFAULT_CONFIG.get(key)
+            want = dict if isinstance(base, dict) or key == "agents" else list if isinstance(base, list) else None
+            if want and key in g and not isinstance(g[key], want):
+                die(f"{p} sets '{key}' to {type(g[key]).__name__}, but it must be a "
+                    f"{'JSON object' if want is dict else 'list'}. Fix that setting in the file, then run this command "
+                    "again.")
+        def bad(where, want, val):
+            die(f"{p} '{where}' must be {want} (got {type(val).__name__}). Fix that setting in the file, then run "
+                "this command again.")
+
+        def is_strs(v):
+            return isinstance(v, list) and all(isinstance(x, str) for x in v)
+
+        def name_ok(v):
+            return isinstance(v, str) and bool(v.strip())
+
+        def keys_ok(where, d):
+            for k in d:
+                if not name_ok(k):
+                    bad(f"{where} key {k!r}", "a non-empty name", k)
+
+        # --- providers: a list of objects; unknown extra fields are accepted (the project path keeps them too)
+        seen_ids = set()
+        for i, prov in enumerate(g.get("providers") or []):
+            if not isinstance(prov, dict):
+                die(f"{p} 'providers[{i}]' must be an object describing one provider (got {type(prov).__name__}). "
+                    "Fix that entry in the file, then run this command again.")
+            if "paid_ok_at" in prov:
+                die(f"{p} can't hold paid consent (providers[].paid_ok_at): approving paid use is per project. "
+                    "Remove that field from the file.")
+            if not name_ok(prov.get("id")):
+                die(f"{p} 'providers[{i}]' is missing 'id' (a non-empty name for the provider). Fix that entry in the "
+                    "file, then run this command again.")
+            if prov["id"] in seen_ids:
+                die(f"{p} 'providers[{i}].id' {prov['id']!r} appears twice in 'providers'; each provider id must be "
+                    "unique. Remove or rename one entry, then run this command again.")
+            seen_ids.add(prov["id"])
+            if prov.get("preset") is not None and prov["preset"] not in PRESETS:
+                die(f"{p} 'providers[{i}].preset' is {prov['preset']!r}; known presets: {', '.join(PRESETS)}. Fix that "
+                    "entry in the file, then run this command again.")
+            if "command" in prov and not (is_strs(prov["command"]) and prov["command"]
+                                          and all(c.strip() for c in prov["command"])):
+                bad(f"providers[{i}].command", "a non-empty list of non-empty strings", prov["command"])
+            if not (prov.get("preset") or prov.get("command")):
+                die(f"{p} 'providers[{i}]' needs a 'preset' or a 'command' to say how to run it. Fix that entry in the "
+                    "file, then run this command again.")
+            for f in ("model", "company", "cost"):
+                if f in prov and not name_ok(prov[f]):
+                    bad(f"providers[{i}].{f}", "a non-empty string", prov[f])
+            if "variant" in prov and not isinstance(prov["variant"], str):
+                bad(f"providers[{i}].variant", "a string", prov["variant"])
+            if "stdin" in prov and not isinstance(prov["stdin"], bool):
+                bad(f"providers[{i}].stdin", "true or false", prov["stdin"])
+            if "for_risk" in prov and not (is_strs(prov["for_risk"])
+                                           and all(x in ("low", "normal", "high") for x in prov["for_risk"])):
+                bad(f"providers[{i}].for_risk", "a list of risk names (low, normal, high)", prov["for_risk"])
+            if "prefer_for" in prov and not (is_strs(prov["prefer_for"])
+                                             and all(x in LENSES for x in prov["prefer_for"])):
+                bad(f"providers[{i}].prefer_for", f"a list of lens names ({', '.join(LENSES)})", prov["prefer_for"])
+        # --- role_models: role name -> tier or model name (names are checked against real roles elsewhere)
+        keys_ok("role_models", g.get("role_models") or {})
+        for role, tier in (g.get("role_models") or {}).items():
+            if not name_ok(tier):
+                bad(f"role_models.{role}", "a non-empty string (a tier or a model name)", tier)
+        # --- host_models: company -> {tier: model name, alternates: [model names]}
+        keys_ok("host_models", g.get("host_models") or {})
+        for host, hm in (g.get("host_models") or {}).items():
+            if not isinstance(hm, dict):
+                bad(f"host_models.{host}", "an object of tier names to models", hm)
+            keys_ok(f"host_models.{host}", hm)
+            for tier, model in hm.items():
+                if tier == "alternates":
+                    if not (is_strs(model) and all(m.strip() for m in model)):
+                        bad(f"host_models.{host}.alternates", "a list of non-empty model names", model)
+                elif not name_ok(model):
+                    bad(f"host_models.{host}.{tier}", "a non-empty string (a model name)", model)
+        # --- ui_reviewers: lens -> list of provider names
+        keys_ok("ui_reviewers", g.get("ui_reviewers") or {})
+        for lens, lst in (g.get("ui_reviewers") or {}).items():
+            if not (is_strs(lst) and all(x.strip() for x in lst)):
+                bad(f"ui_reviewers.{lens}", "a list of non-empty provider names", lst)
+        # --- agents: role name -> a bare 'model' or a 'provider/model' string (role, provider and model names are
+        # checked against the real ones where the override is used)
+        keys_ok("agents", g.get("agents") or {})
+        for name, spec in (g.get("agents") or {}).items():
+            if not name_ok(spec):
+                bad(f"agents.{name}", "a non-empty string ('model' or 'provider/model')", spec)
+            parts = spec.split("/", 1)  # first '/' only: a model name may itself hold one (opencode-go/glm-5.3)
+            if len(parts) == 2 and not (parts[0].strip() and parts[1].strip()):
+                bad(f"agents.{name}", "'model' or 'provider/model' with both parts non-empty (split at the first '/')",
+                    spec)
+        # --- host_provider: a non-empty string ('auto' or a company)
+        if "host_provider" in g and not name_ok(g["host_provider"]):
+            bad("host_provider", "a non-empty string", g["host_provider"])
+        return g
+
+    def user_config(self, project=None):
+        """The raw settings in effect before defaults: the global file with the project's file over it, key by key.
+        One rule for both layers: a dict value merges one level deep (its sub-entries replace whole, so a partial
+        host_models.anthropic replaces the shipped entry), anything else replaces whole. An untouched old default
+        review_depth is dropped (only the project level can carry one: the global file refuses the key)."""
+        out = {}
+        for layer in (self.global_config(), (read_json(self.config_path, {}) if project is None else project) or {}):
+            for k, v in layer.items():
+                if k == "review_depth" and v == OLD_DEFAULT_REVIEW_DEPTH:
+                    continue
+                if isinstance(v, dict) and isinstance(out.get(k), dict):
+                    out[k] = {**out[k], **v}
+                else:
+                    out[k] = v
+        return out
+
     def config(self):
-        return config_from_user(read_json(self.config_path, {}) or {})
+        return config_from_user(self.user_config())
 
     # --- active run
     def active_slug(self):
@@ -2581,6 +2722,12 @@ def cmd_providers(args):
     cfg = ctx.config()
     host = detect_host(cfg)
     plist = providers(cfg)
+    if (args.remove or args.add or args.discover) and "providers" not in (read_json(ctx.config_path, {}) or {}) \
+            and ctx.global_config().get("providers"):
+        # a list replaces whole, so writing here would freeze a copy of the machine-wide list into this project
+        die(f"This project has no providers list of its own; its providers come from {ctx.global_config_path}. The "
+            "developer changes them there (an agent can't write to that folder), or an override for this project only "
+            "is set with: ratchet.py config --set providers='<json list>'.")
     if args.remove:
         plist = [pv for pv in plist if pv["id"] != args.remove]
         _write_providers(ctx, plist)
@@ -3023,8 +3170,11 @@ def cmd_init(args):
     ctx = Ctx(root)
     ctx.ratchet.mkdir(exist_ok=True)
     if not ctx.config_path.exists():
+        glob = ctx.global_config()  # load (and validate) it before writing anything
+        # a key the machine-wide file sets is not copied here: this file wins key by key, so a copy would hide it
         cfg = {k: DEFAULT_CONFIG[k] for k in ["human_review", "host_provider", "ui_reviewers", "regression_command",
-                                               "commit_per_checkpoint", "design_md", "standards", "app"]}
+                                               "commit_per_checkpoint", "design_md", "standards", "app"]
+               if k not in glob}
         write_json(ctx.config_path, cfg)
         full = ctx.config()
         host = detect_host(full)
@@ -3032,7 +3182,11 @@ def cmd_init(args):
                  and shutil.which(provider_binary(pv) or "")]
         print(f"Host provider: {host}" + (" (set host_provider in .ratchet/config.json)" if host == "unknown" else "")
               + ". Other providers installed: " + (", ".join(found) if found else "none found")
-              + ". Run `ratchet.py providers --discover` to test them and add other agent CLIs.")
+              + (". Run `ratchet.py providers --discover` to test them and add other agent CLIs."
+                 if not glob.get("providers") else
+                 f". Your providers list comes from {ctx.global_config_path}; the developer edits that file to add other agent CLIs "
+                 "(an agent can't write there), or an override for this project only is set with "
+                 "`ratchet.py config --set providers='<json list>'`."))
     learn = ctx.ratchet / "learnings.md"
     if not learn.exists():
         learn.write_text("# Ratchet learnings\n\nEvery Ratchet agent reads this file before starting work. "
@@ -12173,11 +12327,17 @@ def cmd_merged(args):
             still.append(f"reference file {f}")
     main_cfg = main_blob(f"{RATCHET_DIR}/config.json")
     main_cfg = _read_record(root, data=main_cfg)[0] if main_cfg is not None else None
-    main_cfg = config_from_user(main_cfg) if main_cfg is not None else None
+    main_cfg = config_from_user(ctx.user_config(main_cfg if isinstance(main_cfg, dict) else {})) \
+        if main_cfg is not None else None
+    lane_blob = tgit("show", f"{p1}:{prefix}{RATCHET_DIR}/config.json", text=False)
+    lane_cfg = _read_record(root, data=lane_blob.stdout)[0] if lane_blob.returncode == 0 else {}
+    lane_cfg = config_from_user(ctx.user_config(lane_cfg if isinstance(lane_cfg, dict) else {}))
     for k, h in (snap.get("rules") or {}).items():
         if now_["rules"].get(k) == h:
             continue
-        if main_cfg is not None and _sha(main_cfg.get(k)) == now_["rules"].get(k):
+        # main's version, over the global file as it is now; and the lane's own side (first parent's project file over
+        # the same global file) still matches what was approved, so a global-file change is never taken for main's.
+        if main_cfg is not None and _sha(main_cfg.get(k)) == now_["rules"].get(k) and _sha(lane_cfg.get(k)) == h:
             snap["rules"][k] = now_["rules"][k]
             accepted.append(f"config rule '{k}'")
         else:
@@ -14665,6 +14825,7 @@ def cmd_fingerprint(args):
 def cmd_config(args):
     ctx = Ctx(find_root())
     if args.set:
+        ctx.global_config()  # a damaged per-user file stops the command before anything is saved
         user = read_json(ctx.config_path, {}) or {}
         for kv in args.set:
             k, _, v = kv.partition("=")

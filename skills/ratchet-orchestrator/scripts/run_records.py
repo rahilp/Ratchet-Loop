@@ -790,7 +790,7 @@ def integrity_problems(ctx, st) -> list[str]:
     extra = set(now_["cps"]) - set(snap.get("cps", {}))
     if extra:
         out.append(f"new checkpoints {sorted(extra)} (use feedback + plan-extend)")
-    user = read_json(ctx.config_path, {}) or {}
+    user = ctx.user_config()
     for k, h in snap.get("rules", {}).items():
         if now_["rules"].get(k) != h:
             old_defaults = [_sha(v) for v in SHIPPED_DEFAULT_HISTORY.get(k, [])]

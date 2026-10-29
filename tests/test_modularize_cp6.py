@@ -234,6 +234,15 @@ def t01_module_byte_identical_and_explicit_imports():
         if name not in rr_defs:
             continue
         pinned_seg = ast.get_source_segment(pinned_src, pinned_defs[name])
+        if name == "integrity_problems":
+            # The ONE intended later edit to a moved body (agent-model-config lane, CP1): the integrity lock reads the
+            # layered config (machine-wide file under the project's) so a change to a locked key in the machine-wide
+            # file is caught like a project change. Every other line must still match the pre-move body exactly.
+            _old_line = "    user = read_json(ctx.config_path, {}) or {}\n"
+            _new_line = "    user = ctx.user_config()\n"
+            check("[CP6-T01] integrity_problems: the pinned body holds the one line CP1 replaced, exactly once",
+                  pinned_seg.count(_old_line) == 1, pinned_seg.count(_old_line))
+            pinned_seg = pinned_seg.replace(_old_line, _new_line)
         rr_seg = ast.get_source_segment(rr_src, rr_defs[name])
         check(f"[CP6-T01] {name}'s body in run_records.py is byte-for-byte identical to its pre-move body",
               rr_seg == pinned_seg, "" if rr_seg == pinned_seg else (pinned_seg, rr_seg))
