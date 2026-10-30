@@ -27,11 +27,11 @@ tests/shortcuts/__pycache__`.)
 
 54 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
 files the brief names explicitly (`test_quota_shared.py`, `test_discover_paid.py`, Kind 4 below)
-that carry the identical real obligation but don't literally match either regex today — **56
+that carry the identical real obligation but don't literally match either regex today — **57
 files total**, consistent with the brief's "43+".
 
 ## Kind 1 — module-load only (loads ratchet.py dynamically via `importlib.util.spec_from_file_location`,
-never inspects its on-disk text directly): 32 files
+never inspects its on-disk text directly): 33 files
 
 - `test_gates.py` — gate-integrity suite; the shared `ENGINE`/`g` module alias almost every other
   suite below imports instead of loading ratchet.py a second time itself. Module-load-only known
@@ -107,6 +107,9 @@ never inspects its on-disk text directly): 32 files
 - `test_config_scopes.py` — CP2: `config --scope/--sources/--global/--set/--unset`; drives the engine in-process
   through `test_config_layers.py`'s helpers and loads ratchet.py itself once via `spec_from_file_location` only to
   read `DEFAULT_CONFIG` (known config keys). Never inspects its on-disk text or tree shape.
+- `test_agents_config.py` — CP3: the `agents` setting (one line per role); drives the engine in-process through
+  `test_config_layers.py`'s helpers and reads `LANE_LOCAL_CONFIG_KEYS` from the engine module they load. Never
+  inspects its on-disk text or tree shape.
 
 ## Kind 2 — source-text/AST only (reads ratchet.py's literal on-disk text and/or walks its parsed
 tree, never loads it as a module itself): 9 files

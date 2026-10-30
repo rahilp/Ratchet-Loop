@@ -428,6 +428,12 @@ RULE_KEYS = ("review_depth", "reviewers", "max_adversarial_rounds", "max_adversa
              "doc_globs", "doc_exclude_globs", "test_globs", "doc_test_command", "related_test_command",
              "related_tests_max", "related_always", "small_edit_lines", "load_stretch_max", "suite_watch_seconds")
 
+# Rule keys added after plans were already being approved, whose shipped default is "not set". They are kept out of
+# RULE_KEYS (which stays as moved) and a snapshot records one only when it is set (see _late_rule_aware), so an
+# approval taken with it unset reads the same to an older engine and to a snapshot from before the key existed,
+# and such a snapshot still reports the key when it is set afterwards.
+LATE_RULE_KEYS = ("agents",)
+
 # --------------------------------------------------------------------------- run bookkeeping
 
 def _set_blocked(st, reason):
@@ -812,6 +818,33 @@ def integrity_problems(ctx, st) -> list[str]:
     if snap.get("human_review") != st.get("human_review"):
         out.append("human_review mode")
     return out
+
+
+def _late_rule_aware(snapshot_fn, problems_fn):
+    """Wrap the two integrity functions (their own bodies stay as moved) so a rule key added after plans were already
+    approved (LATE_RULE_KEYS) is recorded only when it is set, and compared as "unset" when the snapshot lacks it."""
+    def snapshot(ctx, st):
+        snap = snapshot_fn(ctx, st)
+        cfg = ctx.config()
+        for k in LATE_RULE_KEYS:
+            if cfg.get(k):
+                snap["rules"][k] = _sha(cfg.get(k))
+        return snap
+
+    def problems(ctx, st):
+        out = problems_fn(ctx, st)
+        snap = st.get("approved")
+        if snap:
+            cfg = ctx.config()
+            for k in LATE_RULE_KEYS:
+                out = [p for p in out if p != f"config rule '{k}'"]
+                if snap.get("rules", {}).get(k) != (_sha(cfg.get(k)) if cfg.get(k) else None):
+                    out.append(f"config rule '{k}'")
+        return out
+    return snapshot, problems
+
+
+approval_snapshot, integrity_problems = _late_rule_aware(approval_snapshot, integrity_problems)
 
 
 def verify_integrity(ctx, st):

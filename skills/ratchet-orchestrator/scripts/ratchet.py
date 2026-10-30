@@ -142,6 +142,14 @@ _STATE_LOCK_HELD = False  # set by main() while this process holds the state loc
 # depth, checks, commands, standards, ...) is a project's own policy and is refused there, loudly.
 GLOBAL_ALLOWED_KEYS = ("role_models", "host_models", "providers", "agents", "host_provider", "ui_reviewers")
 
+# The roles `agents` can name: the sub-agent roles by their plain name (the `ratchet-` engine name without its prefix,
+# see ROLE_PLAIN) plus the three the host does not run as a sub-agent. `role_models` names the engine form.
+AGENT_HOST_ROLES = ("orchestrator", "director", "reviewer")
+
+
+def agent_roles() -> list[str]:
+    return [r[len("ratchet-"):] for r in sorted(ROLE_PLAIN)] + list(AGENT_HOST_ROLES)
+
 
 class Ctx:
     def __init__(self, root: Path):
@@ -197,8 +205,9 @@ class Ctx:
             want = dict if isinstance(base, dict) or key == "agents" else list if isinstance(base, list) else None
             if want and key in g and not isinstance(g[key], want):
                 die(f"{p} sets '{key}' to {type(g[key]).__name__}, but it must be a "
-                    f"{'JSON object' if want is dict else 'list'}. Fix that setting in the file, then run this command "
-                    "again.")
+                    f"{'JSON object' if want is dict else 'list'}"
+                    f"{' mapping role names to values (a model, or provider/model)' if key == 'agents' else ''}. Fix "
+                    "that setting in the file, then run this command again.")
         def bad(where, want, val):
             die(f"{p} '{where}' must be {want} (got {type(val).__name__}). Fix that setting in the file, then run "
                 "this command again.")
@@ -289,13 +298,14 @@ class Ctx:
             bad("host_provider", "a non-empty string", g["host_provider"])
         return g
 
-    def validate_candidate(self, user, project):
+    def validate_candidate(self, user, project, strict=()):
         """The one validation of a settings layer: `user` is the content of the project's file (project=True) or the
         machine-wide file (project=False), as about to be written or as just read. It is merged over/under the other
         layer exactly as the loader does (user_config, then config_from_user), then every setting present is checked;
         the first wrong one stops the command naming the file it came from, the setting, the expected type and how to
         repair it. Called before every write (`config --set/--unset`, both files) and by the read paths that show a
-        layer (`--scope`, `--sources`). Returns user. Keeps check_global_config's rules for the provider and model
+        layer (`--scope`, `--sources`). Returns user. The merge step (user_config) also refuses an unknown role, provider or
+        model in `agents`, an unknown role in `role_models`, and one role set in both keys of one file. Keeps check_global_config's rules for the provider and model
         settings and uses the typed readers (quota_retest_minutes, provider_share, _suite_watch_seconds,
         _lanes_start_template, related_test_command's {files} rule) where a setting has one. Every other
         DEFAULT_CONFIG setting must have the type family its consumers need, taken from its shipped default (a bool is
@@ -341,7 +351,7 @@ class Ctx:
         else:
             self.check_global_config(user)
             glob, proj = user, None  # user_config reads the project's file itself
-        merged = self.user_config(project=proj, glob=glob)
+        merged = self.user_config(project=proj, glob=glob, strict=strict, write_path=mine)
         cfg = config_from_user(merged)
 
         def bad(key, want):
@@ -411,14 +421,29 @@ class Ctx:
             bad("related_test_command", "a command containing the {files} placeholder")
         return user
 
-    def user_config(self, project=None, glob=None):
+    def user_config(self, project=None, glob=None, check_roles=True, strict=(), write_path=None):
         """The raw settings in effect before defaults: the global file with the project's file over it, key by key.
         One rule for both layers: a dict value merges one level deep (its sub-entries replace whole, so a partial
         host_models.anthropic replaces the shipped entry), anything else replaces whole. An untouched old default
         review_depth is dropped (only the project level can carry one: the global file refuses the key). `glob` and
-        `project` stand in for the files' content (a candidate about to be written)."""
+        `project` stand in for the files' content (a candidate about to be written). Unless check_roles is False, each
+        file's `agents` and `role_models` are checked (_check_role_settings, _check_agent_choices) and a wrong one stops
+        naming the file. A role set by `role_models` in one file replaces that role's `agents` value from the file
+        below it; an `agents` value above a lower `role_models` one keeps it as the fallback for when the `agents`
+        choice cannot apply on this host (resolve_role picks, a file holding both for one role is refused)."""
         out = {}
-        for layer in (self.global_config() if glob is None else glob, (self.check_project_config(read_json(self.config_path, {})) if project is None else project) or {}):
+        layers = ((self.global_config() if glob is None else glob, self.global_config_path),
+                  ((self.check_project_config(read_json(self.config_path, {})) if project is None else project) or {},
+                   self.config_path))
+        for layer, path in layers:
+            if check_roles:
+                self._check_role_settings(layer, path)
+            # a role named by `agents` or `role_models` in this layer replaces the other key's value from a lower one
+            rm = layer.get("role_models")
+            if isinstance(out.get("agents"), dict) and isinstance(rm, dict):
+                out["agents"] = {k: v for k, v in out["agents"].items() if "ratchet-" + k not in rm}
+                if not out["agents"]:
+                    del out["agents"]
             for k, v in layer.items():
                 if k == "review_depth" and v == OLD_DEFAULT_REVIEW_DEPTH:
                     continue
@@ -426,10 +451,60 @@ class Ctx:
                     out[k] = {**out[k], **v}
                 else:
                     out[k] = v
+        if check_roles:
+            self._check_agent_choices(layers, config_from_user(out), strict, write_path)
         return out
 
-    def config(self):
-        return config_from_user(self.user_config())
+    def _check_role_settings(self, layer, path):
+        """One settings file's `agents` and `role_models`: the shape (check_global_config's rules), every role name a real
+        Ratchet role (the valid ones are listed), and no role set in both keys. Stops naming the file and the keys."""
+        keep = {k: layer[k] for k in ("agents", "role_models") if k in layer}
+        self.check_global_config(keep, path=path, project=True)
+        for name in keep.get("agents") or {}:
+            if name not in agent_roles():
+                die(f"{path} 'agents.{name}' is not a Ratchet role; the valid roles are: {', '.join(agent_roles())}. "
+                    "Fix that setting in the file, then run this command again.")
+        for name in keep.get("role_models") or {}:
+            if name not in ROLE_PLAIN:
+                die(f"{path} 'role_models.{name}' is not a Ratchet role; the valid roles are: "
+                    f"{', '.join(sorted(ROLE_PLAIN))}. Fix that setting in the file, then run this command again.")
+        for name in keep.get("agents") or {}:
+            if "ratchet-" + name in (keep.get("role_models") or {}):
+                die(f"{path} sets the same role twice: 'agents.{name}' and 'role_models.ratchet-{name}'. Keep one of "
+                    "them (agents is the simple one), then run this command again.")
+
+    def _check_agent_choices(self, layers, cfg, strict=(), write_path=None):
+        """Each `agents` value is a model or provider/model (split at the first '/'). A provider must be a known one (a
+        preset or a configured provider id, from either file). A bare model this host cannot use is not an error at
+        load, whatever it is (one machine-wide file must load on every host; the role keeps its role_models/default
+        model and _agent_notes says so). Only a role in `strict` (being written by config --set) is refused, on the host
+        doing the write and only when that host declares a model list, and only in the file being written (write_path);
+        the other file is checked as at load. The model after a provider's '/' is the
+        provider's own to accept."""
+        provs = sorted(set(PRESETS) | {p.get("id") for p in cfg.get("providers") or [] if isinstance(p, dict)})
+        allowed = _host_bare_models(cfg)  # None: this host declares no models, so any bare name is accepted
+        models = allowed or _known_bare_models(cfg)
+        for layer, path in layers:
+            for name, spec in (layer.get("agents") or {}).items():
+                prov, slash, model = spec.partition("/") if isinstance(spec, str) else ("", "", "")
+                if not (isinstance(spec, str) and spec.strip() and (not slash or (prov.strip() and model.strip()))):
+                    die(f"{path} 'agents.{name}' is {spec!r}; write it as a model or as provider/model with both parts "
+                        f"filled in (split at the first '/'). The known models are: {', '.join(sorted(models))}.")
+                if slash and prov not in provs:
+                    die(f"{path} 'agents.{name}' names the provider {prov!r}, which is not known; the known providers "
+                        f"are: {', '.join(provs)}. Write the value as provider/model or just a model.")
+                if slash:
+                    continue
+                if name in strict and path == write_path and allowed is not None and _agent_model({**cfg, "agents": {name: spec}}, name) is None:
+                    die(f"{path} 'agents.{name}' is {spec!r}, which the running host ({detect_host(cfg)}) can't use; "
+                        f"the models it can use are: {', '.join(sorted(allowed or _known_bare_models(cfg) - _foreign_bare_models(cfg)))}"
+                        ", or write provider/model.")
+
+    def config(self, check_roles=True):
+        """The effective settings. Unless check_roles is False (only `init`, which reads nothing but the host and
+        review defaults and must still start a run whose settings a person edited badly), a wrong `agents` or
+        `role_models` setting stops it, as user_config describes."""
+        return config_from_user(self.user_config(check_roles=check_roles))
 
     # --- active run
     def active_slug(self):
@@ -1609,7 +1684,7 @@ CANCEL_HINT_RE = re.compile(r"\b(cancel|abandon|scrap|kill)\b[^.?!]*\b(run|build
 # developer's consent to paid ones, and its own review limits): `integrate` never takes a lane's value for them,
 # main's is kept and the lane's is listed as not taken. Every other key, and any unknown one, is project-wide.
 LANE_LOCAL_CONFIG_KEYS = ["review_depth", "reviewers", "providers", "host_provider", "host_models", "role_models",
-                          "ui_reviewers", "approver", "human_review", "max_adversarial_rounds",
+                          "agents", "ui_reviewers", "approver", "human_review", "max_adversarial_rounds",
                           "max_adversarial_rounds_run", "unavailable_ttl_hours", "probe_providers", "probe_ttl_minutes",
                           "probe_timeout_sec", "quota_retest_minutes", "provider_share"]
 
@@ -2433,7 +2508,7 @@ def plain_reviewer(cfg, rid, model=None) -> str:
 
 
 def models_table(cfg) -> list[tuple[str, str]]:
-    return [(role, role_model(cfg, role)) for role in sorted(set(ROLE_PLAIN) | set(cfg.get("role_models") or {}))]
+    return [(role, role_model(cfg, role)) for role in sorted(ROLE_PLAIN)]
 
 
 ROLE_PLAIN = {"ratchet-checkpoint-planner": "planning the steps", "ratchet-implementer": "writing the code",
@@ -2449,6 +2524,8 @@ def cmd_models(args):
     """Which model each role uses on this host, so the orchestrator can pass it when it spawns a sub-agent."""
     cfg = Ctx(find_root()).config()
     rows = models_table(cfg)
+    for line in _agent_notes(cfg):
+        print(line, file=sys.stderr)
     if args.json:
         print(json.dumps({"host": detect_host(cfg), "roles": dict(rows),
                           "alternates": host_model_map(cfg).get("alternates") or []}, indent=2))
@@ -3315,7 +3392,7 @@ def cmd_init(args):
                                                "commit_per_checkpoint", "design_md", "standards", "app"]
                if k not in glob}
         write_json(ctx.config_path, cfg)
-        full = ctx.config()
+        full = ctx.config(check_roles=False)
         host = detect_host(full)
         found = [pv["id"] for pv in providers(full) if provider_company(pv) not in (None, host)
                  and shutil.which(provider_binary(pv) or "")]
@@ -3373,7 +3450,7 @@ def cmd_init(args):
     human = [e for e in _human_since(ctx, "0") if e.get("session")]
     st = {
         "slug": slug, "feature": args.feature, "phase": "planning", "created_at": now(),
-        "human_review": args.human_review or ctx.config()["human_review"],
+        "human_review": args.human_review or ctx.config(check_roles=False)["human_review"],
         "current": None, "checkpoints": {}, "plan_hash": None, "awaiting_since": None,
         "history": [], "branch": branch, "dirty_at_start": dirty[:50],
         "owner_session": _noted_session(root, "init") or (human[-1]["session"] if human else None),
@@ -3808,13 +3885,126 @@ def host_model_map(cfg) -> dict:
     return ((cfg.get("host_models") or {}).get(detect_host(cfg)) or {})
 
 
+def _provider_company(cfg, prov) -> str | None:
+    entry = provider_by_id(cfg, prov) or {}
+    return norm_company(entry.get("company") or (PRESETS.get(entry.get("preset") or prov) or {}).get("company")
+                        or (prov if prov not in PRESETS else None))
+
+
+def _host_bare_models(cfg) -> set | None:
+    """The bare models the running host can use for a sub-agent: its host_models tiers and alternates, 'inherit', and
+    the models of configured providers whose company is the host's. None (any non-empty name is accepted) when the
+    host has no host_models entry: the engine cannot list that host's models (for example Codex by default), so it
+    never refuses a name the host may well run."""
+    hm = host_model_map(cfg)
+    if not hm:
+        return None
+    host = detect_host(cfg)
+    out = {v for k, v in hm.items() if k != "alternates" and isinstance(v, str)} | set(hm.get("alternates") or [])
+    out |= {p["model"] for p in cfg.get("providers") or [] if isinstance(p, dict) and p.get("model")
+            and _provider_company(cfg, p.get("id")) == host}
+    out.add("inherit")
+    return out
+
+
+def _known_bare_models(cfg) -> set:
+    """Every bare model any host_models entry or configured provider names, plus 'inherit'."""
+    out = {"inherit"}
+    for hm in (cfg.get("host_models") or {}).values():
+        if isinstance(hm, dict):
+            out |= {v for k, v in hm.items() if k != "alternates" and isinstance(v, str)} | set(hm.get("alternates") or [])
+    return out | {p["model"] for p in cfg.get("providers") or [] if isinstance(p, dict) and p.get("model")}
+
+
+def _foreign_bare_models(cfg) -> set:
+    """Models another host's host_models entry names that the running host's own entry (if any) does not."""
+    host, out = detect_host(cfg), set()
+    for h, hm in (cfg.get("host_models") or {}).items():
+        if h != host and isinstance(hm, dict):
+            out |= {v for k, v in hm.items() if k != "alternates" and isinstance(v, str)} | set(hm.get("alternates") or [])
+    return out - (_host_bare_models(cfg) or set()) - {"inherit"}
+
+
+def _agent_model(cfg, role) -> str | None:
+    """The model `agents.<role>` picks for a sub-agent role, or None when it sets none that applies. A bare model
+    applies only when this host can use it (_host_bare_models); a `provider/model` value applies only when that
+    provider is the host's own company (a sub-agent runs on the host, which cannot be switched to another provider);
+    otherwise None, and the role keeps its role_models model."""
+    spec = (cfg.get("agents") or {}).get(role[len("ratchet-"):] if role.startswith("ratchet-") else role)
+    if not isinstance(spec, str):
+        return None
+    prov, slash, model = spec.partition("/")
+    if not slash:
+        allowed = _host_bare_models(cfg)
+        if allowed is None:  # the host lists no models: any name, except one another host's entry names
+            return spec if spec.strip() and spec not in _foreign_bare_models(cfg) else None
+        return spec if spec.strip() and spec in allowed else None
+    company = _provider_company(cfg, prov)
+    return model if company and company == detect_host(cfg) else None
+
+
+def resolve_role(layers, role, cfg=None) -> dict | None:
+    """What one role runs on, from `layers` (raw settings dicts or (name, dict) pairs, lowest first, such as
+    [global, project]). Walks them top-down: the first layer that sets the role by either key (`agents.<name>` or
+    `role_models.<engine name>`) wins. An `agents` choice that cannot apply on this host (_agent_model) yields the
+    first role_models value at or below that layer, else the shipped default. Returns {role, asked, used, source,
+    reason} (reason is "" when asked == used), or None for a role that is not one of Ratchet's sub-agent roles.
+    `cfg` is the effective config (host and model names); built from the layers when not given."""
+    if role not in ROLE_PLAIN:
+        return None
+    named = [(l if isinstance(l, tuple) else (f"layer {i + 1}", l)) for i, l in enumerate(layers)]
+    if cfg is None:
+        merged = {}
+        for _, l in named:
+            for k, v in l.items():
+                merged[k] = {**merged[k], **v} if isinstance(v, dict) and isinstance(merged.get(k), dict) else v
+        cfg = config_from_user(merged)
+    friendly = role[len("ratchet-"):]
+
+    def tier_model(tier):
+        if tier in ("strong", "standard", "light"):
+            return host_model_map(cfg).get(tier) or "inherit"
+        if tier == "alternate":  # a different model from the session's, for work that must not share its blind spots
+            return (host_model_map(cfg).get("alternates") or ["inherit"])[0]
+        return tier or "inherit"
+
+    for i in range(len(named) - 1, -1, -1):
+        name, layer = named[i]
+        spec = (layer.get("agents") or {}).get(friendly)
+        if spec:
+            used = _agent_model({**cfg, "agents": {friendly: spec}}, role)
+            if used:
+                return {"role": role, "asked": spec, "used": used, "source": name, "reason": ""}
+            for _, low in reversed(named[:i + 1]):  # cannot apply here: the role_models value below, else the default
+                if role in (low.get("role_models") or {}):
+                    fb = tier_model(low["role_models"][role])
+                    break
+            else:
+                fb = tier_model(DEFAULT_CONFIG["role_models"].get(role))
+            return {"role": role, "asked": spec, "used": fb, "source": name,
+                    "reason": f"agents.{friendly} = {spec!r} can't apply on this host ({detect_host(cfg)})"}
+        if role in (layer.get("role_models") or {}):
+            tier = layer["role_models"][role]
+            return {"role": role, "asked": tier, "used": tier_model(tier), "source": name, "reason": ""}
+    return {"role": role, "asked": None, "used": tier_model(DEFAULT_CONFIG["role_models"].get(role)),
+            "source": "default", "reason": ""}
+
+
+def _agent_notes(cfg) -> list[str]:
+    """One plain line per `agents` choice that cannot apply to its sub-agent role on this host."""
+    notes = []
+    for name in sorted((cfg.get("agents") or {})):
+        r = resolve_role([cfg], "ratchet-" + name, cfg)
+        if r and r["reason"]:
+            notes.append(f"RATCHET note: agents.{name} = {cfg['agents'][name]!r} can't apply on this host "
+                         f"({detect_host(cfg)}); {r['role']} keeps its role_models/default model, {r['used']}.")
+    return notes
+
+
 def role_model(cfg, role) -> str:
-    tier = (cfg.get("role_models") or {}).get(role, "inherit")
-    if tier in ("strong", "standard", "light"):
-        return host_model_map(cfg).get(tier) or "inherit"
-    if tier == "alternate":  # a different model from the session's, for work that must not share its blind spots
-        return (host_model_map(cfg).get("alternates") or ["inherit"])[0]
-    return tier or "inherit"
+    """The model a role runs on (resolve_role over the effective config)."""
+    r = resolve_role([cfg], role, cfg)
+    return r["used"] if r else "inherit"
 HOST_HINTS = [  # environment variables the common agent CLIs set for the tools they run
     ("anthropic", ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")),
     ("openai", ("CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED")),
@@ -15032,7 +15222,10 @@ def cmd_config(args):
         if any(kv.partition("=")[0].split(".")[0] == "provider_share" for kv in sets):
             share = user.get("provider_share")  # as it will read once merged over the defaults
             provider_share({"provider_share": {**DEFAULT_CONFIG["provider_share"], **share} if isinstance(share, dict) else share})
-        ctx.validate_candidate(user, project=not args.glob)  # what is written must load: refused before the write
+        strict = {kv.partition("=")[0].split(".")[1] for kv in sets if kv.startswith("agents.")}
+        if any(kv.partition("=")[0] == "agents" for kv in sets):
+            strict |= set(agent_roles())  # a whole agents object: every role in it is checked as written
+        ctx.validate_candidate(user, project=not args.glob, strict=strict)  # what is written must load: refused before the write
         if sets or user != before:
             write_json(path, user)
         for k in absent:
@@ -15046,6 +15239,8 @@ def cmd_config(args):
             for part in k.split("."):
                 cur = cur.get(part) if isinstance(cur, dict) else None
             ok(f"Set {k} = {json.dumps(cur)}")
+        for line in _agent_notes(cfg):
+            print(line, file=sys.stderr)
         return
     if args.sources:
         g = ctx.global_config()

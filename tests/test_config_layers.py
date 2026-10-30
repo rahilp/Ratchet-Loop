@@ -311,7 +311,7 @@ def t09_project_only_keys_refused_in_global():
 def t10_machine_wide_keys_load():
     glob = {"role_models": {"ratchet-implementer": "opus-x"},
             "providers": [{"id": "codex", "preset": "codex"}],
-            "host_provider": "codex", "ui_reviewers": {"visual": ["codex"]}, "agents": {"x": "opus"},
+            "host_provider": "codex", "ui_reviewers": {"visual": ["codex"]}, "agents": {"fixer": "sonnet-9"},
             "host_models": {"anthropic": {"standard": "sonnet-9"}}}
     d, env = project({"human_review": "end"}, glob=glob)
     r = run(d, env, "status")
@@ -323,7 +323,7 @@ def t10_machine_wide_keys_load():
     check("[CP1-T10] providers from the global file show", good and cfg["providers"] == glob["providers"])
     check("[CP1-T10] host_provider, ui_reviewers and agents from the global file load",
           good and cfg["host_provider"] == "codex" and cfg["ui_reviewers"]["visual"] == ["codex"]
-          and cfg["agents"] == {"x": "opus"})
+          and cfg["agents"] == {"fixer": "sonnet-9"})
     check("[CP1-T10] host_models from the global file merge one level deep; a sub-entry replaces the shipped one whole",
           good and cfg["host_models"]["anthropic"] == {"standard": "sonnet-9"}
           and set(cfg["host_models"]) >= set(old_merge({})["host_models"]))
@@ -365,9 +365,12 @@ def t12_locked_setting_in_global_asks_approval():
 
 def t13_unlocked_global_keys_do_not_disturb_run():
     d, env = approved_project()
-    put_global(env, {"agents": {"x": "opus"}})
+    put_global(env, {"providers": [{"id": "codex", "preset": "codex"}]})
+    own = json.loads(project_path(d).read_text())
+    own.pop("providers", None)  # the project's empty providers list would otherwise shadow the global one
+    project_path(d).write_text(json.dumps(own))
     cfg, _ = effective(d, env)
-    check("[CP1-T13] the unlocked global key is in effect", cfg is not None and cfg["agents"] == {"x": "opus"})
+    check("[CP1-T13] the unlocked global key is in effect", cfg is not None and {"id": "codex", "preset": "codex"} in cfg["providers"])
     r = run(d, env, "tests-written", "CP1")
     out = text(r)
     check("[CP1-T13] no approval is requested and the gated command proceeds",
@@ -510,7 +513,7 @@ def x08_user_config_matches_config_from_user_without_global():
     m = engine()
     d, env = project({"human_review": "end"})
     cases = [{}, {"human_review": "end"}, {"review_depth": m.OLD_DEFAULT_REVIEW_DEPTH},
-             {"review_depth": {"low": 1}, "role_models": {"x": "y"}, "host_models": {"anthropic": {"standard": "z"}}},
+             {"review_depth": {"low": 1}, "role_models": {"ratchet-implementer": "y"}, "host_models": {"anthropic": {"standard": "z"}}},
              {"providers": [{"id": "a"}], "standards": ["s"], "ui_reviewers": {"visual": ["q"]}}]
     for i, c in enumerate(cases):
         project_path(d).write_text(json.dumps(c))
@@ -770,11 +773,12 @@ def x17_global_nested_shapes_are_validated():
 
 
 def x18_valid_global_shapes_still_load():
-    good = (("agents bare model", {"agents": {"ratchet-fixer": "opus-x"}}),
-            ("agents provider/model", {"agents": {"ratchet-fixer": "codex/gpt-x"}}),
-            ("agents provider/org/model", {"agents": {"reviewer": "opencode-glm/opencode-go/glm-5.3"}}),
-            ("agents a/b/c", {"agents": {"x": "a/b/c"}}),
-            ("agents model with a slash", {"agents": {"reviewer": "opencode-go/glm-5.3"}}),
+    good = (("agents bare model", {"agents": {"fixer": "opus"}}),
+            ("agents provider/model", {"agents": {"fixer": "codex/gpt-x"}}),
+            ("agents provider/org/model", {"agents": {"reviewer": "opencode-glm/opencode-go/glm-5.3"},
+                                                 "providers": [{"id": "opencode-glm", "preset": "opencode"}]}),
+            ("agents a/b/c", {"agents": {"implementer": "codex/b/c"}}),
+            ("agents model with a slash", {"agents": {"reviewer": "opencode/glm-5.3"}}),
             ("role_models tier and model", {"role_models": {"ratchet-fixer": "strong", "ratchet-implementer": "m-1"}}),
             ("host_models full", {"host_models": {"anthropic": {"strong": "a", "alternates": ["b", "c"]}}}),
             ("host_models empty alternates", {"host_models": {"anthropic": {"alternates": []}}}),
