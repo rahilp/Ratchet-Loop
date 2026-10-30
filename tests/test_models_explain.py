@@ -531,8 +531,10 @@ def x07_ui_lens_applies_company_and_paid_rules():
     d2, env2 = project({"providers": [paid], "ui_reviewers": {"visual": ["codex"]}})
     fake_clis(env2)
     e2 = view(d2, env2)[1]["ui-reviewer-visual"]
-    check("[CP4-X07] a per-use UI provider without consent is shown as the UI path really runs it, with the true note",
-          e2.get("effective") == "codex" and "does not check paid consent" in s(e2.get("reason")), e2)
+    r2 = s(e2.get("reason")).lower()
+    check("[CP4-X07] a per-use UI provider without the exact OK is skipped with a plain money reason and falls back to this agent",
+          e2.get("effective") == "this agent" and "costs money" in r2 and "paid_ok_at" in r2
+          and "does not check paid consent" not in r2, e2)
     d3, env3 = project({"providers": [dict(paid, paid_ok_at="2026-01-01T00:00:00+00:00")],
                         "ui_reviewers": {"visual": ["codex"]}})
     fake_clis(env3)

@@ -476,7 +476,8 @@ class Ctx:
 
     def _check_agent_choices(self, layers, cfg, strict=(), write_path=None):
         """Each `agents` value is a model or provider/model (split at the first '/'). A provider must be a known one (a
-        preset or a configured provider id, from either file). A bare model this host cannot use is not an error at
+        preset or a configured provider id, from either file); a bare `agents.reviewer` must be a known provider (or a
+        known model, which picks no outside reviewer). A bare model this host cannot use is not an error at
         load, whatever it is (one machine-wide file must load on every host; the role keeps its role_models/default
         model and _agent_notes says so). Only a role in `strict` (being written by config --set) is refused, on the host
         doing the write and only when that host declares a model list, and only in the file being written (write_path);
@@ -496,6 +497,9 @@ class Ctx:
                         f"are: {', '.join(provs)}. Write the value as provider/model or just a model.")
                 if slash:
                     continue
+                if name == "reviewer" and spec not in provs and spec not in models:
+                    die(f"{path} 'agents.reviewer' is {spec!r}, which is not a known provider; the known providers are: "
+                        f"{', '.join(provs)}. Write the value as a provider or provider/model.")
                 if name in strict and path == write_path and allowed is not None and _agent_model({**cfg, "agents": {name: spec}}, name) is None:
                     die(f"{path} 'agents.{name}' is {spec!r}, which the running host ({detect_host(cfg)}) can't use; "
                         f"the models it can use are: {', '.join(sorted(allowed or _known_bare_models(cfg) - _foreign_bare_models(cfg)))}"
@@ -1253,7 +1257,9 @@ def _fix_round_reviewers(ctx, cfg, cp: dict, pick: dict, share=None) -> list[dic
     same way they do for any other round), else that slot's own same-lens stand-in through resolve_reviewers'
     existing fallback for the slot, with the reviewer it stands in for and the reason named on the row."""
     rid, slot = pick["reviewer"], pick["slot"]
-    own = resolve_reviewers(ctx, cfg, dict(cp, reviewers=[rid]), share=share)
+    # the pinned one-slot list keeps the model the reviewer's own slot launched: the choice's where that slot took it
+    own_cfg = launch_cfg(cfg, cp, {"resolved": [{"id": rid, "slot": slot}]}, rid)
+    own = resolve_reviewers(ctx, own_cfg, dict(cp, reviewers=[rid]), share=share)
     if len(own) == 1 and own[0]["id"] == rid:
         own[0]["slot"] = slot  # the slot it held in the blocked round, so a same-round refill replaces that slot
         return own
@@ -2544,7 +2550,10 @@ def _sub_agent_detail(cfg, layers, role) -> dict:
     cant = f"the host ({host}) can't choose a model per sub-agent, so {friendly} runs on your session's model"
     if r["reason"]:
         choices = {v for k, v in hm.items() if k != "alternates" and isinstance(v, str)} - {"inherit"}
-        if "/" in str(asked):
+        if friendly in LENS_CHOICE_ROLES and reviewer_choice(cfg, friendly):
+            reason = (f"{asked!r} picks the outside provider for the UI review, not this sub-agent's model; "
+                      f"{friendly} keeps its own default model")
+        elif "/" in str(asked):
             reason = (f"a sub-agent runs on the host ({host}), so it can't use a model from another company's "
                       f"provider; {friendly} keeps its own default model")
         elif not choices and not hm.get("alternates"):
@@ -2572,24 +2581,58 @@ def _sub_agent_detail(cfg, layers, role) -> dict:
 _AUTO_REVIEWER = "the best available provider for each review slot, this agent when none is"
 
 
+def _real_first_reviewer(ctx, cfg) -> dict | None:
+    """The first slot of a low-risk step, resolved by the real selection (resolve_reviewers, share applied but never
+    reserved), or None when it would find no reviewer. Reads settings and recorded status only."""
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            res = resolve_reviewers(ctx, cfg, {"id": "models", "risk": "low"},
+                                    share={"data": provider_health(), "ignore": set()})
+    except SystemExit:
+        return None
+    return res[0] if res else None
+
+
 def _reviewer_detail(ctx, cfg, layers) -> dict:
-    """The `reviewer` row. A provider/model request is explained from the recorded availability (reviewer_availability
-    reads files and looks for the CLI on PATH; it never runs one). Selection itself is not touched."""
+    """The `reviewer` row. A provider (or provider/model) request is explained from the recorded availability
+    (reviewer_availability reads files and looks for the CLI on PATH; it never runs one), and "used" is only said when
+    the real selection (resolve_reviewers) picks that provider first, so the view and the review cannot disagree."""
     source = _layer_source(layers, "agents", "reviewer")
     spec = (cfg.get("agents") or {}).get("reviewer")
     if not isinstance(spec, str) or not spec.strip():
         return {"role": "reviewer", "requested": "automatic", "source": "builtin", "reason": "",
                 "effective": _AUTO_REVIEWER}
     own = _AUTO_REVIEWER  # an excluded request changes nothing: reviewers still pick by review_depth, as when unset
-    prov, slash, model = spec.partition("/")
-    if not slash:
-        return {"role": "reviewer", "requested": spec, "effective": own, "source": source,
-                "reason": f"{spec!r} is a model, not provider/model, so it picks no outside reviewer"}
-    rid = f"{prov}-both"
-    if _roster_spec(cfg, rid) is None:
+    prov, model = _choice_parts(spec)
+    if provider_by_id(cfg, prov) is None:
+        if "/" not in spec and prov not in PRESETS:
+            return {"role": "reviewer", "requested": spec, "effective": own, "source": source,
+                    "reason": f"{spec!r} is a model, not provider/model, so it picks no outside reviewer"}
         return {"role": "reviewer", "requested": spec, "effective": own, "source": source,
                 "reason": f"provider {prov!r} is unavailable: it is not set up in this project"}
-    okay, why = reviewer_availability(ctx, cfg, rid)
+    rid = f"{prov}-both"
+    problem = reviewer_model_problem(provider_by_id(cfg, prov)) if model else None
+    low = {"id": "models", "risk": "low"}
+    first = _real_first_reviewer(ctx, cfg)  # the real selection on the config as written: the choice is applied per slot
+    def of_prov(rid_):  # by the provider's own id, never an id prefix (opencode vs opencode-glm)
+        return (_roster_spec(cfg, rid_) or {}).get("provider") == prov
+    if first is not None and of_prov(first["id"]):
+        okay, why = True, ""
+        # the model is the one the first slot really reports: the chosen one only where the launch takes it
+        applied = choice_applies_to(cfg, low, {"resolved": [first]}, first["id"])
+        cfg = launch_cfg(cfg, low, {"resolved": [first]}, first["id"])
+        rid = first["id"]
+    else:
+        okay, why = reviewer_availability(ctx, with_reviewer_choice(cfg), rid)
+        if okay and first is not None:
+            # reviewer_availability said yes, but the real selection does not lead with it (a share cap, a pinned or
+            # listed reviewer, a per-use provider behind a usable flat-rate one): say what it says
+            why = next((w for k, w in first["reasons"].items() if of_prov(k)), "")
+            if not why:
+                why = (reviewer_choice_notes(cfg, low) or
+                       [f"the real selection puts {first['id']} first for the first review slot"])[0]
+                why = why.replace("RATCHET note: ", "")
+            okay = False
     if okay:
         # Real selection also uses the per-lens ids; one marked unavailable falls back for that slot only.
         down = {lens: w for lens in ("standards", "correctness") if _roster_spec(cfg, f"{prov}-{lens}") is not None
@@ -2600,9 +2643,15 @@ def _reviewer_detail(ctx, cfg, layers) -> dict:
             used = [f"the {names[x]} slot" for x in ("standards", "correctness") if x not in down]
             fell = [f"the {names[x]} slot falls back automatically ({w})" for x, w in down.items()]
             part = f"{prov} is used for " + (" and ".join(used) if used else "no single-lens slot") + "; " + "; ".join(fell)
-        return {"role": "reviewer", "requested": spec, "effective": plain_reviewer(cfg, rid, model), "source": source,
-                "reason": part}
-    if why.startswith(("failed recently", "'")):
+        if problem:
+            part = "; ".join(x for x in (part, f"the model {model!r} was not applied: {problem}") if x)
+        elif model and not applied:
+            # the first slot keeps its written model: say so with the words reviewer_choice_notes already has
+            notes = [n.replace("RATCHET note: ", "") for n in reviewer_choice_notes(cfg, low)]
+            part = "; ".join(x for x in (part, *notes) if x)
+        return {"role": "reviewer", "requested": spec, "effective": plain_reviewer(cfg, rid, None if problem else model),
+                "source": source, "reason": part}
+    if why.startswith(("failed recently", "'", "it already has")):
         why = f"{prov} is unavailable: {why}"
     elif why.startswith("costs money"):
         why += " (needs paid approval; consent is not recorded and this view grants none)"
@@ -2621,28 +2670,30 @@ def _ui_review_module():
 
 
 def _ui_reviewer_detail(ctx, cfg, layers) -> list[dict]:
-    """One row per UI review lens, by the UI review path's own rule (ui_review.py): only claude, codex and gemini
-    run, never the host's company, tried in the listed order; claude and codex need their CLI on PATH, gemini needs
-    GEMINI_API_KEY or GOOGLE_API_KEY. That path applies no benches and no paid check, so neither does this view; it
-    says so when the first runner is per-use paid with no recorded OK. Reads PATH and the environment only."""
+    """One row per UI review lens, by the UI review path's own rules (ui_review.py): only claude, codex and gemini
+    run, never the host's company, tried in order (ui_lens_order: the provider agents.<lens>-reviewer chose first); a
+    per-use provider with no recorded OK is skipped; claude and codex need their CLI on PATH, gemini needs
+    GEMINI_API_KEY or GOOGLE_API_KEY. That path applies no benches. Reads PATH and the environment only."""
     ui, host, out = _ui_review_module(), detect_host(cfg), []
     defaults = DEFAULT_CONFIG.get("ui_reviewers") or {}
-    for lens, names in sorted((cfg.get("ui_reviewers") or {}).items()):
-        names = [n for n in names if isinstance(n, str)] if isinstance(names, list) else []
+    for lens in sorted(cfg.get("ui_reviewers") or {}):
+        names, model = ui_lens_order(cfg, lens)
+        chose = reviewer_choice(cfg, f"{lens}-reviewer")
         why, pick = "", None
         for n in names:
-            w = ui.skip_reason(n.strip(), host) or (f"{n} is unavailable: {ui.runner_unready(n.strip())}"
-                                                    if ui.runner_unready(n.strip()) else "")
+            w = (ui.skip_reason(n, host)
+                 or (f"{n} {paid_no_ok_reason(ui_lens_provider(cfg, n, chose))}"
+                     if per_use_unapproved(ui_lens_provider(cfg, n, chose)) else "")
+                 or (f"{n} is unavailable: {ui.runner_unready(n)}" if ui.runner_unready(n) else ""))
             if not w:
-                pick = n.strip()
+                pick = n
                 break
             why = why or w
-        if pick and per_use_unapproved(provider_by_id(cfg, pick)):
-            why = (why + "; " if why else "") + (f"{pick} costs money per use and the UI review path does not check "
-                                                 "paid consent; tracked to be closed")
-        same = (cfg.get("ui_reviewers") or {}).get(lens) == defaults.get(lens)
-        out.append({"role": f"ui-reviewer-{lens}", "requested": ", ".join(names), "effective": pick or "this agent",
-                    "source": "builtin" if same else _layer_source(layers, "ui_reviewers", lens),
+        same = not chose and (cfg.get("ui_reviewers") or {}).get(lens) == defaults.get(lens)
+        shown = f"{pick}/{model}" if pick and model and chose and pick == chose[0] else pick
+        out.append({"role": f"ui-reviewer-{lens}", "requested": ", ".join(names), "effective": shown or "this agent",
+                    "source": ("builtin" if same else _layer_source(layers, "agents", f"{lens}-reviewer")
+                               if chose else _layer_source(layers, "ui_reviewers", lens)),
                     "reason": "" if pick and pick == names[0] and not why else why})
     return out
 
@@ -2889,8 +2940,10 @@ def provider_health() -> dict:
 
 
 def _health_key(pv) -> str:
-    """The provider's one key in the shared record: its tool plus its model. A hand-written command provider has no
-    preset, so its program is its tool (and its id tells two providers run through one program apart)."""
+    """The provider's one key in the shared record: its tool plus its own `model` (never the model agents.reviewer
+    chose: a bench or share count recorded for the provider applies to a chosen model, and a test of a chosen model is
+    kept in its project only, see _probe_chosen_model). A hand-written command provider has no preset, so its program is
+    its tool (and its id tells two providers run through one program apart)."""
     tool = pv.get("preset") or Path(provider_binary(pv) or str(pv.get("id"))).name
     label = pv.get("model")
     if not label and not pv.get("preset") and pv.get("id") not in (None, tool):
@@ -3919,12 +3972,34 @@ def provider_by_id(cfg, pid) -> dict | None:
     return next((pv for pv in providers(cfg) if pv["id"] == pid), None)
 
 
+PAID_NO_OK = ("costs money per use and the developer has not given the exact OK for this model "
+              "(no paid_ok_at), so it is never used or sent a request")
+
+
+def _other_model_chosen(pv) -> bool:
+    """True for the copy with_reviewer_choice makes when agents.reviewer chose a model other than the provider's own
+    `model`: paid_ok_at is the developer's OK for that own model only."""
+    chosen = pv.get("launch_model") if pv else None
+    return bool(chosen) and chosen != pv.get("model")
+
+
 def per_use_unapproved(pv) -> bool:
     """True for a provider whose cost label is anything but flat-rate (per-use, or any label Ratchet cannot call
-    free) and that carries no paid_ok_at: the developer never gave the exact OK for its model, so it is never chosen
-    for a review and never sent a request, not even a test request. A provider with no cost label is not in this
-    class (it keeps working as it always did)."""
-    return bool(pv) and pv.get("cost") not in (None, "", "flat") and not pv.get("paid_ok_at")
+    free) and that carries no paid_ok_at for the model it would launch: the developer never gave the exact OK for
+    that model, so it is never chosen for a review and never sent a request, not even a test request. The OK covers
+    the provider's own `model` only: a different model chosen with agents.reviewer (`launch_model`) has none. A
+    provider with no cost label is not in this class (it keeps working as it always did)."""
+    return (bool(pv) and pv.get("cost") not in (None, "", "flat")
+            and (not pv.get("paid_ok_at") or _other_model_chosen(pv)))
+
+
+def paid_no_ok_reason(pv) -> str:
+    """Why per_use_unapproved(pv) is true, in plain words (PAID_NO_OK, or the chosen model that has no OK)."""
+    if pv and pv.get("paid_ok_at") and _other_model_chosen(pv):
+        return (f"costs money per use and the developer has not given the exact OK for {pv['launch_model']} (the OK on "
+                f"record is for {pv.get('model') or 'another model'}, and choosing a model grants none), so it is never "
+                "used or sent a request")
+    return PAID_NO_OK
 
 
 def _cost_tier(pv) -> int:
@@ -3940,13 +4015,89 @@ def _reviewer_cost_tier(cfg, spec) -> int:
     return _cost_tier(pv) if pv is not None else 0
 
 
-def ranked_provider_ids(cfg, lens, health=None) -> list[str]:
+LENS_CHOICE_ROLES = ("visual-reviewer", "behavior-reviewer")  # agents.<role> that can also pick a UI review provider
+
+
+def _choice_parts(spec) -> tuple[str, str | None]:
+    """('provider', 'model' or None) of an agents value: split at the first '/' (a model may itself hold one)."""
+    prov, _, model = str(spec).strip().partition("/")
+    return prov.strip(), (model.strip() or None)
+
+
+def reviewer_choice(cfg, role="reviewer") -> tuple[str, str | None] | None:
+    """(provider id, model or None) that `agents.<role>` picks as the outside reviewer, or None when it picks none: no
+    value, a value that is a bare model (not a provider), or a provider that is not set up in this project. For the
+    UI lenses (visual-reviewer, behavior-reviewer) any provider or preset name counts, since ui_review.py runs
+    claude, codex and gemini by name. It is a preference only: it never grants paid approval (per_use_unapproved
+    still decides) and never changes how many reviewers a step gets."""
+    spec = (cfg.get("agents") or {}).get(role)
+    if not isinstance(spec, str) or not spec.strip():
+        return None
+    prov, model = _choice_parts(spec)
+    if role == "reviewer":
+        return (prov, model) if provider_by_id(cfg, prov) is not None else None
+    return (prov, model) if prov and (prov in PRESETS or provider_by_id(cfg, prov) is not None) else None
+
+
+def reviewer_model_problem(pv) -> str | None:
+    """Plain words for why a model chosen for provider `pv` cannot reach what it launches, else None: a hand-written
+    `command` is used as written, so it takes a model only where it has a {model} placeholder."""
+    if pv and pv.get("command") and not any("{model}" in str(c) for c in pv["command"]):
+        return (f"the command of provider {pv['id']!r} has no {{model}} placeholder, so a chosen model can't be passed "
+                "to it; it runs as written")
+    return None
+
+
+def reviewer_model_applies(cfg) -> bool:
+    """True when agents.reviewer chose a model and it can reach the provider's launch command (no model chosen, or a
+    command that cannot take one, is False): the only case where launch_model is set and the review record names it."""
+    ch = reviewer_choice(cfg)
+    return bool(ch and ch[1] and reviewer_model_problem(provider_by_id(cfg, ch[0])) is None)
+
+
+def with_reviewer_choice(cfg) -> dict:
+    """The config with the chosen reviewer provider's model set to launch (`launch_model` on that provider, which
+    provider_command and roster read). Nothing else changes: the shared-record key (_health_key) still reads the
+    provider's own `model`, so a bench or share count recorded for the provider still applies (a failing test of the
+    chosen model is not written there, see _probe_chosen_model). Returns `cfg` itself when no model is chosen or the
+    provider's command has no {model} to put it in (reviewer_model_problem). The copy keeps `paid_ok_at`, but
+    per_use_unapproved treats a model other than the provider's own `model` as having no OK. The copy is for reading;
+    never write it back to a config file."""
+    ch = reviewer_choice(cfg)
+    if not reviewer_model_applies(cfg):
+        return cfg
+    return dict(cfg, providers=[dict(pv, launch_model=ch[1]) if pv.get("id") == ch[0] else pv
+                                for pv in cfg.get("providers") or []])
+
+
+def ui_lens_provider(cfg, name, choice):
+    """The provider entry named `name`, as the UI review would launch it: a copy carrying the model `choice` (the
+    (provider, model) agents.<lens>-reviewer picked) when `name` is the chosen provider, so per_use_unapproved sees the
+    model that would run. None when `name` is not a configured provider."""
+    pv = provider_by_id(cfg, name)
+    return dict(pv, launch_model=choice[1]) if pv and choice and choice[1] and choice[0] == name else pv
+
+
+def ui_lens_order(cfg, lens) -> tuple[list[str], str | None]:
+    """(UI review runner names for `lens` in the order tried, the model chosen for the first): the lens's
+    ui_reviewers list with the provider `agents.<lens>-reviewer` names moved to the front. The host's own sub-agents
+    stay the final fallback (ui_review.py adds them last)."""
+    raw = (cfg.get("ui_reviewers") or {}).get(lens)
+    names = [n.strip() for n in raw if isinstance(n, str) and n.strip()] if isinstance(raw, list) else []
+    ch = reviewer_choice(cfg, f"{lens}-reviewer")
+    if ch:
+        names = [ch[0]] + [n for n in names if n != ch[0]]
+    return names, (ch[1] if ch else None)
+
+
+def ranked_provider_ids(cfg, lens, health=None, lead=None) -> list[str]:
     """Every provider id, best first for a slot of `lens`: any that is not per-use (flat-rate or no cost label) before
     a per-use one, and inside that first tier a provider that prefers the lens (`prefer_for`, set with providers --add
     --prefer-for) before one that does not, then the fewest review starts in the shared record's recent hours (any
     lane, any project), then flat-rate before no cost label, then the one picked longest ago (a round replaced
-    unreviewed gives its starts back but keeps this time), then the order written in config. This is only an order:
-    whether a provider can be used right now (installed, not out, per-use with the developer's OK) is
+    unreviewed gives its starts back but keeps this time), then the order written in config. `lead` (the provider
+    agents.reviewer chose) goes first of all; resolve_reviewers keeps it from lifting a per-use provider over a
+    usable flat-rate one. This is only an order: whether a provider can be used right now (installed, not out, per-use with the developer's OK) is
     reviewer_availability's call."""
     health = provider_health() if health is None else health
     at = _dt.datetime.now(_dt.timezone.utc)
@@ -3957,7 +4108,8 @@ def ranked_provider_ids(cfg, lens, health=None) -> list[str]:
         last = phealth.last_picked(health, _health_key(pv), at)  # a replaced unreviewed round keeps it: rotation goes on
         return (_cost_tier(pv), 0 if lens in (pv.get("prefer_for") or []) else 1, len(starts),
                 0 if pv.get("cost") == "flat" else 1, last, i)
-    return [pv["id"] for _i, pv in sorted(enumerate(providers(cfg)), key=key)]
+    ranked = [pv["id"] for _i, pv in sorted(enumerate(providers(cfg)), key=key)]
+    return [lead] + [p for p in ranked if p != lead] if lead in ranked else ranked  # the developer's choice leads
 
 
 def provider_company(pv) -> str | None:
@@ -3975,18 +4127,25 @@ def provider_binary(pv) -> str | None:
     return (PRESETS.get(pv.get("preset", "")) or {}).get("bin")
 
 
+def launch_model(entry) -> str | None:
+    """The model a provider entry launches: the one agents.reviewer chose for it (`launch_model`, set only on the
+    copy with_reviewer_choice makes), else its own `model`."""
+    return entry.get("launch_model") or entry.get("model")
+
+
 def provider_command(pv) -> tuple[list[str], bool]:
     """(command template, prompt on stdin?) of a provider: its own `command` (or its preset's) with the model filled
     in. A preset's command also gets the model flag and the thinking-cap arguments appended (_variant_args: the
     provider's `variant`, else the preset's default, "none" sends nothing); an own `command` is used as written."""
     preset = PRESETS.get(pv.get("preset", "")) or {}
+    model = launch_model(pv)
     if pv.get("command"):
-        cmd = [str(c).replace("{model}", str(pv.get("model") or "")) for c in pv["command"]]
+        cmd = [str(c).replace("{model}", str(model or "")) for c in pv["command"]]
         return cmd, bool(pv.get("stdin", False))
     cmd = list(preset.get("command") or [])
-    if pv.get("model") and cmd:
+    if model and cmd:
         at = preset.get("model_at", 1)
-        cmd = cmd[:at] + list(preset.get("model_flag") or ["--model"]) + [str(pv["model"])] + cmd[at:]
+        cmd = cmd[:at] + list(preset.get("model_flag") or ["--model"]) + [str(model)] + cmd[at:]
     return cmd + _variant_args(preset, pv), bool(preset.get("stdin", False))
 
 
@@ -4005,7 +4164,8 @@ def roster(cfg) -> dict:
     for pv in providers(cfg):
         for lens in LENSES:
             out.setdefault(f"{pv['id']}-{lens}", {"kind": "command", "provider": pv["id"], "lens": lens,
-                                                  "vendor": provider_company(pv), "model": pv.get("model"),
+                                                  "vendor": provider_company(pv),
+                                                  "model": launch_model(pv),
                                                   "for_risk": pv.get("for_risk")})
     return out
 
@@ -4086,6 +4246,8 @@ def _agent_model(cfg, role) -> str | None:
         return None
     prov, slash, model = spec.partition("/")
     if not slash:
+        if role[len("ratchet-"):] in LENS_CHOICE_ROLES and reviewer_choice(cfg, role[len("ratchet-"):]):
+            return None  # it names the outside UI review provider (ui_lens_order), not a model for this sub-agent
         allowed = _host_bare_models(cfg)
         if allowed is None:  # the host lists no models: any name, except one another host's entry names
             return spec if spec.strip() and spec not in _foreign_bare_models(cfg) else None
@@ -4145,6 +4307,8 @@ def _agent_notes(cfg) -> list[str]:
     """One plain line per `agents` choice that cannot apply to its sub-agent role on this host."""
     notes = []
     for name in sorted((cfg.get("agents") or {})):
+        if name in LENS_CHOICE_ROLES and reviewer_choice(cfg, name):
+            continue  # it picks the outside UI review provider (ui_lens_order), which models explains in its own row
         r = resolve_role([cfg], "ratchet-" + name, cfg)
         if r and r["reason"]:
             notes.append(f"RATCHET note: agents.{name} = {cfg['agents'][name]!r} can't apply on this host "
@@ -4219,16 +4383,21 @@ def _update_unavailable(ctx, change, note: bool = True, lock=None) -> str:
     return res
 
 
-def mark_unavailable(ctx, rid, reason, hours=None, note: bool = True, lock=None, quota: bool = False):
+def mark_unavailable(ctx, rid, reason, hours=None, note: bool = True, lock=None, quota: bool = False, model=None):
     """Marks `rid` unavailable until `hours` from now (returns that time), unless unavailable-reviewers.json's lock
     is busy, when nothing is saved and this returns None (reviewer_status's --mark checks for that and dies, with
     note=False so _update_unavailable's own stderr note does not also print). `lock`: as _update_unavailable.
-    `quota`: the mark is a wait for a provider out of credits (a passing test request does not clear it)."""
+    `quota`: the mark is a wait for a provider out of credits (a passing test request does not clear it).
+    `model`: the mark is about that exact model only (a failed test of a model agents.reviewer chose): it counts
+    only while the reviewer would launch that model (reviewer_availability), so removing or correcting the choice
+    brings the reviewer back at once."""
     hours = hours if hours is not None else float(ctx.config().get("unavailable_ttl_hours", 6))
     until = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=hours)).isoformat(timespec="microseconds")
     mark = {"reason": reason[:300], "since": now(), "until": until}
     if quota:
         mark["quota"] = True
+    if model:
+        mark["model"] = str(model)
     res = _update_unavailable(ctx, lambda live: live.__setitem__(rid, mark), note=note, lock=lock)
     return None if res == "busy" else until
 
@@ -4252,12 +4421,16 @@ def reviewer_availability(ctx, cfg, rid, risk=None) -> tuple[bool, str]:
     if risk and spec.get("for_risk") and risk not in spec["for_risk"]:
         return False, f"not set up for {risk}-risk steps (for_risk: {', '.join(spec['for_risk'])})"
     if per_use_unapproved(provider_by_id(cfg, spec.get("provider"))):
-        return False, ("costs money per use and the developer has not given the exact OK for this model "
-                       "(no paid_ok_at), so it is never used or sent a request")
+        return False, paid_no_ok_reason(provider_by_id(cfg, spec.get("provider")))
     binary = reviewer_binary(cfg, rid) or ""
     if not binary or not shutil.which(binary):
         return False, f"'{binary or spec.get('preset')}' CLI not installed"
     down = unavailable_reviewers(ctx).get(rid) if ctx else None
+    if down is not None and down.get("model") and down["model"] != launch_model(spec):
+        # a failed test of a model that is no longer the one launched (the choice was removed or changed). `cfg` must be
+        # the config as this reviewer is launched (launch_cfg / the slot's config in resolve_reviewers), so its spec
+        # carries the chosen model; the mark and the launch then name the same one.
+        down = None
     if down is None:  # a provider another lane found failing is out here too, until its bench ends
         down = provider_bench(cfg, rid)
     if down:
@@ -4274,16 +4447,17 @@ def _host_fallbacks(cfg, rid) -> list[str]:
     return [f"host-alt-{x}" for x in order if f"host-alt-{x}" in r] + [f"host-{x}" for x in order if f"host-{x}" in r]
 
 
-def expand_slot(cfg, slot, health=None) -> list[str]:
+def expand_slot(cfg, slot, health=None, lead=None) -> list[str]:
     """The reviewer ids a slot may use, in the order they are tried. An explicit id keeps the place it was written
     in; any-<lens> becomes the providers' reviewers for that lens in ranked_provider_ids order (cost tier, lens
-    preference, fewest recent starts), then the host's own."""
+    preference, fewest recent starts), then the host's own. `lead`: the provider agents.reviewer chose, first among
+    an any-<lens> token's providers (an explicit id is never moved)."""
     alts = list(slot) if isinstance(slot, list) else [slot]
     out = []
     for a in alts:
         m = re.fullmatch(r"any-(correctness|standards|both)", str(a))
         if m:
-            out += [f"{pid}-{m.group(1)}" for pid in ranked_provider_ids(cfg, m.group(1), health)]
+            out += [f"{pid}-{m.group(1)}" for pid in ranked_provider_ids(cfg, m.group(1), health, lead)]
             out += [f"host-alt-{m.group(1)}", f"host-{m.group(1)}"]
         else:
             out.append(a)
@@ -4311,6 +4485,85 @@ def _dup_key(spec):
             spec.get("lens"))
 
 
+def review_slots(cfg, cp) -> list:
+    """The review slots of a step: its own `reviewers` pin, else review_depth for its risk (else the older
+    "adversaries" count)."""
+    if cp.get("reviewers"):
+        return list(cp["reviewers"])
+    depth = cfg.get("review_depth") or {}
+    slots = depth.get(cp.get("risk", "normal")) or depth.get("normal")
+    if not slots:  # legacy config: "adversaries": N
+        slots = ["host-both"] if int(cfg.get("adversaries", 2)) == 1 else ["host-standards", "host-correctness"]
+    return slots
+
+
+def round_slots(cfg, cp, rnd=None) -> list:
+    """The review slots the open round `rnd` was resolved from: review_depth["low"] for a small fix after approval
+    (_small_fix_reviewers resolves it with dict(cp, risk="low")), else the step's own (review_slots). The one slot basis
+    resolve_reviewers, launch_cfg, choice_applies_to, the notes and external_review.py all use, so a slot number means
+    the same slot everywhere."""
+    if rnd and rnd.get("small_fix") and not _is_fix_after_block(rnd):
+        return review_slots(cfg, dict(cp, risk="low"))
+    return review_slots(cfg, cp)
+
+
+def _slot_takes_choice(slot) -> bool:
+    """True when the slot has an any-<lens> token, the only place agents.reviewer can lead; a slot that lists reviewer
+    ids only keeps its written order."""
+    return any(re.fullmatch(r"any-(correctness|standards|both)", str(a)) for a in (slot if isinstance(slot, list) else [slot]))
+
+
+def reviewer_choice_notes(cfg, cp, rnd=None) -> list[str]:
+    """Plain lines saying where agents.reviewer is NOT applied for this step: a provider that is not set up in this
+    project, a checkpoint's own `reviewers` pin, review slots that list reviewer ids (their written order and model are
+    kept), or a chosen model that the provider's command has no {model} placeholder to take. [] when nothing is chosen
+    or it applies everywhere. `rnd`: the open round, when the notes are about it (a small fix after approval is about
+    review_depth["low"]'s slots, see round_slots)."""
+    spec = (cfg.get("agents") or {}).get("reviewer")
+    ch = reviewer_choice(cfg)
+    if not ch:
+        if isinstance(spec, str) and spec.strip():
+            prov, _model = _choice_parts(spec)
+            if ("/" in spec or prov in PRESETS) and provider_by_id(cfg, prov) is None:
+                return [f"RATCHET note: agents.reviewer = {spec!r} was not applied: provider {prov!r} is not set up in "
+                        f"this project (add it with `ratchet.py providers --add {prov} --preset {prov}`)."]
+        return []
+    asked = f"agents.reviewer = {spec!r}"
+    if cp.get("reviewers"):
+        return [f"RATCHET note: {asked} was not applied: {cp.get('id', 'this step')} pins its reviewers "
+                f"({', '.join(map(str, cp['reviewers']))}), and a pin keeps its written order."]
+    out = []
+    problem = reviewer_model_problem(provider_by_id(cfg, ch[0])) if ch[1] else None
+    if problem:
+        out.append(f"RATCHET note: {asked}: the model {ch[1]!r} was not applied: {problem}.")
+    fixed = [str(n) for n, sl in enumerate(round_slots(cfg, cp, rnd), 1) if not _slot_takes_choice(sl)]
+    if fixed:
+        out.append(f"RATCHET note: {asked} was not applied to review slot{'s' if len(fixed) > 1 else ''} "
+                   f"{', '.join(fixed)}: review_depth lists reviewer ids there, and ids keep their written order and model.")
+    return out
+
+
+def choice_applies_to(cfg, cp, rnd, rid) -> bool:
+    """True when agents.reviewer's model is launched for reviewer `rid` of the open round `rnd`: the step does not pin
+    its reviewers, `rid` filled an any-<lens> slot (the only place the choice applies, as resolve_reviewers decides)
+    and the model can reach the provider's command (reviewer_model_applies). external_review.py asks this before it
+    launches and stamps the model, so the launch agrees with what `reviewers` and `models` reported. The slot list is the
+    one the round was resolved from (round_slots): a small fix after approval is resolved from review_depth["low"]."""
+    if cp.get("reviewers") or not reviewer_model_applies(cfg):
+        return False
+    slot = next((r.get("slot") for r in (rnd.get("resolved") or []) if r.get("id") == rid), None)
+    slots = round_slots(cfg, cp, rnd)
+    return isinstance(slot, int) and 1 <= slot <= len(slots) and _slot_takes_choice(slots[slot - 1])
+
+
+def launch_cfg(cfg, cp, rnd, rid) -> dict:
+    """`cfg` as reviewer `rid` of round `rnd` is launched: with agents.reviewer's model where choice_applies_to says the
+    round chose it for that reviewer, else the config as written. The one per-reviewer application of the choice
+    outside resolve_reviewers (which applies it per slot), so a probe, a paid check or a row never sees a model the
+    launch will not run. `cfg` must be the config as read, never the copy with_reviewer_choice makes."""
+    return with_reviewer_choice(cfg) if choice_applies_to(cfg, cp, rnd, rid) else cfg
+
+
 def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None, share=None) -> list[dict]:
     """Turn review slots into concrete reviewer ids for THIS round.
 
@@ -4323,6 +4576,12 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None, s
     providers are unavailable, after every other working provider (ranked the same way). A slot whose own pick turns out to be the
     same company, model and lens as a reviewer an earlier slot already chose collapses (no entry): that review
     already runs once, not twice, under a different id.
+
+    `agents.reviewer` (the config's choice of outside reviewer, a provider or provider/model) leads every any-<lens>
+    slot inside the cost tiers and sets the model that slot launches (with_reviewer_choice); a per-use provider it names
+    is set aside behind usable flat-rate ones, and one chosen with a model other than the one the developer approved
+    (paid_ok_at) is never picked. A checkpoint's own `reviewers` pin, and a slot that lists reviewer ids, keep their
+    written order AND their written model (reviewer_choice_notes reports it, choice_applies_to is what the launch asks).
 
     `exclude`: reviewer ids never picked even though reviewer_availability still calls them okay — a reply cut
     off mid-answer twice this round falls back only its own slot, without the long-lived unavailable_ttl_hours
@@ -4342,6 +4601,9 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None, s
     applies no share (a round already open is only shown, never counted again).
     """
     exclude = exclude or set()
+    plain = cfg  # as read: the choice's model is applied slot by slot below, never to the whole config
+    choice = None if cp.get("reviewers") else reviewer_choice(cfg)  # a checkpoint's own pin keeps its written order
+    lead = choice[0] if choice else None
     health = share["data"] if share is not None else provider_health()  # the shared record: starts spread the slots
     cap, tentative, at = (provider_share(cfg) if share is not None else None), {}, _dt.datetime.now(_dt.timezone.utc)
 
@@ -4355,15 +4617,9 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None, s
         win = _minutes_text(cap[1])
         return (f"it already has {n} review start{'' if n == 1 else 's'} in the last {win}, and a provider takes at "
                 f"most {cap[0]} per {win} across all lanes on this machine")
-    if cp.get("reviewers"):
-        slots = list(cp["reviewers"])
-    else:
-        depth = cfg.get("review_depth") or {}
-        slots = depth.get(cp.get("risk", "normal")) or depth.get("normal")
-        if not slots:  # legacy config: "adversaries": N
-            slots = ["host-both"] if int(cfg.get("adversaries", 2)) == 1 else ["host-standards", "host-correctness"]
-    roster_ = {rid: _roster_spec(cfg, rid) for rid in set(roster(cfg)) | {a for sl in slots for a in expand_slot(cfg, sl, health)}}
-    roster_ = {k: v for k, v in roster_.items() if v is not None}
+    slots = review_slots(cfg, cp)
+    every = set(roster(cfg)) | {a for sl in slots for a in expand_slot(cfg, sl, health, lead)}
+    roster_ = {k: v for k, v in ((rid, _roster_spec(cfg, rid)) for rid in every) if v is not None}
     risk = cp.get("risk", "normal")
     chosen, chosen_keys, out = set(), set(), []
     for t in taken or ():
@@ -4373,7 +4629,11 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None, s
     for n, slot in enumerate(slots, 1):
         if only_slots is not None and n not in only_slots:
             continue
-        alts = expand_slot(cfg, slot, health)
+        # the chosen model is launched only in a slot that takes the choice (an any-<lens> token); a slot that lists
+        # reviewer ids keeps its written model too, as it keeps its written order
+        cfg = with_reviewer_choice(plain) if choice and _slot_takes_choice(slot) else plain
+        roster_ = {k: v for k, v in ((rid, _roster_spec(cfg, rid)) for rid in every) if v is not None}
+        alts = expand_slot(cfg, slot, health, lead)
         unknown = [a for a in alts if a not in roster_]
         if unknown:
             die(f"review_depth/checkpoint names unknown reviewer(s) {unknown}; add them under config 'providers' "
@@ -4403,6 +4663,18 @@ def resolve_reviewers(ctx, cfg, cp, exclude=None, taken=None, only_slots=None, s
             else:
                 skipped.append(a)
                 reasons[a] = why
+        if (lead and candidates and _slot_takes_choice(slot) and candidates[0] in {f"{lead}-{x}" for x in LENSES}
+                and _reviewer_cost_tier(cfg, roster_[candidates[0]]) > 0
+                and any(roster_[c].get("kind") == "command" and _reviewer_cost_tier(cfg, roster_[c]) == 0
+                        for c in candidates)):
+            # the choice is a preference inside the existing cost tiers: a per-use provider (with the developer's OK)
+            # never outranks a usable one that is not, so it is set aside here, plainly, and ranks after them
+            skipped.append(candidates[0])
+            reasons[candidates[0]] = ("pay-per-use providers rank after usable flat-rate ones; choosing it does not "
+                                      "lift it over them")
+            free = [c for c in candidates[1:] if roster_[c].get("kind") == "command"
+                    and _reviewer_cost_tier(cfg, roster_[c]) == 0]
+            candidates = free + [candidates[0]] + [c for c in candidates[1:] if c not in free]
         used_vendors = {roster_[c].get("vendor") for c in chosen if roster_[c].get("kind") == "command"}
         # A company not yet reviewing is preferred only among candidates of the first candidate's cost tier, so it never
         # lifts a per-use provider over a usable one that is not (the candidates are already in ranked order)
@@ -4479,6 +4751,7 @@ def cmd_plan_submit(args):
     plan-extend applies that last check only to the lines feedback added since the approval snapshot, so a plan
     approved before it keeps working."""
     ctx = Ctx(find_root())
+    ctx.config()  # a wrong agents/role_models setting stops here, naming its file, before the plan is submitted
     st = ctx.state()
     if st["phase"] not in ("planning", "awaiting_plan_approval"):
         die(f"plan-submit only allowed while planning (phase is {st['phase']}). Use plan-extend for feedback.")
@@ -14647,11 +14920,31 @@ def cmd_status(args):
     cmd_status_text(ctx)
 
 
+def _probe_chosen_model(ctx, cfg, pv) -> tuple[bool, str]:
+    """The test request for a provider whose launched model is the one agents.reviewer chose, not its own `model`. Its
+    result belongs to this project alone: the shared record is keyed by the provider's own model and is read by every
+    project, so a failure here must not bench that model for the others (nor a pass mark it tested). A failure marks
+    the provider's reviewers unavailable here for unavailable_ttl_hours, for that model only (the mark names it, so
+    it ends the moment the choice is removed or changed); a pass clears this project's marks."""
+    good, detail = probe_provider(ctx, cfg, pv, record=False)[:2]
+    busy = False
+    if good:
+        busy = _update_unavailable(ctx, lambda live: [live.pop(f"{pv['id']}-{lens}", None) for lens in LENSES],
+                                   note=False) == "busy"
+    else:
+        for lens in LENSES:
+            busy = mark_unavailable(ctx, f"{pv['id']}-{lens}", f"test request of {launch_model(pv)} failed: {detail}",
+                                    note=False, model=launch_model(pv)) is None or busy
+    if busy:  # the unavailable-reviewers record was locked by another command: this result was not saved
+        detail += " (not saved: unavailable-reviewers.json is busy, run this again)"
+    return good, detail
+
+
 def cmd_reviewers(args):
     """Open (or show) the adversarial review round for a checkpoint. Opening a round is what counts toward the
     retry caps, so re-rolling reviewers until one approves still costs rounds."""
     ctx = Ctx(find_root())
-    cfg = ctx.config()
+    cfg = ctx.config()  # as written: launch_cfg / resolve_reviewers apply agents.reviewer's model per slot only
     st = ctx.state()
     cps = _cur(ctx, st, args.cp)
     _expect_step(cps, ["adversarial", "complete"], args.cp)
@@ -14787,13 +15080,33 @@ def cmd_reviewers(args):
         new_nonce = secrets.token_hex(8)
         ignore_old = {_start_id(old_nonce, x) for x in give_old}
         reserved, tries = False, 0
+        tested = set()  # providers on a chosen model, tested once per call (their result is not in the shared record)
+        chosen_cfg = with_reviewer_choice(cfg)  # read only for the model a reviewer that takes the choice would launch
+
+        def due_for(picked):
+            """[(provider id, on the chosen model?)] to test for these picks. A pick is on the chosen model only where
+            the launch takes it (choice_applies_to: an any-<lens> slot of an unpinned step), so a pinned or id-listed
+            reviewer is tested, paid-checked and reported on its written model."""
+            out = set()
+            for r in picked:
+                pid = (_roster_spec(cfg, r["id"]) or {}).get("provider")
+                if not pid:
+                    continue
+                on_choice = (choice_applies_to(cfg, cp, {"resolved": picked, "small_fix": small_fix, "kind": kind}, r["id"])
+                             and _other_model_chosen(provider_by_id(chosen_cfg, pid)))
+                out.add((pid, on_choice))
+            return sorted(out)
+
+        def due_now(pid, on_choice):  # the shared record says whether a provider on its own model needs a test; a chosen one does once
+            if on_choice:
+                return pid not in tested and bool(cfg.get("probe_providers", True))
+            return probe_due(ctx, cfg, pid)
         while True:  # test the providers we are about to rely on; a failing one hands its slot on
             tries += 1
             # who would review, with the share applied (read, not reserved): a provider the locked pick will skip for
             # being at its share gets no test request
             resolved = pick_round({"data": provider_health(), "ignore": set(ignore_old)})
-            due = {(_roster_spec(cfg, r["id"]) or {}).get("provider") for r in resolved}
-            due = [pid for pid in due if pid and probe_due(ctx, cfg, pid)] if tries < 6 else []
+            due = [x for x in due_for(resolved) if due_now(*x)] if tries < 6 else []
             if not due:
                 got = _reserve_under_lock(cfg, ignore_old, pick_round, lambda _r: [(x, old_nonce) for x in give_old],
                                           lambda picked: [(r["id"], new_nonce) for r in picked], keep_picked=True)
@@ -14801,14 +15114,17 @@ def cmd_reviewers(args):
                     break
                 resolved = got
                 give_old = []  # given back with the reservation
-                due = {(_roster_spec(cfg, r["id"]) or {}).get("provider") for r in resolved}
-                due = [pid for pid in due if pid and probe_due(ctx, cfg, pid)] if tries < 6 else []
+                due = [x for x in due_for(resolved) if due_now(*x)] if tries < 6 else []
                 if not due:
                     reserved = True
                     break
                 update_review_starts(cfg, new_nonce, give_back=[r["id"] for r in resolved])  # not tested yet: release
-            for pid in due:
-                good, detail = probe_shared(ctx, cfg, provider_by_id(cfg, pid))
+            for pid, on_choice in due:
+                if on_choice:
+                    tested.add(pid)
+                    good, detail = _probe_chosen_model(ctx, chosen_cfg, provider_by_id(chosen_cfg, pid))
+                else:
+                    good, detail = probe_shared(ctx, cfg, provider_by_id(cfg, pid))
                 print(f"  checked {pid}: {'working' if good else 'not usable now (' + detail + ')'}", file=sys.stderr)
         if fix_pick:
             if len(resolved) != 1:
@@ -14883,7 +15199,8 @@ def cmd_reviewers(args):
         own_failed = set(rnd.get("failed_reviewers") or [])  # reviewers whose own run failed (external_review.py)
         failed_now = set(rnd.get("failed_providers") or [])
         for r in rnd["resolved"]:
-            if not (out_dir_now / f"{r['id']}.json").exists() and not reviewer_availability(ctx, cfg, r["id"])[0]:
+            if (not (out_dir_now / f"{r['id']}.json").exists()
+                    and not reviewer_availability(ctx, launch_cfg(cfg, cp, rnd, r["id"]), r["id"])[0]):
                 failed_now.add(_reviewer_health_key(cfg, r["id"]) or r["id"])
         failed_ids = {r for r in roster(cfg) if (_reviewer_health_key(cfg, r) or r) in failed_now}
         changed, swapped_in, dropped, started, given_back = False, [], set(), [], []
@@ -14902,7 +15219,7 @@ def cmd_reviewers(args):
             # reviewer that failed earlier this round stays out, and starts are recorded like any other refill.
             cur = rnd["resolved"][0]
             if not (out_dir_now / f"{cur['id']}.json").exists():  # a finished review is kept untouched
-                okay, _why = reviewer_availability(ctx, cfg, cur["id"])
+                okay, _why = reviewer_availability(ctx, launch_cfg(cfg, cp, rnd, cur["id"]), cur["id"])
                 if not okay or cur["id"] in round_cutoff or cur["id"] in failed_ids:
                     replacement = _small_fix_reviewers(ctx, cfg, cp, exclude=round_cutoff | failed_ids)
                     if replacement is not None:
@@ -14929,7 +15246,8 @@ def cmd_reviewers(args):
             # one slot gets that slot's own same-lens stand-in, and the round stays a one-reviewer fix round.
             replace = [i for i, r in enumerate(rnd["resolved"])
                        if not (out_dir_now / f"{r['id']}.json").exists()
-                       and (not reviewer_availability(ctx, cfg, r["id"])[0] or r["id"] in round_cutoff
+                       and (not reviewer_availability(ctx, launch_cfg(cfg, cp, rnd, r["id"]), r["id"])[0]
+                            or r["id"] in round_cutoff
                             or r["id"] in failed_ids)]
             keep = {r["id"] for i, r in enumerate(rnd["resolved"]) if i not in replace}
             replaced_slots = {rnd["resolved"][i]["slot"] for i in replace}
@@ -15012,7 +15330,7 @@ def cmd_reviewers(args):
     rows = []
     for res_r in rnd["resolved"]:
         rid = res_r["id"]
-        spec = dict(_roster_spec(cfg, rid) or {}, id=rid, output=str(out_dir / f"{rid}.json"),
+        spec = dict(_roster_spec(launch_cfg(cfg, cp, rnd, rid), rid) or {}, id=rid, output=str(out_dir / f"{rid}.json"),
                     slot=res_r["slot"], fallback_for=res_r["fallback_for"], reasons=res_r["reasons"])
         if spec["kind"] == "agent":
             want = ("a model DIFFERENT from yours: " + " or ".join(host_model_map(cfg).get("alternates") or [])
@@ -15077,6 +15395,8 @@ def cmd_reviewers(args):
         legacy_pin_msg = None
     if legacy_pin_msg:
         res["legacy_pin_note"] = legacy_pin_msg
+    for line in reviewer_choice_notes(cfg, cp, rnd):
+        print(line, file=sys.stderr)
     if args.json:
         print(json.dumps(res, indent=2))
         return

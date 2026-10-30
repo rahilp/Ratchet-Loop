@@ -24,6 +24,12 @@ plus the model it runs and, when the model doesn't say it, the company). Each pr
 
 `ratchet.py providers --discover` finds installed agent CLIs, sends each a test request and adds what works.
 
+`agents.reviewer` (a provider or provider/model, in the project's or the machine-wide config) can choose the model
+that runs: when this reviewer filled an any-<lens> slot of the open round, the chosen model is launched in place of the
+provider's own, and the review file carries it as a `model` field, covered by the signature. A checkpoint's `reviewers`
+pin, a review_depth slot that lists reviewer ids, and a hand-written `command` with no {model} placeholder keep the
+model they were written with (the file then carries no `model`).
+
 If the CLI is missing, or it fails (auth, quota, timeout, no parseable answer), this script marks that
 provider (its tool plus model; every reviewer on the program when the program is missing or cannot start) unavailable for
 `unavailable_ttl_hours`, records it as failed in the open round so it stays out of that round, and exits with code 3 (a provider that says it is out of credits
@@ -628,6 +634,17 @@ def main():
     if not rnd or rnd.get("recorded") or rnd.get("fingerprint") != fp or a.reviewer not in rnd.get("reviewers", []):
         sys.exit(f"No open review round for {a.cp} that includes '{a.reviewer}' at the current code. "
                  f"Run `ratchet.py reviewers {a.cp}` first and launch exactly the reviewers it lists.")
+    # agents.reviewer's model is launched (and stamped below) only where the round chose it: a pinned or listed
+    # reviewer keeps its written model, and a command with no {model} cannot take one
+    cfg = eng.launch_cfg(cfg, cp, rnd, a.reviewer)
+    spec = eng._roster_spec(cfg, a.reviewer)
+    # Choosing a model never approves paid use: a per-use provider with no OK for the model about to run (the chosen one
+    # carries none) is never launched, whatever the round says.
+    pv = eng.provider_by_id(cfg, spec.get("provider"))
+    if eng.per_use_unapproved(pv):
+        print(f"'{a.reviewer}' is not launched: {eng.paid_no_ok_reason(pv)}. Run `ratchet.py reviewers {a.cp}` for this "
+              "round's reviewers.", file=sys.stderr)
+        sys.exit(3)
     _focus, rules, scope = eng.review_rules(ctx, cfg, cp, cps["gates"]["adversarial"], rnd, fp, cps)
     prompt = build_prompt(eng, ctx, cfg, cp, a.reviewer, spec, fp, a.fixes, cps.get("base_tree"), rnd["nonce"], rules,
                           prev_round_tree=rnd.get("prev_round_tree"), scope=scope)
@@ -827,6 +844,9 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
                                     if base else review.get("files_reviewed") or ["(whole diff)"])
     review.update(reviewer=a.reviewer, lens=spec.get("lens"), vendor=spec.get("vendor"), round_nonce=rnd["nonce"],
                   checkpoint=a.cp, fingerprint=fp)
+    chosen = eng.reviewer_choice(cfg)
+    if chosen and chosen[1] and spec.get("provider") == chosen[0] and spec.get("model") == chosen[1]:
+        review["model"] = chosen[1]  # the model agents.reviewer chose is the one launched above; signed with the rest
     review["findings"] = [f for f in review.get("findings") or [] if isinstance(f, dict)]
     review["verdict"] = "APPROVE" if not review["findings"] else "CHANGES_REQUESTED"
     # Sign it with this round's secret (kept in Ratchet's per-user folder), so adv-record can tell it from a review

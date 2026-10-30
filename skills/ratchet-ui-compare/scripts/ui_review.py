@@ -3,7 +3,11 @@
 ui_review.py — run the Ratchet UI gate's two reviewers (visual + behaviour) in ISOLATED sessions
 and merge their verdicts. Provider-neutral: each role is given to the first AVAILABLE provider in
 config `ui_reviewers` that is DIFFERENT from the model hosting the loop (Gemini, Claude, Codex…);
-if none is available, the role falls back to the host's own sub-agents.
+if none is available, the role falls back to the host's own sub-agents. `agents.visual-reviewer` /
+`agents.behavior-reviewer` (a provider or provider/model) move that provider, and its model, to the front of the
+role's list. A per-use provider with no recorded OK from the developer (providers[].paid_ok_at, which covers the
+provider's own model only) is skipped, with the reason printed, whether it was listed or chosen; so is a chosen
+provider that cannot run UI review.
 
 Every reviewer works inside a temp folder that holds ONLY the screenshots, the accessibility
 snapshots, the design file and the scope — never the project's code, instructions or chat history.
@@ -198,7 +202,7 @@ def runner_unready(name: str) -> str:
 
 def skip_reason(name: str, host: str) -> str:
     """'' when `name` is a UI review candidate for a host of company `host`, else why it is dropped before any run
-    (not one of the RUNNERS, or the host's own company). The one eligibility rule; role_providers applies it."""
+    (not one of the RUNNERS, or the host's own company). The one eligibility rule; role_plan applies it."""
     if name not in RUNNERS:
         return f"{name} is not a UI review provider (only {', '.join(RUNNERS)} run UI review)"
     if PROVIDER_VENDOR.get(name) == host:
@@ -296,19 +300,43 @@ def _engine():
     return mod
 
 
-def role_providers(a) -> tuple[str, dict]:
-    """Ordered provider list per role, minus the host's own provider; 'host' is implied last."""
+def role_plan(a) -> tuple[str, dict, dict, dict]:
+    """(host, {role: runners in the order tried}, {role: (provider, model) chosen with a model, or None}, {role: [why a
+    runner was skipped before running]}). Config `ui_reviewers` gives the order, with the provider
+    `agents.<role>-reviewer` names moved to the front; 'host' is implied last. Minus the host's own provider, and
+    minus a per-use provider with no recorded OK from the developer (a choice grants none)."""
+    eng, cfg = None, None
     try:
         eng = _engine()
         cfg = eng.Ctx(eng.find_root()).config()
         host = eng.detect_host(cfg)
-        prefs = cfg.get("ui_reviewers") or {}
     except SystemExit:
-        host, prefs = os.environ.get("RATCHET_HOST_PROVIDER", "unknown"), {}
-    out = {}
+        host, eng = os.environ.get("RATCHET_HOST_PROVIDER", "unknown"), None
+    out, models, skipped = {}, {}, {}
     for role, override in (("visual", a.visual), ("behavior", a.behavior)):
-        lst = override.split(",") if override else prefs.get(role) or ["gemini", "claude", "codex"]
-        out[role] = [p.strip() for p in lst if p.strip() and not skip_reason(p.strip(), host)]
+        names = eng.ui_lens_order(cfg, role)[0] if eng else []
+        chose = eng.reviewer_choice(cfg, f"{role}-reviewer") if eng and not override else None
+        lst = override.split(",") if override else names or ["gemini", "claude", "codex"]
+        out[role], skipped[role] = [], []
+        models[role] = chose if chose and chose[1] else None
+        for p in (x.strip() for x in lst):
+            if not p:
+                continue
+            if skip_reason(p, host):
+                if chose and p == chose[0]:  # the developer's own pick is dropped: say why, not nothing
+                    skipped[role].append(f"agents.{role}-reviewer = {p!r} was not used: {skip_reason(p, host)}")
+                continue
+            pv = eng.ui_lens_provider(cfg, p, chose) if eng else None
+            if eng and eng.per_use_unapproved(pv):  # the OK covers the provider's own model, not a chosen one
+                skipped[role].append(f"{p} {eng.paid_no_ok_reason(pv)}")
+                continue
+            out[role].append(p)
+    return host, out, models, skipped
+
+
+def role_providers(a) -> tuple[str, dict]:
+    """Ordered provider list per role, minus the host's own provider; 'host' is implied last (see role_plan)."""
+    host, out, _models, _skipped = role_plan(a)
     return host, out
 
 
@@ -442,7 +470,7 @@ def cmd_review(a):
         ctx, st, n = got
         key = _ui_key(eng, ctx, st, cp, n)
         rnd = (ctx, st, n, key)
-    host, providers = role_providers(a)
+    host, providers, chosen_model, set_aside = role_plan(a)
     fp_at_start = _current_fingerprint() if rnd else None
     manifest["review_scope"] = a.scope              # what the reviewers were told to judge; ratchet.py checks it
     if rnd:
@@ -456,7 +484,9 @@ def cmd_review(a):
         tried = []
         for prov in providers[role]:
             try:
-                r = RUNNERS[prov](staged[role], role, a.model if prov == "claude" else None, a.timeout)
+                pick = chosen_model[role]
+                model = pick[1] if pick and prov == pick[0] else (a.model if prov == "claude" else None)
+                r = RUNNERS[prov](staged[role], role, model, a.timeout)
                 r.update(reviewer=role, provider=prov, checkpoint=manifest.get("checkpoint"), fingerprint=fp_at_start)
                 if rnd:
                     r["manifest_stamp"] = manifest["stamp"]  # combine refuses it once the manifest is stamped again
@@ -471,6 +501,8 @@ def cmd_review(a):
         done = list(ex.map(run_role, ("visual", "behavior")))
     results, for_host = [], {}
     for role, r, tried in done:
+        for t in set_aside[role]:
+            print(f"  · {role}: skipped {t}", file=sys.stderr)
         for t in tried:
             print(f"  · {role}: skipped {t}", file=sys.stderr)
         if r is None:

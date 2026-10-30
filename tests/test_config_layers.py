@@ -802,7 +802,9 @@ def x19_every_provider_field_the_engine_reads_is_validated_globally():
     """Scan every engine script for the provider-entry fields it reads or writes (a constant key on `pv`/`prov`) and
     require each to be refused in the global file when wrong-shaped, or to be on EXEMPT with the reason it is not."""
     import ast
-    exempt = {}  # field -> "not validated because ..."; empty: every provider field the engine uses is validated
+    exempt = {"launch_model": "never read from a settings file: it exists only in memory, on a provider copy made by "
+                              "with_reviewer_choice / launch_cfg from agents.reviewer, so there is no file value to refuse"}
+    # field -> "not validated because ..."
     wrong = {"id": 5, "preset": 5, "command": "ls", "model": 1, "company": 1, "cost": 1, "variant": 1, "stdin": "yes",
              "for_risk": "high", "prefer_for": "both", "paid_ok_at": "2026-01-01"}
     found = set()
