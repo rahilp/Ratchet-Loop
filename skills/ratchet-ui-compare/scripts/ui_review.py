@@ -184,10 +184,32 @@ def _task(kind):
             f"(reviewer=\"{kind}\").")
 
 
+def runner_unready(name: str) -> str:
+    """'' when the runner can start now, else the plain reason it cannot. The one readiness test for the UI review
+    runners: claude and codex need their CLI on PATH, gemini needs GEMINI_API_KEY or GOOGLE_API_KEY (it calls the
+    HTTP API, not the gemini CLI). Reads PATH and the environment only. The run functions below raise this text, and
+    `ratchet.py models` shows it."""
+    if name in ("claude", "codex"):
+        return "" if shutil.which(name) else f"{name} CLI not on PATH"
+    if name == "gemini":
+        return "" if (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")) else "GEMINI_API_KEY not set"
+    return f"{name} is not a UI review runner"
+
+
+def skip_reason(name: str, host: str) -> str:
+    """'' when `name` is a UI review candidate for a host of company `host`, else why it is dropped before any run
+    (not one of the RUNNERS, or the host's own company). The one eligibility rule; role_providers applies it."""
+    if name not in RUNNERS:
+        return f"{name} is not a UI review provider (only {', '.join(RUNNERS)} run UI review)"
+    if PROVIDER_VENDOR.get(name) == host:
+        return f"same company as the host ({host}) — not an independent reviewer"
+    return ""
+
+
 def run_claude(td: Path, kind: str, model: str | None, timeout: int) -> dict:
+    if runner_unready("claude"):
+        raise RuntimeError(runner_unready("claude"))
     exe = shutil.which("claude")
-    if not exe:
-        raise RuntimeError("claude CLI not on PATH")
     cmd = [exe, "-p", _task(kind), "--append-system-prompt", agent_prompt(f"ratchet-{kind}-reviewer"),
            "--output-format", "json", "--json-schema", json.dumps(REVIEW_SCHEMA), "--tools", "Read",
            "--allowedTools", "Read", "--setting-sources", "", "--no-session-persistence"]
@@ -204,9 +226,9 @@ def run_claude(td: Path, kind: str, model: str | None, timeout: int) -> dict:
 
 
 def run_codex(td: Path, kind: str, model: str | None, timeout: int) -> dict:
+    if runner_unready("codex"):
+        raise RuntimeError(runner_unready("codex"))
     exe = shutil.which("codex")
-    if not exe:
-        raise RuntimeError("codex CLI not on PATH")
     last = td / f".{kind}-last.txt"
     cmd = [exe, "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--output-last-message", str(last)]
     for png in sorted(td.rglob("*.png")):
@@ -240,9 +262,9 @@ def parse_review(stdout: str, kind: str) -> dict:
 
 
 def run_gemini(td: Path, kind: str, model: str | None, timeout: int) -> dict:
+    if runner_unready("gemini"):
+        raise RuntimeError(runner_unready("gemini"))
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not key:
-        raise RuntimeError("GEMINI_API_KEY not set")
     model = model or os.environ.get("RATCHET_GEMINI_MODEL", "gemini-2.5-pro")
     parts = [{"text": agent_prompt(f"ratchet-{kind}-reviewer") + "\n\n" + (td / "INPUT.md").read_text()
               + "\n\nReturn ONLY JSON matching this schema:\n" + json.dumps(REVIEW_SCHEMA)}]
@@ -286,7 +308,7 @@ def role_providers(a) -> tuple[str, dict]:
     out = {}
     for role, override in (("visual", a.visual), ("behavior", a.behavior)):
         lst = override.split(",") if override else prefs.get(role) or ["gemini", "claude", "codex"]
-        out[role] = [p.strip() for p in lst if p.strip() in RUNNERS and PROVIDER_VENDOR.get(p.strip()) != host]
+        out[role] = [p.strip() for p in lst if p.strip() and not skip_reason(p.strip(), host)]
     return host, out
 
 

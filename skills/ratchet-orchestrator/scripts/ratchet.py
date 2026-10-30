@@ -435,6 +435,7 @@ class Ctx:
         layers = ((self.global_config() if glob is None else glob, self.global_config_path),
                   ((self.check_project_config(read_json(self.config_path, {})) if project is None else project) or {},
                    self.config_path))
+        self.settings_layers = [("global", layers[0][0]), ("project", layers[1][0])]  # what `models` explains
         for layer, path in layers:
             if check_roles:
                 self._check_role_settings(layer, path)
@@ -2520,19 +2521,169 @@ ROLE_PLAIN = {"ratchet-checkpoint-planner": "planning the steps", "ratchet-imple
               "ratchet-variant-writer": "disguised examples for high-risk checks"}
 
 
+_TIERS = ("strong", "standard", "light", "alternate")
+_SESSION_NOTE = "Ratchet can't switch a running session's model; start the session with that model to use it"
+
+
+def _layer_source(layers, key, name) -> str:
+    """'project', 'global' or 'builtin': the highest settings file whose `key` map names `name`."""
+    for label, layer in reversed(layers):
+        if isinstance(layer.get(key), dict) and name in layer[key]:
+            return label
+    return "builtin"
+
+
+def _sub_agent_detail(cfg, layers, role) -> dict:
+    """One sub-agent role: what was asked, what it really runs on, and why they differ (resolve_role plus the host's
+    model map). Reads settings only."""
+    r = resolve_role(layers, role, cfg)
+    host, hm = detect_host(cfg), host_model_map(cfg)
+    source = r["source"] if r["source"] in ("global", "project") else "builtin"
+    asked, used = r["asked"], r["used"]
+    friendly = role[len("ratchet-"):]
+    cant = f"the host ({host}) can't choose a model per sub-agent, so {friendly} runs on your session's model"
+    if r["reason"]:
+        choices = {v for k, v in hm.items() if k != "alternates" and isinstance(v, str)} - {"inherit"}
+        if "/" in str(asked):
+            reason = (f"a sub-agent runs on the host ({host}), so it can't use a model from another company's "
+                      f"provider; {friendly} keeps its own default model")
+        elif not choices and not hm.get("alternates"):
+            reason = cant
+        else:
+            reason = (f"{asked!r} is an unknown tier or model on this host ({host}); {friendly} keeps its own default "
+                      "model")
+        return {"role": role, "requested": asked, "effective": used, "source": source, "reason": reason}
+    tier = asked if asked is not None else DEFAULT_CONFIG["role_models"].get(role)
+    if tier in _TIERS:
+        have = hm.get("alternates") if tier == "alternate" else hm.get(tier)
+        if have or tier == "strong":
+            return {"role": role, "requested": tier, "effective": used, "source": source, "reason": ""}
+        reason = cant if not hm else (f"the host ({host}) has no entry for the {tier} tier, so {friendly} runs on "
+                                      "your session's model")
+        return {"role": role, "requested": tier, "effective": used, "source": source, "reason": reason}
+    known = {v for k, v in hm.items() if k != "alternates" and isinstance(v, str)} | set(hm.get("alternates") or [])
+    reason = ""
+    if tier and (hm.get("alternates") or len(known) > 1) and tier != "inherit" and tier not in known:
+        reason = (f"{tier!r} is an unknown tier or model on this host ({host}); it is passed on as written and the "
+                  "host may refuse it")
+    return {"role": role, "requested": tier or used, "effective": used, "source": source, "reason": reason}
+
+
+_AUTO_REVIEWER = "the best available provider for each review slot, this agent when none is"
+
+
+def _reviewer_detail(ctx, cfg, layers) -> dict:
+    """The `reviewer` row. A provider/model request is explained from the recorded availability (reviewer_availability
+    reads files and looks for the CLI on PATH; it never runs one). Selection itself is not touched."""
+    source = _layer_source(layers, "agents", "reviewer")
+    spec = (cfg.get("agents") or {}).get("reviewer")
+    if not isinstance(spec, str) or not spec.strip():
+        return {"role": "reviewer", "requested": "automatic", "source": "builtin", "reason": "",
+                "effective": _AUTO_REVIEWER}
+    own = _AUTO_REVIEWER  # an excluded request changes nothing: reviewers still pick by review_depth, as when unset
+    prov, slash, model = spec.partition("/")
+    if not slash:
+        return {"role": "reviewer", "requested": spec, "effective": own, "source": source,
+                "reason": f"{spec!r} is a model, not provider/model, so it picks no outside reviewer"}
+    rid = f"{prov}-both"
+    if _roster_spec(cfg, rid) is None:
+        return {"role": "reviewer", "requested": spec, "effective": own, "source": source,
+                "reason": f"provider {prov!r} is unavailable: it is not set up in this project"}
+    okay, why = reviewer_availability(ctx, cfg, rid)
+    if okay:
+        # Real selection also uses the per-lens ids; one marked unavailable falls back for that slot only.
+        down = {lens: w for lens in ("standards", "correctness") if _roster_spec(cfg, f"{prov}-{lens}") is not None
+                for ok2, w in [reviewer_availability(ctx, cfg, f"{prov}-{lens}")] if not ok2}
+        part = ""
+        if down:
+            names = {"standards": "code-standards", "correctness": "bugs"}
+            used = [f"the {names[x]} slot" for x in ("standards", "correctness") if x not in down]
+            fell = [f"the {names[x]} slot falls back automatically ({w})" for x, w in down.items()]
+            part = f"{prov} is used for " + (" and ".join(used) if used else "no single-lens slot") + "; " + "; ".join(fell)
+        return {"role": "reviewer", "requested": spec, "effective": plain_reviewer(cfg, rid, model), "source": source,
+                "reason": part}
+    if why.startswith(("failed recently", "'")):
+        why = f"{prov} is unavailable: {why}"
+    elif why.startswith("costs money"):
+        why += " (needs paid approval; consent is not recorded and this view grants none)"
+    return {"role": "reviewer", "requested": spec, "effective": own, "source": source, "reason": why}
+
+
+def _ui_review_module():
+    """ui_review.py, loaded by path: its UI review rules (skip_reason, runner_unready) are the one copy the real run and
+    this view share."""
+    import importlib.util
+    path = Path(__file__).resolve().parents[2] / "ratchet-ui-compare" / "scripts" / "ui_review.py"
+    spec = importlib.util.spec_from_file_location("ratchet_ui_review", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _ui_reviewer_detail(ctx, cfg, layers) -> list[dict]:
+    """One row per UI review lens, by the UI review path's own rule (ui_review.py): only claude, codex and gemini
+    run, never the host's company, tried in the listed order; claude and codex need their CLI on PATH, gemini needs
+    GEMINI_API_KEY or GOOGLE_API_KEY. That path applies no benches and no paid check, so neither does this view; it
+    says so when the first runner is per-use paid with no recorded OK. Reads PATH and the environment only."""
+    ui, host, out = _ui_review_module(), detect_host(cfg), []
+    defaults = DEFAULT_CONFIG.get("ui_reviewers") or {}
+    for lens, names in sorted((cfg.get("ui_reviewers") or {}).items()):
+        names = [n for n in names if isinstance(n, str)] if isinstance(names, list) else []
+        why, pick = "", None
+        for n in names:
+            w = ui.skip_reason(n.strip(), host) or (f"{n} is unavailable: {ui.runner_unready(n.strip())}"
+                                                    if ui.runner_unready(n.strip()) else "")
+            if not w:
+                pick = n.strip()
+                break
+            why = why or w
+        if pick and per_use_unapproved(provider_by_id(cfg, pick)):
+            why = (why + "; " if why else "") + (f"{pick} costs money per use and the UI review path does not check "
+                                                 "paid consent; tracked to be closed")
+        same = (cfg.get("ui_reviewers") or {}).get(lens) == defaults.get(lens)
+        out.append({"role": f"ui-reviewer-{lens}", "requested": ", ".join(names), "effective": pick or "this agent",
+                    "source": "builtin" if same else _layer_source(layers, "ui_reviewers", lens),
+                    "reason": "" if pick and pick == names[0] and not why else why})
+    return out
+
+
+def models_detail(ctx, cfg, layers) -> list[dict]:
+    """Every role's {role, requested, effective, source, reason}, from the settings and recorded status only: no
+    provider is contacted and nothing is written or spent."""
+    out = [_sub_agent_detail(cfg, layers, role) for role in sorted(ROLE_PLAIN)]
+    for role in ("orchestrator", "director"):
+        spec = (cfg.get("agents") or {}).get(role)
+        asked = spec if isinstance(spec, str) and spec.strip() else None
+        out.append({"role": role, "requested": asked or "inherit", "effective": "inherit",
+                    "source": _layer_source(layers, "agents", role) if asked else "builtin",
+                    "reason": _SESSION_NOTE if asked else ""})
+    out.append(_reviewer_detail(ctx, cfg, layers))
+    return out + _ui_reviewer_detail(ctx, cfg, layers)
+
+
 def cmd_models(args):
-    """Which model each role uses on this host, so the orchestrator can pass it when it spawns a sub-agent."""
-    cfg = Ctx(find_root()).config()
+    """Which model each role uses on this host (the old `roles` rows and JSON fields), plus `detail`: for every role
+    what was requested, what is really used, which settings level asked (builtin, global, project) and, when they
+    differ, one plain reason. Read-only: it reads settings and recorded provider status, never runs a CLI."""
+    ctx = Ctx(find_root())
+    cfg = ctx.config()
     rows = models_table(cfg)
+    detail = models_detail(ctx, cfg, ctx.settings_layers)
     for line in _agent_notes(cfg):
         print(line, file=sys.stderr)
     if args.json:
         print(json.dumps({"host": detect_host(cfg), "roles": dict(rows),
-                          "alternates": host_model_map(cfg).get("alternates") or []}, indent=2))
+                          "alternates": host_model_map(cfg).get("alternates") or [], "detail": detail}, indent=2))
         return
     print(f"Host: {detect_host(cfg)}. Spawn each role's sub-agent with this model (inherit = your own model):")
     for role, m in rows:
         print(f"  {role:<28} {m}")
+    print("\nAsked for versus really used, and which settings level asked (builtin, global or project):")
+    for e in detail:
+        print(f"  {e['role']:<28} asked {_plain_model(e['requested'])}; uses {_plain_model(e['effective'])}; "
+              f"from {e['source']}")
+        if e["reason"]:
+            print(f"  {'':<28} why: {e['reason']}")
 
 
 def _review_preview(ctx, cfg, cp) -> tuple[list[str], bool]:
