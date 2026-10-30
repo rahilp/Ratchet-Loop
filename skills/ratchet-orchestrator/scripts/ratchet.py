@@ -82,7 +82,7 @@ from run_records import (_set_blocked, ratchet_home, _hook_env_path, _same_path,
                          register_active, choice_letter, message_intent, hooks_waive_intent, is_listed_yes,
                          approval_snapshot, integrity_problems, verify_integrity)
 from plan_support import (objective_problems, _proves_values, proves_problems, objective_brief,  # noqa: E402
-                          _normalize_role, ROLE_BRIEFS, ROLE_ORDER, NO_OBJECTIVE_NOTE, _digest_words,
+                          _normalize_role, ROLE_BRIEFS, ROLE_ORDER, ROLE_ALIASES, NO_OBJECTIVE_NOTE, _digest_words,
                           _learnings_bullets, _related_spec_items, _earlier_work_lines,
                           _BULLET_HEAD_RE, _ACCEPTED_FINDING_MARKER_RE)
 from status_text import (plain_reason, blocked_options, plain_now, waiting_question, question_line,  # noqa: E402
@@ -149,6 +149,9 @@ AGENT_HOST_ROLES = ("orchestrator", "director", "reviewer")
 
 def agent_roles() -> list[str]:
     return [r[len("ratchet-"):] for r in sorted(ROLE_PLAIN)] + list(AGENT_HOST_ROLES)
+
+
+UNKNOWN_MODEL_MARK = "not a model Ratchet knows"  # the words of the refusal for a misspelled agents model (the launch guard keys on them)
 
 
 class Ctx:
@@ -439,6 +442,7 @@ class Ctx:
         for layer, path in layers:
             if check_roles:
                 self._check_role_settings(layer, path)
+                self._check_provider_keys(layer, path)
             # a role named by `agents` or `role_models` in this layer replaces the other key's value from a lower one
             rm = layer.get("role_models")
             if isinstance(out.get("agents"), dict) and isinstance(rm, dict):
@@ -474,19 +478,46 @@ class Ctx:
                 die(f"{path} sets the same role twice: 'agents.{name}' and 'role_models.ratchet-{name}'. Keep one of "
                     "them (agents is the simple one), then run this command again.")
 
+    def _check_provider_keys(self, layer, path):
+        """One settings file's `providers`: `launch_model` is the in-memory key the choice logic sets (with_reviewer_choice),
+        so a hand-written one is refused naming the key and the file, and `models` (the models a provider says it offers,
+        which agents.reviewer is checked against) must be a non-empty list of names. Stops naming the file."""
+        provs = layer.get("providers")
+        for i, entry in enumerate(provs if isinstance(provs, list) else []):
+            if not isinstance(entry, dict):
+                continue
+            if "launch_model" in entry:
+                die(f"{path} 'providers[{i}].launch_model' can't be written by hand: Ratchet sets it in memory when "
+                    "agents.reviewer picks a model. Remove that key from the file (choose a model with agents.reviewer "
+                    "instead), then run this command again.")
+            ms = entry.get("models")
+            if "models" in entry and not (isinstance(ms, list) and ms and all(isinstance(m, str) and m.strip() for m in ms)):
+                die(f"{path} 'providers[{i}].models' must be a non-empty list of the model names this provider offers "
+                    f"(got {json.dumps(ms)[:60]}). Fix that setting in the file, then run this command again.")
+
     def _check_agent_choices(self, layers, cfg, strict=(), write_path=None):
         """Each `agents` value is a model or provider/model (split at the first '/'). A provider must be a known one (a
         preset or a configured provider id, from either file); a bare `agents.reviewer` must be a known provider (or a
-        known model, which picks no outside reviewer). A bare model this host cannot use is not an error at
-        load, whatever it is (one machine-wide file must load on every host; the role keeps its role_models/default
-        model and _agent_notes says so). Only a role in `strict` (being written by config --set) is refused, on the host
-        doing the write and only when that host declares a model list, and only in the file being written (write_path);
-        the other file is checked as at load. The model after a provider's '/' is the
-        provider's own to accept."""
+        known model, which picks no outside reviewer). The model itself is tolerant at load, whatever it is: a bare
+        model this host cannot use, a name nothing knows (a typo such as sonet) and a provider/model the provider's
+        `models` list does not hold all load (one machine-wide file must load on every host, and a typo must never
+        block `config`, `models`, `status` or the `--unset` that repairs it); the role keeps its role_models/default
+        model and _agent_notes and `models` say so. The refusals are where work starts: brief and the launch guard
+        (agent_model_problem), plan-submit and a `reviewers` that would open a round (reviewer_offer_problem), and the UI review launch (ui_review.py). Only a role in `strict` (being written
+        by config --set) is refused for a name nothing knows, or (on the host doing the write, only when that host
+        declares a model list) one this host can't use, and only in the file being written (write_path); the other file
+        is checked as at load. The model after a provider's '/' is the provider's own to accept."""
         provs = sorted(set(PRESETS) | {p.get("id") for p in cfg.get("providers") or [] if isinstance(p, dict)})
         allowed = _host_bare_models(cfg)  # None: this host declares no models, so any bare name is accepted
         models = allowed or _known_bare_models(cfg)
         for layer, path in layers:
+            for role, spec in (layer.get("role_models") or {}).items():
+                if f"role_models.{role}" in strict and path == write_path and role in ROLE_PLAIN:
+                    known = _unknown_role_model_names(cfg, role[len("ratchet-"):], f"role_models.{role}", spec)
+                    if known is not None:  # writing a typo is refused here too; one already in a file still loads
+                        die(f"{path} 'role_models.{role}' is {spec!r}, which is {UNKNOWN_MODEL_MARK}; the valid names "
+                            f"are: {', '.join(sorted(known))} (or a full model id such as claude-opus-4-1). Choose one "
+                            "of those.")
             for name, spec in (layer.get("agents") or {}).items():
                 prov, slash, model = spec.partition("/") if isinstance(spec, str) else ("", "", "")
                 if not (isinstance(spec, str) and spec.strip() and (not slash or (prov.strip() and model.strip()))):
@@ -497,6 +528,12 @@ class Ctx:
                         f"are: {', '.join(provs)}. Write the value as provider/model or just a model.")
                 if slash:
                     continue
+                if name in strict and path == write_path and name != "reviewer":
+                    known = _unknown_model_names(cfg, name, spec)
+                    if known is not None:  # writing a typo is refused; one already in a file still loads (see above)
+                        die(f"{path} 'agents.{name}' is {spec!r}, which is {UNKNOWN_MODEL_MARK}; the valid names "
+                            f"are: {', '.join(sorted(known))} (or a full model id such as claude-opus-4-1, or "
+                            "provider/model). Choose one of those.")
                 if name == "reviewer" and spec not in provs and spec not in models:
                     die(f"{path} 'agents.reviewer' is {spec!r}, which is not a known provider; the known providers are: "
                         f"{', '.join(provs)}. Write the value as a provider or provider/model.")
@@ -1727,6 +1764,10 @@ def _custom_providers_sha(cfg) -> str:
     return _sha(rows)
 
 
+LAUNCH_MODEL_LINE = "Launch with model: "
+_ENGINE_ROLE = {v: k for k, v in ROLE_ALIASES.items()}  # brief role -> agent name (reviewer is the ratchet-adversary agent)
+
+
 def cmd_brief(args):
     """`brief [CPn] --role <role>`: the one place every Ratchet sub-agent's opening text comes from, so the
     orchestrator spawns a sub-agent with `ratchet.py brief CPn --role <role>` instead of retyping or half-remembering
@@ -1742,7 +1783,11 @@ def cmd_brief(args):
     gets the plain NO_OBJECTIVE_NOTE instead of a crash. An unknown CPn is refused by `cp_by_id`, the same shared
     lookup every other command uses. The planner's brief, and only the planner's, ends with one more block: the
     "What earlier work says" section from `_earlier_work_lines` (see there), so the plan builds on what earlier
-    work in this project already learned instead of rediscovering or contradicting it."""
+    work in this project already learned instead of rediscovering or contradicting it. When the developer picked a
+    model for this role (chosen_launch: `agents.<role>` or `role_models`, either settings file), one more line,
+    `Launch with model: <model>`, follows the header; none is printed when nothing was picked. Reading the settings
+    here means a damaged one stops `brief`, naming the file, as every other command does; so does a misspelled model
+    for this role (agent_model_problem), though that one still loads everywhere else."""
     role = _normalize_role(args.role)
     if role is None:
         die(f"'{args.role}' is not a valid role for brief. Valid roles: {', '.join(ROLE_ORDER)} (or an agent name "
@@ -1758,6 +1803,14 @@ def cmd_brief(args):
         header = f"Brief for the {role} (no checkpoint yet)"
     print(header)
     print("")
+    cfg = ctx.config()
+    bad = agent_model_problem(ctx, cfg, _ENGINE_ROLE.get(role, role))
+    if bad:  # a misspelled model is refused where work starts, not at load (so it stays repairable)
+        die(bad)
+    pick = chosen_launch(cfg, ctx.settings_layers, "ratchet-" + _ENGINE_ROLE.get(role, role))
+    if pick:  # the model the developer chose: the launch guard refuses a launch of this sub-agent on any other
+        print(f"{LAUNCH_MODEL_LINE}{pick['model']}")
+        print("")
     st, _why = _read_record(ctx.state_path())
     plan = _plan_for_briefs(plan, st)  # the approved done-means lines once approved (CP4), see _plan_for_briefs
     print(objective_brief(plan, _done_means_proof_notes(ctx, plan, st)))
@@ -2553,6 +2606,10 @@ def _sub_agent_detail(cfg, layers, role) -> dict:
         if friendly in LENS_CHOICE_ROLES and reviewer_choice(cfg, friendly):
             reason = (f"{asked!r} picks the outside provider for the UI review, not this sub-agent's model; "
                       f"{friendly} keeps its own default model")
+        elif (known := _unknown_model_names(cfg, friendly, asked)) is not None:
+            reason = (f"{asked!r} is an unknown tier or model on this host ({host}) and invalid: it is "
+                      f"{UNKNOWN_MODEL_MARK} (the valid names are: {', '.join(sorted(known))}); `brief` and the "
+                      f"launch guard refuse it until it is fixed, and {friendly} keeps its own default model")
         elif "/" in str(asked):
             reason = (f"a sub-agent runs on the host ({host}), so it can't use a model from another company's "
                       f"provider; {friendly} keeps its own default model")
@@ -2563,6 +2620,12 @@ def _sub_agent_detail(cfg, layers, role) -> dict:
                       "model")
         return {"role": role, "requested": asked, "effective": used, "source": source, "reason": reason}
     tier = asked if asked is not None else DEFAULT_CONFIG["role_models"].get(role)
+    if asked is not None and (known := _unknown_role_model_names(cfg, friendly, "role_models." + role, asked)) is not None:
+        # a role_models value nothing knows is judged like a misspelled agents one: invalid, never shown as used
+        return {"role": role, "requested": asked, "effective": resolve_role([], role, cfg)["used"], "source": source,
+                "reason": (f"{asked!r} is an unknown tier or model on this host ({host}) and invalid: it is "
+                           f"{UNKNOWN_MODEL_MARK} (the valid names are: {', '.join(sorted(known))}); `brief` and the "
+                           f"launch guard refuse it until it is fixed, and {friendly} keeps its own default model")}
     if tier in _TIERS:
         have = hm.get("alternates") if tier == "alternate" else hm.get(tier)
         if have or tier == "strong":
@@ -2610,7 +2673,13 @@ def _reviewer_detail(ctx, cfg, layers) -> dict:
                     "reason": f"{spec!r} is a model, not provider/model, so it picks no outside reviewer"}
         return {"role": "reviewer", "requested": spec, "effective": own, "source": source,
                 "reason": f"provider {prov!r} is unavailable: it is not set up in this project"}
+    offered = (provider_by_id(cfg, prov) or {}).get("models")
+    if "/" in spec and model and isinstance(offered, list) and offered and model not in offered:
+        return {"role": "reviewer", "requested": spec, "effective": own, "source": source,
+                "reason": f"provider {prov!r} does not offer the model {model!r} (it offers: "
+                          f"{', '.join(map(str, offered))}); `reviewers` and `plan-submit` refuse it until it is fixed"}
     rid = f"{prov}-both"
+    applied = False
     problem = reviewer_model_problem(provider_by_id(cfg, prov)) if model else None
     low = {"id": "models", "risk": "low"}
     first = _real_first_reviewer(ctx, cfg)  # the real selection on the config as written: the choice is applied per slot
@@ -2649,8 +2718,11 @@ def _reviewer_detail(ctx, cfg, layers) -> dict:
             # the first slot keeps its written model: say so with the words reviewer_choice_notes already has
             notes = [n.replace("RATCHET note: ", "") for n in reviewer_choice_notes(cfg, low)]
             part = "; ".join(x for x in (part, *notes) if x)
-        return {"role": "reviewer", "requested": spec, "effective": plain_reviewer(cfg, rid, None if problem else model),
-                "source": source, "reason": part}
+        shown = plain_reviewer(cfg, rid, None if problem else model)
+        entry = provider_by_id(cfg, prov) or {}
+        if model and applied and not entry.get("models") and model != entry.get("model"):
+            shown += " (model not verified: the provider declares no models it offers, so it is passed on as written)"
+        return {"role": "reviewer", "requested": spec, "effective": shown, "source": source, "reason": part}
     if why.startswith(("failed recently", "'", "it already has")):
         why = f"{prov} is unavailable: {why}"
     elif why.startswith("costs money"):
@@ -2682,6 +2754,7 @@ def _ui_reviewer_detail(ctx, cfg, layers) -> list[dict]:
         why, pick = "", None
         for n in names:
             w = (ui.skip_reason(n, host)
+                 or ui_lens_model_problem(cfg, lens, n, chose)
                  or (f"{n} {paid_no_ok_reason(ui_lens_provider(cfg, n, chose))}"
                      if per_use_unapproved(ui_lens_provider(cfg, n, chose)) else "")
                  or (f"{n} is unavailable: {ui.runner_unready(n)}" if ui.runner_unready(n) else ""))
@@ -2691,10 +2764,21 @@ def _ui_reviewer_detail(ctx, cfg, layers) -> list[dict]:
             why = why or w
         same = not chose and (cfg.get("ui_reviewers") or {}).get(lens) == defaults.get(lens)
         shown = f"{pick}/{model}" if pick and model and chose and pick == chose[0] else pick
+        offered = (provider_by_id(cfg, pick) or {}).get("models") if pick else None
+        if shown != pick and not (isinstance(offered, list) and offered) and not why:
+            why = (f"the model {model!r} is not verified: provider {pick!r} declares no models list, so it is passed "
+                   "to the runner as written")  # applied, but nothing could check it
+        spec = (cfg.get("agents") or {}).get(f"{lens}-reviewer")
+        known = _unknown_model_names(cfg, f"{lens}-reviewer", spec) if not chose else None
+        if known is not None:  # a misspelled bare model: it picks no runner and is never launched
+            why = (f"{spec!r} is invalid: it is {UNKNOWN_MODEL_MARK} (the valid names are: {', '.join(sorted(known))}); "
+                   f"the {lens} lens ignores it and keeps its listed order") + (f"; {why}" if why else "")
         out.append({"role": f"ui-reviewer-{lens}", "requested": ", ".join(names), "effective": shown or "this agent",
                     "source": ("builtin" if same else _layer_source(layers, "agents", f"{lens}-reviewer")
                                if chose else _layer_source(layers, "ui_reviewers", lens)),
                     "reason": "" if pick and pick == names[0] and not why else why})
+        if known is not None or (shown != pick and why.startswith("the model ")):
+            out[-1]["reason"] = why  # shown even when the first runner is the one used
     return out
 
 
@@ -4078,6 +4162,22 @@ def ui_lens_provider(cfg, name, choice):
     return dict(pv, launch_model=choice[1]) if pv and choice and choice[1] and choice[0] == name else pv
 
 
+def ui_lens_model_problem(cfg, lens, name, choice) -> str:
+    """Plain words for why the UI review must not start runner `name` on the model `choice` (the (provider, model)
+    agents.<lens>-reviewer picked) gave it, else '': the choice names `name`, the provider declares the models it offers
+    (`models`) and the model is not one of them. A provider that declares nothing passes the model through, so it is
+    never refused here (`models` says not verified). Names the model, the provider and the offered list. It is a
+    refusal for that runner only: the review goes on with the next free runner or the host; nothing is ever approved."""
+    if not (choice and choice[1] and choice[0] == name):
+        return ""
+    offered = (provider_by_id(cfg, name) or {}).get("models")
+    if not (isinstance(offered, list) and offered and choice[1] not in offered):
+        return ""
+    return (f"agents.{lens}-reviewer = '{name}/{choice[1]}' was not used: provider {name!r} does not offer the model "
+            f"{choice[1]!r} (not offered by {name}; it offers: {', '.join(map(str, offered))}), so {name} was not "
+            "started; choose one of those or `ratchet.py config --unset agents." + lens + "-reviewer`")
+
+
 def ui_lens_order(cfg, lens) -> tuple[list[str], str | None]:
     """(UI review runner names for `lens` in the order tried, the model chosen for the first): the lens's
     ui_reviewers list with the provider `agents.<lens>-reviewer` names moved to the front. The host's own sub-agents
@@ -4320,6 +4420,128 @@ def role_model(cfg, role) -> str:
     """The model a role runs on (resolve_role over the effective config)."""
     r = resolve_role([cfg], role, cfg)
     return r["used"] if r else "inherit"
+def chosen_launch(cfg, layers, role) -> dict | None:
+    """The model a developer explicitly picked for sub-agent `role` (its engine name, `ratchet-<name>`), as
+    {"model", "source", "key"}, or None when nothing was picked: only a value written in the machine-wide or the
+    project's file counts (`agents.<name>`, else the older `role_models`; the project's wins, resolve_role), never the
+    shipped default or `inherit`. An `agents` choice this host cannot apply yields the explicit `role_models` value at
+    or below it (what the role really runs on), or nothing when only the default is left. `key` is the setting to name when talking to the
+    developer's agent. This is the one place `brief` (the `Launch with model:` line) and the launch guard get the model
+    from, so they cannot disagree with the `models` view."""
+    r = resolve_role(layers, role, cfg)
+    if not r or r["source"] not in ("global", "project") or r["used"] in (None, "", "inherit"):
+        return None
+    if r["reason"]:  # the `agents` choice can't apply on this host: an explicit role_models value at or below it still does
+        named = [(l if isinstance(l, tuple) else (f"layer {i + 1}", l)) for i, l in enumerate(layers)]
+        idx = [n for n, _ in named].index(r["source"])
+        for label, low in reversed(named[:idx + 1]):
+            if role in (low.get("role_models") or {}):
+                return {"model": r["used"], "source": label, "key": f"role_models.{role}"}
+        return None  # only the shipped default is left: nothing was picked
+    layer = dict(layers).get(r["source"]) or {}
+    friendly = role[len("ratchet-"):]
+    key = f"agents.{friendly}" if (layer.get("agents") or {}).get(friendly) else f"role_models.{role}"
+    return {"model": r["used"], "source": r["source"], "key": key}
+
+
+def _unknown_model_names(cfg, name, spec):
+    """The valid bare model names (a set) when `spec`, the bare value of agents.<name>, is a name nothing knows (a typo
+    such as sonet), else None. Judged against every host's table and every provider's `models` list (one machine-wide
+    file must load on every host, so a gpt or gemini name is fine on a Claude host), plus the family of a full model id
+    the tables cannot judge (claude-opus-4-1 is "not verified", never a typo). A reviewer value, a provider/model value
+    and a UI lens naming a provider are not model names and are never judged here."""
+    if not isinstance(spec, str) or "/" in spec or name == "reviewer":
+        return None
+    provs = set(PRESETS) | {p.get("id") for p in cfg.get("providers") or [] if isinstance(p, dict)}
+    if name in LENS_CHOICE_ROLES and spec in provs:
+        return None
+    known = _known_bare_models(cfg) | {m for p in cfg.get("providers") or [] if isinstance(p, dict)
+                                       for m in (p.get("models") if isinstance(p.get("models"), list) else [])}
+    return None if spec.strip() in known or company_of_model(spec) is not None else known
+
+
+def _winning_agents_setting(ctx, name):
+    """(file path, value) of the settings file that decides `agents.<name>` (the project's wins over the machine-wide
+    file, as resolve_role walks them), or None when none sets it or a role_models entry in a higher file replaces it.
+    Needs ctx.config() to have run (it fills ctx.settings_layers)."""
+    paths = {"global": ctx.global_config_path, "project": ctx.config_path}
+    for label, layer in reversed(getattr(ctx, "settings_layers", None) or []):
+        if name in (layer.get("agents") or {}):
+            return paths[label], layer["agents"][name]
+        if "ratchet-" + name in (layer.get("role_models") or {}):
+            return None
+    return None
+
+
+def _winning_model_settings(ctx, name) -> list:
+    """[(file path, setting key, value)] that decide the model of sub-agent role `name` (its short name), read through
+    both routes the way resolve_role walks the settings files (the project's wins over the machine-wide file; in one
+    file `agents.<name>` or the older `role_models.ratchet-<name>`). The first entry is the winner; when that is an
+    `agents` value, a second entry is the `role_models` value at or below it (what the role falls back to when the
+    `agents` choice can't apply here). Empty when nothing is set. Needs ctx.config() to have run."""
+    paths = {"global": ctx.global_config_path, "project": ctx.config_path}
+    layers = list(getattr(ctx, "settings_layers", None) or [])
+    for i in range(len(layers) - 1, -1, -1):
+        label, layer = layers[i]
+        if (layer.get("agents") or {}).get(name):
+            out = [(paths[label], f"agents.{name}", layer["agents"][name])]
+            for low_label, low in reversed(layers[:i + 1]):
+                if "ratchet-" + name in (low.get("role_models") or {}):
+                    out.append((paths[low_label], f"role_models.ratchet-{name}", low["role_models"]["ratchet-" + name]))
+                    break
+            return out
+        if "ratchet-" + name in (layer.get("role_models") or {}):
+            return [(paths[label], f"role_models.ratchet-{name}", layer["role_models"]["ratchet-" + name])]
+    return []
+
+
+def _unknown_role_model_names(cfg, name, key, spec):
+    """_unknown_model_names for a value written under `key`: a `role_models` value may also be a tier (strong, standard,
+    light, alternate), which is always valid, and the valid names then list the tiers too."""
+    known = _unknown_model_names(cfg, name, spec)
+    if known is None or not key.startswith("role_models."):
+        return known
+    return None if spec in _TIERS else known | set(_TIERS)
+
+
+def agent_model_problem(ctx, cfg, name) -> str | None:
+    """The refusal message for sub-agent role `name` (its short name, such as implementer) when the model chosen for it
+    is a name nothing knows (_unknown_model_names), else None. The choice is read through both routes, `agents.<name>`
+    and the older `role_models.ratchet-<name>`, in either settings file (_winning_model_settings): the winning one is
+    judged, and so is the role_models value an inapplicable `agents` choice falls back to. Names the model, the file,
+    the setting and the valid names. Loading stays tolerant (so `config --unset` can repair it); `brief` and the launch
+    guard use this to refuse the launch itself."""
+    sets = _winning_model_settings(ctx, name)
+    if len(sets) > 1 and not (resolve_role(ctx.settings_layers, "ratchet-" + name, cfg) or {}).get("reason"):
+        sets = sets[:1]  # the agents choice applies, so the role_models value below it decides nothing
+    for path, key, value in sets:
+        known = _unknown_role_model_names(cfg, name, key, value)
+        if known is not None:
+            return (f"{path} '{key}' is {value!r}, which is {UNKNOWN_MODEL_MARK}; the valid names are: "
+                    f"{', '.join(sorted(known))} (or a full model id such as claude-opus-4-1). Nothing was launched. Fix "
+                    f"it with `ratchet.py config --unset {key}` (add --global if it is in the machine-wide file) or "
+                    f"`config --set {key}=<valid name>`, then try again.")
+    return None
+
+
+def reviewer_offer_problem(ctx, cfg) -> str | None:
+    """The refusal message when `agents.reviewer` is provider/model, the provider declares the models it offers
+    (`models`) and the model is not one of them, else None: a provider that declares nothing passes the model through
+    ("not verified" in `models`). Names the model, the provider, the file and the offered list. Loading stays tolerant;
+    `plan-submit`, and `reviewers` only where a round would open (never when it shows an open round or skips a docs-only step), use this to refuse before a round opens or a test request is spent."""
+    won = _winning_agents_setting(ctx, "reviewer")
+    if not won or not isinstance(won[1], str) or "/" not in won[1]:
+        return None
+    prov, model = _choice_parts(won[1])
+    offered = (provider_by_id(cfg, prov) or {}).get("models")
+    if not (model and isinstance(offered, list) and offered and model not in offered):
+        return None
+    return (f"{won[0]} 'agents.reviewer' is {won[1]!r}, but provider {prov!r} does not offer the model {model!r}; the "
+            f"models it offers are: {', '.join(map(str, offered))}. Nothing was started. Choose one of those with "
+            "`ratchet.py config --set agents.reviewer=<provider>/<model>` (add --global if it is in the machine-wide "
+            "file), or `config --unset agents.reviewer`, or fix the provider's 'models' list, then try again.")
+
+
 HOST_HINTS = [  # environment variables the common agent CLIs set for the tools they run
     ("anthropic", ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")),
     ("openai", ("CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED")),
@@ -4751,7 +4973,9 @@ def cmd_plan_submit(args):
     plan-extend applies that last check only to the lines feedback added since the approval snapshot, so a plan
     approved before it keeps working."""
     ctx = Ctx(find_root())
-    ctx.config()  # a wrong agents/role_models setting stops here, naming its file, before the plan is submitted
+    bad = reviewer_offer_problem(ctx, ctx.config())  # a wrong agents/role_models setting stops here, naming its file,
+    if bad:  # and so does a reviewer model the provider does not offer, before the plan is submitted
+        die(bad)
     st = ctx.state()
     if st["phase"] not in ("planning", "awaiting_plan_approval"):
         die(f"plan-submit only allowed while planning (phase is {st['phase']}). Use plan-extend for feedback.")
@@ -14986,6 +15210,9 @@ def cmd_reviewers(args):
     else:
         pin_changed = sorted(rnd.get("reviewers_pin") or []) != sorted(cp.get("reviewers") or [])
     if not rnd or rnd.get("recorded") or rnd["fingerprint"] != fp or pin_changed:
+        bad = reviewer_offer_problem(ctx, cfg)  # work-start only: not when showing an open round, not when the review is skipped
+        if bad:  # a model the provider does not offer: refused before a round opens or a test request is spent
+            die(bad)
         ci = _checkin_state(cps)
         if ci.get("open"):
             die(f"{args.cp}: a check-in is open from round {ci['open']['round']} (reviews have been dragging). "
@@ -15696,6 +15923,9 @@ def cmd_config(args):
         strict = {kv.partition("=")[0].split(".")[1] for kv in sets if kv.startswith("agents.")}
         if any(kv.partition("=")[0] == "agents" for kv in sets):
             strict |= set(agent_roles())  # a whole agents object: every role in it is checked as written
+        strict |= {kv.partition("=")[0] for kv in sets if kv.partition("=")[0].startswith("role_models.")}
+        if any(kv.partition("=")[0] == "role_models" for kv in sets):
+            strict |= {"role_models." + r for r in ROLE_PLAIN}  # the older key, the same check: "role_models.<engine name>"
         ctx.validate_candidate(user, project=not args.glob, strict=strict)  # what is written must load: refused before the write
         if sets or user != before:
             write_json(path, user)
@@ -18362,11 +18592,41 @@ def _brief_guard(n: dict, root: Path) -> str | None:
     plan = _plan_for_briefs(ctx.plan(), st)  # the approved done-means lines (CP4), the same ones brief prints
     expected = re.sub(r"\s+", " ", objective_brief(plan, _done_means_proof_notes(ctx, plan, st))).strip()
     got = re.sub(r"\s+", " ", str(n["input"].get("prompt") or n["prompt"] or "")).strip()
-    if expected and expected in got:
-        return None
-    cp = (st or {}).get("current") or "CPn"
-    return (f"RATCHET GUARD: this sub-agent's prompt is missing the plan's objective. Start its prompt with the "
-            f"output of `$RATCHET brief {cp} --role {role}`, then the rest of the prompt.")
+    problems = []
+    if not (expected and expected in got):
+        cp = (st or {}).get("current") or "CPn"
+        problems.append(f"RATCHET GUARD: this sub-agent's prompt is missing the plan's objective. Start its prompt with "
+                        f"the output of `$RATCHET brief {cp} --role {role}`, then the rest of the prompt.")
+    problems += _model_guard(n, ctx)
+    return " ".join(problems) or None
+
+
+def _model_guard(n: dict, ctx) -> list[str]:
+    """The refusal (as a list of one message, else []) of a launch of a `ratchet-<role>` sub-agent whose `model` is not
+    the one the developer picked for that role (chosen_launch: `agents.<role>` or `role_models`, global or project, the
+    project's wins). A launch that names no model would inherit the parent session's, which is refused too. A role with
+    no pick is never refused (the shipped defaults stay advisory), and neither is an agent that is not a Ratchet role.
+    A role whose chosen model is a misspelled name is refused too (agent_model_problem), whatever the launch names.
+    Reading the settings can stop (a damaged file calls `die`); that is deliberately not caught, so `run_hook` fails
+    open and records the crash, like any other guard crash. Same rule for the older `Task` tool name and `Agent`."""
+    tok = str(n["input"].get("subagent_type") or "").rsplit(":", 1)[-1]
+    if tok not in ROLE_PLAIN:
+        return []
+    cfg = ctx.config()  # a damaged settings file stops here on purpose: run_hook fails open and records the crash
+    bad = agent_model_problem(ctx, cfg, tok[len("ratchet-"):])
+    if bad:
+        return [f"RATCHET GUARD: this launch was refused because a setting names a model Ratchet does not know. {bad}"]
+    pick = chosen_launch(cfg, ctx.settings_layers, tok)
+    if not pick:
+        return []
+    got = n["input"].get("model")
+    got = got.strip() if isinstance(got, str) else ""
+    if got.lower() == pick["model"].lower():
+        return []
+    now = (f"names the model {got!r}" if got and got != "inherit"
+           else "names no model, so it would inherit the parent session's model")
+    return [f"RATCHET GUARD: {tok} is set to run on {pick['model']} (from {pick['key']}), but this launch {now}. "
+            f"Relaunch it with model: {pick['model']!r}."]
 
 
 MERGE_SHARED = {f"{RATCHET_DIR}/{f}" for f in ("config.json", "standards.md", "learnings.md", ".gitignore")}

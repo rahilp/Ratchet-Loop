@@ -5,7 +5,9 @@ and merge their verdicts. Provider-neutral: each role is given to the first AVAI
 config `ui_reviewers` that is DIFFERENT from the model hosting the loop (Gemini, Claude, Codex…);
 if none is available, the role falls back to the host's own sub-agents. `agents.visual-reviewer` /
 `agents.behavior-reviewer` (a provider or provider/model) move that provider, and its model, to the front of the
-role's list. A per-use provider with no recorded OK from the developer (providers[].paid_ok_at, which covers the
+role's list. A chosen model the provider's declared `models` list does not hold is refused before that runner starts
+(the reason names the model, the provider and the offered list on stderr) and the next free runner, or the host, takes
+the role; a provider that declares no `models` passes the model through. A per-use provider with no recorded OK from the developer (providers[].paid_ok_at, which covers the
 provider's own model only) is skipped, with the reason printed, whether it was listed or chosen; so is a chosen
 provider that cannot run UI review.
 
@@ -304,7 +306,9 @@ def role_plan(a) -> tuple[str, dict, dict, dict]:
     """(host, {role: runners in the order tried}, {role: (provider, model) chosen with a model, or None}, {role: [why a
     runner was skipped before running]}). Config `ui_reviewers` gives the order, with the provider
     `agents.<role>-reviewer` names moved to the front; 'host' is implied last. Minus the host's own provider, and
-    minus a per-use provider with no recorded OK from the developer (a choice grants none)."""
+    minus a per-use provider with no recorded OK from the developer (a choice grants none), and minus the chosen
+    provider when its declared `models` list does not hold the chosen model (the reason is in the last dict; a provider
+    that declares nothing passes the model through)."""
     eng, cfg = None, None
     try:
         eng = _engine()
@@ -325,6 +329,11 @@ def role_plan(a) -> tuple[str, dict, dict, dict]:
             if skip_reason(p, host):
                 if chose and p == chose[0]:  # the developer's own pick is dropped: say why, not nothing
                     skipped[role].append(f"agents.{role}-reviewer = {p!r} was not used: {skip_reason(p, host)}")
+                continue
+            bad = eng.ui_lens_model_problem(cfg, role, p, chose) if eng and not override else ""
+            if bad:  # a model the provider does not offer: that runner is never started; the next free one (or the host) is
+                skipped[role].append(bad)
+                models[role] = None
                 continue
             pv = eng.ui_lens_provider(cfg, p, chose) if eng else None
             if eng and eng.per_use_unapproved(pv):  # the OK covers the provider's own model, not a chosen one

@@ -25,13 +25,13 @@ module directly, can itself contain the pattern strings as embedded constants an
 match; this doc's counts were taken right after `rm -rf tests/__pycache__
 tests/shortcuts/__pycache__`.)
 
-56 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
+57 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
 files the brief names explicitly (`test_quota_shared.py`, `test_discover_paid.py`, Kind 4 below)
-that carry the identical real obligation but don't literally match either regex today — **58
+that carry the identical real obligation but don't literally match either regex today — **59
 files total**, consistent with the brief's "43+".
 
 ## Kind 1 — module-load only (loads ratchet.py dynamically via `importlib.util.spec_from_file_location`,
-never inspects its on-disk text directly): 34 files
+never inspects its on-disk text directly): 35 files
 
 - `test_gates.py` — gate-integrity suite; the shared `ENGINE`/`g` module alias almost every other
   suite below imports instead of loading ratchet.py a second time itself. Module-load-only known
@@ -114,6 +114,10 @@ never inspects its on-disk text directly): 34 files
   lens choices); drives `resolve_reviewers` and the CLI in-process through the shared engine loader and loads
   `ui_review.py` itself once via `spec_from_file_location` to read its UI runner order. Never inspects ratchet.py's
   on-disk text or tree shape.
+- `test_agents_launch.py`: CP6: sub-agents launch on the chosen model (the `Launch with model:` brief line, the launch
+  guard's refusal, model-name validity, a provider's `models` list, the mark's `model`); drives the engine in-process
+  through `test_config_layers.py`'s helpers and loads `external_review.py` once via `spec_from_file_location` to run a
+  review. Never inspects ratchet.py's on-disk text or tree shape.
 
 ## Kind 2 — source-text/AST only (reads ratchet.py's literal on-disk text and/or walks its parsed
 tree, never loads it as a module itself): 9 files

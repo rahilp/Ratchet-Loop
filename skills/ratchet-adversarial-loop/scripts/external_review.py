@@ -722,9 +722,13 @@ def _review(eng, ctx, cfg, a, spec, cp, cps, rnd, st, fp, prompt, out, work, pro
                 sys.exit(3)
             now_ = eng._dt.datetime.now(eng._dt.timezone.utc)  # the shared record could not be saved: mark this project
             hours = max((quota[0] - now_).total_seconds(), 60) / 3600
+        # Only a failure of one reviewer on a model agents.reviewer chose names that model (the mark then lapses when the
+        # choice is removed or changed). A missing program or an out-of-credits provider is about every reviewer behind
+        # it, so its mark carries no model and is never read as stale; a choice that was not applied leaves today's mark.
+        on_choice = not (quota or program) and eng._other_model_chosen(eng.provider_by_id(cfg, spec.get("provider")))
         for r in same:
             until = eng.mark_unavailable(ctx, r, reason if r == a.reviewer else f"{binary} failed: {reason}",
-                                         hours=hours, quota=bool(quota))
+                                         hours=hours, quota=bool(quota), model=spec.get("model") if on_choice else None)
         print(f"{a.reviewer} UNAVAILABLE: {reason}\n"
               f"Marked unavailable until {(until or 'later')[:16]}Z. Run `ratchet.py reviewers {a.cp}`: its slot now "
               "goes to the next provider, or to the host's own sub-agents.", file=sys.stderr)
