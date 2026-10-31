@@ -17189,6 +17189,8 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
     # the next command reads them (Ctx.state). A user message also restarts the stop hook's count (_stop_blocks).
     _heartbeat(root, "prompt", n["host"])
     log = rdir / "human_log.jsonl"
+    if not isinstance(n.get("prompt"), str) or not n["prompt"].strip():  # no text, so nothing the user said
+        return False, ""
     problem = chain_problem(log, "human_log.jsonl")
     if problem:  # never a crash: the message is not recorded, so it approves and answers nothing
         return False, ("[ratchet] Ratchet did not record this message, so it approves nothing and answers no waiting "

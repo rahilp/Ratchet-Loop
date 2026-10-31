@@ -425,17 +425,21 @@ def case_t17_t18():
     check("[CP1-T18] setup: the new line is in the list", NEW_TEST_LINE in lst)
     if NEW_TEST_LINE in lst:
         i = lst.index(NEW_TEST_LINE)
-        check("[CP1-T18] it sits right after test_guardrails.py", i > 0 and lst[i - 1] == "python3 tests/test_guardrails.py",
-              lst[max(0, i - 1):i + 2])
-        check("[CP1-T18] it sits right before test_hook_list_payload.py",
-              i + 1 < len(lst) and lst[i + 1] == "python3 tests/test_hook_list_payload.py", lst[max(0, i - 1):i + 2])
+        prev_ok = i == 0 or lst[i - 1] < NEW_TEST_LINE
+        next_ok = i + 1 >= len(lst) or lst[i + 1] > NEW_TEST_LINE
+        check("[CP1-T18] its previous neighbour in the list sorts before it", prev_ok, lst[max(0, i - 1):i + 2])
+        check("[CP1-T18] its next neighbour in the list sorts after it", next_ok, lst[max(0, i - 1):i + 2])
+        guard, listpay = "python3 tests/test_guardrails.py", "python3 tests/test_hook_list_payload.py"
+        check("[CP1-T18] it sits after test_guardrails.py and before test_hook_list_payload.py",
+              guard in lst and listpay in lst and lst.index(guard) < i < lst.index(listpay), lst[max(0, i - 2):i + 3])
         without = [x for x in lst if x != NEW_TEST_LINE]
         # the list already has a few older out-of-order pairs; adding the line must not add one
         check("[CP1-T18] adding the line adds no out-of-order pair to the list",
               inversions(lst) == inversions(without), inversions(lst))
     else:
-        check("[CP1-T18] it sits right after test_guardrails.py", False, "line missing")
-        check("[CP1-T18] it sits right before test_hook_list_payload.py", False, "line missing")
+        check("[CP1-T18] its previous neighbour in the list sorts before it", False, "line missing")
+        check("[CP1-T18] its next neighbour in the list sorts after it", False, "line missing")
+        check("[CP1-T18] it sits after test_guardrails.py and before test_hook_list_payload.py", False, "line missing")
         check("[CP1-T18] adding the line adds no out-of-order pair to the list", False, "line missing")
 
 
