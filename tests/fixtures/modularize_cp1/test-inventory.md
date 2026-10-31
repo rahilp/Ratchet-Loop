@@ -25,9 +25,9 @@ module directly, can itself contain the pattern strings as embedded constants an
 match; this doc's counts were taken right after `rm -rf tests/__pycache__
 tests/shortcuts/__pycache__`.)
 
-57 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
+58 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
 files the brief names explicitly (`test_quota_shared.py`, `test_discover_paid.py`, Kind 4 below)
-that carry the identical real obligation but don't literally match either regex today — **59
+that carry the identical real obligation but don't literally match either regex today — **60
 files total**, consistent with the brief's "43+".
 
 ## Kind 1 — module-load only (loads ratchet.py dynamically via `importlib.util.spec_from_file_location`,
@@ -120,7 +120,7 @@ never inspects its on-disk text directly): 35 files
   review. Never inspects ratchet.py's on-disk text or tree shape.
 
 ## Kind 2 — source-text/AST only (reads ratchet.py's literal on-disk text and/or walks its parsed
-tree, never loads it as a module itself): 9 files
+tree, never loads it as a module itself): 10 files
 
 - `test_quick_path.py` — CP2 (quick-path change classification). Source-text known fixture
   (CP1-T03's own `SOURCE_TEXT_EXAMPLE`): line 478-480, `src = g.ENGINE.read_text(encoding="utf-8")`;
@@ -175,6 +175,12 @@ tree, never loads it as a module itself): 9 files
   ratchet.py cannot affect it. Listed here only because it lives directly under `tests/` (so, unlike the
   analyzer's `tests/fixtures/impact_analysis_*/` sample-data files — excluded from the live grep for the
   same CP1-X01 reason that excludes embedded bytecode constants — it stays inside the oracle's scope).
+- `test_agents_docs.py`: CP8: the README guide for changing one role and the follow-ups from CP1 to CP7. It runs the
+  README section's own copyable `ratchet.py` commands in-process against a throwaway project and checks the README,
+  the SKILL.md files and schemas.md agree with the code; its source-scan cases read ratchet.py's text with
+  `ast.parse` and `ast.walk` (no placeholder-free f-strings, docstrings that name the first slot of a low-risk
+  step and the nested shape checks) and the same for `ui_review.py`. It never loads ratchet.py with
+  `spec_from_file_location` itself, so it matches only the source-text/AST pattern, not the module-load one.
 
 ## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 13 files
 

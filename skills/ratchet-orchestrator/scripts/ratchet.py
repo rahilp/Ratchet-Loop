@@ -151,10 +151,15 @@ def agent_roles() -> list[str]:
     return [r[len("ratchet-"):] for r in sorted(ROLE_PLAIN)] + list(AGENT_HOST_ROLES)
 
 
+_UNKNOWN_PROVIDER_PHRASE = "which is not known; the known providers"  # the refusal for an unknown provider part in `agents`
 UNKNOWN_MODEL_MARK = "not a model Ratchet knows"  # the words of the refusal for a misspelled agents model (the launch guard keys on them)
 
 
 class Ctx:
+    # True only while `config --set/--unset` runs: a provider-or-host_models problem in a settings file that command is
+    # not writing is then set aside instead of stopping the command, so the repair commands always work (see user_config).
+    repairing = False
+
     def __init__(self, root: Path):
         self.root = root
         self.ratchet = root / RATCHET_DIR
@@ -181,6 +186,9 @@ class Ctx:
         g = read_json(p, absent)
         if g is absent:
             return {}
+        if self.repairing and isinstance(g, dict):  # host_models is judged by user_config, which can set the file aside
+            self.check_global_config({k: v for k, v in g.items() if k != "host_models"})
+            return g
         return self.check_global_config(g)
 
     def check_project_config(self, p):
@@ -343,8 +351,9 @@ class Ctx:
           load_stretch_max    the engine itself falls back to 4 on any bad value
           min_review_timeout_sec  no consumer reads it, so nothing can crash
           design_md   the design-file reader tolerates any value and falls back to the default DESIGN.md
-        Entries inside review_depth, blocking_severities (a word or a list per risk), app, checks and the host model
-        maps are not type-checked: they accept several shapes and are resolved where used."""
+        Entries inside review_depth, blocking_severities (a word or a list per risk), app and checks are not
+        type-checked: they accept several shapes and are resolved where used. host_models is checked down to its
+        tiers and alternates (check_global_config), in the project's file as in the machine-wide one."""
         mine = self.config_path if project else self.global_config_path
         other = self.global_config_path if project else self.config_path
         if project:
@@ -425,24 +434,56 @@ class Ctx:
         return user
 
     def user_config(self, project=None, glob=None, check_roles=True, strict=(), write_path=None):
+        """The merge below, plus the repair rule: while `config --set/--unset` runs (self.repairing), a file other than
+        the one being written (write_path; none once the write is done) that fails on a wrong-shaped host_models or an
+        unknown provider in `agents` is read as empty for this command, so the command that repairs one file is never
+        stopped by the other. Every other problem, and every problem in the written file, still stops it."""
+        # the files are read here (this function may read config.json), global first, as the merge checks them
+        if not (self.repairing and check_roles):
+            g = self.global_config() if glob is None else glob
+            p = self.check_project_config(read_json(self.config_path, {})) if project is None else project
+            return self._merge_layers(p, g, check_roles, strict, write_path)
+        skip = set()
+        for _ in range(3):
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(buf):
+                    g = self.global_config() if glob is None else glob
+                    p = self.check_project_config(read_json(self.config_path, {})) if project is None else project
+                    out = self._merge_layers(p, g, check_roles, strict, write_path, skip)
+            except SystemExit:
+                msg = buf.getvalue()
+                hit = next((str(q) for q in (self.global_config_path, self.config_path)
+                            if str(q) in msg and str(q) != str(write_path) and str(q) not in skip), None)
+                if not (hit and ("'host_models" in msg or _UNKNOWN_PROVIDER_PHRASE in msg)):
+                    sys.stderr.write(msg)
+                    raise
+                skip.add(hit)
+                continue
+            sys.stderr.write(buf.getvalue())
+            return out
+        die("Ratchet could not set aside the settings file that blocks this command.")
+
+    def _merge_layers(self, project=None, glob=None, check_roles=True, strict=(), write_path=None, skip=()):
         """The raw settings in effect before defaults: the global file with the project's file over it, key by key.
         One rule for both layers: a dict value merges one level deep (its sub-entries replace whole, so a partial
         host_models.anthropic replaces the shipped entry), anything else replaces whole. An untouched old default
         review_depth is dropped (only the project level can carry one: the global file refuses the key). `glob` and
-        `project` stand in for the files' content (a candidate about to be written). Unless check_roles is False, each
+        `project` are the files' content (user_config reads them, or passes a candidate about to be written). Unless check_roles is False, each
         file's `agents` and `role_models` are checked (_check_role_settings, _check_agent_choices) and a wrong one stops
         naming the file. A role set by `role_models` in one file replaces that role's `agents` value from the file
         below it; an `agents` value above a lower `role_models` one keeps it as the fallback for when the `agents`
         choice cannot apply on this host (resolve_role picks, a file holding both for one role is refused)."""
         out = {}
-        layers = ((self.global_config() if glob is None else glob, self.global_config_path),
-                  ((self.check_project_config(read_json(self.config_path, {})) if project is None else project) or {},
-                   self.config_path))
+        layers = ((glob, self.global_config_path), (project or {}, self.config_path))
+        layers = tuple(({}, path) if str(path) in skip else (layer, path) for layer, path in layers)
         self.settings_layers = [("global", layers[0][0]), ("project", layers[1][0])]  # what `models` explains
         for layer, path in layers:
             if check_roles:
                 self._check_role_settings(layer, path)
                 self._check_provider_keys(layer, path)
+                if "host_models" in layer:  # the shape the machine-wide file is held to, applied to the project's file too
+                    self.check_global_config({"host_models": layer["host_models"]}, path=path, project=True)
             # a role named by `agents` or `role_models` in this layer replaces the other key's value from a lower one
             rm = layer.get("role_models")
             if isinstance(out.get("agents"), dict) and isinstance(rm, dict):
@@ -526,7 +567,7 @@ class Ctx:
                     die(f"{path} 'agents.{name}' is {spec!r}; write it as a model or as provider/model with both parts "
                         f"filled in (split at the first '/'). The known models are: {', '.join(sorted(models))}.")
                 if slash and prov not in provs and prov not in companies:
-                    die(f"{path} 'agents.{name}' names the provider {prov!r}, which is not known; the known providers "
+                    die(f"{path} 'agents.{name}' names the provider {prov!r}, {_UNKNOWN_PROVIDER_PHRASE} "
                         f"are: {', '.join(provs)}, and the known companies are: {', '.join(companies)}. Write the value "
                         "as provider/model or just a model.")
                 if slash:
@@ -2638,7 +2679,7 @@ def _sub_agent_detail(cfg, layers, role) -> dict:
         return {"role": role, "requested": tier, "effective": used, "source": source, "reason": reason}
     known = {v for k, v in hm.items() if k != "alternates" and isinstance(v, str)} | set(hm.get("alternates") or [])
     reason = ""
-    if tier and (hm.get("alternates") or len(known) > 1) and tier != "inherit" and tier not in known:
+    if tier and (hm.get("alternates") or len(known) > 1) and str(tier).lower() != "inherit" and tier not in known:
         reason = (f"{tier!r} is an unknown tier or model on this host ({host}); it is passed on as written and the "
                   "host may refuse it")
     return {"role": role, "requested": tier or used, "effective": used, "source": source, "reason": reason}
@@ -2662,7 +2703,8 @@ def _real_first_reviewer(ctx, cfg) -> dict | None:
 def _reviewer_detail(ctx, cfg, layers) -> dict:
     """The `reviewer` row. A provider (or provider/model) request is explained from the recorded availability
     (reviewer_availability reads files and looks for the CLI on PATH; it never runs one), and "used" is only said when
-    the real selection (resolve_reviewers) picks that provider first, so the view and the review cannot disagree."""
+    the real selection (resolve_reviewers) picks that provider first. The row judges the first slot of a low-risk step
+    (_real_first_reviewer), not every slot of every step, so the view and the review cannot disagree about that slot."""
     source = _layer_source(layers, "agents", "reviewer")
     spec = (cfg.get("agents") or {}).get("reviewer")
     if not isinstance(spec, str) or not spec.strip():
@@ -2814,7 +2856,7 @@ def session_offer_problem(cfg, spec) -> str:
     """Plain words for why an orchestrator/director value `provider/model` cannot be used (the provider declares the
     models it offers and the model is not one of them), else ''. Bare models and providers that declare nothing pass."""
     prov, model = _session_choice(spec)
-    offered = provider_not_offered(cfg, prov, model) if prov else None
+    offered = provider_not_offered(cfg, prov, model) if prov and model.lower() != "inherit" else None  # inherit names no model
     return "" if not offered else (f"provider {prov!r} does not offer the model {model!r} (not offered by {prov}; it "
                                    f"offers: {', '.join(map(str, offered))})")
 
@@ -4176,6 +4218,20 @@ def known_companies() -> set:
     return {p["company"] for p in PRESETS.values() if p["company"]} | {norm_company(k) for k in PRESETS}
 
 
+def _resolution_company(pv) -> str | None:
+    """The company a configured provider answers to when an agents value names a company (openai/gpt-5): its own
+    `company`, else its preset's (a tool tied to no company, such as copilot, answers to its tool's name, github), else
+    the company of its model. The preset comes before the model, so a copilot provider whose model is gpt-5 is not
+    mistaken for openai, and it agrees with _host_tool, which starts the session. Only resolve_provider_name uses it:
+    provider_company (reviewer selection, cross-company review) is unchanged."""
+    if pv.get("company"):
+        return norm_company(pv["company"])
+    preset = pv.get("preset")
+    if preset in PRESETS:
+        return PRESETS[preset]["company"] or norm_company(preset)
+    return company_of_model(pv.get("model"))
+
+
 def resolve_provider_name(cfg, prov) -> str | None:
     """The id of the configured provider the provider part `prov` of an agents value names: a provider with that id, or
     (for a company name such as openai that is no preset tool name) the first configured provider of that company, in
@@ -4185,7 +4241,7 @@ def resolve_provider_name(cfg, prov) -> str | None:
     company = norm_company(prov)
     if prov in PRESETS or company not in known_companies():
         return None
-    return next((pv["id"] for pv in providers(cfg) if provider_company(pv) == company), None)
+    return next((pv["id"] for pv in providers(cfg) if _resolution_company(pv) == company), None)
 
 
 PAID_NO_OK = ("costs money per use and the developer has not given the exact OK for this model "
@@ -4488,6 +4544,11 @@ def _agent_model(cfg, role) -> str | None:
     if not isinstance(spec, str):
         return None
     prov, slash, model = spec.partition("/")
+    if spec.strip().lower() == "inherit" or (slash and model.strip().lower() == "inherit"):
+        # inherit, in any case, is the session's own model for every host: it is only judged where the company is
+        if not slash or (_provider_company(cfg, prov) == detect_host(cfg)):
+            return "inherit"
+        return None
     if not slash:
         if role[len("ratchet-"):] in LENS_CHOICE_ROLES and reviewer_choice(cfg, role[len("ratchet-"):]):
             return None  # it names the outside UI review provider (ui_lens_order), not a model for this sub-agent
@@ -4522,7 +4583,7 @@ def resolve_role(layers, role, cfg=None) -> dict | None:
             return host_model_map(cfg).get(tier) or "inherit"
         if tier == "alternate":  # a different model from the session's, for work that must not share its blind spots
             return (host_model_map(cfg).get("alternates") or ["inherit"])[0]
-        return tier or "inherit"
+        return "inherit" if isinstance(tier, str) and tier.strip().lower() == "inherit" else tier or "inherit"
 
     for i in range(len(named) - 1, -1, -1):
         name, layer = named[i]
@@ -4600,7 +4661,7 @@ def _unknown_model_names(cfg, name, spec):
         return None
     known = _known_bare_models(cfg) | {m for p in cfg.get("providers") or [] if isinstance(p, dict)
                                        for m in (p.get("models") if isinstance(p.get("models"), list) else [])}
-    return None if spec.strip() in known or company_of_model(spec) is not None else known
+    return None if spec.strip() in known or spec.strip().lower() == "inherit" or company_of_model(spec) is not None else known
 
 
 def _winning_agents_setting(ctx, name):
@@ -4926,9 +4987,10 @@ def choice_applies_to(cfg, cp, rnd, rid) -> bool:
 
 def launch_cfg(cfg, cp, rnd, rid) -> dict:
     """`cfg` as reviewer `rid` of round `rnd` is launched: with agents.reviewer's model where choice_applies_to says the
-    round chose it for that reviewer, else the config as written. The one per-reviewer application of the choice
-    outside resolve_reviewers (which applies it per slot), so a probe, a paid check or a row never sees a model the
-    launch will not run. `cfg` must be the config as read, never the copy with_reviewer_choice makes."""
+    round chose it for that reviewer, else the config as written. Every per-reviewer caller outside resolve_reviewers
+    (which applies the choice per slot) uses it, so a probe, a paid check or a row never sees a model the launch will not
+    run; `reviewer-status` has no round and applies the choice to the chosen provider as a whole (with_reviewer_choice).
+    `cfg` must be the config as read, never the copy with_reviewer_choice makes."""
     return with_reviewer_choice(cfg) if choice_applies_to(cfg, cp, rnd, rid) else cfg
 
 
@@ -5963,8 +6025,8 @@ def _lanes_start_run(args, main: Path):
         else:
             start = f"Open your agent CLI in {x['worktree']} and give it the brief {x['brief']}"
         out.append(dict({k: x[k] for k in ("name", "branch", "worktree", "brief")}, start=start))
-    empty = (f"Note: the model argument in the start command is empty because no orchestrator model is chosen "
-             f"(set one with `ratchet.py config --set agents.orchestrator=<model>`)."
+    empty = ("Note: the model argument in the start command is empty because no orchestrator model is chosen "
+             "(set one with `ratchet.py config --set agents.orchestrator=<model>`)."
              if template and not model and any("{model}" in w for w in template) else "")
     if args.json:
         print(json.dumps(dict({"request": name, "lanes": out}, **({"note": empty} if empty else {})), indent=2))
@@ -15839,8 +15901,9 @@ def cmd_reviewer_status(args):
             _die_record_busy(p, f"{args.mark} was not marked unavailable")
         ok(f"{args.mark} skipped until {until[:16]}Z; the next provider, or the host's sub-agents, fill its slot")
     print(f"Host provider: {detect_host(cfg)}")
+    chosen = with_reviewer_choice(cfg)  # judge a chosen-model mark the way `reviewers` does (the model that would launch)
     for rid, spec in roster(cfg).items():
-        okay, why = reviewer_availability(ctx, cfg, rid)
+        okay, why = reviewer_availability(ctx, chosen, rid)
         print(f"  {'✓' if okay else '·'} {rid:<22} {str(spec.get('vendor') or '?'):<10} {why}")
 
 
@@ -16049,6 +16112,7 @@ def cmd_config(args):
             die(f"--set takes key=value (got {kv!r}); a key is a setting name, with dots for a nested one, such as "
                 "related_tests_max=6 or role_models.ratchet-fixer=sonnet. Nothing was changed.", 2)
     if sets or unsets:
+        ctx.repairing = True  # a wrong host_models or provider in the file NOT being written never blocks the repair
         glob_cfg = ctx.global_config()  # a damaged per-user file stops the command before anything is saved
         path = ctx.global_config_path if args.glob else ctx.config_path
         before = glob_cfg if args.glob else ctx.check_project_config(read_json(ctx.config_path, {}))
@@ -16074,6 +16138,8 @@ def cmd_config(args):
                     "Nothing was changed.")
             cur = user
             for p in parts[:-1]:
+                if not isinstance(cur.setdefault(p, {}), dict) and parts[0] == "host_models":
+                    cur[p] = {}  # a hand-written wrong shape (a bare string) is replaced by the group the key names
                 if not isinstance(cur.setdefault(p, {}), dict):
                     die(f"Can't set {k}: {p} is not a settings group in {path}. Nothing was changed.", 2)
                 cur = cur[p]

@@ -344,7 +344,9 @@ def role_plan(a) -> tuple[str, dict, dict, dict]:
 
 
 def role_providers(a) -> tuple[str, dict]:
-    """Ordered provider list per role, minus the host's own provider; 'host' is implied last (see role_plan)."""
+    """Ordered provider list per role, minus the host's own provider; 'host' is implied last (see role_plan). Test-only:
+    the tests call it for the runner order, and the review itself reads role_plan, which also returns the chosen models
+    and the names it set aside."""
     host, out, _models, _skipped = role_plan(a)
     return host, out
 
