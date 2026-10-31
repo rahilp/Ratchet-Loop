@@ -181,6 +181,10 @@ tree, never loads it as a module itself): 10 files
   `ast.parse` and `ast.walk` (no placeholder-free f-strings, docstrings that name the first slot of a low-risk
   step and the nested shape checks) and the same for `ui_review.py`. It never loads ratchet.py with
   `spec_from_file_location` itself, so it matches only the source-text/AST pattern, not the module-load one.
+- `test_ffl_wording.py`: fast-follow cleanups CP1: the README, the SKILL.md files and schemas.md say what the repair
+  commands really do, and a full model id gets one answer in the hint and the refusal. Its source-scan case reads
+  ratchet.py's text with `ENGINE.read_text` and `ast.parse` to check the `_check_agent_choices` docstring; it never
+  loads ratchet.py with `spec_from_file_location` itself, so it matches only the source-text/AST pattern.
 
 ## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 13 files
 

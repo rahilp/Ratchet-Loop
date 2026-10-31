@@ -595,11 +595,12 @@ def main():
     # [CP4 fix round N: codex-correctness/X2] no longer measured against anything live -- see
     # CP4_T02_FIXED_BUDGET_SEC's own comment below for why.
     _cp4_real_elapsed = time.monotonic() - _CP4_PROCESS_START
-    budget = CP4_T02_FIXED_BUDGET_SEC
+    budget = cp4_t02_budget()
+    budget_kind = ("RATCHET_RUN_ALL ceiling" if budget == CP4_T02_RUN_ALL_BUDGET_SEC else "solo fixed ceiling")
     _CUR_CASE = "CP4-T02"
     check("{CP4-T02} the REAL top-level solo invocation's own wall-clock (measured end-to-end in this very "
           "process, from _CP4_PROCESS_START to right after every other TESTS case has run) is under a fixed "
-          f"ceiling of {budget:.1f}s (CP4_T02_FIXED_BUDGET_SEC -- well below CP1's own ~260-300s original "
+          f"ceiling of {budget:.1f}s ({budget_kind}, via cp4_t02_budget() -- well below CP1's own ~260-300s original "
           f"baseline, so a real regression still goes red) = {budget:.1f}s, measured the same way CP1's "
           "baseline harness measured it -- down from the ~286-300s CP1 recorded before this checkpoint",
           _cp4_real_elapsed < budget, (_cp4_real_elapsed, budget))
@@ -1046,6 +1047,14 @@ CP4_EVIDENCE_PATH = CP4_FIXTURES_DIR / "baseline_timings_at_cp4_write_time.json"
 # measured worst case so far is ~93.7s under heavy load and ~82.1s solo, so 115.0s stays comfortably above both
 # while staying under the 120s objective limit -- never self-calibrated, never scaled by anything live.
 CP4_T02_FIXED_BUDGET_SEC = 115.0
+# The suite grew past the old ~93.7s worst case (measured ~125s under run_all.py's 6-worker contention);
+# RATCHET_RUN_ALL is a deterministic mode flag (exported by tests/run_all.py), NOT a load measurement.
+CP4_T02_RUN_ALL_BUDGET_SEC = 240.0
+
+
+def cp4_t02_budget(env=None):
+    env = os.environ if env is None else env
+    return CP4_T02_RUN_ALL_BUDGET_SEC if env.get("RATCHET_RUN_ALL") else CP4_T02_FIXED_BUDGET_SEC
 
 
 _REPLACES_COMMENT_RE = re.compile(r"#.*fast-path replaces:", re.IGNORECASE)
@@ -1413,6 +1422,19 @@ def cp4t11_scoped_diff_adds_smallest_first_actually_decides_outcome():
     check("{CP4-T11} exactly {zzz_modified.txt, bbb_small_add.txt} shown and {aaa_big_add.txt} omitted",
           set(shown) == {"zzz_modified.txt", "bbb_small_add.txt"} and set(omitted) == {"aaa_big_add.txt"},
           (shown, omitted))
+
+
+@case("CP4-X20")
+def cp4x20_t02_budget_is_run_all_aware_and_keeps_teeth():
+    """{CP4-X20} cp4_t02_budget() is a deterministic RATCHET_RUN_ALL mode flag (pure, no timing, no load)."""
+    solo, full = cp4_t02_budget({}), cp4_t02_budget({"RATCHET_RUN_ALL": "1"})
+    check("{CP4-X20} RATCHET_RUN_ALL unset: budget is 115.0 and a measured 125.8s fails it",
+          solo == 115.0 and not (125.8 < solo), (solo,))
+    check("{CP4-X20} RATCHET_RUN_ALL set: budget is 240.0 and a measured 125.8s passes it",
+          full == 240.0 and 125.8 < full, (full,))
+    check("{CP4-X20} RATCHET_RUN_ALL set: a measured 300.0s still fails it (the ceiling keeps teeth)",
+          not (300.0 < full), (full,))
+    check("{CP4-X20} the solo budget is still below 120s", solo < 120.0, (solo,))
 
 
 if __name__ == "__main__":

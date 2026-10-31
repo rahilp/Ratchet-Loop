@@ -548,7 +548,10 @@ class Ctx:
         (agent_model_problem), plan-submit and a `reviewers` that would open a round (reviewer_offer_problem), and the UI review launch (ui_review.py). Only a role in `strict` (being written
         by config --set) is refused for a name nothing knows, or (on the host doing the write, only when that host
         declares a model list) one this host can't use, and only in the file being written (write_path); the other file
-        is checked as at load. The model after a provider's '/' is the provider's own to accept."""
+        is checked as at load. The model after a provider's '/' is the provider's own to accept. A full model id is
+        written as provider/model, for example anthropic/claude-opus-4-1: a bare full id (claude-opus-4-1) is still fine
+        at load and for role_models, but config --set refuses it on a host that lists its models (host_models) and
+        names the provider/model form, and the agents.<role> typo hint names the same example."""
         provs = sorted(set(PRESETS) | {p.get("id") for p in cfg.get("providers") or [] if isinstance(p, dict)})
         companies = sorted(known_companies() - set(provs))
         allowed = _host_bare_models(cfg)  # None: this host declares no models, so any bare name is accepted
@@ -576,15 +579,15 @@ class Ctx:
                     known = _unknown_model_names(cfg, name, spec)
                     if known is not None:  # writing a typo is refused; one already in a file still loads (see above)
                         die(f"{path} 'agents.{name}' is {spec!r}, which is {UNKNOWN_MODEL_MARK}; the valid names "
-                            f"are: {', '.join(sorted(known))} (or a full model id such as claude-opus-4-1, or "
-                            "provider/model). Choose one of those.")
+                            f"are: {', '.join(sorted(known))} (or a full model id written as provider/model, such as "
+                            "anthropic/claude-opus-4-1). Choose one of those.")
                 if name == "reviewer" and spec not in provs and spec not in companies and spec not in models:
                     die(f"{path} 'agents.reviewer' is {spec!r}, which is not a known provider; the known providers are: "
                         f"{', '.join(provs)}, and the known companies are: {', '.join(companies)}. Write the value as a provider or provider/model.")
                 if name in strict and path == write_path and allowed is not None and _agent_model({**cfg, "agents": {name: spec}}, name) is None:
                     die(f"{path} 'agents.{name}' is {spec!r}, which the running host ({detect_host(cfg)}) can't use; "
                         f"the models it can use are: {', '.join(sorted(allowed or _known_bare_models(cfg) - _foreign_bare_models(cfg)))}"
-                        ", or write provider/model.")
+                        ", or write a full model id as provider/model, such as anthropic/claude-opus-4-1.")
 
     def config(self, check_roles=True):
         """The effective settings. Unless check_roles is False (only `init`, which reads nothing but the host and
