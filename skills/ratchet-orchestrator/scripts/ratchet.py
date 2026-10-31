@@ -497,7 +497,8 @@ class Ctx:
 
     def _check_agent_choices(self, layers, cfg, strict=(), write_path=None):
         """Each `agents` value is a model or provider/model (split at the first '/'). A provider must be a known one (a
-        preset or a configured provider id, from either file); a bare `agents.reviewer` must be a known provider (or a
+        preset, a configured provider id from either file, or a known company such as openai: known_companies(), from the
+        PRESETS company fields _host_tool uses; the model part can't be checked offline); a bare `agents.reviewer` must be a known provider (or a
         known model, which picks no outside reviewer). The model itself is tolerant at load, whatever it is: a bare
         model this host cannot use, a name nothing knows (a typo such as sonet) and a provider/model the provider's
         `models` list does not hold all load (one machine-wide file must load on every host, and a typo must never
@@ -508,6 +509,7 @@ class Ctx:
         declares a model list) one this host can't use, and only in the file being written (write_path); the other file
         is checked as at load. The model after a provider's '/' is the provider's own to accept."""
         provs = sorted(set(PRESETS) | {p.get("id") for p in cfg.get("providers") or [] if isinstance(p, dict)})
+        companies = sorted(known_companies() - set(provs))
         allowed = _host_bare_models(cfg)  # None: this host declares no models, so any bare name is accepted
         models = allowed or _known_bare_models(cfg)
         for layer, path in layers:
@@ -523,9 +525,10 @@ class Ctx:
                 if not (isinstance(spec, str) and spec.strip() and (not slash or (prov.strip() and model.strip()))):
                     die(f"{path} 'agents.{name}' is {spec!r}; write it as a model or as provider/model with both parts "
                         f"filled in (split at the first '/'). The known models are: {', '.join(sorted(models))}.")
-                if slash and prov not in provs:
+                if slash and prov not in provs and prov not in companies:
                     die(f"{path} 'agents.{name}' names the provider {prov!r}, which is not known; the known providers "
-                        f"are: {', '.join(provs)}. Write the value as provider/model or just a model.")
+                        f"are: {', '.join(provs)}, and the known companies are: {', '.join(companies)}. Write the value "
+                        "as provider/model or just a model.")
                 if slash:
                     continue
                 if name in strict and path == write_path and name != "reviewer":
@@ -534,9 +537,9 @@ class Ctx:
                         die(f"{path} 'agents.{name}' is {spec!r}, which is {UNKNOWN_MODEL_MARK}; the valid names "
                             f"are: {', '.join(sorted(known))} (or a full model id such as claude-opus-4-1, or "
                             "provider/model). Choose one of those.")
-                if name == "reviewer" and spec not in provs and spec not in models:
+                if name == "reviewer" and spec not in provs and spec not in companies and spec not in models:
                     die(f"{path} 'agents.reviewer' is {spec!r}, which is not a known provider; the known providers are: "
-                        f"{', '.join(provs)}. Write the value as a provider or provider/model.")
+                        f"{', '.join(provs)}, and the known companies are: {', '.join(companies)}. Write the value as a provider or provider/model.")
                 if name in strict and path == write_path and allowed is not None and _agent_model({**cfg, "agents": {name: spec}}, name) is None:
                     die(f"{path} 'agents.{name}' is {spec!r}, which the running host ({detect_host(cfg)}) can't use; "
                         f"the models it can use are: {', '.join(sorted(allowed or _known_bare_models(cfg) - _foreign_bare_models(cfg)))}"
@@ -2667,12 +2670,14 @@ def _reviewer_detail(ctx, cfg, layers) -> dict:
                 "effective": _AUTO_REVIEWER}
     own = _AUTO_REVIEWER  # an excluded request changes nothing: reviewers still pick by review_depth, as when unset
     prov, model = _choice_parts(spec)
+    asked_prov, prov = prov, resolve_provider_name(cfg, prov) or prov  # a company name stands for its configured provider
     if provider_by_id(cfg, prov) is None:
-        if "/" not in spec and prov not in PRESETS:
+        if "/" not in spec and prov not in PRESETS and prov not in known_companies():
             return {"role": "reviewer", "requested": spec, "effective": own, "source": source,
                     "reason": f"{spec!r} is a model, not provider/model, so it picks no outside reviewer"}
-        return {"role": "reviewer", "requested": spec, "effective": own, "source": source,
-                "reason": f"provider {prov!r} is unavailable: it is not set up in this project"}
+        what = (f"no provider of the company {asked_prov!r} is set up in this project" if asked_prov not in PRESETS
+                and asked_prov in known_companies() else f"provider {asked_prov!r} is unavailable: it is not set up in this project")
+        return {"role": "reviewer", "requested": spec, "effective": own, "source": source, "reason": what}
     offered = (provider_by_id(cfg, prov) or {}).get("models")
     if "/" in spec and model and isinstance(offered, list) and offered and model not in offered:
         return {"role": "reviewer", "requested": spec, "effective": own, "source": source,
@@ -2782,6 +2787,111 @@ def _ui_reviewer_detail(ctx, cfg, layers) -> list[dict]:
     return out
 
 
+def _session_choice(spec) -> tuple:
+    """(provider id or None, model) of an orchestrator/director value: a bare model, or provider/model (split at the
+    first '/')."""
+    prov, slash, model = str(spec).partition("/")
+    return (prov.strip(), model.strip()) if slash else (None, str(spec).strip())
+
+
+def _session_model(spec) -> str:
+    """The model an orchestrator/director value names, or '' when it names none: `inherit` (also provider/inherit)
+    means the session's own model, so no model argument or flag is ever built from it."""
+    model = _session_choice(spec)[1]
+    return "" if model.lower() == "inherit" else model
+
+
+def _host_tool(host) -> str | None:
+    """The PRESETS name of the agent tool for a host company (anthropic -> claude, openai -> codex, github -> copilot,
+    opencode -> opencode), or None for a host with no preset."""
+    for key, p in PRESETS.items():
+        if p["company"] == host:
+            return key
+    return next((key for key in PRESETS if norm_company(key) == host), None)
+
+
+def session_offer_problem(cfg, spec) -> str:
+    """Plain words for why an orchestrator/director value `provider/model` cannot be used (the provider declares the
+    models it offers and the model is not one of them), else ''. Bare models and providers that declare nothing pass."""
+    prov, model = _session_choice(spec)
+    offered = provider_not_offered(cfg, prov, model) if prov else None
+    return "" if not offered else (f"provider {prov!r} does not offer the model {model!r} (not offered by {prov}; it "
+                                   f"offers: {', '.join(map(str, offered))})")
+
+
+def _tool_runs(tool, model) -> bool:
+    """Can the agent tool `tool` (a PRESETS name) run `model`? A tool tied to one company (claude, codex, gemini) runs
+    only that company's models (the tier aliases opus, sonnet, haiku and inherit count as anthropic); a multi-company
+    tool (company None: copilot, opencode, ...) runs any model; a model whose company Ratchet cannot tell is not
+    judged."""
+    own = PRESETS[tool]["company"]
+    company = "anthropic" if str(model).strip().lower() == "inherit" else company_of_model(model)
+    return own is None or company is None or company == own
+
+
+def _cannot_run_note(tool, model) -> str:
+    """The plain words for a bare model the host's tool cannot run: no command is printed, and the provider/model form
+    (or a session in a tool that runs it) is named instead."""
+    company = company_of_model(model)
+    other = _host_tool(company) if company else None
+    pair = (f"use the provider/model form, for example {company}/{model}, which gives "
+            f"`{PRESETS[other]['bin']} {' '.join(PRESETS[other]['model_flag'])} {model}`, or start a session in the tool "
+            f"that runs it" if other else
+            "use the provider/model form with a provider that runs it, or start a session in the tool that runs it")
+    return f"{tool} (this host's tool) cannot run {model}, so Ratchet shows no start command for it; {pair}"
+
+
+def _session_start(cfg, role, spec) -> dict:
+    """The new keys of an orchestrator/director row whose model was chosen: {"start": the command that starts a session
+    on it (the host's own model flag from PRESETS for a bare model the host's tool can run, the chosen provider's tool
+    for provider/model; absent when it cannot be written, the model is a misspelled name, or the host's tool cannot
+    run that model), "reason": the plain explanation}. Ratchet never runs it and cannot switch or inspect a running
+    session."""
+    prov, model = _session_choice(spec)
+    host, per_use, bad, cannot = detect_host(cfg), "", None, ""
+    if prov is None:
+        tool = _host_tool(host)
+        bad = _unknown_model_names(cfg, role, spec)
+        if tool and not _tool_runs(tool, model):
+            cannot, tool = _cannot_run_note(tool, model), None
+    else:
+        entry = provider_by_id(cfg, resolve_provider_name(cfg, prov)) or {}
+        own = provider_by_id(cfg, prov) or {}
+        tool = own.get("preset") or prov
+        if tool not in PRESETS and own.get("command"):  # a provider with its own command and no preset
+            tool = None
+            cannot = (f"Ratchet cannot build a session start command from provider {prov}'s own command, so it shows "
+                      f"none; start your agent tool on {model} yourself")
+        else:
+            tool = tool if tool in PRESETS else _host_tool(norm_company(prov))
+        if tool and not _tool_runs(tool, model):  # a company's tool cannot run another company's model
+            cannot, tool = (f"{prov} ({tool}) cannot run {model}, so Ratchet shows no start command for it; choose a "
+                            "provider whose tool runs it, or start a session in the tool that runs it"), None
+        chosen = dict(entry, launch_model=model)
+        if per_use_unapproved(chosen):
+            per_use = f"; {prov} {paid_no_ok_reason(chosen)} (needs paid approval; this choice grants none)"
+    if session_offer_problem(cfg, spec):
+        return {"reason": (f"{spec!r} is invalid: {session_offer_problem(cfg, spec)}; no start command is shown and "
+                           "lanes-start refuses it")}
+    if bad is not None:
+        return {"reason": (f"{spec!r} is invalid: it is {UNKNOWN_MODEL_MARK} (the valid names are: "
+                           f"{', '.join(sorted(bad))}); no start command is shown and it is refused where work starts")}
+    if not _session_model(spec):   # inherit: the session's own model, so there is nothing to start it on
+        next_ = "the next session you start" if role == "director" else "the next session Ratchet starts"
+        return {"reason": (f"inherit means your session's own model, so no start command is needed: start the session as "
+                           f"usual with no model flag. The choice applies to {next_}; Ratchet can't switch a running "
+                           "session's model and can't confirm which model the current session runs on"
+                           + (" (it never inspects it)" if role == "director" else ""))}
+    cmd = " ".join([PRESETS[tool]["bin"], *PRESETS[tool]["model_flag"], model]) if tool else ""
+    how = (f"to run it on {model}, start a new session with: {cmd}" if cmd else cannot or
+           f"to run it on {model}, start a new session on that model in your agent tool (Ratchet has no start command "
+           f"for {'host ' + host if prov is None else 'provider ' + prov})")
+    next_ = "the next session you start" if role == "director" else "the next session Ratchet starts"
+    note = (f"{how}. The choice applies to {next_}; Ratchet can't switch a running session's model and can't confirm "
+            f"which model the current session runs on" + (" (it never inspects it)" if role == "director" else ""))
+    return dict({"start": cmd} if cmd else {}, reason=note + per_use)
+
+
 def models_detail(ctx, cfg, layers) -> list[dict]:
     """Every role's {role, requested, effective, source, reason}, from the settings and recorded status only: no
     provider is contacted and nothing is written or spent."""
@@ -2789,9 +2899,12 @@ def models_detail(ctx, cfg, layers) -> list[dict]:
     for role in ("orchestrator", "director"):
         spec = (cfg.get("agents") or {}).get(role)
         asked = spec if isinstance(spec, str) and spec.strip() else None
-        out.append({"role": role, "requested": asked or "inherit", "effective": "inherit",
-                    "source": _layer_source(layers, "agents", role) if asked else "builtin",
-                    "reason": _SESSION_NOTE if asked else ""})
+        row = {"role": role, "requested": asked or "inherit", "effective": "inherit",
+               "source": _layer_source(layers, "agents", role) if asked else "builtin",
+               "reason": _SESSION_NOTE if asked else ""}
+        if asked:
+            row.update(_session_start(cfg, role, asked))
+        out.append(row)
     out.append(_reviewer_detail(ctx, cfg, layers))
     return out + _ui_reviewer_detail(ctx, cfg, layers)
 
@@ -4056,6 +4169,25 @@ def provider_by_id(cfg, pid) -> dict | None:
     return next((pv for pv in providers(cfg) if pv["id"] == pid), None)
 
 
+def known_companies() -> set:
+    """The company names the provider part of an agents value may use besides a provider id: the `company` of each
+    PRESETS tool (anthropic, openai, google) and the company name of each tool (github for copilot) -- the same names
+    _host_tool turns into the tool that starts a session. Derived from PRESETS, never a second list."""
+    return {p["company"] for p in PRESETS.values() if p["company"]} | {norm_company(k) for k in PRESETS}
+
+
+def resolve_provider_name(cfg, prov) -> str | None:
+    """The id of the configured provider the provider part `prov` of an agents value names: a provider with that id, or
+    (for a company name such as openai that is no preset tool name) the first configured provider of that company, in
+    config order. None when none is set up. It never creates a provider, grants no paid approval and adds no reviewer."""
+    if provider_by_id(cfg, prov) is not None:
+        return prov
+    company = norm_company(prov)
+    if prov in PRESETS or company not in known_companies():
+        return None
+    return next((pv["id"] for pv in providers(cfg) if provider_company(pv) == company), None)
+
+
 PAID_NO_OK = ("costs money per use and the developer has not given the exact OK for this model "
               "(no paid_ok_at), so it is never used or sent a request")
 
@@ -4118,9 +4250,12 @@ def reviewer_choice(cfg, role="reviewer") -> tuple[str, str | None] | None:
     if not isinstance(spec, str) or not spec.strip():
         return None
     prov, model = _choice_parts(spec)
+    have = resolve_provider_name(cfg, prov)  # a company name (openai) means the configured provider of that company
     if role == "reviewer":
-        return (prov, model) if provider_by_id(cfg, prov) is not None else None
-    return (prov, model) if prov and (prov in PRESETS or provider_by_id(cfg, prov) is not None) else None
+        return (have, model) if have is not None else None
+    if have is None and prov and prov not in PRESETS and norm_company(prov) in known_companies():
+        have = _host_tool(norm_company(prov))  # no provider set up: the UI review runs that company's tool by name
+    return (have or prov, model) if prov and (have or prov in PRESETS) else None
 
 
 def reviewer_model_problem(pv) -> str | None:
@@ -4162,6 +4297,14 @@ def ui_lens_provider(cfg, name, choice):
     return dict(pv, launch_model=choice[1]) if pv and choice and choice[1] and choice[0] == name else pv
 
 
+def provider_not_offered(cfg, prov, model):
+    """The models provider `prov` declares (`models`, a list) when `model` is not one of them, else None: a provider
+    that declares nothing passes any model through ("not verified" in `models`). The one check behind the
+    agents.reviewer, UI-lens and orchestrator/director provider/model refusals."""
+    offered = (provider_by_id(cfg, resolve_provider_name(cfg, prov)) or {}).get("models")
+    return offered if model and isinstance(offered, list) and offered and model not in offered else None
+
+
 def ui_lens_model_problem(cfg, lens, name, choice) -> str:
     """Plain words for why the UI review must not start runner `name` on the model `choice` (the (provider, model)
     agents.<lens>-reviewer picked) gave it, else '': the choice names `name`, the provider declares the models it offers
@@ -4170,8 +4313,8 @@ def ui_lens_model_problem(cfg, lens, name, choice) -> str:
     refusal for that runner only: the review goes on with the next free runner or the host; nothing is ever approved."""
     if not (choice and choice[1] and choice[0] == name):
         return ""
-    offered = (provider_by_id(cfg, name) or {}).get("models")
-    if not (isinstance(offered, list) and offered and choice[1] not in offered):
+    offered = provider_not_offered(cfg, name, choice[1])
+    if not offered:
         return ""
     return (f"agents.{lens}-reviewer = '{name}/{choice[1]}' was not used: provider {name!r} does not offer the model "
             f"{choice[1]!r} (not offered by {name}; it offers: {', '.join(map(str, offered))}), so {name} was not "
@@ -4533,8 +4676,8 @@ def reviewer_offer_problem(ctx, cfg) -> str | None:
     if not won or not isinstance(won[1], str) or "/" not in won[1]:
         return None
     prov, model = _choice_parts(won[1])
-    offered = (provider_by_id(cfg, prov) or {}).get("models")
-    if not (model and isinstance(offered, list) and offered and model not in offered):
+    offered = provider_not_offered(cfg, prov, model)
+    if not offered:
         return None
     return (f"{won[0]} 'agents.reviewer' is {won[1]!r}, but provider {prov!r} does not offer the model {model!r}; the "
             f"models it offers are: {', '.join(map(str, offered))}. Nothing was started. Choose one of those with "
@@ -4746,9 +4889,12 @@ def reviewer_choice_notes(cfg, cp, rnd=None) -> list[str]:
     if not ch:
         if isinstance(spec, str) and spec.strip():
             prov, _model = _choice_parts(spec)
-            if ("/" in spec or prov in PRESETS) and provider_by_id(cfg, prov) is None:
-                return [f"RATCHET note: agents.reviewer = {spec!r} was not applied: provider {prov!r} is not set up in "
-                        f"this project (add it with `ratchet.py providers --add {prov} --preset {prov}`)."]
+            if ("/" in spec or prov in PRESETS or prov in known_companies()) and resolve_provider_name(cfg, prov) is None:
+                tool = prov if prov in PRESETS else _host_tool(norm_company(prov)) or "<tool>"
+                what = (f"no provider of the company {prov!r} is set up in this project" if prov not in PRESETS
+                        and prov in known_companies() else f"provider {prov!r} is not set up in this project")
+                return [f"RATCHET note: agents.reviewer = {spec!r} was not applied: {what} "
+                        f"(add one with `ratchet.py providers --add {tool} --preset {tool}`); Ratchet adds none itself."]
         return []
     asked = f"agents.reviewer = {spec!r}"
     if cp.get("reviewers"):
@@ -5628,17 +5774,17 @@ def cmd_director_enroll(args):
 
 
 _LANE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_LANE_PLACEHOLDERS = ("{worktree}", "{brief}", "{name}")
+_LANE_PLACEHOLDERS = ("{worktree}", "{brief}", "{name}", "{model}")
 
 
 def _lanes_start_template(cfg: dict):
-    """The developer's lane_start_command (a non-empty list of strings using only {worktree}, {brief} and {name}), or
-    None when none is set. Dies, before anything is created, when it is not usable."""
+    """The developer's lane_start_command (a non-empty list of strings using only {worktree}, {brief}, {name} and
+    {model}), or None when none is set. Dies, before anything is created, when it is not usable."""
     t = cfg.get("lane_start_command")
     if t is None:
         return None
     what = ("lane_start_command in .ratchet/config.json must be a list of words (an argument list such as "
-            "[\"mycli\", \"--cwd\", \"{worktree}\"]) using only the placeholders {worktree}, {brief} and {name}. "
+            "[\"mycli\", \"--cwd\", \"{worktree}\"]) using only the placeholders {worktree}, {brief}, {name} and {model}. "
             "Fix or remove it, then run lanes-start again. Nothing was changed.")
     if not isinstance(t, list) or not t or not all(isinstance(x, str) and x for x in t):
         die(what)
@@ -5710,7 +5856,21 @@ def _lanes_start_run(args, main: Path):
     rdir = main / RATCHET_DIR / "requests"
     if (rdir / f"{name}.json").exists() or (rdir / name).exists():
         die(f"A request named '{name}' is already recorded. Give this one another --name. Nothing was changed.")
-    template = _lanes_start_template(Ctx(main).config())
+    mctx = Ctx(main)
+    mcfg = mctx.config()
+    template = _lanes_start_template(mcfg)
+    bad = agent_model_problem(mctx, mcfg, "orchestrator")   # a misspelled model is refused here; loading stays tolerant
+    if bad:
+        die(bad)
+    chosen = (mcfg.get("agents") or {}).get("orchestrator")
+    if isinstance(chosen, str) and session_offer_problem(mcfg, chosen):
+        won = _winning_agents_setting(mctx, "orchestrator")
+        die(f"{won[0] if won else mctx.config_path} 'agents.orchestrator' is {chosen!r}, but "
+            f"{session_offer_problem(mcfg, chosen)}. Nothing was started. Choose one of those with `ratchet.py config "
+            "--set agents.orchestrator=<provider>/<model>` (add --global if it is in the machine-wide file), or "
+            "`config --unset agents.orchestrator`, or fix the provider's 'models' list, then run lanes-start again. "
+            "Nothing was changed.")
+    model = _session_model(chosen) if isinstance(chosen, str) else ""   # {model}: empty when none (or inherit) is chosen
     _director_key()
     ep = _enrolled_path()
     _d, why = _read_record(ep)
@@ -5797,18 +5957,17 @@ def _lanes_start_run(args, main: Path):
     out = []
     for x in lanes:
         if template:
-            fill = {"{worktree}": x["worktree"], "{brief}": x["brief"], "{name}": x["name"]}
-            parts = []
-            for w in template:
-                for k, v in fill.items():
-                    w = w.replace(k, v)
-                parts.append(w)
+            fill = {"{worktree}": x["worktree"], "{brief}": x["brief"], "{name}": x["name"], "{model}": model}
+            parts = [re.sub(r"\{(?:worktree|brief|name|model)\}", lambda m: fill[m.group(0)], w) for w in template]
             start = shlex.join(parts)
         else:
             start = f"Open your agent CLI in {x['worktree']} and give it the brief {x['brief']}"
         out.append(dict({k: x[k] for k in ("name", "branch", "worktree", "brief")}, start=start))
+    empty = (f"Note: the model argument in the start command is empty because no orchestrator model is chosen "
+             f"(set one with `ratchet.py config --set agents.orchestrator=<model>`)."
+             if template and not model and any("{model}" in w for w in template) else "")
     if args.json:
-        print(json.dumps({"request": name, "lanes": out}, indent=2))
+        print(json.dumps(dict({"request": name, "lanes": out}, **({"note": empty} if empty else {})), indent=2))
         return
     ok(f"Request '{name}' recorded: {len(out)} lane(s) ready. Lanes are enrolled with no run; each lane's agent runs "
        "init itself.")
@@ -5817,6 +5976,8 @@ def _lanes_start_run(args, main: Path):
         if template:
             print(f"Start command for {x['name']} (Ratchet only prints it; run it yourself):")
         print(x["start"])
+    if empty:
+        print(empty)
 
 
 def _git_top_problem(main: Path, command: str, by_hand: str):
@@ -15940,6 +16101,10 @@ def cmd_config(args):
             for part in k.split("."):
                 cur = cur.get(part) if isinstance(cur, dict) else None
             ok(f"Set {k} = {json.dumps(cur)}")
+        for role in ("orchestrator", "director"):
+            if any(kv.partition("=")[0] in (f"agents.{role}", "agents") for kv in sets) and (cfg.get("agents") or {}).get(role):
+                print(f"RATCHET note: agents.{role} applies to the next session you start; {_SESSION_NOTE}. "
+                      "`ratchet.py models` shows the start command.")
         for line in _agent_notes(cfg):
             print(line, file=sys.stderr)
         return

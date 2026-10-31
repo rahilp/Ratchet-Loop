@@ -156,7 +156,7 @@ def _default_config_literals():
             "spec_archive": True,
             "spec_keep": None,              # no spec tool: keep a running spec (openspec/specs/<run>/spec.md)? None = not asked yet           # archive an OpenSpec change (merge its deltas into the specs) when the run is approved
             "regression_command": None,     # full suite run before a checkpoint can complete
-            "lane_start_command": None,     # `lanes-start` prints this argument list ({worktree}, {brief}, {name}) per lane; never runs it
+            "lane_start_command": None,     # `lanes-start` prints this argument list ({worktree}, {brief}, {name}, {model}) per lane; never runs it
             # The quick path (`ratchet.py changes CPn`): a file matching doc_globs and not doc_exclude_globs (plus the
             # configured design_md and standards files) counts as a doc, not code. A test file matching test_globs "names"
             # a doc when its text contains the doc's repo-relative path or file name. doc_test_command (with a {files}
