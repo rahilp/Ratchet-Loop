@@ -570,6 +570,7 @@ python3 tests/test_docs.py
 python3 tests/test_docs_accuracy.py
 python3 tests/test_flaky.py
 python3 tests/test_feedback_fixes.py
+python3 tests/test_ffl_role_report.py
 python3 tests/test_ffl_wording.py
 python3 tests/test_fix_round.py
 python3 tests/test_fix_round_carry_bench.py

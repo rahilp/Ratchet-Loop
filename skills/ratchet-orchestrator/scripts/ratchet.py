@@ -2615,7 +2615,15 @@ def plain_reviewer(cfg, rid, model=None) -> str:
 
 
 def models_table(cfg) -> list[tuple[str, str]]:
-    return [(role, role_model(cfg, role)) for role in sorted(ROLE_PLAIN)]
+    rows = []
+    for role in sorted(ROLE_PLAIN):
+        r = resolve_role([cfg], role, cfg)
+        used = r["used"]
+        if (not r["reason"] and r["asked"] is not None
+                and _unknown_role_model_names(cfg, role[len("ratchet-"):], "role_models." + role, r["asked"]) is not None):
+            used = resolve_role([], role, cfg)["used"]  # a misspelled role_models value is shown as the default, not as used
+        rows.append((role, used))
+    return rows
 
 
 ROLE_PLAIN = {"ratchet-checkpoint-planner": "planning the steps", "ratchet-implementer": "writing the code",
@@ -2665,6 +2673,8 @@ def _sub_agent_detail(cfg, layers, role) -> dict:
         else:
             reason = (f"{asked!r} is an unknown tier or model on this host ({host}); {friendly} keeps its own default "
                       "model")
+        if r.get("invalid_below"):
+            reason += f"; {r['invalid_below']}"
         return {"role": role, "requested": asked, "effective": used, "source": source, "reason": reason}
     tier = asked if asked is not None else DEFAULT_CONFIG["role_models"].get(role)
     if asked is not None and (known := _unknown_role_model_names(cfg, friendly, "role_models." + role, asked)) is not None:
@@ -4567,8 +4577,13 @@ def resolve_role(layers, role, cfg=None) -> dict | None:
     """What one role runs on, from `layers` (raw settings dicts or (name, dict) pairs, lowest first, such as
     [global, project]). Walks them top-down: the first layer that sets the role by either key (`agents.<name>` or
     `role_models.<engine name>`) wins. An `agents` choice that cannot apply on this host (_agent_model) yields the
-    first role_models value at or below that layer, else the shipped default. Returns {role, asked, used, source,
-    reason} (reason is "" when asked == used), or None for a role that is not one of Ratchet's sub-agent roles.
+    first role_models value at or below that layer, else the shipped default. Only that fallback skips a misspelled
+    role_models value (the default is used, and the reason and `invalid_below` name it). A role_models value that is
+    misspelled with no `agents` choice above it is not skipped here: it comes back as asked, with the tier_model
+    result and an empty reason; `_sub_agent_detail` (detail row) and `models_table` (spawn table) report it as
+    invalid, and `brief` and the launch guard refuse it. Returns {role, asked, used, source, reason} (reason is ""
+    when asked == used; `invalid_below` is added only for the skipped fallback misspelling), or None for a role that
+    is not one of Ratchet's sub-agent roles.
     `cfg` is the effective config (host and model names); built from the layers when not given."""
     if role not in ROLE_PLAIN:
         return None
@@ -4595,14 +4610,26 @@ def resolve_role(layers, role, cfg=None) -> dict | None:
             used = _agent_model({**cfg, "agents": {friendly: spec}}, role)
             if used:
                 return {"role": role, "asked": spec, "used": used, "source": name, "reason": ""}
+            bad = ""
             for _, low in reversed(named[:i + 1]):  # cannot apply here: the role_models value below, else the default
                 if role in (low.get("role_models") or {}):
-                    fb = tier_model(low["role_models"][role])
+                    val = low["role_models"][role]
+                    if (known := _unknown_role_model_names(cfg, friendly, "role_models." + role, val)) is not None:
+                        # a misspelling is never what the role runs on: fall back to the shipped default and say so
+                        bad = (f"role_models.{role} = {val!r} is invalid: it is {UNKNOWN_MODEL_MARK} (the valid "
+                               f"names are: {', '.join(sorted(known))})")
+                        fb = tier_model(DEFAULT_CONFIG["role_models"].get(role))
+                    else:
+                        fb = tier_model(val)
                     break
             else:
                 fb = tier_model(DEFAULT_CONFIG["role_models"].get(role))
-            return {"role": role, "asked": spec, "used": fb, "source": name,
-                    "reason": f"agents.{friendly} = {spec!r} can't apply on this host ({detect_host(cfg)})"}
+            out = {"role": role, "asked": spec, "used": fb, "source": name,
+                   "reason": f"agents.{friendly} = {spec!r} can't apply on this host ({detect_host(cfg)})"}
+            if bad:
+                out["invalid_below"] = bad
+                out["reason"] += f"; {bad}"
+            return out
         if role in (layer.get("role_models") or {}):
             tier = layer["role_models"][role]
             return {"role": role, "asked": tier, "used": tier_model(tier), "source": name, "reason": ""}
@@ -4618,8 +4645,10 @@ def _agent_notes(cfg) -> list[str]:
             continue  # it picks the outside UI review provider (ui_lens_order), which models explains in its own row
         r = resolve_role([cfg], "ratchet-" + name, cfg)
         if r and r["reason"]:
+            keeps = (f"{r['role']} keeps its default model, {r['used']}, because {r['invalid_below']}"
+                     if r.get("invalid_below") else f"{r['role']} keeps its role_models/default model, {r['used']}")
             notes.append(f"RATCHET note: agents.{name} = {cfg['agents'][name]!r} can't apply on this host "
-                         f"({detect_host(cfg)}); {r['role']} keeps its role_models/default model, {r['used']}.")
+                         f"({detect_host(cfg)}); {keeps}.")
     return notes
 
 
@@ -4639,6 +4668,8 @@ def chosen_launch(cfg, layers, role) -> dict | None:
     if not r or r["source"] not in ("global", "project") or r["used"] in (None, "", "inherit"):
         return None
     if r["reason"]:  # the `agents` choice can't apply on this host: an explicit role_models value at or below it still does
+        if r.get("invalid_below"):
+            return None  # the role_models value below is a misspelling, so nothing valid was picked
         named = [(l if isinstance(l, tuple) else (f"layer {i + 1}", l)) for i, l in enumerate(layers)]
         idx = [n for n, _ in named].index(r["source"])
         for label, low in reversed(named[:idx + 1]):
