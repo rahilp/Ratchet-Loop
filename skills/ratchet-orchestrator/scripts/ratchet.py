@@ -16765,6 +16765,18 @@ def _dashboard_routes(base: Path):
 #
 # Hooks fail OPEN on internal errors (logged to .ratchet/hook-errors.log): Copilot denies every
 # tool call when a preToolUse hook crashes, and a crashing guard must never brick a session.
+#
+# Codex reply rules, checked 2026-10-31 against primary sources: docs at
+# https://learn.chatgpt.com/docs/hooks (308 from https://developers.openai.com/codex/hooks) and
+# codex-rs/hooks/src/events/stop.rs at commit 75a4146 (last commit to change stop.rs before release
+# rust-v0.166.0, tag commit 6ff1e1c; identical there) and pre_tool_use.rs as read at release
+# rust-v0.166.0 (the exit-2 rule is the same at 75a4146).
+#   - Stop with nothing to block: exit 0 with EMPTY stdout is a valid Stop no-op (stop.rs parse_completed);
+#     exit 0 with non-JSON text is Failed.
+#   - Block: exit 2 needs NON-BLANK stderr. For Stop (stop.rs) that stderr becomes the continuation
+#     prompt; for PreToolUse (pre_tool_use.rs, `Some(2) if handler.can_apply_control_effects()`) it
+#     becomes the block reason. Exit 2 with blank stderr makes the hook Failed, not a block.
+#   - Older Codex versions: whether they reject empty Stop stdout is unverified (no primary evidence found).
 
 HOOK_HOSTS = ("claude", "codex", "gemini", "copilot")
 HOOK_EVENTS = {  # host -> (stop, prompt, guard) event names in that host's config

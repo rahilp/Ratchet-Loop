@@ -195,7 +195,7 @@ tree, never loads it as a module itself): 10 files
   Its structural cases read ratchet.py's text with `ENGINE.read_text` and `ast.parse` / `ast.walk` to find every
   provider field the engine reads and every sub-command; it never loads ratchet.py with `spec_from_file_location` itself.
 
-## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 13 files
+## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 14 files
 
 - `test_trust_cp4.py` — trust-holes CP4: agent-set overrides no longer bypass checks. Loads
   ratchet.py dynamically (`ratchet_engine_slow_hook`) AND reads `ENGINE.read_text()` +
@@ -299,6 +299,11 @@ tree, never loads it as a module itself): 10 files
   `ast.parse`/`ast.walk`s both that live text and the pinned pre-move commit's text (via `git show`)
   to compare each of the 17 names' body byte-for-byte, find leftover top-level `def`s, check for
   star imports and import cycles, and confirm no new module-level mutable registry was introduced.
+- `test_hook_codex_contract.py` — hook-dialect CP1: what `hook stop|guard --host codex` prints (quiet exit 0 no-op,
+  exit 2 with a non-blank stderr reason) and that the claude, gemini and copilot replies stay byte-identical. Loads
+  ratchet.py dynamically (`ratchet_codex_contract`, via `spec_from_file_location`) to call `emit_hook` directly.
+  Separately reads `ENGINE.read_text()` and `ast.parse`s it to check the Codex citation comment sits, as comments
+  only, in the block just above `HOOK_HOSTS`.
 
 ## Kind 4 — brief-named, but don't literally match either live-grep pattern today: 2 files
 
