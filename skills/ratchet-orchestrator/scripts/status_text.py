@@ -14,7 +14,7 @@ cmd_plan_summary and next_action (the CLI/next-action handlers) stay in ratchet.
 names they call now resolve through this module's explicit import, the same way plan_support.py's/
 run_records.py's/records.py's/provider_discovery.py's own moved names are reached from their callers.
 
-Twelve ratchet.py-resident names these functions call are NOT one of the moved names and stay in ratchet.py for
+Twelve ratchet.py-resident names the moved functions call are NOT one of the moved names and stay in ratchet.py for
 now (candidates for a later checkpoint's own module, not this one's responsibility): _finish_pending (plain_now,
 _finish_held), _question_waiter/_question_answered/_pq (waiting_question), _plan_as_approved/_approved_after_dm/
 _done_means_proof/_dm_none_note (done_means_table; _approved_after_dm is also read directly by _finish_blockers
@@ -36,7 +36,7 @@ docstrings describe for their own small fixed literals: GATING_QUESTIONS/ALWAYS_
 (waiting_question) and CARRY_ON_QUESTIONS (waiting_question) keep their exact original tuple shape (none is a
 Dict/List/Set literal or a dict()/list()/set()/Counter()/defaultdict()/OrderedDict() call, so this move's own
 mutable-literal scan does not flag any of them either way); DM_NO_TESTS_NOTE (done_means_table) is a plain
-string, likewise unflagged. STEP_PLAIN (plain_now) and QUESTION_WORDS (question_line) were plain dict literals
+string, likewise unflagged. STEP_PLAIN (plain_now, and also step_stall below) and QUESTION_WORDS (question_line) were plain dict literals
 in their original home; here they are each given in an equivalent but immutable shape instead
 (types.MappingProxyType(...) wrapping the same literal) -- behaviourally identical for the only way the moved
 bodies use them (".get()"), never mutated in their original home either, and this way the scan (which checks
@@ -44,6 +44,11 @@ the literal AST shape of the top-level value, not what it is used for: a Call to
 of the banned dict()/list()/set()/... constructors) finds neither a new mutable registry, exactly as it
 expects for this move -- the same device run_records.py's own docstring documents for its own
 _HOOK_ENV_TIE_RANK.
+
+The schedule helpers at the end of this file (schedule_numbers/step_stall and the _sched_* helpers) are new, not
+moved. They are pure (no disk, git or subprocess access, no real clock) except for three more ratchet.py-resident
+names, reached lazily through _ratchet_module() at call time like the twelve above: PROGRESS_EVENTS and
+_plain_duration (step_stall) and _parse_iso (_sched_time). step_stall also reads STEP_PLAIN.
 
 HELD_AGAIN_PREFIX is read as a bare name both inside the moved functions (_apply_accepted_lines,
 _finish_block_lines) and by two call sites that stay in ratchet.py (the accept-line/finish-receipt commands
@@ -160,7 +165,8 @@ def _approved_done_means(*args, **kwargs):
 
 # A plain dict literal here would be flagged by this move's own new-mutable-registry scan; a MappingProxyType
 # wrapping one is not (its own top-level value is a Call to MappingProxyType, not a Dict literal), and it is
-# behaviourally identical for the only way plain_now/question_line use these (".get()") -- see module docstring.
+# behaviourally identical for the only way plain_now/question_line/step_stall use these (".get()") -- see module
+# docstring.
 STEP_PLAIN = types.MappingProxyType({
     "tests": "writing the tests", "red": "checking the new tests fail before any code exists",
     "implement": "building it", "behavior": "running the tests", "ui": "checking how it looks",
@@ -605,3 +611,197 @@ def _finish_block_lines(ctx, st, blockers: list) -> list[str]:
                "director token with --reason) accepts it, and an accepted line no longer holds the finish. You "
                "cannot accept a line yourself.")
     return out
+
+
+# --------------------------------------------------------------------------- schedule numbers
+#
+# schedule_numbers/step_stall work out, from what the run already records in state.json (and the config), how long
+# the remaining steps will probably take, and whether the current step has gone too long with no gate progress.
+# Pure: no disk, git or subprocess access, and no reading of the real clock -- `now` (a timezone-aware datetime) is
+# always passed in. Everything is wall-clock time, waits inside a step included, in UTC. The projected finish, its range and the
+# per-step average are never finer than 5 minutes; the stall warning states the real elapsed time (and its
+# "since" time) to the minute.
+
+STALL_BUDGET_DEFAULT = 90
+SCHEDULE_ROUND_MINUTES = 5
+
+
+def _sched_time(value):
+    """A recorded timestamp as an aware UTC datetime; None when it is not text or not ISO. A text with no zone
+    is read as UTC (the way the engine writes its own)."""
+    if not isinstance(value, str):
+        return None
+    d = _ratchet_module()._parse_iso(value.strip())  # the engine's own reader: "Z" suffix, naive read as UTC
+    return d.astimezone(_dt.timezone.utc) if d is not None else None
+
+
+def _sched_round(d, now):
+    """`d` rounded to the nearest 5-minute mark (zero seconds), never earlier than `now`."""
+    step = SCHEDULE_ROUND_MINUTES * 60
+    secs = d.timestamp()
+    out = _dt.datetime.fromtimestamp(round(secs / step) * step, tz=_dt.timezone.utc)
+    if out < now:
+        out += _dt.timedelta(seconds=step)
+    return out
+
+
+def _sched_iso(d):
+    return d.isoformat()
+
+
+def _sched_clock(d):
+    return d.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _sched_dur(seconds):
+    """A length of time as '1h 40m', rounded to 5 minutes."""
+    mins = int(round(max(0, seconds) / 60 / SCHEDULE_ROUND_MINUTES)) * SCHEDULE_ROUND_MINUTES
+    h, m = divmod(mins, 60)
+    return f"{h}h {m}m" if h and m else (f"{h}h" if h else f"{m}m")
+
+
+def _sched_num(x):
+    return f"{x:.1f}".rstrip("0").rstrip(".") if isinstance(x, float) else str(x)
+
+
+def _sched_attempts(c):
+    gates = c.get("gates") if isinstance(c.get("gates"), dict) else {}
+    adv = gates.get("adversarial") if isinstance(gates.get("adversarial"), dict) else {}
+    a = adv.get("attempts")
+    return a if isinstance(a, (int, float)) and not isinstance(a, bool) and a > 0 else 0
+
+
+def _sched_int(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def schedule_numbers(st, plan_ids, cfg, now) -> dict:
+    """The projected finish and review-round numbers for a run, from state.json alone -- see the section note."""
+    cps = st.get("checkpoints") if isinstance(st, dict) else None
+    cps = cps if isinstance(cps, dict) else {}
+    ids = [i for i in (plan_ids or [])]
+    spans, rounds = [], []
+    for cid in ids:
+        c = cps.get(cid)
+        if not isinstance(c, dict) or c.get("status") != "done":
+            continue
+        a, b = _sched_time(c.get("started_at")), _sched_time(c.get("completed_at"))
+        if a is None or b is None or b < a:
+            continue
+        spans.append((b - a).total_seconds())
+        rounds.append(_sched_attempts(c))
+    finished = len(spans)
+    open_ids = [i for i in ids if not (isinstance(cps.get(i), dict) and cps[i].get("status") == "done")]
+    left = len(open_ids)
+    cur = st.get("current") if isinstance(st, dict) else None
+    cur_open = cur in open_ids
+    cur_start = _sched_time(cps[cur].get("started_at")) if cur_open and isinstance(cps.get(cur), dict) else None
+    sources = ["checkpoints[].status", "checkpoints[].started_at", "checkpoints[].completed_at"]
+    if cur_open:
+        sources.append("current")
+    cfg = cfg if isinstance(cfg, dict) else {}
+    limit = _sched_int(cfg.get("max_adversarial_rounds_run"))
+    used = _sched_int(st.get("adv_rounds_total", 0)) if isinstance(st, dict) else None
+    allowed = max(0, limit - (used or 0)) if limit is not None else None
+    if limit is not None:
+        sources += ["adv_rounds_total", "max_adversarial_rounds_run"]
+    avg = expected = None
+    if finished:
+        sources.insert(3, "checkpoints[].gates.adversarial.attempts")
+        avg = round(sum(rounds) / finished, 2)
+        expected = round(avg * left, 2)
+    label = "none" if not finished else ("rough" if finished < 3 else "estimate")
+    finish = earliest = latest = None
+    notes = []
+    if finished and left:
+        elapsed = (now - cur_start).total_seconds() if cur_start is not None else 0
+        if cur_open and cur_start is None:
+            notes.append("the current step's start time is unreadable, so it is counted as only just started")
+
+        def at(span):
+            rest = max(0, span - elapsed) if cur_open else 0
+            n = left - 1 if cur_open else left
+            return _sched_round(now + _dt.timedelta(seconds=rest + n * span), now)
+
+        mean = sum(spans) / finished
+        finish, earliest, latest = at(mean), at(min(spans)), at(max(spans))
+    plural = "step" if finished == 1 else "steps"
+    if not finished:
+        text = f"no estimate yet: {finished} finished steps to work from"
+    elif not left:
+        text = f"nothing is left to build ({finished} finished {plural})"
+    else:
+        word = "rough estimate" if label == "rough" else "estimate"
+        text = (f"{word} {_sched_clock(finish)} (between {_sched_clock(earliest)} and {_sched_clock(latest)}), "
+                f"resting on {finished} finished {plural} that took about {_sched_dur(sum(spans) / finished)} each "
+                "(wall-clock time, waits inside a step included)")
+    if notes:
+        text += "; " + "; ".join(notes)
+    if avg is not None and left:
+        er = _sched_num(float(expected))
+        text += f". Review rounds: about {er} more expected ({_sched_num(float(avg))} per finished step x {left} left)"
+        if allowed is not None:
+            if expected > allowed:
+                text += f", more than the {allowed} the run's review limit still allows"
+            else:
+                text += f", within the {allowed} the run's review limit still allows"
+    return {"label": label, "finished": finished, "left": left,
+            "finish": _sched_iso(finish) if finish else None,
+            "earliest": _sched_iso(earliest) if earliest else None,
+            "latest": _sched_iso(latest) if latest else None,
+            "avg_rounds": avg, "expected_rounds_left": expected, "allowed_rounds_left": allowed,
+            "sources": sources, "text": text}
+
+
+def stall_budget(cfg):
+    """(minutes, note): the stall budget (config stall_budget_minutes, 90 unless set) and, when the setting is there
+    but not a positive number, a note saying it was ignored (else None). Lets a caller state the note even while the
+    step is under budget, when step_stall itself returns None."""
+    if not isinstance(cfg, dict) or "stall_budget_minutes" not in cfg:
+        return STALL_BUDGET_DEFAULT, None
+    raw = cfg["stall_budget_minutes"]
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        return raw, None
+    return STALL_BUDGET_DEFAULT, f"stall_budget_minutes ({raw!r}) was ignored, {STALL_BUDGET_DEFAULT} minutes used"
+
+
+def step_stall(st, cfg, now):
+    """None when the current step is not stalled, else a dict naming it (cp, step, elapsed_seconds, since,
+    budget_minutes, note, text). Stalled = phase building and longer than the stall budget (config
+    stall_budget_minutes, 90 unless set) since the latest of the step's start, the latest progress event for it in
+    the history, and the latest run-level resumed/unblocked entry."""
+    if not isinstance(st, dict) or st.get("phase") != "building":
+        return None
+    cur = st.get("current")
+    cps = st.get("checkpoints") if isinstance(st.get("checkpoints"), dict) else {}
+    c = cps.get(cur) if isinstance(cur, str) else None
+    if not isinstance(c, dict):
+        return None
+    progress = _ratchet_module().PROGRESS_EVENTS
+    marks = []
+    t = _sched_time(c.get("started_at"))
+    if t is not None:
+        marks.append(t)
+    hist = st.get("history") if isinstance(st.get("history"), list) else []
+    for e in hist:
+        if not isinstance(e, dict):
+            continue
+        ev = e.get("event")
+        if (ev in progress and e.get("cp") == cur) or ev in ("resumed", "unblocked"):
+            t = _sched_time(e.get("at"))
+            if t is not None:
+                marks.append(t)
+    if not marks:
+        return None
+    since = max(marks)
+    budget, note = stall_budget(cfg)
+    elapsed = int((now - since).total_seconds())
+    if elapsed <= budget * 60:
+        return None
+    step = c.get("step")
+    plain = STEP_PLAIN.get(step, step) if isinstance(step, str) else step
+    text = (f"STALL: {cur} has been {plain} for {_ratchet_module()._plain_duration(elapsed)} with no gate progress "
+            f"(budget {budget} minutes, since {_sched_clock(since)})")
+    return {"cp": cur, "step": step, "elapsed_seconds": elapsed, "since": _sched_iso(since),
+            "budget_minutes": budget, "note": note, "text": text}
+

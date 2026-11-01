@@ -31,7 +31,7 @@ that carry the identical real obligation but don't literally match either regex 
 files total**, consistent with the brief's "43+".
 
 ## Kind 1 — module-load only (loads ratchet.py dynamically via `importlib.util.spec_from_file_location`,
-never inspects its on-disk text directly): 36 files
+never inspects its on-disk text directly): 37 files
 
 - `test_gates.py` — gate-integrity suite; the shared `ENGINE`/`g` module alias almost every other
   suite below imports instead of loading ratchet.py a second time itself. Module-load-only known
@@ -122,6 +122,9 @@ never inspects its on-disk text directly): 36 files
   kept in the shared provider-health record under the provider's tool plus that model and reused until
   `probe_ttl_minutes`, a failure stays a project mark, and the docs say so. Drives the engine in-process against
   throwaway projects with stub agent CLIs and loads `provider_health.py` once via `spec_from_file_location`. Never
+  inspects ratchet.py's on-disk text or tree shape.
+- `test_schedule.py`: schedule awareness CP1: the projected-finish numbers and the stall check, as pure helpers in
+  `status_text.py`; loads that module once via `spec_from_file_location` and calls them with an injected clock. Never
   inspects ratchet.py's on-disk text or tree shape.
 
 ## Kind 2 — source-text/AST only (reads ratchet.py's literal on-disk text and/or walks its parsed

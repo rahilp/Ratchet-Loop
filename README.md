@@ -688,6 +688,7 @@ python3 tests/test_review_objective.py
 python3 tests/test_run_all_dedupe.py
 python3 tests/test_run_cmd_env.py
 python3 tests/test_runner.py
+python3 tests/test_schedule.py
 python3 tests/test_shortcuts.py
 python3 tests/test_shortcuts_extra.py
 python3 tests/test_shortcuts_guard.py
