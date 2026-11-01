@@ -78,11 +78,18 @@ async function aria(page) {
   return "";
 }
 
+// A state's own width/height beat the spec's, which beat 1280x800; each side is merged on its own.
+export function stateViewport(spec, state) {
+  const own = (state && state.viewport) || {};
+  const top = (spec && spec.viewport) || {};
+  return { width: own.width ?? top.width ?? 1280, height: own.height ?? top.height ?? 800 };
+}
+
 async function captureTarget(browser, spec, state, target, outDir) {
   const base = spec.targets[target];
   const side = state[target] || {};
   const ctx = await browser.newContext({
-    viewport: spec.viewport || { width: 1280, height: 800 },
+    viewport: stateViewport(spec, state),
     deviceScaleFactor: 1,
     reducedMotion: "reduce",
     colorScheme: spec.colorScheme || "light",
@@ -191,7 +198,7 @@ async function main() {
       captureTarget(browser, spec, state, "reference", dir),
       captureTarget(browser, spec, state, "app", dir),
     ]);
-    manifest.states.push({ name: state.name, scope: state.scope || "", dir, reference: ref, app });
+    manifest.states.push({ name: state.name, scope: state.scope || "", viewport: stateViewport(spec, state), dir, reference: ref, app });
     const warn = [ref, app].filter((r) => r.fatal || r.steps.some((s) => !s.ok));
     console.log(`${warn.length ? "!" : "✓"} ${state.name}: ref=${ref.fatal || "ok"} app=${app.fatal || "ok"}` +
       `${ref.consoleErrors.length + app.consoleErrors.length ? `  console errors: ref ${ref.consoleErrors.length}, app ${app.consoleErrors.length}` : ""}`);
@@ -202,4 +209,6 @@ async function main() {
   console.log(`manifest: ${mp}`);
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+// Run only when started as a script (also through a symlink or a relative path), not when imported.
+const isMain = process.argv[1] && fs.realpathSync(path.resolve(process.argv[1])) === fs.realpathSync(new URL(import.meta.url));
+if (isMain) main().catch((e) => { console.error(e); process.exit(1); });

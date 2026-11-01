@@ -145,7 +145,10 @@ def stage(manifest: dict, design: Path | None, scope: str, cases: Path | None, k
     for st in manifest["states"]:
         sd = td / re.sub(r"[^A-Za-z0-9_-]+", "-", st["name"])
         sd.mkdir()
-        lines.append(f"## State `{st['name']}` — scope: {st.get('scope') or scope}")
+        top = manifest.get("viewport") if isinstance(manifest.get("viewport"), dict) else {}
+        own = st.get("viewport") if isinstance(st.get("viewport"), dict) else {}
+        w, h = own.get("width", top.get("width")), own.get("height", top.get("height"))
+        lines.append(f"## State `{st['name']}` — scope: {st.get('scope') or scope}, viewport: {w}x{h}")
         for side in ("reference", "app"):
             rec = st[side]
             if rec.get("fatal"):

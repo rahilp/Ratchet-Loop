@@ -249,10 +249,19 @@ Consumed by `ratchet-ui-compare/scripts/capture.mjs`.
       "journey": [ {"hover": "[data-testid=nav-approvals]"}, {"click": "[data-testid=nav-approvals]"} ],
       "full_page": false,
       "mask": ["[data-testid=clock]"]
+    },
+    {
+      "name": "empty-phone",
+      "scope": "Sidebar link, page header, empty state only, at phone width",
+      "viewport": { "width": 390 },
+      "reference": { "path": "?state=empty#/approvals", "steps": [] },
+      "app":       { "path": "/approvals", "steps": [ {"waitFor": "text=No requests"} ] }
     }
   ]
 }
 ```
+
+`viewport` (`{width, height}`) is optional on the spec and on each state, and `width` or `height` may be left out. For width and for height separately, a state's own value beats the spec's value, which beats the default (1280 wide, 800 high), so the `empty-phone` state above is captured at 390x800. `capture.mjs` captures the reference and the app of a state at that state's resolved viewport and stores it on the state in `manifest.json` as `"viewport": {"width": 390, "height": 800}`. `ui_review.py` ends each state's heading in the reviewers' evidence with `, viewport: 390x800`, so a reviewer judges each state at its own width. A spec with no per-state `viewport` behaves as before: every state uses the spec's `viewport`.
 
 Step verbs: `goto`, `click`, `fill`+`value`, `press`, `hover`, `select`+`value`, `check`, `uncheck`, `wait` (ms), `waitFor` (selector), `scroll` (selector or `bottom`). The same `journey` is replayed on both targets for the behaviour reviewer, with a screenshot after every step.
 

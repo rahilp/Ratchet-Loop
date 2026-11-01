@@ -22,6 +22,7 @@ Schema: `ratchet-orchestrator/references/schemas.md` §5. Rules:
 - **One entry per `ui_states` item** of this checkpoint. `reference.path` is usually `?state=<name>` for a prototype. `app.path` + `steps` put the real app in the *same* state (same data, same open panel, same form values). Use seed data or fixtures. Never compare "some data" against "other data".
 - **Scope** = this checkpoint's `ui_scope`. The scope grows with each checkpoint: a skeleton checkpoint judges only the nav and title, even though the reference shows the full screen.
 - **journey**: 2–6 steps that exercise what this checkpoint added (open dialog → submit empty → see validation). The same steps run on both sides.
+- **Width**: the spec-level `viewport` is the default for every state. A state that must be shown at another width (a phone state beside desktop states) sets its own `viewport` (`{width, height}`, either side optional); see schemas.md §5.
 - `mask` anything nondeterministic (clocks, avatars from the network, charts with live data).
 - Login steps go under `login.app` (credentials come from `app-scout.json`).
 
