@@ -403,7 +403,8 @@ def t06_status_json_byte_identical():
           (r_init.returncode, r_init.stderr))
     if r_init.returncode != 0:
         return
-    pinned_script = SCRIPT_DIR / f"_cp4_t06_pinned_{os.getpid()}.py"
+    # The `.py.tmp` name is not seen by the engine's code-change watcher, as in test_modularize_cp6.py.
+    pinned_script = SCRIPT_DIR / f"_cp4_t06_pinned_{os.getpid()}.py.tmp"
     pinned_script.write_text(pinned_src)
     try:
         r_before = subprocess.run([sys.executable, str(pinned_script), "status", "--json"], cwd=str(d),

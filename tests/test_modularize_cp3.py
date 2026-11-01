@@ -431,7 +431,8 @@ def t07_cli_fingerprint_output_unchanged_by_the_move():
     # Written INTO the real scripts dir (temporarily, cleaned up right after): the pinned source's own
     # `sys.path.insert(0, Path(__file__).resolve().parent)` plus `import spec_sources`/`import provider_health`
     # only resolve when it sits next to those sibling modules, exactly as ratchet.py itself does today.
-    pinned_script = SCRIPT_DIR / f"_cp3_t07_pinned_{os.getpid()}.py"
+    # The `.py.tmp` name is not seen by the engine's code-change watcher, as in test_modularize_cp6.py.
+    pinned_script = SCRIPT_DIR / f"_cp3_t07_pinned_{os.getpid()}.py.tmp"
     pinned_script.write_text(pinned_src)
     try:
         r_before = subprocess.run([sys.executable, str(pinned_script), "fingerprint"], cwd=d,

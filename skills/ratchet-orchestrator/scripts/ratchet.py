@@ -2745,8 +2745,9 @@ def _reviewer_detail(ctx, cfg, layers) -> dict:
         if "/" not in spec and prov not in PRESETS and prov not in known_companies():
             return {"role": "reviewer", "requested": spec, "effective": own, "source": source,
                     "reason": f"{spec!r} is a model, not provider/model, so it picks no outside reviewer"}
-        what = (f"no provider of the company {asked_prov!r} is set up in this project" if asked_prov not in PRESETS
-                and asked_prov in known_companies() else f"provider {asked_prov!r} is unavailable: it is not set up in this project")
+        what = (company_model_text(cfg, asked_prov) or
+                (f"no provider of the company {asked_prov!r} is set up in this project" if asked_prov not in PRESETS
+                 and asked_prov in known_companies() else f"provider {asked_prov!r} is unavailable: it is not set up in this project"))
         return {"role": "reviewer", "requested": spec, "effective": own, "source": source, "reason": what}
     offered = (provider_by_id(cfg, prov) or {}).get("models")
     if "/" in spec and model and isinstance(offered, list) and offered and model not in offered:
@@ -4291,6 +4292,40 @@ def resolve_provider_name(cfg, prov) -> str | None:
     return next((pv["id"] for pv in providers(cfg) if _resolution_company(pv) == company), None)
 
 
+def company_model_providers(cfg, prov) -> list[dict]:
+    """The configured providers, in config order, that run a model of the company `prov` names although the company name
+    did not choose them: [] when resolve_provider_name finds a provider of that company (it wins) or when no provider
+    runs such a model. Reporting only: the reviewer selection (provider_company, model first) is not changed by it."""
+    company = norm_company(prov)
+    if prov in PRESETS or company not in known_companies() or resolve_provider_name(cfg, prov) is not None:
+        return []
+    return [pv for pv in providers(cfg) if provider_company(pv) == company]
+
+
+def company_model_text(cfg, prov) -> str | None:
+    """One plain sentence for a company name that matched no provider by the company-name rule while a configured
+    provider (such as Copilot) runs a model of that company: it names each such provider (id and model, in config
+    order), says the company name did not choose it and how to choose it (`<id>` or `<id>/<model>`), and for the host's
+    own company says it is not an independent reviewer. None when there is no such provider (the caller keeps its
+    'no provider of the company' message)."""
+    found = company_model_providers(cfg, prov)
+    if not found:
+        return None
+    host = detect_host(cfg)
+    parts = []
+    for pv in found:
+        pid, model = pv["id"], pv.get("model")
+        tool = _resolution_company(pv)
+        forms = f"`{pid}` or `{pid}/{model}`" if model else f"`{pid}`"
+        part = (f"{pid}" + (f" (model {model})" if model else "") + f" answers to its tool's company name ({tool}); "
+                f"choose it with {forms}")
+        if provider_company(pv) == host:
+            part += f"; it runs a model of the same company as the host ({host}), so it is not an independent reviewer"
+        parts.append(part)
+    return (f"the company name {prov!r} did not choose a provider: the company name means the tool's own company "
+            f"(the first configured provider of that company), and " + "; ".join(parts))
+
+
 PAID_NO_OK = ("costs money per use and the developer has not given the exact OK for this model "
               "(no paid_ok_at), so it is never used or sent a request")
 
@@ -5019,6 +5054,8 @@ def reviewer_choice_notes(cfg, cp, rnd=None) -> list[str]:
         if isinstance(spec, str) and spec.strip():
             prov, _model = _choice_parts(spec)
             if ("/" in spec or prov in PRESETS or prov in known_companies()) and resolve_provider_name(cfg, prov) is None:
+                if (named := company_model_text(cfg, prov)) is not None:
+                    return [f"RATCHET note: agents.reviewer = {spec!r} was not applied by the company name: {named}."]
                 tool = prov if prov in PRESETS else _host_tool(norm_company(prov)) or "<tool>"
                 what = (f"no provider of the company {prov!r} is set up in this project" if prov not in PRESETS
                         and prov in known_companies() else f"provider {prov!r} is not set up in this project")
