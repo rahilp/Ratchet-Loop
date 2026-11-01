@@ -18,6 +18,9 @@ snapshots, the design file and the scope — never the project's code, instructi
            the host's sub-agents: the staged folders and the follow-up `combine` command are printed.
   stage    Only stage the isolated folders (for host sub-agents).
   combine  Merge reviewer JSON files into combined.json.
+  lint     Warn about browser cases the capture spec cannot show (read-only). Run it on the capture spec and the test
+           plan BEFORE review or stage; review and stage do not run it. Exit 0 with WARN lines is not all-clear:
+           fix each named gap in the capture spec first.
 
 Inside an active Ratchet run, `review` and `stage` stamp and sign the capture manifest for the checkpoint's UI round,
 and everything written is signed for that round. Outside a run (no .ratchet folder, or no active run) they still work
@@ -644,6 +647,81 @@ def cmd_combine(a):
     print(f"combined → {comb['verdict']} ({comb['summary']})")
 
 
+def _case_key(x) -> str:
+    return str(x).strip().lower().replace("_", "-")
+
+
+def _width(spec: dict, state: dict) -> dict:
+    """The width a state is captured at: its own, else the spec's, else 1280x800 (each side on its own, as capture.mjs)."""
+    own = state.get("viewport") if isinstance(state.get("viewport"), dict) else {}
+    top = spec.get("viewport") if isinstance(spec.get("viewport"), dict) else {}
+    return {"width": own.get("width", top.get("width", 1280)), "height": own.get("height", top.get("height", 800))}
+
+
+_STEP_KEYS = ("goto", "click", "fill", "press", "hover", "select", "check", "uncheck", "wait", "waitFor", "scroll")
+
+
+def _valid_step(s) -> bool:
+    """A journey step capture.mjs can run: an object with a truthy recognised action key (as its runStep)."""
+    return isinstance(s, dict) and any(s.get(k) for k in _STEP_KEYS)
+
+
+def capture_gaps(test_plan, capture_spec) -> list[dict]:
+    """Browser-layer cases of the plan that the capture spec cannot show: [{case, title, missing, detail}], in plan
+    order. missing is 'no-state' (nothing covers the case), 'no-journey' (the covering state has no journey steps) or
+    'viewport' (the covering state is captured at another width than the case asks for). Never raises on odd shapes."""
+    cases = test_plan.get("cases") if isinstance(test_plan, dict) else test_plan
+    spec = capture_spec if isinstance(capture_spec, dict) else {}
+    states = [st for st in spec.get("states", []) if isinstance(st, dict)] if isinstance(spec.get("states"), list) else []
+    out = []
+    for c in cases if isinstance(cases, list) else []:
+        if not isinstance(c, dict) or c.get("layer") != "browser":
+            continue
+        cid = c.get("id") if isinstance(c.get("id"), str) and c.get("id").strip() else "(no id)"
+        title, ui_state = c.get("title", ""), c.get("ui_state")
+        want = c.get("viewport") if isinstance(c.get("viewport"), dict) else {}
+        covering = [st for st in states
+                    if (cid != "(no id)" and isinstance(st.get("cases"), list)
+                        and _case_key(cid) in [_case_key(x) for x in st["cases"] if isinstance(x, str)])
+                    or (isinstance(ui_state, str) and ui_state and st.get("name") == ui_state)]
+        if not covering:
+            what = f"ui_state '{ui_state}' names no capture state" if isinstance(ui_state, str) and ui_state \
+                else "no capture state lists this case"
+            out.append({"case": cid, "title": title, "missing": "no-state", "detail": f"no state: {what}"})
+            continue
+        found = []
+        for st in covering:
+            probs, name, eff = [], st.get("name"), _width(spec, st)
+            if not (isinstance(st.get("journey"), list) and any(_valid_step(x) for x in st["journey"])):
+                probs.append(("no-journey", f"state '{name}' has no journey steps"))
+            if any(k in want and want[k] != eff[k] for k in ("width", "height")):
+                asked = f"{want.get('width', eff['width'])}x{want.get('height', eff['height'])}"
+                probs.append(("viewport", f"state '{name}' is captured at width {eff['width']}x{eff['height']}, "
+                                          f"the case asks for width {asked}"))
+            if not probs:
+                found = []
+                break
+            found = found or probs
+        out += [{"case": cid, "title": title, "missing": m, "detail": d} for m, d in found]
+    return out
+
+
+def cmd_lint(a):
+    def load(path, what):
+        try:
+            return json.loads(Path(path).read_text())
+        except (OSError, ValueError) as e:
+            sys.exit(f"lint: cannot read {what} {path}: {type(e).__name__}")
+    spec, plan = load(a.spec, "spec"), load(a.cases, "cases")
+    if not isinstance(spec, dict):
+        sys.exit(f"lint: {a.spec} is not a capture spec (expected a JSON object)")
+    if not (isinstance(plan, list) or (isinstance(plan, dict) and isinstance(plan.get("cases"), list))):
+        hint = "; the --spec and --cases paths look swapped" if isinstance(plan, dict) and "states" in plan else ""
+        sys.exit(f"lint: {a.cases} is not a test plan (expected a list of cases or an object with a cases list){hint}")
+    for g in capture_gaps(plan, spec):
+        print(f"WARN {g['case']}: {g['detail']}")
+
+
 def main():
     p = argparse.ArgumentParser()
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -662,6 +740,8 @@ def main():
     c.add_argument("--inputs", nargs="+", required=True); c.add_argument("--out", required=True)
     c.add_argument("--checkpoint"); c.add_argument("--manifest", help="capture manifest (carries the fingerprint)")
     c.set_defaults(fn=cmd_combine)
+    l = sp.add_parser("lint", help="warn about browser cases the capture spec cannot show")
+    l.add_argument("--spec", required=True); l.add_argument("--cases", required=True); l.set_defaults(fn=cmd_lint)
     a = p.parse_args()
     a.fn(a)
 
