@@ -477,7 +477,11 @@ class Ctx:
         """The raw settings in effect before defaults: the global file with the project's file over it, key by key.
         One rule for both layers: a dict value merges one level deep (its sub-entries replace whole, so a partial
         host_models.anthropic replaces the shipped entry), anything else replaces whole. An untouched old default
-        review_depth is dropped (only the project level can carry one: the global file refuses the key). `glob` and
+        review_depth is dropped (only the project level can carry one: the global file refuses the key). An old
+        project's copied host_provider or ui_reviewers (the shipped DEFAULT_CONFIG value, which an older init copied
+        into the project's file) is dropped too, key by key, when the machine-wide file sets that same key, so the
+        copy no longer hides it (_drop_old_copies); this is read-time only, nothing is rewritten, and a project that
+        deliberately sets the exact default reads as a copy. `glob` and
         `project` are the files' content (user_config reads them, or passes a candidate about to be written). Unless check_roles is False, each
         file's `agents` and `role_models` are checked (_check_role_settings, _check_agent_choices) and a wrong one stops
         naming the file. A role set by `role_models` in one file replaces that role's `agents` value from the file
@@ -489,6 +493,7 @@ class Ctx:
         out = {}
         layers = ((glob, self.global_config_path), (project or {}, self.config_path))
         layers = tuple(({}, path) if str(path) in skip else (layer, path) for layer, path in layers)
+        layers = (layers[0], (_drop_old_copies(layers[1][0], layers[0][0]), layers[1][1]))
         self.settings_layers = [("global", layers[0][0]), ("project", layers[1][0])]  # what `models` explains
         for layer, path in layers:
             if check_roles:
@@ -2652,6 +2657,19 @@ ROLE_PLAIN = {"ratchet-checkpoint-planner": "planning the steps", "ratchet-imple
 
 _TIERS = ("strong", "standard", "light", "alternate")
 _SESSION_NOTE = "Ratchet can't switch a running session's model; start the session with that model to use it"
+
+
+_OLD_COPIED_KEYS = ("host_provider", "ui_reviewers")
+
+
+def _drop_old_copies(project, glob) -> dict:
+    """The project's settings without an old init's copies: host_provider or ui_reviewers equal to the shipped
+    DEFAULT_CONFIG value while the machine-wide file sets that same key (each key judged alone). Read-time only; the
+    file is never rewritten. A project that deliberately sets the exact default cannot be told from a copy."""
+    if not (isinstance(project, dict) and isinstance(glob, dict)):
+        return project
+    return {k: v for k, v in project.items()
+            if not (k in _OLD_COPIED_KEYS and k in glob and v == DEFAULT_CONFIG.get(k))}
 
 
 def _layer_source(layers, key, name) -> str:
@@ -16244,7 +16262,8 @@ def _config_unset(layer, key):
 def cmd_config(args):
     """Show or change the settings. No flag: the merged settings, as ever. --scope global|project|effective shows one
     level (effective is the merged view); --sources says, per top-level key, which level it came from (builtin,
-    global or project). --set key=value / --unset key change the project's file, or with --global the machine-wide
+    global or project; an old project's copied host_provider/ui_reviewers that the machine-wide file overrides count
+    as global, see _drop_old_copies). --set key=value / --unset key change the project's file, or with --global the machine-wide
     file (checked by the same rules as loading it, written atomically, never as a Ratchet record); removing a key
     returns that setting to the next level down. Anything refused is refused before a file is written."""
     ctx = Ctx(find_root())
@@ -16326,7 +16345,7 @@ def cmd_config(args):
         ctx.validate_candidate(p, project=True)
         src = {}
         for k in ctx.config():
-            if k in p and not (k == "review_depth" and p[k] == OLD_DEFAULT_REVIEW_DEPTH):
+            if k in _drop_old_copies(p, g) and not (k == "review_depth" and p[k] == OLD_DEFAULT_REVIEW_DEPTH):
                 src[k] = "project"
             else:
                 src[k] = "global" if k in g else "builtin"
