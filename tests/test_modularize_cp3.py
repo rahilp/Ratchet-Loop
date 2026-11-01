@@ -641,8 +641,10 @@ def t11_baseline_still_byte_identical():
             check("[CP3-T11] a live `status --json` invocation right now succeeds", live_status is not None,
                   (r.returncode, r.stdout[-300:]))
             if live_status is not None:
+                # CP2 of the schedule-awareness lane: `status --json` gained the one top-level key `schedule`; it is the
+                # only key ignored on the live side (the baseline file is unchanged), every other key must still match.
                 check("[CP3-T11] status --json's top-level key set is unchanged from CP1's baseline",
-                      set(live_status) == set(saved_status), (sorted(live_status), sorted(saved_status)))
+                      set(live_status) - {"schedule"} == set(saved_status), (sorted(live_status), sorted(saved_status)))
 
     d = Path(_tmp.mkdtemp(prefix="cp3-t11-hook-"))
     r = subprocess.run([sys.executable, str(ENGINE), "init", "hook cap", "--slug", "hk"], cwd=str(d),

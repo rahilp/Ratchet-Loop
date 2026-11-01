@@ -98,6 +98,11 @@ def check(name, cond, detail=""):
     print(f"  {'✓' if cond else '✗'} {name}" + ("" if cond else f"   {str(detail)[:400]}"))
 
 
+# CP2 of the schedule-awareness lane: drop_schedule_output (shared in tests/_tmp.py) is applied to BOTH sides of the
+# full-content byte-compare below; it drops exactly the added top-level `schedule` key / 'Projected finish:' line.
+drop_schedule_output = _tmp.drop_schedule_output
+
+
 # ---- git / pinned-source plumbing -----------------------------------------------------------------------
 
 
@@ -328,8 +333,10 @@ def t03_status_json_byte_identical():
     check("[CP6-T03] a live `status --json` invocation right now succeeds", live_status is not None,
           (r.returncode, r.stdout[-300:]))
     if live_status is not None:
+        # CP2 of the schedule-awareness lane: `status --json` gained the one top-level key `schedule`; it is the
+        # only key ignored on the live side (the baseline file is unchanged), every other key must still match.
         check("[CP6-T03] status --json's top-level key set is unchanged from CP1's baseline",
-              set(live_status) == set(saved_status), (sorted(live_status), sorted(saved_status)))
+              set(live_status) - {"schedule"} == set(saved_status), (sorted(live_status), sorted(saved_status)))
 
     # Full-output comparison on a reproducible fixture, the same pinned-vs-current-on-one-fixture technique
     # CP4-06 already established (CP1's own saved sample is captured from this run's own ever-advancing state,
@@ -354,7 +361,9 @@ def t03_status_json_byte_identical():
         if r_before.returncode == 0 and r_after.returncode == 0:
             check("[CP6-T03] the complete status --json output (not just the top-level key set checked above) "
                   "is byte-identical between the pinned pre-move engine and the current, already-split engine, "
-                  "on the same fresh fixture", r_before.stdout == r_after.stdout, (r_before.stdout, r_after.stdout))
+                  "on the same fresh fixture",
+                  drop_schedule_output(r_before.stdout) == drop_schedule_output(r_after.stdout),
+                  (r_before.stdout, r_after.stdout))
     finally:
         pass  # the shared pinned script is deleted once, by main()'s own `finally`, not per call site
 

@@ -738,8 +738,10 @@ def t11_baseline_still_byte_identical():
             check("[CP2-T11] a live `status --json` invocation right now succeeds", live_status is not None,
                   (r.returncode, r.stdout[-300:]))
             if live_status is not None:
+                # CP2 of the schedule-awareness lane: `status --json` gained the one top-level key `schedule`; it is the
+                # only key ignored on the live side (the baseline file is unchanged), every other key must still match.
                 check("[CP2-T11] status --json's top-level key set is unchanged from CP1's baseline",
-                      set(live_status) == set(saved_status), (sorted(live_status), sorted(saved_status)))
+                      set(live_status) - {"schedule"} == set(saved_status), (sorted(live_status), sorted(saved_status)))
 
     # a fresh hook reply, built the same way CP1's capture was: a throwaway project built with the real `init`
     # command, fed a copilot-dialect guard payload that edits that project's own state.json directly.

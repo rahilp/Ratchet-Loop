@@ -88,6 +88,11 @@ def check(name, cond, detail=""):
     print(f"  {'✓' if cond else '✗'} {name}" + ("" if cond else f"   {str(detail)[:400]}"))
 
 
+# CP2 of the schedule-awareness lane: drop_schedule_output (shared in tests/_tmp.py) is applied to BOTH sides of the
+# full-content byte-compare below; it drops exactly the added top-level `schedule` key / 'Projected finish:' line.
+drop_schedule_output = _tmp.drop_schedule_output
+
+
 # ---- git / pinned-source plumbing -----------------------------------------------------------------------
 
 
@@ -435,9 +440,11 @@ def t05_help_status_hook_exit_codes_unchanged():
         check("[CP5-T05] a live `status --json` invocation right now succeeds", live_status is not None,
               (r.returncode, r.stdout[-300:]))
         if live_status is not None and saved_status is not None:
+            # CP2 of the schedule-awareness lane: `status --json` gained the one top-level key `schedule`; it is the
+            # only key ignored on the live side (the baseline file is unchanged), every other key must still match.
             check("[CP5-T05] status --json's top-level key set is unchanged from CP1's baseline, including "
                   "that a benched provider still shows up the same way under unavailable_reviewers",
-                  set(live_status) == set(saved_status), (sorted(live_status), sorted(saved_status)))
+                  set(live_status) - {"schedule"} == set(saved_status), (sorted(live_status), sorted(saved_status)))
 
     # The two checks above only compare top-level KEYS against CP1's baseline (captured from this run's own
     # ever-changing active state, not a controlled fixture), so a regression in shared_unavailable's nested
@@ -514,8 +521,8 @@ def t05_help_status_hook_exit_codes_unchanged():
                         t = t.replace(str(p), "<root>")
                     return t
 
-                cur_norm = _normalize_status_t05(r_cur.stdout, d_cur, d_pin)
-                pin_norm = _normalize_status_t05(r_pin.stdout, d_pin, d_cur)
+                cur_norm = _normalize_status_t05(drop_schedule_output(r_cur.stdout), d_cur, d_pin)
+                pin_norm = _normalize_status_t05(drop_schedule_output(r_pin.stdout), d_pin, d_cur)
                 check("[CP5-T05] status --json's FULL content (not just its top-level keys) is "
                       "byte-identical before and after the move on the same isolated fixture, once "
                       "timestamps and each run's own temp project path are normalized away -- including "

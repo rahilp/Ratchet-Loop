@@ -654,10 +654,10 @@ def _sched_clock(d):
 
 
 def _sched_dur(seconds):
-    """A length of time as '1h 40m', rounded to 5 minutes."""
+    """A length of time as '1h 40m', rounded to 5 minutes, spelled by the engine's own _plain_duration (the one the
+    STALL text uses), so the projected-finish line and the stall line never spell the same length two ways."""
     mins = int(round(max(0, seconds) / 60 / SCHEDULE_ROUND_MINUTES)) * SCHEDULE_ROUND_MINUTES
-    h, m = divmod(mins, 60)
-    return f"{h}h {m}m" if h and m else (f"{h}h" if h else f"{m}m")
+    return _ratchet_module()._plain_duration(mins * 60)
 
 
 def _sched_num(x):
@@ -804,4 +804,34 @@ def step_stall(st, cfg, now):
             f"(budget {budget} minutes, since {_sched_clock(since)})")
     return {"cp": cur, "step": step, "elapsed_seconds": elapsed, "since": _sched_iso(since),
             "budget_minutes": budget, "note": note, "text": text}
+
+
+def schedule_status(st, plan, cfg, now) -> dict:
+    """What `status` and `status --json` show as the projected finish: {steps_left, eta, rounds, sources, line}.
+    `line` is the one plain 'Projected finish:' line and `eta`/`rounds` carry the same numbers (eta: finish, earliest,
+    latest as 'YYYY-MM-DD HH:MM UTC', label, based_on_steps; rounds: expected, used, run_limit, over_limit; both null
+    until a step has finished). Everything is null (steps_left 0 or null, sources empty) when no step is left or the
+    run is done or cancelled. Pure: built from schedule_numbers, `now` is passed in."""
+    st = st if isinstance(st, dict) else {}
+    cps = plan.get("checkpoints") if isinstance(plan, dict) else None
+    ids = [c["id"] for c in (cps if isinstance(cps, list) else []) if isinstance(c, dict) and isinstance(c.get("id"), str)]
+    r = schedule_numbers(st, ids, cfg, now)
+    left = r["left"]
+    if not left or st.get("phase") in ("cancelled", "done"):
+        return {"steps_left": 0 if not left else None, "eta": None, "rounds": None, "sources": [], "line": None}
+    eta = rounds = None
+    if r["finish"]:
+        eta = {"finish": _sched_clock(_sched_time(r["finish"])), "earliest": _sched_clock(_sched_time(r["earliest"])),
+               "latest": _sched_clock(_sched_time(r["latest"])), "label": r["label"], "based_on_steps": r["finished"]}
+    limit = _sched_int(cfg.get("max_adversarial_rounds_run")) if isinstance(cfg, dict) else None
+    used = _sched_int(st.get("adv_rounds_total", 0)) or 0
+    text = r["text"]
+    if r["expected_rounds_left"] is not None:
+        over = None if r["allowed_rounds_left"] is None else r["expected_rounds_left"] > r["allowed_rounds_left"]
+        rounds = {"expected": r["expected_rounds_left"], "used": used, "run_limit": limit, "over_limit": over}
+        if limit is not None:
+            text += f" ({used} of the run's {limit} rounds used so far)"
+    head = f"{left} {'step' if left == 1 else 'steps'} left; "
+    line = f"Projected finish: {head}{text}. Worked out from these state.json fields: {', '.join(r['sources'])}"
+    return {"steps_left": left, "eta": eta, "rounds": rounds, "sources": r["sources"], "line": line}
 

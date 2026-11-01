@@ -89,7 +89,7 @@ from status_text import (plain_reason, blocked_options, plain_now, waiting_quest
                          exit_code_only_line, exit_code_only_note, _lines_word, done_means_table,
                          _finish_block_lines, _finish_blockers, _finish_held, _finish_legacy_note,
                          _finish_integrity_lines, _unproven_finish_lines, _accepted_lines,
-                         _apply_accepted_lines, HELD_AGAIN_PREFIX)
+                         _apply_accepted_lines, HELD_AGAIN_PREFIX, schedule_status)
 import run_records  # noqa: E402  (module object: offers run_records.py's own live _IN_HOOK/_HOOK_ENV_ADVISORY
                      # views THIS exact, currently-executing module's own namespace -- a no-op if some OTHER
                      # ratchet.py instance in this same process already bound first; see run_records.py's own
@@ -2549,6 +2549,9 @@ def cmd_status_text(ctx: Ctx):
     q = waiting_question(ctx, st)
     if q:
         print(question_line(q))
+    sched_line = schedule_status(st, plan, ctx.config(), _dt.datetime.now(_dt.timezone.utc))["line"]
+    if sched_line:
+        print(sched_line)
     if _finish_pending(st):
         # CP4: the finish is held while an approved done-means line is unproven (never for a plan approved before
         # this rule, which gets the plain note instead), or while a checkpoint or test plan changed after approval
@@ -16100,6 +16103,7 @@ def status_json(ctx: Ctx) -> dict:
             "awaiting_since": st.get("awaiting_since"), "approval_mode": approval_mode(ctx),
             "wait": live_wait(st), "question": waiting_question(ctx, st),
             "adv_rounds_used": st.get("adv_rounds_total", 0),
+            "schedule": schedule_status(st, plan, ctx.config(), _dt.datetime.now(_dt.timezone.utc)),
             "unavailable_reviewers": {**shared_unavailable(ctx.config()), **unavailable_reviewers(ctx)},
             "host_provider": detect_host(ctx.config()),
             "hooks_warning": hw, "hook_heartbeat": read_heartbeat(ctx.root),

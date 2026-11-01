@@ -1019,6 +1019,790 @@ def test_CP1_X01_stall_budget_states_a_bad_setting_even_while_under_budget():
     check("absent key: (90, no note)", isinstance(r, tuple) and r[0] == 90 and not r[1], r)
 
 
+# ================================================================================================ CP2 section
+# CP2: `status` / `status --json` show the projected finish. Black-box through the CLI on small synthetic projects:
+# one approved 5-step project is built once, cloned per case and hand-edited the way tests/test_modularize_cp8.py
+# does (state.json edited, then re-baselined with the engine's own record_chain). The engine has no fake clock, so
+# every timestamp is written relative to the real time the test runs and finish times are asserted as "now + N
+# minutes within 10 minutes". The pinned engine at 30b2b55 (cp8's pinned_script) is the "before" for every pin case.
+#
+# Pinned shape of the new output (the implementer chooses the wording around it):
+#   plain `status`: exactly one line that STARTS with "Projected finish:" after the "Phase:" line while a step is left;
+#     it carries the steps left, the label (rough / estimate / no estimate yet), the finish and range as
+#     "YYYY-MM-DD HH:MM UTC", the expected review rounds against the run-wide limit, and the state.json field names.
+#   `status --json`: a top-level `schedule` object, always present: {steps_left, eta: null | {finish, earliest, latest,
+#     label ('rough' | 'estimate'), based_on_steps}, rounds: null | {expected, used, run_limit, over_limit},
+#     sources: [state.json field names], line: the exact plain line (null when no line is shown)}.
+
+import io          # noqa: E402  (CP2 section: output capture and subprocess calls)
+import subprocess  # noqa: E402
+
+S2_PREFIX = "Projected finish:"
+S2_CLOCK = re.compile(r"(\d{4}-\d\d-\d\d \d\d:\d\d) UTC")
+S2_CLOCK_ONLY = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d UTC$")
+S2_OVER = re.compile(r"\b(more than|past|exceed\w*|over the)\b", re.I)
+S2_SCHEMAS = ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md"
+S2_BASELINE = HERE / "fixtures" / "modularize_cp1" / "baseline" / "status_json.json"
+S2_RUN_DIR = ROOT / ".ratchet" / "runs" / "schedule-awareness-projected-completion-eta-per"
+S2_LANE_BASE = "6087151d4a11caace22f9c37d22581e382f15093"   # the commit CP2 started from (CP1's landing commit)
+_S2 = {}
+
+
+def s2c():
+    """tests/test_modularize_cp8.py, imported when first needed (its pinned-engine and fixture helpers)."""
+    if "c8" not in _S2:
+        import test_modularize_cp8
+        _S2["c8"] = test_modularize_cp8
+    return _S2["c8"]
+
+
+def s2_base(kind):
+    """The shared throwaway project a case clones: 'approved' (5 steps, building), 'pre' (plan submitted, not yet
+    approved), 'question' (the approve-plan question is open) or 'noplan' (init only)."""
+    if kind not in _S2:
+        c = s2c()
+        g = c.g
+        cfg = ["max_adversarial_rounds_run=10"]
+        if kind == "approved":
+            d = g.project("sched", cps=5, config=cfg)
+            g.approve_plan(d)
+        elif kind == "pre":
+            d = g.project("sched-pre", cps=5, config=cfg)
+        elif kind == "question":
+            d = c.clone(s2_base("pre"))
+            g.rx(d, "ask", "approve-plan")
+        else:
+            d = Path(_tmp.mkdtemp(prefix="ratchet-sched-noplan-"))
+            for cmd in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+                g.git(d, *cmd)
+            (d / "a.txt").write_text("a\n")
+            g.git(d, "add", "-A")
+            g.git(d, "commit", "-qm", "init")
+            g.say(d, "please build the feature")
+            r = g.rx(d, "init", "feature", "--slug", "f")
+            assert r.returncode == 0, r.stderr
+        _S2[kind] = d
+    return _S2[kind]
+
+
+def s2_fx(spans=(), attempts=None, cur=None, adv_total=0, phase="building", edit=None, base="approved"):
+    """A clone of a base project with `spans` finished steps (each ended 5 minutes before now), then the current step
+    started `cur` ago when given, the rest not started; adv_rounds_total and the phase are set; `edit(st)` last."""
+    c = s2c()
+    d = c.clone(s2_base(base))
+
+    def fn(st):
+        now = datetime.now(timezone.utc)
+        ids = list(st["checkpoints"])
+        for i, cid in enumerate(ids):
+            cp = st["checkpoints"][cid]
+            if i < len(spans):
+                cp["status"], cp["step"] = "done", "complete"
+                cp["started_at"], cp["completed_at"] = iso(now - M(5) - spans[i]), iso(now - M(5))
+                for gt in cp["gates"].values():
+                    if isinstance(gt, dict):
+                        gt["status"] = "passed"
+                cp["gates"]["adversarial"]["attempts"] = attempts[i] if attempts else 1
+            elif i == len(spans) and cur is not None:
+                cp["status"], cp["step"], cp["started_at"], cp["completed_at"] = "in_progress", "tests", iso(now - cur), None
+            else:
+                cp["status"], cp["step"], cp["started_at"], cp["completed_at"] = "pending", "tests", None, None
+        st["current"] = ids[len(spans)] if len(spans) < len(ids) else None
+        st["adv_rounds_total"] = adv_total
+        st["phase"] = phase
+        if edit:
+            edit(st)
+
+    c.mutate(d, fn)
+    return d
+
+
+def s2_f0():
+    return s2_fx(cur=M(1))
+
+
+def s2_f1():
+    return s2_fx(spans=(M(60),), attempts=(2,), cur=M(5), adv_total=2)
+
+
+def s2_f2():
+    return s2_fx(spans=(M(40), M(80)), attempts=(1, 3), cur=M(1), adv_total=4)
+
+
+def s2_f3(adv_total=3, phase="building", edit=None):
+    return s2_fx(spans=(M(60),) * 3, attempts=(2, 1, 3), cur=M(1), adv_total=adv_total, phase=phase, edit=edit)
+
+
+def s2_fdone():
+    return s2_fx(spans=(M(60),) * 5, attempts=(1,) * 5, phase="awaiting_final_review")
+
+
+def s2_fblocked():
+    return s2_f3(edit=s2c().blocked("CP4: 3 adversarial rounds used without approval"))
+
+
+def s2_out(d, env=None, engine=None):
+    """(plain status result, status --json result, parsed json or None)."""
+    c = s2c()
+    eng = engine or c.ENGINE
+    rp = c.run(eng, d, ["status"], env=env)
+    rj = c.run(eng, d, ["status", "--json"], env=env)
+    try:
+        j = json.loads(rj.stdout)
+    except ValueError:
+        j = None
+    return rp, rj, j
+
+
+def s2_lines(text):
+    return [ln.rstrip("\n") for ln in text.splitlines() if ln.startswith(S2_PREFIX)]
+
+
+def s2_dict(o, key=None):
+    v = o.get(key) if (key is not None and isinstance(o, dict)) else (o if key is None else None)
+    return v if isinstance(v, dict) else {}
+
+
+def s2_settled(d, env=None):
+    """s2_out, run once more when the plain line and the JSON line differ (the two calls can straddle a 5-minute mark)."""
+    for _ in range(2):
+        rp, rj, j = s2_out(d, env)
+        lines = s2_lines(rp.stdout)
+        if lines and s2_dict(s2_dict(j, "schedule"), "line") == lines[0]:
+            break
+        if not lines and "line" not in s2_dict(j, "schedule"):
+            break
+    return rp, rj, j
+
+
+def s2_line(rp):
+    """The single plain 'Projected finish:' line of a `status` result, or None; a failed check when there is not one."""
+    lines = s2_lines(rp.stdout)
+    check("`status` exits 0", rp.returncode == 0, (rp.returncode, rp.stderr[-300:]))
+    check("`status` prints exactly one line starting 'Projected finish:'", len(lines) == 1, lines)
+    return lines[0] if len(lines) == 1 else None
+
+
+def s2_sch(j, rj):
+    check("`status --json` exits 0 and parses to an object", rj.returncode == 0 and isinstance(j, dict),
+          (rj.returncode, rj.stderr[-300:], rj.stdout[-200:]))
+    sch = s2_dict(j, "schedule") if isinstance(j, dict) else {}
+    check("`status --json` has a top-level `schedule` object", isinstance(j, dict) and isinstance(j.get("schedule"), dict),
+          list(j) if isinstance(j, dict) else None)
+    return sch
+
+
+def s2_pclock(text):
+    try:
+        # S2_CLOCK.findall captures the clock without its ' UTC' suffix; the JSON fields carry it. Accept both forms.
+        if isinstance(text, str) and not text.endswith(" UTC"):
+            text += " UTC"
+        return datetime.strptime(text, "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def s2_near(text, minutes, tol=10):
+    """Whether the clock text is real-now + `minutes`, within `tol` minutes."""
+    d = s2_pclock(text)
+    return d is not None and abs((d - (datetime.now(timezone.utc) + M(minutes))).total_seconds()) <= tol * 60
+
+
+def s2_nums(line):
+    """The standalone numbers of a line, clock times left out."""
+    return re.findall(r"(?<![\w.:/-])\d+(?:\.\d+)?(?![\w:/-])", S2_CLOCK.sub("", line or ""))
+
+
+def s2_has_num(line, n):
+    return any(float(x) == float(n) for x in s2_nums(line))
+
+
+@contextlib.contextmanager
+def s2_pinned(tag):
+    p = s2c().pinned_script(tag)
+    try:
+        yield p
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def s2_norm(text, own, other):
+    return s2c()._normalize_clone_text(s2c().drop_schedule_output(text), own, other)
+
+
+def s2_pair(d, args, pin, env=None, stdin=None):
+    """(pinned result, live result, pinned text, live text): the same command on the pinned engine and on the built
+    engine, each in its own clone of `d`, with the schedule additions dropped and each clone's own path normalized."""
+    c = s2c()
+    d1, d2 = c.clone(d), c.clone(d)
+    if stdin is None:
+        r1, r2 = c.run(pin, d1, args, env=env), c.run(c.ENGINE, d2, args, env=env)
+    else:
+        r1 = subprocess.run([sys.executable, str(pin), *args], cwd=str(d1), capture_output=True, text=True,
+                            env=env or c.g.ENV, timeout=60, input=stdin(d1))
+        r2 = subprocess.run([sys.executable, str(c.ENGINE), *args], cwd=str(d2), capture_output=True, text=True,
+                            env=env or c.g.ENV, timeout=60, input=stdin(d2))
+    return r1, r2, s2_norm(r1.stdout, d1, d2), s2_norm(r2.stdout, d2, d1)
+
+
+@case("CP2-T01")
+def test_CP2_T01_no_finished_step_says_no_estimate_yet():
+    d = s2_f0()
+    rp, rj, j = s2_settled(d)
+    line = s2_line(rp)
+    sch = s2_sch(j, rj)
+    lo = (line or "").lower()
+    check("the line says 'no estimate yet'", "no estimate yet" in lo, line)
+    check("the line gives the steps left (5)", s2_has_num(line, 5) and "left" in lo, line)
+    check("the line shows no clock time", S2_CLOCK.search(line or "") is None, line)
+    check("the line shows no range", "between" not in lo and "range" not in lo, line)
+    out = rp.stdout.splitlines()
+    ph = [i for i, ln in enumerate(out) if ln.startswith("Phase:")]
+    at = [i for i, ln in enumerate(out) if ln.startswith(S2_PREFIX)]
+    check("the line sits after the 'Phase:' line", bool(ph) and bool(at) and at[0] > ph[0], (ph, at))
+    work = [i for i, ln in enumerate(out) if ln.startswith("Working on step")]
+    check("the line sits after the 'Working on step' (plain-now) line", bool(work) and bool(at) and at[0] > work[0],
+          (work, at))
+    check("schedule.eta is null", "eta" in sch and sch["eta"] is None, sch.get("eta", "missing"))
+    check("schedule.steps_left is 5", sch.get("steps_left") == 5, sch.get("steps_left"))
+    check("schedule.line equals the plain line", line is not None and sch.get("line") == line, (sch.get("line"), line))
+
+
+@case("CP2-T02")
+def test_CP2_T02_one_finished_step_is_rough_and_says_it_rests_on_one():
+    rp, rj, j = s2_settled(s2_f1())
+    line = s2_line(rp)
+    sch = s2_sch(j, rj)
+    eta = s2_dict(sch, "eta")
+    clocks = S2_CLOCK.findall(line or "")
+    check("the line is labelled rough", "rough" in (line or "").lower(), line)
+    check("the line says it rests on 1 finished step",
+          "1 finished step" in (line or "") and "1 finished steps" not in (line or ""), line)
+    check("the line shows a finish time about 55 + 3 x 60 = 235 minutes from now", bool(clocks) and s2_near(clocks[0], 235),
+          clocks)
+    check("with one finished step every clock on the line is the same time", len(clocks) >= 1 and len(set(clocks)) == 1,
+          clocks)
+    check("schedule.eta.label is 'rough'", eta.get("label") == "rough", eta)
+    check("schedule.eta.based_on_steps is 1", eta.get("based_on_steps") == 1, eta)
+    check("schedule.eta.finish is about 235 minutes from now", s2_near(eta.get("finish"), 235), eta.get("finish"))
+    check("schedule.eta.earliest and latest are the same as finish",
+          eta.get("earliest") == eta.get("finish") == eta.get("latest") and eta.get("finish") is not None, eta)
+    check("schedule.steps_left is 4", sch.get("steps_left") == 4, sch.get("steps_left"))
+
+
+@case("CP2-T03")
+def test_CP2_T03_two_finished_steps_are_rough_with_a_fastest_to_slowest_range():
+    rp, rj, j = s2_settled(s2_f2())
+    line = s2_line(rp)
+    sch = s2_sch(j, rj)
+    eta = s2_dict(sch, "eta")
+    check("the line is labelled rough", "rough" in (line or "").lower(), line)
+    check("the line says it rests on 2 finished steps", "2 finished steps" in (line or ""), line)
+    check("finish is about now + 3 x 60 - 1 = 180 minutes", s2_near(eta.get("finish"), 180), eta.get("finish"))
+    check("earliest is about now + 3 x 40 = 120 minutes", s2_near(eta.get("earliest"), 120), eta.get("earliest"))
+    check("latest is about now + 3 x 80 = 240 minutes", s2_near(eta.get("latest"), 240), eta.get("latest"))
+    f, lo, hi = (s2_pclock(eta.get(k)) for k in ("finish", "earliest", "latest"))
+    check("earliest <= finish <= latest", None not in (f, lo, hi) and lo <= f <= hi, eta)
+    check("the line shows exactly those three clock times",
+          set(S2_CLOCK.findall(line or "")) == {str(eta.get(k))[:-4] for k in ("finish", "earliest", "latest")},
+          (S2_CLOCK.findall(line or ""), eta))
+    check("schedule.eta.label is 'rough' on 2 finished steps", eta.get("label") == "rough", eta)
+    check("schedule.eta.based_on_steps is 2", eta.get("based_on_steps") == 2, eta)
+
+
+@case("CP2-T04")
+def test_CP2_T04_three_finished_steps_is_an_estimate_not_rough():
+    rp, rj, j = s2_settled(s2_f3())
+    line = s2_line(rp)
+    sch = s2_sch(j, rj)
+    eta = s2_dict(sch, "eta")
+    check("the word 'rough' is not in the line", line is not None and "rough" not in line.lower(), line)
+    check("the line says it rests on 3 finished steps", "3 finished steps" in (line or ""), line)
+    check("the line says estimate", "estimate" in (line or "").lower() and "no estimate" not in (line or "").lower(), line)
+    clocks = S2_CLOCK.findall(line or "")
+    check("the line shows a finish about now + 59 + 60 = 120 minutes", bool(clocks) and s2_near(clocks[0], 120), clocks)
+    check("schedule.eta.label is 'estimate'", eta.get("label") == "estimate", eta)
+    check("schedule.eta.based_on_steps is 3", eta.get("based_on_steps") == 3, eta)
+    check("schedule.eta.finish is about 120 minutes from now", s2_near(eta.get("finish"), 120), eta.get("finish"))
+
+
+@case("CP2-T05")
+def test_CP2_T05_expected_rounds_are_the_average_times_the_steps_left():
+    rp, rj, j = s2_settled(s2_f3())
+    line = s2_line(rp)
+    rounds = s2_dict(s2_sch(j, rj), "rounds")
+    check("the line mentions review rounds", "round" in (line or "").lower(), line)
+    check("the line gives 4 expected rounds (mean 2 x 2 steps left)", s2_has_num(line, 4), line)
+    check("schedule.rounds.expected is 4", rounds.get("expected") == 4, rounds)
+    check("schedule.rounds.run_limit is 10", rounds.get("run_limit") == 10, rounds)
+    rp2, rj2, j2 = s2_settled(s2_f2())
+    line2 = s2_line(rp2)
+    rounds2 = s2_dict(s2_sch(j2, rj2), "rounds")
+    check("fixture F2 (1 and 3 rounds, 3 steps left): the line gives 6 expected rounds", s2_has_num(line2, 6), line2)
+    check("fixture F2: schedule.rounds.expected is 6, so a constant cannot pass", rounds2.get("expected") == 6, rounds2)
+
+
+@case("CP2-T06")
+def test_CP2_T06_rounds_past_the_run_limit_are_called_out_plainly():
+    for label, used, over in (("F3-over (8 used + 4 expected > 10)", 8, True), ("F3-ok (3 used + 4 expected)", 3, False),
+                              ("exact fit (6 used + 4 expected = 10 of 10)", 6, False)):
+        rp, rj, j = s2_settled(s2_f3(adv_total=used))
+        line = s2_line(rp)
+        rounds = s2_dict(s2_sch(j, rj), "rounds")
+        check(f"{label}: schedule.rounds.used is {used}, expected 4, run_limit 10",
+              (rounds.get("used"), rounds.get("expected"), rounds.get("run_limit")) == (used, 4, 10), rounds)
+        check(f"{label}: schedule.rounds.over_limit is {over}", rounds.get("over_limit") is over, rounds)
+        said = S2_OVER.search(line or "") is not None and "limit" in (line or "").lower()
+        if over:
+            check(f"{label}: the line says plainly the expected rounds go past the run-wide limit", said, line)
+        else:
+            check(f"{label}: the line has no 'past the limit' sentence", line is not None and not S2_OVER.search(line), line)
+
+
+@case("CP2-T07")
+def test_CP2_T07_finish_times_are_utc_and_never_finer_than_five_minutes():
+    zones = ("America/New_York", "Asia/Kolkata")
+    g = s2c().g
+    for label, mk in (("F1", s2_f1), ("F2", s2_f2), ("F3", s2_f3)):
+        d = mk()
+
+        def one_round():
+            got = {}
+            for tz in zones:
+                rp, rj, j = s2_out(d, dict(g.ENV, TZ=tz))
+                got[tz] = ((s2_lines(rp.stdout) or [""])[0], s2_dict(j, "schedule"))
+            return got
+
+        got = one_round()
+        if got[zones[0]][0] != got[zones[1]][0]:   # the two zones' calls may straddle a 5-minute mark: once more
+            got = one_round()
+        for tz in zones:
+            line, sch = got[tz]
+            clocks = S2_CLOCK.findall(line)
+            check(f"{label} {tz}: the line shows at least one clock time", len(clocks) >= 1, line)
+            check(f"{label} {tz}: every clock minute is divisible by 5", all(int(c[-2:]) % 5 == 0 for c in clocks), clocks)
+            check(f"{label} {tz}: no seconds, offset or zone name on the line",
+                  re.search(r"\d\d:\d\d:\d\d|[+-]\d\d:?\d\d\b|\b(EST|EDT|IST|GMT)\b", S2_CLOCK.sub("", line)) is None, line)
+            eta = s2_dict(sch, "eta")
+            strs = [eta.get(k) for k in ("finish", "earliest", "latest")]
+            check(f"{label} {tz}: the JSON eta strings are '%Y-%m-%d %H:%M UTC' on a 5-minute mark",
+                  all(isinstance(x, str) and S2_CLOCK_ONLY.match(x) and int(x[-6:-4]) % 5 == 0 for x in strs), strs)
+        check(f"{label}: the line is the same text under both time zones", got[zones[0]][0] == got[zones[1]][0]
+              and got[zones[0]][0] != "", (got[zones[0]][0], got[zones[1]][0]))
+
+
+@case("CP2-T08")
+def test_CP2_T08_the_plain_line_and_the_json_field_carry_the_same_numbers():
+    for label, mk in (("F0", s2_f0), ("F1", s2_f1), ("F2", s2_f2), ("F3-over", lambda: s2_f3(adv_total=8))):
+        rp, rj, j = s2_settled(mk())
+        line = s2_line(rp)
+        sch = s2_sch(j, rj)
+        eta, rounds = sch.get("eta"), sch.get("rounds")
+        check(f"{label}: schedule.line is byte-equal to the plain line", line is not None and sch.get("line") == line,
+              (sch.get("line"), line))
+        check(f"{label}: the steps left on the line equal schedule.steps_left",
+              isinstance(sch.get("steps_left"), int) and s2_has_num(line, sch["steps_left"]), (sch.get("steps_left"), line))
+        if isinstance(eta, dict):
+            check(f"{label}: the line's three clock times are the JSON finish, earliest and latest",
+                  set(S2_CLOCK.findall(line or "")) == {str(eta.get(k))[:-4] for k in ("finish", "earliest", "latest")},
+                  (S2_CLOCK.findall(line or ""), eta))
+            check(f"{label}: the label on the line is the JSON label", (eta.get("label") == "rough") == ("rough" in line.lower()),
+                  (eta.get("label"), line))
+            check(f"{label}: the based-on count on the line equals based_on_steps",
+                  f"{eta.get('based_on_steps')} finished step" in line, (eta.get("based_on_steps"), line))
+        else:
+            check(f"{label}: no eta in the JSON means no clock time on the line", eta is None and not S2_CLOCK.search(line or ""),
+                  (eta, line))
+        if isinstance(rounds, dict):
+            check(f"{label}: expected rounds, rounds used and the run limit on the line equal schedule.rounds",
+                  all(rounds.get(k) is not None and s2_has_num(line, rounds.get(k)) for k in ("expected", "used", "run_limit")),
+                  (rounds, line))
+
+
+@case("CP2-T09")
+def test_CP2_T09_both_outputs_name_the_state_fields_the_numbers_came_from():
+    c = s2c()
+    for label, mk in (("F0", s2_f0), ("F3", s2_f3)):
+        d = mk()
+        rp, rj, j = s2_settled(d)
+        line = s2_line(rp)
+        s2_sch(j, rj)
+        src = s2_dict(j, "schedule").get("sources")
+        check(f"{label}: schedule.sources is a non-empty list of names while a line is printed",
+              isinstance(src, list) and bool(src) and all(isinstance(x, str) and x for x in src), src)
+        src = src if isinstance(src, list) else []
+        leaf = lambda n: n.split(".")[-1].replace("[]", "")  # noqa: E731
+        miss = [x for x in src if isinstance(x, str) and leaf(x) not in (line or "")]
+        check(f"{label}: the plain line names every field in schedule.sources", bool(src) and not miss, (miss, line))
+        check(f"{label}: the line names started_at", "started_at" in (line or ""), line)
+        if label == "F3":
+            for want in ("started_at", "completed_at", "gates.adversarial.attempts", "adv_rounds_total",
+                         "max_adversarial_rounds_run"):
+                check(f"F3: schedule.sources lists {want}", any(isinstance(x, str) and x.endswith(want) for x in src), src)
+            for want in ("completed_at", "attempts", "adv_rounds_total", "max_adversarial_rounds_run"):
+                check(f"F3: the plain line names {want}", want in (line or ""), line)
+            st = json.loads(c._spath(d).read_text())
+            cfg = json.loads((Path(d) / ".ratchet" / "config.json").read_text())
+            gone = [x for x in src if isinstance(x, str) and not source_exists(x, st, cfg)]
+            check("F3: every listed source is a field that state.json or the config really has", not gone, gone)
+
+
+@case("CP2-T10")
+def test_CP2_T10_no_line_and_an_empty_schedule_when_no_step_is_left():
+    cancel = s2c().phase("cancelled", blocked_reason="cancelled by the user")
+    for label, d in (("Fdone (finish pause)", s2_fdone()),
+                     ("Fcancel (cancelled run)", s2_fx(spans=(M(60),) * 3, attempts=(1, 1, 1), cur=M(1), edit=cancel))):
+        rp, rj, j = s2_out(d)
+        check(f"{label}: `status` exits 0", rp.returncode == 0, (rp.returncode, rp.stderr[-300:]))
+        check(f"{label}: no line starts with 'Projected finish:'", s2_lines(rp.stdout) == [], s2_lines(rp.stdout))
+        sch = s2_sch(j, rj)
+        check(f"{label}: steps_left is 0 or null", "steps_left" in sch and sch["steps_left"] in (0, None), sch)
+        check(f"{label}: eta is null", "eta" in sch and sch["eta"] is None, sch)
+        check(f"{label}: rounds is null", "rounds" in sch and sch["rounds"] is None, sch)
+        check(f"{label}: no line text in the JSON", sch.get("line") in (None, ""), sch.get("line"))
+    rp, rj, j = s2_settled(s2_fx(spans=(M(60),) * 4, attempts=(1,) * 4, cur=M(1)))
+    line = s2_line(rp)
+    sch = s2_sch(j, rj)
+    check("4 of 5 done: the line gives 1 step left", s2_has_num(line, 1) and "left" in (line or "").lower(), line)
+    check("4 of 5 done: schedule.steps_left is 1", sch.get("steps_left") == 1, sch.get("steps_left"))
+
+
+@case("CP2-T11")
+def test_CP2_T11_damaged_timestamps_never_crash_status_and_never_feed_the_estimate():
+    long_ago = lambda m: iso(datetime.now(timezone.utc) - M(m))  # noqa: E731
+
+    def wreck(st):
+        """CP1..CP4 done with valid 60-minute spans, CP5 running since 5 minutes; each case then damages one field."""
+        for i, cid in enumerate(("CP1", "CP2", "CP3", "CP4")):
+            st["checkpoints"][cid].update(status="done", step="complete", started_at=long_ago(300 - 60 * i),
+                                          completed_at=long_ago(240 - 60 * i))
+        st["checkpoints"]["CP5"].update(status="in_progress", started_at=long_ago(5), completed_at=None)
+        st["current"] = "CP5"
+
+    def bad_all(st):
+        cps = st["checkpoints"]
+        cps["CP1"]["completed_at"] = None                                 # missing
+        cps["CP2"]["completed_at"] = "not-a-date"                         # not a date
+        cps["CP3"]["completed_at"] = long_ago(400)                        # ends before it started
+        cps["CP4"]["started_at"] = 12345                                  # a number
+
+    def bad_with_good(st):
+        bad_all(st)
+        st["checkpoints"]["CP1"].update(started_at=long_ago(65), completed_at=long_ago(5))   # one good 60-minute step
+
+    for label, fn in (("only bad steps", bad_all), ("one good 60-minute step among the bad ones", bad_with_good)):
+        d = s2_fx(edit=lambda st, fn=fn: (wreck(st), fn(st)))
+        rp, rj, j = s2_settled(d)
+        check(f"{label}: `status` exits 0 with no traceback", rp.returncode == 0 and "Traceback" not in rp.stderr + rp.stdout,
+              (rp.returncode, rp.stderr[-300:]))
+        check(f"{label}: `status --json` exits 0 with valid JSON and no traceback",
+              rj.returncode == 0 and isinstance(j, dict) and "Traceback" not in rj.stderr, (rj.returncode, rj.stderr[-300:]))
+        line = s2_line(rp)
+        sch = s2_dict(j, "schedule")
+        if label == "only bad steps":
+            check("only bad steps: the line says 'no estimate yet'", "no estimate yet" in (line or "").lower(), line)
+            check("only bad steps: schedule.eta is null", "eta" in sch and sch["eta"] is None, sch.get("eta", "missing"))
+        else:
+            eta = s2_dict(sch, "eta")
+            check("variant: the line says it rests on 1 finished step",
+                  "1 finished step" in (line or "") and "1 finished steps" not in (line or ""), line)
+            check("variant: based_on_steps is 1", eta.get("based_on_steps") == 1, eta)
+            check("variant: the finish uses the one good 60 minutes (the last step ran 5 minutes: about 55 minutes left)",
+                  s2_near(eta.get("finish"), 55), eta.get("finish"))
+
+
+@case("CP2-T12")
+def test_CP2_T12_the_schedule_key_is_present_in_every_phase_and_nothing_else_is_added():
+    fixtures = (("awaiting plan approval", s2_base("pre")), ("building (F3)", s2_f3()), ("blocked", s2_fblocked()),
+                ("awaiting_final_review", s2_fdone()), ("no plan yet", s2_base("noplan")))
+    with s2_pinned("cp2t12") as pin:
+        for label, d in fixtures:
+            r1, r2, _a, _b = s2_pair(d, ["status", "--json"], pin)
+            try:
+                j1, j2 = json.loads(r1.stdout), json.loads(r2.stdout)
+            except ValueError:
+                j1 = j2 = None
+            check(f"{label}: both engines print JSON", isinstance(j1, dict) and isinstance(j2, dict),
+                  (r1.stdout[-200:], r2.stdout[-200:], r2.stderr[-200:]))
+            if not (isinstance(j1, dict) and isinstance(j2, dict)):
+                continue
+            check(f"{label}: the new top-level keys are exactly {{'schedule'}}", set(j2) - set(j1) == {"schedule"},
+                  (sorted(set(j2) - set(j1)), sorted(set(j1) - set(j2))))
+            check(f"{label}: no key of the pinned engine is gone", not (set(j1) - set(j2)), sorted(set(j1) - set(j2)))
+            check(f"{label}: `schedule` is an object", isinstance(j2.get("schedule"), dict), j2.get("schedule"))
+            if label == "awaiting plan approval":
+                sch = s2_dict(j2, "schedule")
+                check("awaiting plan approval: the same 'no estimate yet' line as T01, with 5 steps left",
+                      "no estimate yet" in str(sch.get("line")).lower() and sch.get("steps_left") == 5, sch)
+
+
+@case("CP2-T13")
+def test_CP2_T13_every_existing_status_json_field_keeps_its_value():
+    fixtures = (("F0", s2_f0()), ("F3", s2_f3()), ("Fblocked", s2_fblocked()), ("Fdone", s2_fdone()))
+    with s2_pinned("cp2t13") as pin:
+        for label, d in fixtures:
+            c = s2c()
+            d1, d2 = c.clone(d), c.clone(d)
+            r1, r2 = c.run(pin, d1, ["status", "--json"]), c.run(c.ENGINE, d2, ["status", "--json"])
+            try:
+                j1, j2 = json.loads(r1.stdout), json.loads(r2.stdout)
+            except ValueError:
+                j1 = j2 = None
+            check(f"{label}: both engines print JSON", isinstance(j1, dict) and isinstance(j2, dict),
+                  (r1.stdout[-200:], r2.stdout[-200:], r2.stderr[-200:]))
+            if not (isinstance(j1, dict) and isinstance(j2, dict)):
+                continue
+            check(f"{label}: the key sets differ by exactly {{'schedule'}}", set(j2) ^ set(j1) == {"schedule"},
+                  (sorted(set(j2) - set(j1)), sorted(set(j1) - set(j2))))
+            for j in (j1, j2):
+                for k in ("root", "viewer_url"):
+                    j.pop(k, None)
+            j2.pop("schedule", None)
+            diff = sorted(k for k in set(j1) | set(j2) if j1.get(k) != j2.get(k))
+            check(f"{label}: after removing only `schedule`, every other field equals the pinned engine's", not diff,
+                  [(k, j1.get(k), j2.get(k)) for k in diff][:3])
+
+
+@case("CP2-T14")
+def test_CP2_T14_taking_the_new_lines_out_leaves_the_old_bytes_exactly():
+    c = s2c()
+    drop = getattr(c, "drop_schedule_output", None)
+    check("tests/test_modularize_cp8.py defines the one normalizer drop_schedule_output", callable(drop), None)
+    if not callable(drop):
+        return
+    # the normalizer drops no more than it must (synthetic texts)
+    plain = "Step 1 of 5 done\nPhase: building\nProjected finish: no estimate yet\nWorking on step 2\n"
+    check("a line that starts with 'Projected finish:' is dropped and nothing else",
+          drop(plain) == "Step 1 of 5 done\nPhase: building\nWorking on step 2\n", drop(plain))
+    keep = ("Note: Projected finish: mid-line\nschedule: changed\n Projected finish: indented\nthe schedule moved\n"
+            "Projected  finish:\n")
+    check("lines that only mention the words, mid-line or after a space, are kept", drop(keep) == keep, drop(keep))
+    pinned_out = "Phase: building\nWorking on step 2\n"
+    check("a pinned output with one extra line is NOT equal after normalizing",
+          drop(pinned_out + "Something new\n") != pinned_out and drop(pinned_out + "A schedule line\n") != pinned_out, None)
+    check("a changed line is NOT equal after normalizing", drop("Phase: blocked\nWorking on step 2\n") != pinned_out, None)
+    doc = {"a": 1, "schedule": {"x": 1}, "b": [1, 2], "checkpoints": [{"id": "CP1", "schedule": 2}], "schedule2": 3}
+    want = {k: v for k, v in doc.items() if k != "schedule"}
+    check("the top-level `schedule` key of a status --json dict is dropped, nothing else",
+          drop(json.dumps(doc, indent=2) + "\n") == json.dumps(want, indent=2) + "\n", drop(json.dumps(doc, indent=2) + "\n"))
+    other = json.dumps({"a": 1, "checkpoints": [{"id": "CP1", "schedule": 2}]}, indent=2) + "\n"
+    check("JSON without a top-level `schedule` key is returned unchanged (a nested `schedule` is kept)",
+          drop(other) == other, drop(other))
+    # real outputs on small fixtures: the same bytes before and after, apart from the removed lines
+    pre, q, f0, f3 = s2_base("pre"), s2_base("question"), s2_f0(), s2_f3()
+    fixtures = (("F0 building", f0), ("F3 building", f3), ("awaiting plan approval", pre), ("question open", q),
+                ("blocked", s2_fblocked()), ("finish pause", s2_fdone()))
+    with s2_pinned("cp2t14") as pin:
+        for label, d in fixtures:
+            for args in (["status"], ["next"], ["plan-summary"]):
+                r1, r2, o1, o2 = s2_pair(d, args, pin)
+                check(f"{label}: `{' '.join(args)}` exits with the same code", r1.returncode == r2.returncode,
+                      (r1.returncode, r2.returncode, r2.stderr[-200:]))
+                check(f"{label}: `{' '.join(args)}` stdout is byte-identical once the schedule lines are dropped",
+                      o1 == o2, (o1[-300:], o2[-300:]))
+        d1, d2 = c.clone(f3), c.clone(f3)
+        raw1, raw2 = c.run(pin, d1, ["status"]).stdout, c.run(c.ENGINE, d2, ["status"]).stdout
+        n1, n2 = c._normalize_clone_text(raw1, d1, d2), c._normalize_clone_text(raw2, d2, d1)
+        added = [ln for ln in n2.splitlines(keepends=True) if ln.startswith(S2_PREFIX)]
+        rest = "".join(ln for ln in n2.splitlines(keepends=True) if not ln.startswith(S2_PREFIX))
+        check("without the normalizer the raw `status` outputs on F3 differ (the normalizer is needed)", n1 != n2, None)
+        check("the raw outputs differ by exactly the schedule lines and nothing else", bool(added) and rest == n1,
+              (added, rest[-200:], n1[-200:]))
+        rn = c.run(c.ENGINE, c.clone(f3), ["next"])
+        try:
+            nj = json.loads(rn.stdout)
+        except ValueError:
+            nj = None
+        check("`next` has no schedule key and no 'Projected finish:' text in CP2",
+              isinstance(nj, dict) and "schedule" not in nj and S2_PREFIX not in rn.stdout, rn.stdout[-300:])
+
+
+@case("CP2-T15")
+def test_CP2_T15_the_earlier_byte_pins_and_key_set_checks_still_pass_with_only_additive_edits():
+    c = s2c()
+    ran = []
+    for name in ("t05_status_text_byte_identical_across_phases", "t06_next_plain_fields_byte_identical",
+                 "t07_plan_summary_byte_identical", "t08_blocked_options_byte_identical_per_reason",
+                 "t09_finish_pause_block_byte_identical", "t11_exit_code_only_note_byte_identical",
+                 "t12_hook_crash_plain_lines_byte_identical", "t13_status_and_next_json_carry_same_fields"):
+        fn = getattr(c, name, None)
+        if not callable(fn):
+            check(f"cp8 pin case {name} exists", False, None)
+            continue
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                fn()
+                crashed = None
+            except Exception as e:  # a crash is a failed check, not a crash of this file
+                crashed = f"{type(e).__name__}: {e}"
+        bad = [ln.strip() for ln in buf.getvalue().splitlines() if "\u2717" in ln]
+        ran.append(name)
+        check(f"cp8 {name}: every byte-pin check passes with its check() calls as written",
+              crashed is None and not bad, (crashed, bad[:2]))
+    check("(sanity) eight cp8 pin cases were called", len(ran) == 8, ran)
+    if not S2_RUN_DIR.exists():
+        check("(not in this lane's run: the diff-scope check is skipped, as cp8's own T17 does)", True)
+    else:
+        r = subprocess.run(["git", "cat-file", "-e", S2_LANE_BASE + "^{commit}"], cwd=str(ROOT), capture_output=True)
+        if r.returncode == 0:
+            d = subprocess.run(["git", "diff", "--numstat", S2_LANE_BASE, "--", "tests/test_modularize_cp8.py"],
+                               cwd=str(ROOT), capture_output=True, text=True, timeout=60)
+            parts = d.stdout.split()
+            check("git diff of tests/test_modularize_cp8.py against its base shows only added lines (none removed)",
+                  d.returncode == 0 and len(parts) >= 3 and parts[1] == "0" and parts[0].isdigit() and int(parts[0]) > 0,
+                  (d.returncode, d.stdout, d.stderr[-200:]))
+    try:
+        saved = json.loads(S2_BASELINE.read_text())
+    except (OSError, ValueError) as e:
+        saved = None
+        check("the CP1 baseline status_json.json parses", False, str(e))
+    rl = subprocess.run([sys.executable, str(c.ENGINE), "status", "--json"], cwd=str(ROOT), capture_output=True,
+                        text=True, timeout=60)
+    try:
+        live = json.loads(rl.stdout) if rl.returncode == 0 else None
+    except ValueError:
+        live = None
+    check("a live `status --json` succeeds", isinstance(live, dict), (rl.returncode, rl.stdout[-200:]))
+    if isinstance(live, dict) and isinstance(saved, dict):
+        check("the live top-level key set differs from the baseline by exactly {'schedule'}",
+              set(live) - set(saved) == {"schedule"} and not (set(saved) - set(live)),
+              (sorted(set(live) - set(saved)), sorted(set(saved) - set(live))))
+
+
+def s2_tree_hash(d):
+    import hashlib
+    h = hashlib.sha256()
+    run_dir = Path(d) / ".ratchet" / "runs" / "f"
+    files = [run_dir / "state.json", Path(d) / ".ratchet" / "config.json"]
+    ev = run_dir / "evidence"
+    if ev.is_dir():
+        files += sorted(p for p in ev.rglob("*") if p.is_file())
+    for p in files:
+        h.update(str(p.relative_to(d)).encode())
+        h.update(p.read_bytes() if p.exists() else b"<missing>")
+    return h.hexdigest()
+
+
+@case("CP2-T16")
+def test_CP2_T16_showing_the_schedule_does_not_write_or_change_anything():
+    c = s2c()
+    d = s2_f3()
+    rp0, rj0, j0 = s2_out(d)
+    check("(sanity) the built `status` really shows the schedule line on F3", len(s2_lines(rp0.stdout)) == 1,
+          s2_lines(rp0.stdout))
+    check("(sanity) the built `status --json` really has the schedule object on F3",
+          isinstance(j0, dict) and isinstance(j0.get("schedule"), dict), None)
+    before = s2_tree_hash(d)
+    for args in (["status"], ["status", "--json"], ["next"]) * 2:
+        r = c.run(c.ENGINE, d, args)
+        check(f"`{' '.join(args)}` exits 0", r.returncode == 0, (r.returncode, r.stderr[-200:]))
+    check("state.json, the evidence folder and .ratchet/config.json are unchanged after showing the schedule",
+          s2_tree_hash(d) == before, None)
+
+    def stop_in(own):
+        return json.dumps({"cwd": str(own), "session_id": "s-owner", "hook_event_name": "Stop"})
+
+    with s2_pinned("cp2t16") as pin:
+        for args in (["status"], ["status --json"], ["next"], ["hook", "stop", "--host", "claude"]):
+            args = args[0].split() if len(args) == 1 else args
+            r1, r2, o1, o2 = s2_pair(d, args, pin, stdin=stop_in if args[0] == "hook" else None)
+            if args[0] == "hook":
+                check("the Stop hook exits with the same code on both engines", r1.returncode == r2.returncode,
+                      (r1.returncode, r2.returncode, r2.stderr[-200:]))
+                check("the Stop hook's reply is identical on both engines for the same state", o1 == o2, (o1[-300:], o2[-300:]))
+            else:
+                check(f"`{' '.join(args)}` exits with the pinned engine's code", r1.returncode == r2.returncode,
+                      (r1.returncode, r2.returncode))
+        n1, n2, _a, _b = s2_pair(d, ["next"], pin)
+        try:
+            a, b = json.loads(n1.stdout), json.loads(n2.stdout)
+        except ValueError:
+            a = b = None
+        check("`next` prints JSON on both engines", isinstance(a, dict) and isinstance(b, dict), (n1.stdout[-100:], n2.stdout[-100:]))
+        if isinstance(a, dict) and isinstance(b, dict):
+            check("`next`'s action equals the pinned engine's", a.get("action") == b.get("action"), (a.get("action"), b.get("action")))
+            check("`next`'s stop_ok equals the pinned engine's", a.get("stop_ok") == b.get("stop_ok"),
+                  (a.get("stop_ok"), b.get("stop_ok")))
+
+
+@case("CP2-T17")
+def test_CP2_T17_other_readers_of_status_keep_working_with_the_new_field():
+    c = s2c()
+    d = s2_f3()
+    rs, rjs, js = s2_out(d)
+    check("(sanity) `status --json` has the schedule object on the lane's run",
+          isinstance(js, dict) and isinstance(js.get("schedule"), dict), None)
+
+    def rows(engine, own):
+        r = c.run(engine, own, ["lanes", "--scan", str(own), "--json"])
+        try:
+            out = json.loads(r.stdout)
+            for row in out:
+                for k in ("root", "viewer_url"):   # each clone's own path is the only variable part of a row
+                    row.pop(k, None)
+        except (ValueError, AttributeError, TypeError):
+            out = None
+        return r, out
+
+    with s2_pinned("cp2t17") as pin:
+        d1, d2 = c.clone(d), c.clone(d)
+        r1, a = rows(pin, d1)
+        r2, b = rows(c.ENGINE, d2)
+    check("both engines list the lane (`lanes --scan --json` exits 0 and prints one row)",
+          r1.returncode == 0 and r2.returncode == 0 and isinstance(a, list) and isinstance(b, list) and len(a) == 1 == len(b),
+          (r1.returncode, r2.returncode, r2.stderr[-200:], r2.stdout[-200:]))
+    if not (isinstance(a, list) and isinstance(b, list) and len(a) == 1 == len(b)):
+        return
+    for k in ("phase", "done", "total", "waiting_on", "awaiting_since"):
+        check(f"the lane row's {k} equals the pinned engine's", a[0].get(k) == b[0].get(k), (k, a[0].get(k), b[0].get(k)))
+    check("the lane row shows done 3 of total 5 in phase building",
+          (b[0].get("done"), b[0].get("total"), b[0].get("phase")) == (3, 5, "building"), b[0])
+    check("the lane row has no key the pinned engine's row lacks, other than `schedule`",
+          set(b[0]) - set(a[0]) <= {"schedule"} and not (set(a[0]) - set(b[0])), (sorted(set(b[0]) ^ set(a[0]))))
+    x, y = dict(a[0]), dict(b[0])
+    y.pop("schedule", None)
+    diff = sorted(k for k in set(x) | set(y) if x.get(k) != y.get(k))
+    check("every other field of the lane row equals the pinned engine's", not diff, [(k, x.get(k), y.get(k)) for k in diff][:3])
+
+
+@case("CP2-T18")
+def test_CP2_T18_schemas_section_9_shows_the_schedule_field_and_calls_it_an_estimate():
+    try:
+        doc_text = S2_SCHEMAS.read_text(encoding="utf-8")
+    except OSError as e:
+        check("schemas.md is readable", False, str(e))
+        return
+    m = re.search(r"^## 9\. .*?(?=^## 10\. )", doc_text, re.S | re.M)
+    check("(fixture sanity) schemas.md has a section 9", m is not None)
+    if m is None:
+        return
+    sec = m.group(0)
+    blk = re.search(r"```json\n(.*?)```", sec, re.S)
+    try:
+        ex = json.loads(blk.group(1)) if blk else None
+    except ValueError:
+        ex = None
+    check("the section 9 status --json example parses", isinstance(ex, dict), None)
+    ex = ex if isinstance(ex, dict) else {}
+    rp, rj, j = s2_out(s2_f3())
+    real = j if isinstance(j, dict) else {}
+    check("(fixture sanity) a real status --json from F3 parses", bool(real), rj.stderr[-200:])
+    check("the example has a `schedule` key", "schedule" in ex, sorted(ex))
+    check("the example's `schedule` is an object with the same keys as the real schedule object",
+          isinstance(ex.get("schedule"), dict) and isinstance(real.get("schedule"), dict)
+          and set(ex["schedule"]) == set(real["schedule"]), (ex.get("schedule"), real.get("schedule")))
+    check("the example's top-level keys equal the real top-level keys exactly",
+          set(ex) == set(real), (sorted(set(real) - set(ex)), sorted(set(ex) - set(real))))
+    dcp = (ex.get("checkpoints") or [{}])[0]
+    rcp = (real.get("checkpoints") or [{}])[0]
+    check("the per-checkpoint keys in the example are unchanged (all documented, none invented)",
+          bool(rcp) and set(dcp) == set(rcp), (sorted(set(rcp) - set(dcp)), sorted(set(dcp) - set(rcp))))
+    sentences = re.split(r"(?<=[.!?])\s+", sec.replace("\n", " "))
+    mine = [s for s in sentences if "schedule" in s.lower() and "estimate" in s.lower() and "not a deadline" in s.lower()]
+    check("the section has a sentence saying the schedule is an estimate, not a deadline", len(mine) >= 1, None)
+
+
 # ================================================================================================ runner
 # Keep this block last. Later checkpoints add their own section (with @case registrations) above it.
 

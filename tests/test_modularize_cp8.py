@@ -163,6 +163,15 @@ def _normalize_clone_text(text, own_dir, other_dir):
     return re.sub(r"file://\S+", "file://<viewer>", t)
 
 
+# CP2 of the schedule-awareness lane adds one 'Projected finish:' line to plain `status` and one top-level `schedule`
+# key to `status --json`, on top of the pinned engine's output. This normalizer is applied to BOTH sides in
+# compare_text and _json_for_compare below and drops exactly those two additions: a line that STARTS with the fixed
+# prefix, and the top-level `schedule` key of a JSON dict whose text is otherwise re-dumped the way the engine writes
+# it (indent 2, trailing newline); text that is not that exact shape is left untouched, so it still fails loudly.
+# Every other byte and key stays compared.
+drop_schedule_output = _tmp.drop_schedule_output
+
+
 def compare_text(label, d, args, env=None, normalize=None):
     """Runs `args` against the pinned pre-move engine and the current engine, each on its own clone of `d`
     (never the same directory twice), and checks returncode/stdout byte-for-byte (optionally normalized).
@@ -174,6 +183,9 @@ def compare_text(label, d, args, env=None, normalize=None):
         r2 = run(ENGINE, d2, args, env=env)
     finally:
         pinned.unlink(missing_ok=True)
+    # CP2 of the schedule-awareness lane: the schedule additions are dropped from BOTH raw outputs first, while a
+    # status --json text still parses (the clone-path rewrite below can break the JSON of a viewer_url string).
+    r1.stdout, r2.stdout = drop_schedule_output(r1.stdout), drop_schedule_output(r2.stdout)
     out1 = _normalize_clone_text(r1.stdout, d1, d2)
     out2 = _normalize_clone_text(r2.stdout, d2, d1)
     if normalize:
@@ -742,6 +754,7 @@ def _json_for_compare(engine_path, d):
         return None
     for k in ("root", "viewer_url"):
         j.pop(k, None)
+    j.pop("schedule", None)  # CP2 of the schedule-awareness lane: the one new top-level key, dropped on both sides
     return j
 
 

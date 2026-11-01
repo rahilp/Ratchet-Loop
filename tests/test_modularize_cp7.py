@@ -92,6 +92,11 @@ def check(name, cond, detail=""):
     print(f"  {'✓' if cond else '✗'} {name}" + ("" if cond else f"   {str(detail)[:400]}"))
 
 
+# CP2 of the schedule-awareness lane: drop_schedule_output (shared in tests/_tmp.py) is applied to BOTH sides of the
+# full-content byte-compare below; it drops exactly the added top-level `schedule` key / 'Projected finish:' line.
+drop_schedule_output = _tmp.drop_schedule_output
+
+
 # ---- fixtures / helpers ------------------------------------------------------------------------------------
 
 
@@ -636,8 +641,10 @@ def t14_help_status_hook_and_exit_codes_byte_identical():
         check("[CP7-T14] `status --json`'s exit code matches CP1's recorded baseline exit code",
               r.returncode == samples[0].get("exit_code"), (r.returncode, samples[0].get("exit_code")))
         if live_status is not None and saved_status is not None:
+            # CP2 of the schedule-awareness lane: `status --json` gained the one top-level key `schedule`; it is the
+            # only key ignored on the live side (the baseline file is unchanged), every other key must still match.
             check("[CP7-T14] status --json's top-level key set is unchanged from CP1's baseline",
-                  set(live_status) == set(saved_status), (sorted(live_status), sorted(saved_status)))
+                  set(live_status) - {"schedule"} == set(saved_status), (sorted(live_status), sorted(saved_status)))
 
     # The two checks above only compare the top-level KEY SET against CP1's baseline (captured once, from
     # this run's own ever-advancing active state, so a literal full-content comparison against that exact
@@ -678,7 +685,8 @@ def t14_help_status_hook_and_exit_codes_byte_identical():
                 check("[CP7-T14] the complete status --json output (not just the top-level key set checked "
                       "above) is byte-identical between the pre-move pinned engine and the current, "
                       "already-split engine, on the same fresh reproducible fixture -- no live-repo state "
-                      "involved", r_before.stdout == r_after.stdout, (r_before.stdout, r_after.stdout))
+                      "involved", drop_schedule_output(r_before.stdout) == drop_schedule_output(r_after.stdout),
+                      (r_before.stdout, r_after.stdout))
 
     hook_samples = [e for e in entries if e.get("kind") == "hook_reply"]
     check("[CP7-T14] setup: a hook_reply baseline entry is recorded", bool(hook_samples), entries)

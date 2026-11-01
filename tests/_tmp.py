@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import json
 import os
 import shutil
 import signal
@@ -119,6 +120,26 @@ _LOCK = threading.RLock()
 _LIVE: list = []          # TmpDir objects not cleaned up yet, oldest first
 _PROCS: list = []         # processes tracked without a folder (see track())
 _OWNER = os.getpid()      # a forked child must never clean up its parent's folders
+
+
+def drop_schedule_output(text):
+    """The one shared normalizer for the schedule-awareness lane's additions to `status`: drops ONLY the
+    top-level `schedule` key of a `status --json` document (when `text` is exactly that dict re-dumped the way
+    the engine writes it: indent 2, trailing newline) and ONLY the lines of plain output that START with
+    'Projected finish:'. Text of any other shape is returned untouched, so a mismatch still fails loudly.
+    Applied to BOTH sides of the pinned-engine byte-compares in tests/test_modularize_cp4..cp8.py."""
+    if not isinstance(text, str):
+        return text
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        if "schedule" in parsed and text == json.dumps(parsed, indent=2) + "\n":
+            del parsed["schedule"]
+            return json.dumps(parsed, indent=2) + "\n"
+        return text
+    return "".join(ln for ln in text.splitlines(keepends=True) if not ln.startswith("Projected finish:"))
 
 
 def _stop(proc) -> None:

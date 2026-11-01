@@ -364,7 +364,9 @@ def t06_status_json_captured():
         check("[CP1-T06] setup: a live `status --json` invocation in this repo succeeds right now (to compare "
               "schemas against)", False, None if live is None else (live.returncode, live.stdout[-300:]))
         return
-    missing_keys = sorted(set(live_json) - set(captured))
+    # CP2 of the schedule-awareness lane: `status --json` gained the one top-level key `schedule` (the captured baseline
+    # file is unchanged), so that one key alone is ignored on the live side; any other new or missing key still fails.
+    missing_keys = sorted(set(live_json) - set(captured) - {"schedule"})
     check("[CP1-T06] the captured sample's top-level keys match a live `status --json` invocation's keys "
           "(same schema; verbatim from a real run)", not missing_keys, missing_keys)
 
