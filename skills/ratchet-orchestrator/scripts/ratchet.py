@@ -16808,7 +16808,8 @@ HOST_ENFORCEMENT = {
     "codex": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": True},
     "gemini": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": True},
     "copilot": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": False},
-    # The plugin's guard and prompt handlers are in; its stop handler is not yet (checkpoint CP6 adds it).
+    # The plugin's guard and prompt handlers are enforced. Its stop handler only re-prompts after the turn ended
+    # (OpenCode calls the `event` hook fire-and-forget), so stop stays False.
     "opencode": {"records": True, "identity": False, "stop": False, "replies": True, "guidance": True},
 }
 

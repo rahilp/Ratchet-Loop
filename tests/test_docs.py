@@ -341,7 +341,7 @@ CP2_FIELDS = ("records", "identity", "stop", "replies", "guidance")
 # installs hooks for, measures what the code actually does, in the same shape as HOST_ENFORCEMENT. Every probe
 # uses a fresh throwaway project in a temp dir.
 CP2_PROBE = r'''
-import contextlib, importlib.util, io, json, os, shutil, sys, tempfile
+import contextlib, importlib.util, io, json, os, re, shutil, sys, tempfile
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("ratchet_engine_cp2", sys.argv[1])
 eng = importlib.util.module_from_spec(spec)
@@ -416,10 +416,37 @@ guard_ok = rc == 0 and field(out, "block") is True
 rc, out, _ = emit("opencode", "stop", True, "cp2 stop probe")
 stop_ok = rc == 0 and field(out, "block") is True
 rc, out, err = emit("opencode", "prompt", False, "cp2 guidance probe")
+
+
+def opencode_stop_is_fire_and_forget(code):
+    """True only when the plugin's stop check (STOP_ARGS, asked in onIdle) is reached through the `event` hook alone.
+    OpenCode calls `event` as `void hook["event"]?.(...)`: never awaited, so it cannot hold a turn open. Any doubt
+    (a piece not found, the stop check used elsewhere, wired to an awaited hook) reads False, which counts as a stop
+    that is enforced and so fails the table check."""
+    try:
+        def_idle = code.index("const onIdle = async")
+        def_event = code.index("const onEvent = async")
+        ret = code.rindex("\n  return {\n")
+        event_key = code.index("\n    event: async", ret)
+    except ValueError:
+        return False
+    nxt = re.search(r'\n    ("chat\.message"|"tool\.execute\.before"|ratchetMarkedText):', code[event_key + 1:])
+    event_end = event_key + 1 + nxt.start() if nxt else len(code)
+    idle_calls = [m.start() for m in re.finditer(r"\bonIdle\(", code)]
+    event_calls = [m.start() for m in re.finditer(r"\bonEvent\(", code)]
+    stop_uses = [m.start() for m in re.finditer(r"\bSTOP_ARGS\b", code)][1:]  # the first is the declaration
+    return (bool(idle_calls) and all(def_event < i < ret for i in idle_calls)
+            and bool(event_calls) and all(event_key < i < event_end for i in event_calls)
+            and bool(stop_uses) and all(def_idle < i < def_event for i in stop_uses))
+
+
 measured["opencode"] = {
     "records": ("hook guard --host opencode" in plugin and guard_ok and guard_blocks("opencode", "runs/x/state.json")),
     "identity": guard_blocks("opencode", "runs/x/reviews/CP1/adv-round-01/a.json", "ratchet-fixer"),
-    "stop": "hook stop --host opencode" in plugin and stop_ok,
+    # the plugin carries `hook stop --host opencode` and the engine blocks, but that only counts as a stop the host
+    # enforces when the check runs in an awaited hook; wired to the fire-and-forget `event` hook it is a re-prompt
+    "stop": ("hook stop --host opencode" in plugin and stop_ok
+             and not opencode_stop_is_fire_and_forget(plugin)),
     "replies": ("hook prompt --host opencode" in plugin and '"chat.message"' in plugin
                 and prompt_recorded("opencode")),
     "guidance": ("hook prompt --host opencode" in plugin and '"chat.message"' in plugin and rc == 0
