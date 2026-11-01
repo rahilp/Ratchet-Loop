@@ -3209,9 +3209,9 @@ def provider_health() -> dict:
 
 def _health_key(pv) -> str:
     """The provider's one key in the shared record: its tool plus its own `model` (never the model agents.reviewer
-    chose: a bench or share count recorded for the provider applies to a chosen model, and a test of a chosen model is
-    kept in its project only, see _probe_chosen_model). A hand-written command provider has no preset, so its program is
-    its tool (and its id tells two providers run through one program apart)."""
+    chose: a bench or share count recorded for the provider applies to a chosen model, and a passed test of a chosen
+    model is kept under its tool plus that model, see _chosen_health_key). A hand-written command provider has no
+    preset, so its program is its tool (and its id tells two providers run through one program apart)."""
     tool = pv.get("preset") or Path(provider_binary(pv) or str(pv.get("id"))).name
     label = pv.get("model")
     if not label and not pv.get("preset") and pv.get("id") not in (None, tool):
@@ -4415,9 +4415,10 @@ def reviewer_model_applies(cfg) -> bool:
 def with_reviewer_choice(cfg) -> dict:
     """The config with the chosen reviewer provider's model set to launch (`launch_model` on that provider, which
     provider_command and roster read). Nothing else changes: the shared-record key (_health_key) still reads the
-    provider's own `model`, so a bench or share count recorded for the provider still applies (a failing test of the
-    chosen model is not written there, see _probe_chosen_model). Returns `cfg` itself when no model is chosen or the
-    provider's command has no {model} to put it in (reviewer_model_problem). The copy keeps `paid_ok_at`, but
+    provider's own `model`, so a bench or share count recorded for the provider still applies (a passed test of the
+    chosen model is kept under its tool plus that model, a failure stays a project mark, see _probe_chosen_model).
+    Returns `cfg` itself when no model is chosen or the provider's command has no {model} to put it in
+    (reviewer_model_problem). The copy keeps `paid_ok_at`, but
     per_use_unapproved treats a model other than the provider's own `model` as having no OK. The copy is for reading;
     never write it back to a config file."""
     ch = reviewer_choice(cfg)
@@ -15472,23 +15473,55 @@ def cmd_status(args):
     cmd_status_text(ctx)
 
 
+def _chosen_health_key(pv) -> str:
+    """The shared-record key of a provider run on the model agents.reviewer chose: its tool plus that model
+    ('codex:gpt-5.1'). Never the provider's own key, so a pass of the chosen model does not mark the own model tested."""
+    return _health_key(dict(pv, model=launch_model(pv)))
+
+
+_CLOCK_SKEW_SECONDS = 60  # a record dated this far ahead of now is a clock mistake, not a fresh result
+
+
+def _chosen_pass_future(data, key, now) -> bool:
+    """True when the entry is dated later than now plus a small clock skew: it cannot be trusted as a fresh pass."""
+    t = phealth._time(phealth._entry(data, key).get("at"))
+    return t is not None and (t - now).total_seconds() > _CLOCK_SKEW_SECONDS
+
+
+def _chosen_pass_fresh(cfg, pv) -> bool:
+    """True when the shared record holds a passed test of this provider on the chosen model inside probe_ttl_minutes
+    (a damaged or undated entry is not fresh)."""
+    now = _dt.datetime.now(_dt.timezone.utc)
+    if _chosen_pass_future(provider_health(), _chosen_health_key(pv), now):
+        return False
+    return phealth.fresh_ok(provider_health(), _chosen_health_key(pv), now, float(cfg.get("probe_ttl_minutes", 120)))
+
+
 def _probe_chosen_model(ctx, cfg, pv) -> tuple[bool, str]:
-    """The test request for a provider whose launched model is the one agents.reviewer chose, not its own `model`. Its
-    result belongs to this project alone: the shared record is keyed by the provider's own model and is read by every
-    project, so a failure here must not bench that model for the others (nor a pass mark it tested). A failure marks
-    the provider's reviewers unavailable here for unavailable_ttl_hours, for that model only (the mark names it, so
-    it ends the moment the choice is removed or changed); a pass clears this project's marks."""
+    """The test request for a provider whose launched model is the one agents.reviewer chose, not its own `model`. A
+    pass is kept in the shared record under the provider's tool plus that model (_chosen_health_key), dated when the
+    request was sent, so every project skips the request while it is fresh; it never marks the provider's own model
+    as tested. A failure is not written there: it stays a project mark, so it cannot bench that model for the others.
+    It marks the provider's reviewers unavailable here for unavailable_ttl_hours, for that model only (the mark names
+    it, so it ends the moment the choice is removed or changed); a pass clears this project's marks."""
+    sent = _dt.datetime.now(_dt.timezone.utc)
     good, detail = probe_provider(ctx, cfg, pv, record=False)[:2]
     busy = False
     if good:
         busy = _update_unavailable(ctx, lambda live: [live.pop(f"{pv['id']}-{lens}", None) for lens in LENSES],
                                    note=False) == "busy"
+        key = _chosen_health_key(pv)
+        def record(data):
+            if _chosen_pass_future(data, key, sent):  # record_probe would keep a future-dated entry: drop it first
+                data.pop(key, None)
+            phealth.record_probe(data, key, True, detail, sent)
+        busy = _update_health(record, note=False) == "busy" or busy
     else:
         for lens in LENSES:
             busy = mark_unavailable(ctx, f"{pv['id']}-{lens}", f"test request of {launch_model(pv)} failed: {detail}",
                                     note=False, model=launch_model(pv)) is None or busy
-    if busy:  # the unavailable-reviewers record was locked by another command: this result was not saved
-        detail += " (not saved: unavailable-reviewers.json is busy, run this again)"
+    if busy:  # a record was locked by another command: this result was not saved
+        detail += " (not saved: a record is busy, run this again)"
     return good, detail
 
 
@@ -15635,7 +15668,7 @@ def cmd_reviewers(args):
         new_nonce = secrets.token_hex(8)
         ignore_old = {_start_id(old_nonce, x) for x in give_old}
         reserved, tries = False, 0
-        tested = set()  # providers on a chosen model, tested once per call (their result is not in the shared record)
+        tested = set()  # providers on a chosen model, tested once per call
         chosen_cfg = with_reviewer_choice(cfg)  # read only for the model a reviewer that takes the choice would launch
 
         def due_for(picked):
@@ -15652,9 +15685,10 @@ def cmd_reviewers(args):
                 out.add((pid, on_choice))
             return sorted(out)
 
-        def due_now(pid, on_choice):  # the shared record says whether a provider on its own model needs a test; a chosen one does once
+        def due_now(pid, on_choice):  # the shared record says whether a provider needs a test; a chosen model's pass is kept there too
             if on_choice:
-                return pid not in tested and bool(cfg.get("probe_providers", True))
+                return (pid not in tested and bool(cfg.get("probe_providers", True))
+                        and not _chosen_pass_fresh(cfg, provider_by_id(chosen_cfg, pid)))
             return probe_due(ctx, cfg, pid)
         while True:  # test the providers we are about to rely on; a failing one hands its slot on
             tries += 1
@@ -15993,7 +16027,14 @@ def cmd_reviewer_status(args):
     cfg = ctx.config()
     if args.reset:
         key = _reviewer_health_key(cfg, args.reset)
-        if key and _update_health(lambda data: phealth.clear(data, key), note=False) == "busy":
+        pv = provider_by_id(with_reviewer_choice(cfg), (_roster_spec(cfg, args.reset) or {}).get("provider") or args.reset)
+        ckey = _chosen_health_key(pv) if _other_model_chosen(pv) else None  # the chosen model's saved pass too
+
+        def clear_keys(data):
+            for k in (key, ckey):
+                if k:
+                    phealth.clear(data, k)
+        if (key or ckey) and _update_health(clear_keys, note=False) == "busy":
             _die_record_busy(_health_path(), f"{args.reset}'s shared bench was not cleared")
         p = _unavailable_path(ctx)
         if _update_unavailable(ctx, lambda live: live.pop(args.reset, None), note=False) == "busy":
