@@ -39,6 +39,11 @@ def has(text, *patterns):
 
 
 PROVIDERS = ("claude", "codex", "gemini", "copilot")
+# The README per-CLI table has a row for each of the four stdin/stdout-hook CLIs plus OpenCode, the JS-plugin host
+# (HOOK_HOSTS in ratchet.py stays at the four; OpenCode is only HOST_ENFORCEMENT's fifth key). PROVIDERS stays the
+# four for the prose checks further down, which count the hook CLIs only.
+OPENCODE = "opencode"
+TABLE_CLIS = (*PROVIDERS, OPENCODE)
 
 
 def providers_named(text):
@@ -102,23 +107,23 @@ def l_hooks_same_claim(sect):  # T01
     return HOOKS_SAME_RX.search(sect) is not None
 
 
-def l_table_four_cli(sect):  # T02
+def l_table_five_cli(sect):  # T02
     rows = cli_rows(sect)
     if not rows:
         return False
     matches = []
     for r in rows:
         name = r[0] if r else ""
-        matches.append([p for p in PROVIDERS if re.search(r"\b" + p, name, re.I)])
+        matches.append([p for p in TABLE_CLIS if re.search(r"\b" + p, name, re.I)])
     if any(len(h) != 1 for h in matches):
         return False
     found = [h[0] for h in matches]
-    return sorted(found) == sorted(PROVIDERS) and len(found) == len(set(found))
+    return sorted(found) == sorted(TABLE_CLIS) and len(found) == len(set(found))
 
 
 def l_rows_cover(sect, patterns):  # T03-T06
     rows = cli_rows(sect)
-    if len(rows) != 4:
+    if len(rows) != 5:
         return False
     return all(has(row_text(r), *patterns) for r in rows)
 
@@ -145,50 +150,58 @@ def l_cell_affirms(cell, rx):
 
 
 def cols_by_cli(sect):
-    """{cli_name_lower: [cell, ...]} for the 4 data rows, only when every row has the 5 expected columns."""
+    """{cli_name_lower: [cell, ...]} for the 5 data rows (the four hook CLIs and OpenCode), only when every row has
+    the 5 expected columns."""
     rows = cli_rows(sect)
-    if len(rows) != 4 or any(len(r) < 5 for r in rows):
+    if len(rows) != 5 or any(len(r) < 5 for r in rows):
         return {}
     out = {}
     for r in rows:
-        for p in PROVIDERS:
+        for p in TABLE_CLIS:
             if re.search(r"\b" + p, r[0], re.I):
                 out[p] = r
-    return out if len(out) == 4 else {}
+    return out if len(out) == 5 else {}
 
 
-def l_record_col_affirms(sect):  # X01
+# X01-X04 below: the four hook CLIs are affirmed (reviewer identity: Claude Code only) and the OpenCode row follows
+# HOST_ENFORCEMENT["opencode"], passed in as `oc` (the facts dict). Every fact there is False today, so each of its
+# cells must be negated; when a later checkpoint turns a fact on, that cell must affirm it and the row must change.
+def l_record_col_affirms(sect, oc):  # X01
     cols = cols_by_cli(sect)
-    return bool(cols) and all(l_cell_affirms(r[1], RECORD_CELL_RX) for r in cols.values())
+    return bool(cols) and all(l_cell_affirms(cols[p][1], RECORD_CELL_RX) for p in PROVIDERS) \
+        and l_cell_affirms(cols[OPENCODE][1], RECORD_CELL_RX) is oc["records"]
 
 
-def l_stop_col_affirms(sect):  # X02
+def l_stop_col_affirms(sect, oc):  # X02
     cols = cols_by_cli(sect)
-    return bool(cols) and all(l_cell_affirms(r[3], STOP_CELL_RX) for r in cols.values())
+    return bool(cols) and all(l_cell_affirms(cols[p][3], STOP_CELL_RX) for p in PROVIDERS) \
+        and l_cell_affirms(cols[OPENCODE][3], STOP_CELL_RX) is oc["stop"]
 
 
-def l_prompt_col_affirms(sect):  # X03
+def l_prompt_col_affirms(sect, oc):  # X03
     cols = cols_by_cli(sect)
-    return bool(cols) and all(l_cell_affirms(r[4], PROMPT_CELL_RX) for r in cols.values())
+    return bool(cols) and all(l_cell_affirms(cols[p][4], PROMPT_CELL_RX) for p in PROVIDERS) \
+        and l_cell_affirms(cols[OPENCODE][4], PROMPT_CELL_RX) is oc["replies"]
 
 
-def l_reviewer_col_polarity(sect):  # X04
+def l_reviewer_col_polarity(sect, oc):  # X04
     cols = cols_by_cli(sect)
     if not cols:
         return False
     if not l_cell_affirms(cols["claude"][2], REVIEWER_CELL_RX):
         return False
-    return all(not l_cell_affirms(cols[p][2], REVIEWER_CELL_RX) for p in cols if p != "claude")
+    return all(not l_cell_affirms(cols[p][2], REVIEWER_CELL_RX) for p in PROVIDERS if p != "claude") \
+        and l_cell_affirms(cols[OPENCODE][2], REVIEWER_CELL_RX) is oc["identity"]
 
 
 def l_claude_only_subagent(sect):  # T07
     if not ONLY_CLAUDE_SUBAGENT_RX.search(sect):
         return False
     rows = cli_rows(sect)
-    if len(rows) != 4:
+    if len(rows) != 5:
         return False
     others = [r for r in rows if not re.search(r"claude", r[0], re.I)]
-    if len(others) != 3:
+    if len(others) != 4:
         return False
     return not any(SUBAGENT_CLAIM_RX.search(row_text(r)) for r in others)
 
@@ -229,8 +242,12 @@ def cp2_docs_lint():
 
     check("[CP2-T01] the 'hooks work the same on all four CLIs' claim is gone",
           bool(sect) and not l_hooks_same_claim(sect), sect[:200])
-    check("[CP2-T02] a table names all four CLIs, exactly one row each, no fifth CLI",
-          l_table_four_cli(sect), [r[0] if r else "" for r in rows])
+    check("[CP2-T02] a table names all five CLIs (the four hook CLIs and OpenCode), exactly one row each, no sixth CLI",
+          l_table_five_cli(sect), [r[0] if r else "" for r in rows])
+    sixth = sect.replace("| OpenCode |", "| Cursor |", 1)
+    check("[CP2-T02] teeth: renaming the OpenCode row to a sixth CLI, or adding a sixth row, turns the check red",
+          "| OpenCode |" in sect and not l_table_five_cli(sixth)
+          and not l_table_five_cli(sect.replace("| OpenCode |", "| Cursor | x | x | x | x |\n| OpenCode |", 1)))
     check("[CP2-T03] every row covers record/state-file protection", l_rows_cover(sect, RECORD_PATTERNS), rows)
     check("[CP2-T04] every row covers reviewer identity checks", l_rows_cover(sect, REVIEWER_PATTERNS), rows)
     check("[CP2-T05] every row covers the stop hook", l_rows_cover(sect, STOP_PATTERNS), rows)
@@ -247,13 +264,15 @@ def cp2_docs_lint():
     check("[CP2-T11] no em dashes in the new table or surrounding prose", bool(sect) and "—" not in sect)
 
     cols = cols_by_cli(sect)
-    check("[CP2-X01] the record/state-file protection cell is affirmed (not negated) in all four rows",
-          l_record_col_affirms(sect), cols)
-    check("[CP2-X02] the stop-hook cell is affirmed (not negated) in all four rows", l_stop_col_affirms(sect), cols)
-    check("[CP2-X03] the records-your-replies cell is affirmed (not negated) in all four rows",
-          l_prompt_col_affirms(sect), cols)
-    check("[CP2-X04] the reviewer-identity cell affirms it only for Claude Code and negates it for the other three",
-          l_reviewer_col_polarity(sect), cols)
+    oc = cp2_opencode_facts()  # HOST_ENFORCEMENT["opencode"], read from the engine in a child process
+    check("[CP2-X01] the record/state-file protection cell is affirmed (not negated) in the four hook rows, and the "
+          "OpenCode row follows HOST_ENFORCEMENT", l_record_col_affirms(sect, oc), cols)
+    check("[CP2-X02] the stop-hook cell is affirmed (not negated) in the four hook rows, and the OpenCode row follows "
+          "HOST_ENFORCEMENT", l_stop_col_affirms(sect, oc), cols)
+    check("[CP2-X03] the records-your-replies cell is affirmed (not negated) in the four hook rows, and the OpenCode "
+          "row follows HOST_ENFORCEMENT", l_prompt_col_affirms(sect, oc), cols)
+    check("[CP2-X04] the reviewer-identity cell affirms it only for Claude Code, negates it for Codex, Gemini and "
+          "Copilot, and the OpenCode row follows HOST_ENFORCEMENT", l_reviewer_col_polarity(sect, oc), cols)
 
     # Teeth: prove X01-X04 are not keyword-only like T03-T06 by turning one real cell into the adversary's own
     # negated-row examples (evidence/CP2/adversarial/round-01/open-findings.json id X1) and checking the
@@ -270,14 +289,28 @@ def cp2_docs_lint():
     ]
     for tid, old, new, pred in negation_mutants:
         present = old in sect
-        red = present and not pred(sect.replace(old, new, 1))
+        red = present and not pred(sect.replace(old, new, 1), oc)
         check(f"[CP2-{tid}] teeth: negating that row ({new!r}) turns the check red", red,
               "example text not found in README" if not present else "still green")
     swapped = sect.replace(
         "No, Ratchet has no way to know which sub-agent (reviewer) is at work, so it cannot confirm reviewer identity.",
         "Yes, Codex tells Ratchet which sub-agent is acting, so Ratchet can confirm reviewer identity.", 1)
     check("[CP2-X04] teeth: a non-Claude row falsely claiming it confirms reviewer identity is also rejected",
-          not l_reviewer_col_polarity(swapped))
+          not l_reviewer_col_polarity(swapped, oc))
+    # Teeth for the OpenCode row: the cell with the opposite polarity to HOST_ENFORCEMENT (rendered the way X05 renders
+    # it), and a data change that flips the fact under the unchanged README, both turn the matching predicate red.
+    oc_row = next((r for r in cli_rows(sect) if re.search(r"opencode", r[0], re.I)), [])
+    for tid, col, pred, fact in [("X01", 1, l_record_col_affirms, "records"),
+                                 ("X04", 2, l_reviewer_col_polarity, "identity"),
+                                 ("X02", 3, l_stop_col_affirms, "stop"),
+                                 ("X03", 4, l_prompt_col_affirms, "replies")]:
+        flipped = dict(oc, **{fact: not oc[fact]})
+        opposite = cp2_render_row(OPENCODE, flipped)[col]
+        changed = sect.replace(oc_row[col], opposite, 1) if len(oc_row) == 5 else sect
+        check(f"[CP2-{tid}] teeth: the OpenCode {fact} cell turned to the opposite of HOST_ENFORCEMENT is red, and so "
+              "is the unchanged cell once the data flips the fact",
+              len(oc_row) == 5 and opposite != oc_row[col] and not pred(changed, oc) and not pred(sect, flipped),
+              oc_row)
     # Adversarial round 2 (X05-X10): the table must equal the rows rendered from ratchet.py's HOST_ENFORCEMENT,
     # and every fact there is measured against the code. This supersedes the keyword checks T03-T07 and X01-X04.
     cp2_single_source_checks(sect)
@@ -299,7 +332,8 @@ import os as cp2_os
 import subprocess as cp2_subprocess
 
 CP2_ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
-CP2_CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "gemini": "Gemini", "copilot": "Copilot"}
+CP2_CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "gemini": "Gemini", "copilot": "Copilot",
+                 "opencode": "OpenCode"}
 CP2_HEADER = ["CLI", "Protects Ratchet's records", "Confirms reviewer identity", "Stop hook", "Records your replies"]
 CP2_FIELDS = ("records", "identity", "stop", "replies", "guidance")
 
@@ -413,6 +447,19 @@ def cp2_render_row(host, f):
     return [name, records, identity, stop, replies]
 
 
+def cp2_enforcement_keys_ok(data, hosts, events):
+    """True when HOOK_HOSTS equals HOOK_EVENTS' keys, is a subset of HOST_ENFORCEMENT, and the only extra key in
+    HOST_ENFORCEMENT is "opencode", the plugin host."""
+    return (sorted(hosts) == sorted(events) and set(hosts) <= set(data) and set(data) - set(hosts) == {OPENCODE})
+
+
+def cp2_opencode_facts(_cache=[]):
+    """HOST_ENFORCEMENT["opencode"] from the engine (one child process per run of this lint)."""
+    if not _cache:
+        _cache.append(cp2_probe()["data"][OPENCODE])
+    return dict(_cache[0])
+
+
 def cp2_table_diff(sect, data, order):
     """[] when the README table equals the rendered table row by row and cell by cell, else what differs."""
     got = md_table_rows(sect)
@@ -435,8 +482,11 @@ def cp2_fact_mismatches(hosts, data, measured):
 def cp2_single_source_checks(sect):
     probe = cp2_probe()
     data, order, measured = probe["data"], probe["hosts"], probe["measured"]
+    # The README table lists the hook CLIs in HOOK_HOSTS order, then OpenCode, the plugin host. The engine probes
+    # (measured) cover HOOK_HOSTS only: OpenCode has no stdin/stdout hook command to run here.
+    table_order = order + [OPENCODE]
 
-    diffs = cp2_table_diff(sect, data, order)
+    diffs = cp2_table_diff(sect, data, table_order)
     check("[CP2-X05] the README table equals the rows rendered from HOST_ENFORCEMENT, cell by cell", diffs == [],
           diffs)
     # Teeth: the adversary's round-2 examples, an ambiguous reviewer-identity cell, a negated cell and one altered
@@ -457,17 +507,58 @@ def cp2_single_source_checks(sect):
     for old, new in mutants:
         present = old in sect
         check(f"[CP2-X05] teeth: changing one cell to {new!r} breaks the exact match",
-              present and cp2_table_diff(sect.replace(old, new, 1), data, order) != [],
+              present and cp2_table_diff(sect.replace(old, new, 1), data, table_order) != [],
               "cell text not found in README" if not present else "still matches")
     flipped = cp2_json.loads(cp2_json.dumps(data))
     flipped["codex"]["identity"] = True
     check("[CP2-X05] teeth: when the data changes (Codex confirms identity) the unchanged README no longer matches",
-          cp2_table_diff(sect, flipped, order) != [])
+          cp2_table_diff(sect, flipped, table_order) != [])
 
-    check("[CP2-X06] HOST_ENFORCEMENT names exactly the CLIs Ratchet installs hooks for, each with every fact",
-          sorted(data) == sorted(order) == probe["events"]
+    check("[CP2-X06] HOST_ENFORCEMENT names the CLIs Ratchet installs hooks for plus OpenCode (and nothing else), "
+          "each with every fact", cp2_enforcement_keys_ok(data, order, probe["events"])
           and all(sorted(data[h]) == sorted(CP2_FIELDS) and all(isinstance(v, bool) for v in data[h].values())
                   for h in data), data)
+    # Teeth: any key beyond HOOK_HOSTS and OpenCode, a missing hook host, or a missing OpenCode key is caught.
+    for what, mutated in [("a sixth CLI key", dict(data, cursor=dict(data["codex"]))),
+                          ("a missing hook CLI (gemini)", {h: f for h, f in data.items() if h != "gemini"}),
+                          ("a missing OpenCode key", {h: f for h, f in data.items() if h != OPENCODE}),
+                          ("OpenCode swapped for another plugin host",
+                           {("pi" if h == OPENCODE else h): f for h, f in data.items()})]:
+        check(f"[CP2-X06] teeth: HOST_ENFORCEMENT with {what} is rejected",
+              not cp2_enforcement_keys_ok(mutated, order, probe["events"]))
+    check("[CP2-X06] teeth: HOOK_EVENTS naming a CLI that HOOK_HOSTS does not is rejected",
+          not cp2_enforcement_keys_ok(data, order, probe["events"] + ["cursor"]))
+    check("[CP2-X26] HOOK_HOSTS stays the four stdin/stdout-hook CLIs: OpenCode is not a `--host all` target",
+          OPENCODE not in order and sorted(order) == sorted(PROVIDERS), order)
+    check("[CP2-X26] guidance implies replies in HOST_ENFORCEMENT (no CLI passes guidance on without recording "
+          "replies), so the README replies cell shows every row's guidance fact",
+          all(f["replies"] or not f["guidance"] for f in data.values()), data)
+    # The OpenCode row stays in step with HOST_ENFORCEMENT["opencode"], cell by cell: only that row, so a later
+    # checkpoint that turns a fact on cannot leave the README saying the old thing (X05 checks the whole table).
+    oc_diffs = [d for d in cp2_table_diff(sect, data, table_order) if d.startswith(f"row {len(table_order)} ")]
+    check("[CP2-X26] the README OpenCode row equals the row rendered from HOST_ENFORCEMENT['opencode'], cell by cell",
+          oc_diffs == [] and len(md_table_rows(sect)) == len(table_order) + 1, oc_diffs)
+    src_oc = CP2_ENGINE.read_text(encoding="utf-8")
+    oc_line = re.search(r'"opencode": \{"records"[^}\n]*\}', src_oc)
+    for fact in CP2_FIELDS:
+        # Teeth, the way X13 does it: flip one OpenCode fact in a scratch copy of the engine and the unchanged
+        # README must stop matching, in the OpenCode row (and only there).
+        cur = data[OPENCODE][fact]
+        flipped_line = oc_line and oc_line.group(0).replace(f'"{fact}": {cur}', f'"{fact}": {not cur}', 1)
+        if not oc_line or flipped_line == oc_line.group(0):
+            check(f"[CP2-X26] teeth: flipping OpenCode {fact} in a scratch engine is caught", False,
+                  "OpenCode fact line not found in the engine")
+            continue
+        with _tmp.mkdtemp() as tmp:
+            mutant = cp2_real_probe(cp2_engine_variant(tmp, oc_line.group(0), flipped_line))
+        got = mutant["data"][OPENCODE][fact]
+        diffs = cp2_table_diff(sect, mutant["data"], table_order)
+        # "guidance" has no cell of its own: it only shows while replies is on, so it is held by the coherence check.
+        seen = bool(diffs) and all(d.startswith(f"row {len(table_order)} ") for d in diffs)
+        if fact == "guidance" and not data[OPENCODE]["replies"]:
+            seen = not all(f["replies"] or not f["guidance"] for f in mutant["data"].values())
+        check(f"[CP2-X26] teeth: flipping OpenCode {fact} in a scratch engine is caught (README row or coherence)",
+              got is (not cur) and seen, diffs)
 
     for tid, fields, what in [("X07", ("records",), "the guard hook is installed and blocks hand-edits to state"),
                               ("X07", ("stop",), "the stop hook is installed and blocks in the host's dialect"),
@@ -1038,7 +1129,8 @@ def cp2_hook_entry_checks(sect):
     facts = cp2_r4_facts(probe)
     bad = cp2_fact_mismatches(order, data, facts)
     check("[CP2-X17] every README table cell (rendered from HOST_ENFORCEMENT) equals what the installed hook does on "
-          "that CLI", bad == [] and cp2_table_diff(sect, data, order) == [], bad)
+          "that CLI (the four hook CLIs; OpenCode's row is held by X26)",
+          bad == [] and cp2_table_diff(sect, data, order + [OPENCODE]) == [], bad)
 
     # Teeth: break one decision inside an engine copy; the matching check must go red while the others stay green.
     for (what, parts, old, new, caught), mutant in zip(cp2_r4_mutants(), mutant_probes):

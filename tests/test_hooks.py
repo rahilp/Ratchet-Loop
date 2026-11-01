@@ -73,6 +73,65 @@ def hook(d, event, payload, env=None):
     return sh("hook", event, "--host", "auto", cwd=d, stdin=json.dumps(payload), env=env)
 
 
+def opencode_reply_ok(r, block):
+    """OpenCode dialect: exit 0, nothing on stderr, stdout is exactly one JSON object with a boolean `block`
+    equal to the expected one and a string `message`."""
+    try:
+        obj = json.loads(r.stdout)
+    except ValueError:
+        return False
+    return (r.returncode == 0 and r.stderr == "" and isinstance(obj, dict) and isinstance(obj.get("block"), bool)
+            and obj["block"] is block and isinstance(obj.get("message"), str))
+
+
+class FakeRun:  # a stand-in for subprocess.CompletedProcess, to prove the shape checker can fail
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def opencode_cases(d):
+    """`hook <event> --host opencode`: the plugin's payload shape in, one {"block", "message"} JSON reply out."""
+    state = str(d / ".ratchet/runs/hk/state.json")
+    cwd = str(d)
+
+    def oc(event, payload):  # --host opencode is explicit: no auto-detection involved
+        return sh("hook", event, "--host", "opencode", cwd=d, stdin=json.dumps(payload))
+
+    print("OpenCode: one JSON reply {block, message}, exit 0, nothing on stderr")
+    good = '{"block": false, "message": ""}\n'
+    check("opencode shape checker accepts a good not-block reply", opencode_reply_ok(FakeRun(0, good, ""), False))
+    check("opencode shape checker rejects a block reply when none is expected",
+          not opencode_reply_ok(FakeRun(0, '{"block": true, "message": "x"}', ""), False))
+    check("opencode shape checker rejects exit 2, stderr text, empty stdout and a non-boolean block",
+          not opencode_reply_ok(FakeRun(2, good, ""), False) and not opencode_reply_ok(FakeRun(0, good, "x"), False)
+          and not opencode_reply_ok(FakeRun(0, "", ""), False)
+          and not opencode_reply_ok(FakeRun(0, '{"block": "false", "message": ""}', ""), False))
+    base = {"session_id": "ses_1", "cwd": cwd, "call_id": "c1", "agent": "build", "ratchet_plugin_turn": False}
+    r = oc("guard", {**base, "hook_event_name": "tool.execute.before", "tool_name": "bash",
+                     "tool_input": {"command": "ls"}})
+    check("opencode guard on an ordinary command → not-block reply", opencode_reply_ok(r, False), r.stdout + r.stderr)
+    r = oc("prompt", {**base, "hook_event_name": "chat.message", "prompt": "hello"})
+    check("opencode prompt → not-block reply", opencode_reply_ok(r, False), r.stdout + r.stderr)
+    r = oc("stop", {**base, "hook_event_name": "session.idle"})
+    obj = json.loads(r.stdout or "{}")
+    check("opencode stop with CP1 open → one JSON reply (boolean block, string message), exit 0, quiet stderr",
+          r.returncode == 0 and r.stderr == "" and isinstance(obj.get("block"), bool)
+          and isinstance(obj.get("message"), str), r.stdout + r.stderr)
+    # Whether a refused guard call blocks for opencode is the engine's decision (decide_guard is host-neutral); the
+    # reply must be in the same one-object shape either way, and a block carries a reason.
+    r = oc("guard", {**base, "hook_event_name": "tool.execute.before", "tool_name": "write",
+                     "tool_input": {"filePath": state, "content": "{}"}})
+    obj = json.loads(r.stdout or "{}")
+    check("opencode guard on a hand-edit of state.json → still one {block, message} reply, exit 0, quiet stderr; "
+          "a block carries a reason", r.returncode == 0 and r.stderr == "" and isinstance(obj.get("block"), bool)
+          and isinstance(obj.get("message"), str) and (not obj["block"] or obj["message"].strip() != ""),
+          r.stdout + r.stderr)
+    for label, stdin in (("empty stdin", ""), ("not json", "not json"), ("a bare JSON list", "[1, 2]")):
+        r = sh("hook", "guard", "--host", "opencode", cwd=d, stdin=stdin)
+        check(f"opencode guard with {label} fails open → not-block reply", opencode_reply_ok(r, False),
+              r.stdout + r.stderr)
+
+
 def main():
     d = setup_project()
     state = str(d / ".ratchet/runs/hk/state.json")
@@ -180,6 +239,8 @@ def main():
         check(f"{host}: uninstall removes only Ratchet's hooks", gone)
     r = sh("doctor", cwd=d)
     check("doctor reports hook heartbeats per host", "last guard  hook" in r.stdout and "via" in r.stdout, r.stdout[-300:])
+
+    opencode_cases(d)
 
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Install Ratchet Loop without a plugin manager, for any supported agent CLI.
-#   ./install.sh [--host auto|claude|codex|gemini|copilot|all] [--project]
+#   ./install.sh [--host auto|claude|codex|gemini|copilot|opencode|all] [--project]
 # --host defaults to auto: the CLI running this script (your agent) is detected from its environment.
 # Claude Code gets its copy in ~/.claude (or ./.claude with --project). Every other host shares one copy in
 # $RATCHET_HOME (default ~/.ratchet-loop), even with --project; --project only moves Claude's copy and every host's hook config into the repo. The hooks are then written into each host's own config by `ratchet.py install-hooks`.
+# OpenCode is only installed by an explicit --host opencode (never by auto or all): its plugin file goes into
+# OpenCode's plugins folder (the repo's .opencode/plugins with --project).
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 HOST="auto"; SCOPE="user"
 die() { echo "install.sh: $1" >&2; exit 1; }
 while [[ $# -gt 0 ]]; do case "$1" in
-  --host) [[ $# -ge 2 ]] || die "--host needs a value (auto, claude, codex, gemini, copilot or all)"; HOST="$2"; shift 2;;
+  --host) [[ $# -ge 2 ]] || die "--host needs a value (auto, claude, codex, gemini, copilot, opencode or all)"; HOST="$2"; shift 2;;
   --project) SCOPE="project"; shift;;
-  *) die "unknown option '$1' (use --host auto|claude|codex|gemini|copilot|all and --project)";;
+  *) die "unknown option '$1' (use --host auto|claude|codex|gemini|copilot|opencode|all and --project)";;
 esac; done
 if [[ "$HOST" == "auto" ]]; then
   if [[ -n "${CLAUDECODE:-}${CLAUDE_CODE_ENTRYPOINT:-}" ]]; then HOST="claude"
@@ -23,8 +25,8 @@ if [[ "$HOST" == "auto" ]]; then
   echo "Installing for: $HOST"
 fi
 case "$HOST" in
-  claude|codex|gemini|copilot|all) ;;
-  *) die "unknown host '$HOST' (use auto, claude, codex, gemini, copilot or all)";;
+  claude|codex|gemini|copilot|opencode|all) ;;
+  *) die "unknown host '$HOST' (use auto, claude, codex, gemini, copilot, opencode or all)";;
 esac
 
 if [[ "$SCOPE" == "project" ]]; then CLAUDE_DEST="$PWD/.claude"; else CLAUDE_DEST="$HOME/.claude"; fi
@@ -63,6 +65,8 @@ case "$HOST" in
   claude) copy_to "$CLAUDE_DEST"; hooks_for "$CLAUDE_DEST" claude;;
   all)    copy_to "$CLAUDE_DEST"; copy_to "$OTHER_DEST"
           hooks_for "$CLAUDE_DEST" claude; hooks_for "$OTHER_DEST" codex gemini copilot; link_skills codex gemini copilot;;
+  opencode) copy_to "$OTHER_DEST"; hooks_for "$OTHER_DEST" opencode
+          echo "OpenCode: the Ratchet skills are in $OTHER_DEST/skills and were not linked into OpenCode's own skills folder; the agent can read them from there.";;
   *)      copy_to "$OTHER_DEST"; hooks_for "$OTHER_DEST" "$HOST"; link_skills "$HOST";;
 esac
 if [[ ${#UNLINKED[@]} -gt 0 ]]; then

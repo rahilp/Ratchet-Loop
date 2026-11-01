@@ -16786,6 +16786,14 @@ HOOK_EVENTS = {  # host -> (stop, prompt, guard) event names in that host's conf
     "copilot": ("agentStop", "userPromptSubmitted", "preToolUse"),
 }
 VENDOR_TO_HOST = {"anthropic": "claude", "openai": "codex", "google": "gemini", "github": "copilot"}
+# OpenCode is a plugin file, not a hook config, so it is kept out of HOOK_HOSTS (and out of `--host all`): it is
+# only installed by an explicit `--host opencode` (see _opencode_install). The plugin calls `hook <event> --host
+# opencode`, which answers with one JSON reply (emit_hook).
+OPENCODE_HOST = "opencode"
+HOOK_CLI_HOSTS = (*HOOK_HOSTS, OPENCODE_HOST)
+OPENCODE_HEADER = "// Ratchet Loop OpenCode plugin, written by ratchet.py install-hooks"
+OPENCODE_ENGINE_SLOT = "__RATCHET_ENGINE_PATH__"
+OPENCODE_TEMPLATE = SKILL_DIR / "assets" / "opencode-plugin.js"
 
 # What Ratchet enforces on each host CLI today. This is the one source for the per-CLI table in README.md
 # ("Using it with Codex, Gemini or Copilot"); tests/test_docs.py renders that table from it cell by cell and
@@ -16800,6 +16808,8 @@ HOST_ENFORCEMENT = {
     "codex": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": True},
     "gemini": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": True},
     "copilot": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": False},
+    # Nothing is enforced yet: the installed plugin has no handlers (checkpoints CP4 to CP6 add them).
+    "opencode": {"records": False, "identity": False, "stop": False, "replies": False, "guidance": False},
 }
 
 
@@ -19165,6 +19175,9 @@ def decide_guard(n: dict) -> tuple[bool, str]:
 
 def emit_hook(host: str, event: str, block: bool, message: str) -> int:
     """Answer in the host's dialect. Returns the process exit code."""
+    if host == OPENCODE_HOST:  # the plugin reads one JSON object; the exit code is always 0 (the plugin fails open)
+        print(json.dumps({"block": bool(block), "message": message or ""}))
+        return 0
     if host == "copilot":
         if block and event == "guard":
             print(json.dumps({"permissionDecision": "deny", "permissionDecisionReason": message}))
@@ -19322,11 +19335,80 @@ def build_hook_config(host: str, existing: dict | None) -> dict:
     return cfg
 
 
+def opencode_plugin_path(scope: str, root: Path) -> Path:
+    """Where OpenCode loads Ratchet's plugin from. User scope follows OpenCode's own config-folder rules:
+    OPENCODE_CONFIG_DIR when set, else $XDG_CONFIG_HOME/opencode, else ~/.config/opencode."""
+    if scope == "project":
+        return root / ".opencode" / "plugins" / "ratchet.js"
+    if os.environ.get("OPENCODE_CONFIG_DIR"):
+        base = Path(os.environ["OPENCODE_CONFIG_DIR"])
+    elif os.environ.get("XDG_CONFIG_HOME"):
+        base = Path(os.environ["XDG_CONFIG_HOME"]) / "opencode"
+    else:
+        base = Path.home() / ".config" / "opencode"
+    return base / "plugins" / "ratchet.js"
+
+
+def _opencode_is_ours(path: Path) -> bool:
+    """True when the file's first line is Ratchet's header (anything else at that name is the user's own)."""
+    try:
+        first = path.read_bytes().decode("utf-8", errors="replace").split("\n", 1)[0]
+    except OSError:
+        return False
+    return first.rstrip("\r") == OPENCODE_HEADER
+
+
+def render_opencode_plugin() -> str:
+    try:
+        template = OPENCODE_TEMPLATE.read_text(encoding="utf-8")
+    except OSError as e:
+        die(f"opencode: the plugin template {OPENCODE_TEMPLATE} could not be read ({e}). Reinstall Ratchet.")
+    return template.replace(OPENCODE_ENGINE_SLOT, json.dumps(ENGINE_PATH))
+
+
+def _opencode_install(args, root: Path):
+    """Do everything for `--host opencode` except the write itself; returns (path, bytes, verb) when cmd_install_hooks
+    must write the plugin (it is the function that may write an agent CLI's own files), else None."""
+    path = opencode_plugin_path(args.scope, root)
+    ours = _opencode_is_ours(path)
+    if path.exists() and not ours and not args.uninstall:
+        die(f"opencode: {path} is not Ratchet's plugin (its first line is not Ratchet's header), so it was left "
+            "alone. Move or rename it, then run install-hooks again.")
+    if args.uninstall:
+        if ours and args.dry_run:
+            print(f"# opencode: would remove {path}")
+        elif ours:
+            path.unlink()
+            ok(f"opencode: removed {path}")
+        elif path.exists():
+            print(f"  ! {path} is not Ratchet's plugin (its first line is not Ratchet's header), so it was not "
+                  "removed.")
+        else:
+            ok(f"opencode: no Ratchet plugin at {path}, nothing to remove")
+        return
+    text = render_opencode_plugin()
+    if args.dry_run:
+        print(f"# opencode: {path}\n{text}", end="")
+        return
+    data = text.encode("utf-8")
+    if ours and path.read_bytes() == data:
+        ok(f"opencode: the plugin at {path} is already installed and up to date")
+        return
+    return path, data, "updated" if ours else "written"
+
+
 def cmd_install_hooks(args):
     root = find_root()
     hosts = HOOK_HOSTS if args.host == "all" else [
         VENDOR_TO_HOST.get(detect_host({}), "claude") if args.host == "auto" else args.host]
     for host in hosts:
+        if host == OPENCODE_HOST:
+            plan = _opencode_install(args, root)
+            if plan:
+                plan[0].parent.mkdir(parents=True, exist_ok=True)
+                plan[0].write_bytes(plan[1])
+                ok(f"opencode: plugin {plan[2]} at {plan[0]}")
+            continue
         path = hook_config_path(host, args.scope, root)
         existing = read_json(path, {}) or {}
         if args.uninstall:
@@ -19366,6 +19448,9 @@ def cmd_doctor(args):
         if h in ("claude", "codex"):
             found.append("(or installed as a plugin — hooks/hooks.json)")
         print(f"  {h:<8} " + ("; ".join(found) if found else "not installed"))
+    found = [f"{scope}: {p}" for scope in ("project", "user")
+             if _opencode_is_ours(p := opencode_plugin_path(scope, root))]
+    print(f"  {OPENCODE_HOST:<8} " + ("; ".join(found) if found else "not installed"))
     hb = read_heartbeat(root)
     hb_file = root / RATCHET_DIR / "hook-heartbeat.json"
     try:
@@ -20721,12 +20806,12 @@ def main(argv=None):
     a.set_defaults(fn=cmd_view)
     a = sp.add_parser("hook", help="entry point for agent-CLI hooks")
     a.add_argument("event", choices=["stop", "prompt", "guard"])
-    a.add_argument("--host", default="auto", choices=["auto", *HOOK_HOSTS])
+    a.add_argument("--host", default="auto", choices=["auto", *HOOK_CLI_HOSTS])
     a.set_defaults(fn=lambda a: sys.exit(run_hook(a.event, a.host)))
     for legacy, ev in (("hook-stop", "stop"), ("hook-prompt", "prompt"), ("hook-guard", "guard")):
         sp.add_parser(legacy).set_defaults(fn=lambda a, ev=ev: sys.exit(run_hook(ev, "auto")))
     a = sp.add_parser("install-hooks", help="write Ratchet's hooks into an agent CLI's config")
-    a.add_argument("--host", default="auto", choices=["auto", "all", *HOOK_HOSTS])
+    a.add_argument("--host", default="auto", choices=["auto", "all", *HOOK_CLI_HOSTS])
     a.add_argument("--scope", default="project", choices=["project", "user"])
     a.add_argument("--dry-run", action="store_true"); a.add_argument("--uninstall", action="store_true")
     a.set_defaults(fn=cmd_install_hooks)

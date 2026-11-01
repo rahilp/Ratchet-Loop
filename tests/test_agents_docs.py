@@ -511,11 +511,18 @@ def t12_skill_and_schemas_agree_with_the_readme():
           "`agents`" in schemas and "agents.<role>" in schemas and "provider/model" in schemas, None)
 
 
+def t13_docs_clean_ok(porcelain_out, returncode, env=None):
+    """True when git succeeded and tests/test_docs.py is clean, or when RATCHET_RUN_ALL is truthy (tests/run_all.py
+    runs test_docs.py in the same command, so its own pass/fail is the guard and a legitimate uncommitted edit is fine)."""
+    env = os.environ if env is None else env
+    return returncode == 0 and (porcelain_out.strip() == "" or bool(env.get("RATCHET_RUN_ALL")))
+
+
 def t13_existing_doc_lint_is_untouched_and_no_em_dash():
     r = subprocess.run(["git", "status", "--porcelain", "--", "tests/test_docs.py"], cwd=ROOT, capture_output=True,
                        text=True, timeout=60)
-    check("[CP8-T13] tests/test_docs.py is unchanged (it runs next to this file in the same command and must still pass)",
-          (HERE / "test_docs.py").is_file() and r.returncode == 0 and r.stdout.strip() == "", (r.returncode, r.stdout, r.stderr[:100]))
+    check("[CP8-T13] tests/test_docs.py is unchanged (solo), or runs in the same RATCHET_RUN_ALL command where its own pass is the guard",
+          (HERE / "test_docs.py").is_file() and t13_docs_clean_ok(r.stdout, r.returncode), (r.returncode, r.stdout, r.stderr[:100]))
     title, lines, sec = the_section()
     check("[CP8-T13] the new README section contains no em dash (when it exists; CP8-T01 needs it to)", EM not in sec, sec.count(EM))
     for rel in ("README.md", "skills/ratchet-orchestrator/SKILL.md", "skills/ratchet-orchestrator/references/schemas.md"):
@@ -952,6 +959,19 @@ def t18_wrong_shaped_host_models_never_crashes():
               and data.get("alternates") == ["sonnet", "opus"], (rj.returncode, text(rj)[:200]))
 
 
+def x30_docs_clean_helper_keeps_its_teeth():
+    dirty, solo, all_ = " M tests/test_docs.py\n", {}, {"RATCHET_RUN_ALL": "1"}
+    check("[CP8-X30] solo + empty porcelain -> clean", t13_docs_clean_ok("", 0, solo) is True, None)
+    check("[CP8-X30] solo + a modified tests/test_docs.py -> not clean (the check keeps its teeth)",
+          t13_docs_clean_ok(dirty, 0, solo) is False, None)
+    check("[CP8-X30] RATCHET_RUN_ALL + a modified tests/test_docs.py -> clean (test_docs.py itself is the guard)",
+          t13_docs_clean_ok(dirty, 0, all_) is True, None)
+    check("[CP8-X30] RATCHET_RUN_ALL empty string is not truthy -> a modified file still fails",
+          t13_docs_clean_ok(dirty, 0, {"RATCHET_RUN_ALL": ""}) is False, None)
+    check("[CP8-X30] git failed (return code 128) -> not clean in solo mode", t13_docs_clean_ok("", 128, solo) is False, None)
+    check("[CP8-X30] git failed (return code 128) -> not clean under RATCHET_RUN_ALL", t13_docs_clean_ok("", 128, all_) is False, None)
+
+
 TESTS = [
     ("CP8-T01", t01_readme_has_a_short_section_with_a_global_example),
     ("CP8-T02", t02_project_example_next_to_the_global_one),
@@ -971,6 +991,7 @@ TESTS = [
     ("CP8-T16", t16_cp6_follow_ups),
     ("CP8-T17", t17_deferred_doc_minors_are_corrected),
     ("CP8-T18", t18_wrong_shaped_host_models_never_crashes),
+    ("CP8-X30", x30_docs_clean_helper_keeps_its_teeth),
 ]
 
 
