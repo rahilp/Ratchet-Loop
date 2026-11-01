@@ -379,7 +379,9 @@ The five CLIs do not all enforce the same things. Here is what each one actually
 | Codex | Yes, Ratchet's state and evidence files are protected from hand-edits. | No, Ratchet has no way to know which sub-agent (reviewer) is at work, so it cannot confirm reviewer identity. | Yes, the stop hook stops the agent from ending its turn early. | Yes, the prompt hook records your replies and shows Ratchet's guidance back to the agent. |
 | Gemini | Yes, Ratchet's state and evidence files are protected from hand-edits. | No, Ratchet has no way to know which sub-agent (reviewer) is at work, so it cannot confirm reviewer identity. | Yes, the stop hook stops the agent from ending its turn early. | Yes, the prompt hook records your replies and shows Ratchet's guidance back to the agent. |
 | Copilot | Yes, Ratchet's state and evidence files are protected from hand-edits. | No, Ratchet has no way to know which sub-agent (reviewer) is at work, so it cannot confirm reviewer identity. | Yes, the stop hook stops the agent from ending its turn early. | Copilot's prompt hook drops its own message, so the agent never sees Ratchet's guidance, but the reply is still recorded in Ratchet's log. |
-| OpenCode | Yes, Ratchet's state and evidence files are protected from hand-edits. | No, Ratchet has no way to know which sub-agent (reviewer) is at work, so it cannot confirm reviewer identity. | No, the stop hook cannot stop the agent from ending its turn early. | No, the prompt hook does not record your replies. |
+| OpenCode | Yes, Ratchet's state and evidence files are protected from hand-edits. | No, Ratchet has no way to know which sub-agent (reviewer) is at work, so it cannot confirm reviewer identity. | No, the stop hook cannot stop the agent from ending its turn early. | Yes, the prompt hook records your replies and shows Ratchet's guidance back to the agent. |
+
+On OpenCode (and on Copilot) the agent CLI gives Ratchet's hooks no transcript file, so a reply there is not cross-checked against a transcript: approval relies on the reply the prompt hook recorded in Ratchet's log, which the guard protects from hand-edits. On OpenCode only a message you really typed in your own chat is recorded. A message Ratchet's own plugin sends into the chat, a sub-agent's message and a reviewer Ratchet launched are never recorded, and the guard refuses the agent starting `opencode run` (or `npx opencode-ai run`) from the shell, as those plain spellings only: one hidden inside `sh -c` is not caught. Answer Ratchet's questions in the chat, not in OpenCode's own question dialog: an answer given there reaches the agent as a tool result, not as a message you typed, so Ratchet does not record it and it approves nothing. If the plugin is installed in both your user folder and the project, each message you type is still recorded once (a repeat of a message Ratchet already has is ignored) and the agent gets one set of guidance.
 
 Only Claude Code tells Ratchet which sub-agent is acting; none of the other four can do that today, so Ratchet cannot confirm reviewer identity on Codex, Gemini, Copilot or OpenCode the way it can on Claude Code.
 
@@ -597,6 +599,7 @@ python3 tests/test_hook_codex_payloads.py
 python3 tests/test_hook_list_payload.py
 python3 tests/test_hook_opencode_guard.py
 python3 tests/test_hook_opencode_install.py
+python3 tests/test_hook_opencode_prompt.py
 python3 tests/test_hooks.py
 python3 tests/test_hooks_status.py
 python3 tests/test_hooks_waiver.py

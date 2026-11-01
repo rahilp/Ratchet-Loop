@@ -5660,8 +5660,8 @@ def _transcript_ok(entry: dict, since: str | None) -> tuple[bool, str]:
     """Is this logged message a real user turn in the agent CLI's own transcript, typed after `since`?
     The transcript record must parse, say it is the user's, and hold the WHOLE message (whitespace aside)."""
     tp = entry.get("transcript_path")
-    if entry.get("host") == "copilot" and not tp:
-        return True, "copilot hooks carry no transcript"
+    if entry.get("host") in ("copilot", "opencode") and not tp:
+        return True, f"{entry['host']} hooks carry no transcript"
     if not tp or not Path(tp).exists():
         return False, "no transcript to check it against"
     try:
@@ -16808,8 +16808,8 @@ HOST_ENFORCEMENT = {
     "codex": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": True},
     "gemini": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": True},
     "copilot": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": False},
-    # The plugin's guard handler is in; its prompt and stop handlers are not yet (checkpoints CP5 and CP6 add them).
-    "opencode": {"records": True, "identity": False, "stop": False, "replies": False, "guidance": False},
+    # The plugin's guard and prompt handlers are in; its stop handler is not yet (checkpoint CP6 adds it).
+    "opencode": {"records": True, "identity": False, "stop": False, "replies": True, "guidance": True},
 }
 
 
@@ -16909,7 +16909,8 @@ def normalize_hook(data: dict, host: str) -> dict:
         shell_cwd = os.path.normpath(os.path.join(str(cwd), os.path.expanduser(ti["workdir"].strip())))
     return {"host": host, "tool": tool, "kind": kind, "input": ti, "command": str(cmd), "paths": paths,
             "patch": patch, "cwd": cwd, "shell_cwd": shell_cwd,
-            "prompt": data.get("prompt") or "", "session": data.get("session_id") or data.get("sessionId"),
+            "prompt": data.get("prompt") or "", "plugin_turn": data.get("ratchet_plugin_turn") is True, "session": data.get("session_id") or data.get("sessionId"),
+            "message_id": data.get("message_id") if isinstance(data.get("message_id"), str) else "",
             "agent_type": data.get("agent_type") or "", "agent_id": data.get("agent_id") or "",
             "transcript_path": data.get("transcript_path") or data.get("transcriptPath")}
 
@@ -17156,7 +17157,9 @@ HOST_TURN_MARKERS = ("Another Claude session sent a message:",   # Claude Code's
                                                                    # (kept too: an older run or a differently-
                                                                    # rendering host may still only show this text)
                      "[SYSTEM NOTIFICATION - NOT USER INPUT]",    # a host notice about background work
-                     "<task-notification>")                       # Claude Code: a background task finished
+                     "<task-notification>",                       # Claude Code: a background task finished
+                     "[RATCHET PLUGIN TURN - NOT USER INPUT]")    # first line of every text Ratchet's OpenCode plugin
+                                                                   # sends into the chat itself
 # The real bytes the UserPromptSubmit hook receives for a sub-agent hand-back: wrapped as
 # `<agent-message from="...">...</agent-message>` (the attribution value is not fixed). Matched by the opening
 # tag alone, so any attribute content or closing-tag spelling still counts.
@@ -17197,10 +17200,13 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
     rdir = root / RATCHET_DIR
     if not rdir.is_dir():
         return False, ""
-    if host_generated_turn(n.get("prompt")):  # nothing is recorded: not the user's message, not a chat they typed in
+    # Nothing is recorded: not the user's message, not a chat they typed in. Either layer alone is enough: the OpenCode
+    # plugin's own `ratchet_plugin_turn` flag, or its fixed first-line prefix in the text (so a text from an earlier
+    # plugin load, or one sent without the flag, is still dropped). Neither restarts the stop hook's count.
+    if n.get("plugin_turn") or host_generated_turn(n.get("prompt")):
         _heartbeat(root, "prompt", n["host"])
-        return False, ("[ratchet] This turn was sent by the agent CLI itself (a background sub-agent's hand-back or "
-                       "a task notice), not typed by the user, so Ratchet did not record it: it answers no waiting "
+        return False, ("[ratchet] This turn was sent by the agent CLI itself (a background sub-agent's hand-back, a "
+                       "task notice or Ratchet's own plugin), not typed by the user, so Ratchet did not record it: it answers no waiting "
                        "question and approves nothing. Carry on; if it was really the user's reply, ask them to send "
                        "it again.")
     # This hook never takes the state lock and never writes state.json, so it never waits behind a long command
@@ -17216,9 +17222,22 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
         return False, ("[ratchet] Ratchet did not record this message, so it approves nothing and answers no waiting "
                        f"question. {problem}")
     at = now()
-    append_recorded(log, json.dumps({"at": at, "prompt": n["prompt"][:2000], "session": n["session"],
-                                     "host": n["host"], "transcript_path": n.get("transcript_path")},
-                                    ensure_ascii=False) + "\n")
+    entry = {"at": at, "prompt": n["prompt"][:2000], "session": n["session"],
+             "host": n["host"], "transcript_path": n.get("transcript_path")}
+    mid = n.get("message_id") if n["host"] == OPENCODE_HOST else ""
+    if mid:
+        entry["message_id"] = mid
+        # OpenCode loads the plugin once per install folder, so two copies (user and project) can each send this one
+        # message: the same (session, message_id) is one reply, and the first copy's answer stands. Checked under the
+        # same lock as the append, so two copies running together still record it once.
+        with _ChainLock() as lock:
+            recs, _why = _read_record(log, lines=True)
+            if any(e.get("message_id") == mid and e.get("session") == n["session"] for e in recs or []):
+                return False, ""
+            _append_record(log, json.dumps(entry, ensure_ascii=False) + "\n")
+            _record_chain_now(log, lock)
+    else:
+        append_recorded(log, json.dumps(entry, ensure_ascii=False) + "\n")
     ctx = Ctx(root)
     if ctx.active_slug():
         st, why = _read_record(ctx.state_path(), missing=None)
@@ -17430,7 +17449,27 @@ def _proc_subst_targets(seg: str, masked: str | None = None) -> list[str]:
 ENGINE_CALL_RE = re.compile(r"""^\s*(?:(?:\S*python3?(?:\.\d+)?|py)\s+(?:-\S+\s+)*["']?\S*(ratchet|external_review|ui_review)\.py\b"""
                             r"""|\S*node\s+(?:-\S+\s+)*["']?\S*capture\.mjs\b)""")
 NESTED_AGENT_RE = re.compile(r"(^|[\s;&|(/])(claude|gemini|copilot)(?![\w.-])[^;&|\n]*\s(-p|--print|--prompt)\b"
-                             r"|(^|[\s;&|(/])codex(?![\w.-])[^;&|\n]*\sexec\b")
+                             r"|(^|[\s;&|(/])codex(?![\w.-])[^;&|\n]*\sexec\b"
+                             # opencode counts only as the COMMAND word (a segment start, after env assignments and
+                             # command/env/npx/bunx-style wrappers, as a bare name, an `opencode-ai` package name or a
+                             # path ending in it) and `run` must be its first non-option word: a folder named
+                             # opencode in `bun --cwd packages/opencode run dev` or `pytest tests/opencode -k run` is not it
+                             # wrappers: command/env/npx/bunx/exec/nohup/time, sudo, timeout (with its duration word),
+                             # nice/ionice/stdbuf/xargs, bun x / pnpm dlx / npm exec / yarn dlx, each with its flags and the
+                             # value of a flag that takes one; a shell keyword (then/do/else/!/{) may start the command.
+                             # Every piece stays in one command segment (no `;&|`, spaces and tabs only between words), so
+                             # `echo opencode run` is not it and a long run of lines can't make the match slow
+                             r"|(?:^|[;&|(`\n])[ \t]*(?:[A-Za-z_]\w*=(?:\"[^\"]*\"|'[^']*'|[^\s;&|])*[ \t]+"
+                             r"|(?:command|env|npx|bunx|exec|nohup|time)[ \t]+(?:-[^\s;&|]+[ \t]+)*"
+                             r"|sudo[ \t]+(?:-[ughpCDRTU][ \t]+[^\s;&|]+[ \t]+|-[^\s;&|]+[ \t]+)*"
+                             r"|timeout[ \t]+(?:-[sk][ \t]+[^\s;&|]+[ \t]+|-[^\s;&|]+[ \t]+)*[^\s;&|-][^\s;&|]*[ \t]+"
+                             r"|(?:nice|ionice)[ \t]+(?:-[ncp][ \t]+[^\s;&|]+[ \t]+|-[^\s;&|]+[ \t]+)*"
+                             r"|stdbuf[ \t]+(?:-[ioe][ \t]+[^\s;&|]+[ \t]+|-[^\s;&|]+[ \t]+)*"
+                             r"|xargs[ \t]+(?:-[nIPLdsE][ \t]+[^\s;&|]+[ \t]+|-[^\s;&|]+[ \t]+)*"
+                             r"|(?:bun[ \t]+x|pnpm[ \t]+(?:dlx|exec)|npm[ \t]+exec|yarn[ \t]+dlx)[ \t]+(?:-[^\s;&|]+[ \t]+)*"
+                             r"|(?:then|do|else|elif|!|\{)[ \t]+)*"
+                             r"(?:[^\s;&|]*/)?opencode(?:-ai)?(?:@[^\s;&|]*)?(?![\w.-])"
+                             r"(?:\s+-[^\s;&|]+(?:\s+[^\s;&|-][^\s;&|]*)?)*\s+run(?![\w.-])")
 SELF_HOOK_RE = re.compile(r"\bhook\b[\s'\",]+(stop|prompt|guard)\b|\bhook-(stop|prompt|guard)\b")
 # For a command the shell-word reader can't follow at all (a command substitution, a heredoc, $'...'): only refuse
 # it as a hook call when a hook word directly follows `ratchet.py` or a $VAR/${VAR} token, never on the hook words
@@ -18856,8 +18895,8 @@ def _guard_shell(cmd: str, cwd: str, who: dict | None = None) -> str | None:
     cmd = _expand(cmd)
     cmd = _blank_commit_messages(cmd)
     if NESTED_AGENT_RE.search(cmd):
-        return ("RATCHET GUARD: launching another agent session (claude -p, codex exec, gemini -p, copilot -p) from "
-                "the shell is blocked while Ratchet is active — it could impersonate the user. Use sub-agents, "
+        return ("RATCHET GUARD: launching another agent session (claude -p, codex exec, gemini -p, copilot -p, "
+                "opencode run) from the shell is blocked while Ratchet is active — it could impersonate the user. Use sub-agents, "
                 "external_review.py for adversarial reviews, or ui_review.py for UI reviews.")
     if _calls_own_hook(cmd):
         return ("RATCHET GUARD: Ratchet's hooks are called by your agent CLI, not by you. Calling `ratchet.py hook` "

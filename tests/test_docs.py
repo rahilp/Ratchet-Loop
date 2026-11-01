@@ -420,8 +420,10 @@ measured["opencode"] = {
     "records": ("hook guard --host opencode" in plugin and guard_ok and guard_blocks("opencode", "runs/x/state.json")),
     "identity": guard_blocks("opencode", "runs/x/reviews/CP1/adv-round-01/a.json", "ratchet-fixer"),
     "stop": "hook stop --host opencode" in plugin and stop_ok,
-    "replies": "hook prompt --host opencode" in plugin and prompt_recorded("opencode"),
-    "guidance": "hook prompt --host opencode" in plugin and rc == 0 and "cp2 guidance probe" in out + err,
+    "replies": ("hook prompt --host opencode" in plugin and '"chat.message"' in plugin
+                and prompt_recorded("opencode")),
+    "guidance": ("hook prompt --host opencode" in plugin and '"chat.message"' in plugin and rc == 0
+                 and "cp2 guidance probe" in out + err),
 }
 print(json.dumps({"data": eng.HOST_ENFORCEMENT, "hosts": list(eng.HOOK_HOSTS), "events": sorted(eng.HOOK_EVENTS),
                   "measured": measured}))
