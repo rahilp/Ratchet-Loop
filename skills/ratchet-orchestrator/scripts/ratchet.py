@@ -16808,8 +16808,8 @@ HOST_ENFORCEMENT = {
     "codex": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": True},
     "gemini": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": True},
     "copilot": {"records": True, "identity": False, "stop": True, "replies": True, "guidance": False},
-    # Nothing is enforced yet: the installed plugin has no handlers (checkpoints CP4 to CP6 add them).
-    "opencode": {"records": False, "identity": False, "stop": False, "replies": False, "guidance": False},
+    # The plugin's guard handler is in; its prompt and stop handlers are not yet (checkpoints CP5 and CP6 add them).
+    "opencode": {"records": True, "identity": False, "stop": False, "replies": False, "guidance": False},
 }
 
 
@@ -16817,15 +16817,19 @@ def _host_names_subagent(host: str) -> bool:
     return bool(HOST_ENFORCEMENT.get(host, {}).get("identity"))
 
 
+# OpenCode v1.19.5's built-in tools are: invalid, task, read, question, todowrite, lsp, plan_exit, webfetch, websearch,
+# bash, glob, write, edit, grep, apply_patch and skill. `list` and `patch` below are not OpenCode tools: they are other
+# CLIs' names or harmless aliases, kept as they are.
 TOOL_KINDS = {
     "shell": {"bash", "powershell", "run_shell_command", "shell", "exec_command", "local_shell",
               "container.exec", "terminal", "run_in_terminal"},
     "write": {"write", "edit", "multiedit", "notebookedit", "apply_patch", "write_file", "replace", "create",
               "str_replace_editor", "str_replace_based_edit_tool", "create_file", "edit_file", "insert"},
     "read": {"read", "grep", "glob", "ls", "read_file", "read_many_files", "view", "search_file_content",
-             "list_directory", "find_files"},
+             "list_directory", "find_files", "list", "lsp"},
 }
-PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$", re.M)
+# OpenCode's patch parser trims whatever follows the colon, so any spacing (two spaces, none, a tab) names the file
+PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File:[ \t]*(\S.*)$|^\*\*\* Move to:[ \t]*(\S.*)$", re.M)
 
 
 def _hook_input():
@@ -16890,15 +16894,21 @@ def normalize_hook(data: dict, host: str) -> dict:
     paths = [str(ti[k]) for k in ("file_path", "path", "absolute_path", "notebook_path", "filePath", "target_file")
              if isinstance(ti.get(k), str)]
     patch = ""
-    for k in ("patch", "input", "raw"):
+    for k in ("patch", "input", "raw", "patchText"):
         if isinstance(ti.get(k), str) and "*** " in ti[k]:
             patch = ti[k]
-            paths += [a or b for a, b in PATCH_FILE_RE.findall(patch)]
+            paths += [(a or b).strip() for a, b in PATCH_FILE_RE.findall(patch)]
     kind = _tool_kind(tool)
     if kind in ("other", "mcp"):
         kind = "shell" if cmd else ("write" if paths or patch else kind)
+    cwd = data.get("cwd") or os.getcwd()
+    shell_cwd = ""
+    if host == OPENCODE_HOST and kind == "shell" and isinstance(ti.get("workdir"), str) and ti["workdir"].strip():
+        # OpenCode's bash tool runs the command in its `workdir` argument (the model is told to use it instead of
+        # `cd`): judge the command from there, exactly as the guard judges `cd <dir> && <cmd>` on the other hosts
+        shell_cwd = os.path.normpath(os.path.join(str(cwd), os.path.expanduser(ti["workdir"].strip())))
     return {"host": host, "tool": tool, "kind": kind, "input": ti, "command": str(cmd), "paths": paths,
-            "patch": patch, "cwd": data.get("cwd") or os.getcwd(),
+            "patch": patch, "cwd": cwd, "shell_cwd": shell_cwd,
             "prompt": data.get("prompt") or "", "session": data.get("session_id") or data.get("sessionId"),
             "agent_type": data.get("agent_type") or "", "agent_id": data.get("agent_id") or "",
             "transcript_path": data.get("transcript_path") or data.get("transcriptPath")}
@@ -19149,8 +19159,9 @@ def decide_guard(n: dict) -> tuple[bool, str]:
         marks = isinstance(read_heartbeat(root).get("agent_marks"), dict)
     who = {"enforce": marks and _host_names_subagent(n["host"]), "agent_type": n.get("agent_type")}
     if n["kind"] == "shell" and cmd:
-        gcmd, why = _merge_rule(cmd, cwd, root)
-        why = why or _guard_shell(gcmd, cwd, who)
+        scwd = n.get("shell_cwd") or cwd  # OpenCode's bash `workdir`, when it sent one (see normalize_hook)
+        gcmd, why = _merge_rule(cmd, scwd, root)
+        why = why or _guard_shell(gcmd, scwd, who)
         if why:
             return True, why
         _note_engine_call(root, cmd, n.get("session"), n.get("input"))  # which chat runs `init` / `ask` / `wait` / `complete` here (_noted_session)
@@ -19163,8 +19174,8 @@ def decide_guard(n: dict) -> tuple[bool, str]:
                 return True, why
         bad = [p for p in n["paths"] if not _write_allowed(p, cwd)]
         if n["patch"] and not bad:
-            bad = [p for p in re.findall(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", n["patch"], re.M)
-                   if not _write_allowed(p, cwd)]
+            bad = [p.strip() for p in re.findall(r"^\*\*\* (?:Add|Update|Delete) File:[ \t]*(\S.*)$", n["patch"], re.M)
+                   if not _write_allowed(p.strip(), cwd)]
         if bad:
             return True, ("RATCHET GUARD: gate state, evidence, approvals and config under .ratchet/ are written by "
                           "ratchet.py only (you may write reviews/, states/, tests/, reference/, checkpoints.json, "

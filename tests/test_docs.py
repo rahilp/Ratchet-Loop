@@ -408,6 +408,21 @@ for host in eng.HOOK_HOSTS:
         "replies": ("hook prompt --host " + host) in installed and prompt_recorded(host),
         "guidance": rc == 0 and "cp2 guidance probe" in out + err,
     }
+# OpenCode is a rendered plugin file, not a hook command: what it installs is read from the plugin text the install
+# writes (the comment lines are dropped, so only code can satisfy a check), and its guard answer from emit_hook.
+plugin = "\n".join(l for l in eng.render_opencode_plugin().splitlines() if not l.lstrip().startswith("//"))
+rc, out, _ = emit("opencode", "guard", True, "cp2 guard probe")
+guard_ok = rc == 0 and field(out, "block") is True
+rc, out, _ = emit("opencode", "stop", True, "cp2 stop probe")
+stop_ok = rc == 0 and field(out, "block") is True
+rc, out, err = emit("opencode", "prompt", False, "cp2 guidance probe")
+measured["opencode"] = {
+    "records": ("hook guard --host opencode" in plugin and guard_ok and guard_blocks("opencode", "runs/x/state.json")),
+    "identity": guard_blocks("opencode", "runs/x/reviews/CP1/adv-round-01/a.json", "ratchet-fixer"),
+    "stop": "hook stop --host opencode" in plugin and stop_ok,
+    "replies": "hook prompt --host opencode" in plugin and prompt_recorded("opencode"),
+    "guidance": "hook prompt --host opencode" in plugin and rc == 0 and "cp2 guidance probe" in out + err,
+}
 print(json.dumps({"data": eng.HOST_ENFORCEMENT, "hosts": list(eng.HOOK_HOSTS), "events": sorted(eng.HOOK_EVENTS),
                   "measured": measured}))
 '''
@@ -483,8 +498,9 @@ def cp2_single_source_checks(sect):
     probe = cp2_probe()
     data, order, measured = probe["data"], probe["hosts"], probe["measured"]
     # The README table lists the hook CLIs in HOOK_HOSTS order, then OpenCode, the plugin host. The engine probes
-    # (measured) cover HOOK_HOSTS only: OpenCode has no stdin/stdout hook command to run here.
+    # (measured) cover HOOK_HOSTS by running the installed command, and OpenCode from its rendered plugin file.
     table_order = order + [OPENCODE]
+    mhosts = table_order  # the probe also measures OpenCode, from the rendered plugin (see CP2_PROBE)
 
     diffs = cp2_table_diff(sect, data, table_order)
     check("[CP2-X05] the README table equals the rows rendered from HOST_ENFORCEMENT, cell by cell", diffs == [],
@@ -565,30 +581,30 @@ def cp2_single_source_checks(sect):
                               ("X08", ("identity",), "decide_guard checks sub-agent identity on exactly these CLIs"),
                               ("X09", ("replies", "guidance"),
                                "the prompt hook records replies and passes guidance on exactly these CLIs")]:
-        bad = [m for m in cp2_fact_mismatches(order, data, measured) if m[1] in fields]
+        bad = [m for m in cp2_fact_mismatches(mhosts, data, measured) if m[1] in fields]
         check(f"[CP2-{tid}] HOST_ENFORCEMENT matches the code: {what}", bad == [], bad)
     check("[CP2-X08] the CLIs where decide_guard checks sub-agent identity are exactly those the data credits",
-          [h for h in order if measured[h]["identity"]] == [h for h in order if data[h]["identity"]],
-          {h: measured[h]["identity"] for h in order})
+          [h for h in mhosts if measured[h]["identity"]] == [h for h in mhosts if data[h]["identity"]],
+          {h: measured[h]["identity"] for h in mhosts})
 
-    for host, field in [("codex", "identity"), ("copilot", "guidance"), ("gemini", "stop"), ("claude", "records")]:
+    for host, field in [("codex", "identity"), ("copilot", "guidance"), ("gemini", "stop"), ("claude", "records"),
+                        ("opencode", "records")]:
         wrong = cp2_json.loads(cp2_json.dumps(data))
         wrong[host][field] = not wrong[host][field]
         check(f"[CP2-X10] teeth: flipping {host}.{field} in the data is caught by the code check",
-              (host, field, wrong[host][field], measured[host][field]) in cp2_fact_mismatches(order, wrong, measured))
+              (host, field, wrong[host][field], measured[host][field]) in cp2_fact_mismatches(mhosts, wrong, measured))
 
     # Teeth on the code side: an engine copy whose guard checks sub-agent identity on every host (the data left
     # unchanged) is caught as Codex, Gemini and Copilot doing something the data and README deny.
     src = CP2_ENGINE.read_text(encoding="utf-8")
     real = 'return bool(HOST_ENFORCEMENT.get(host, {}).get("identity"))'
     with _tmp.mkdtemp() as tmp:
-        for sib in CP2_ENGINE.parent.glob("*.py"):
-            (Path(tmp) / sib.name).write_text(sib.read_text(encoding="utf-8"), encoding="utf-8")
-        (Path(tmp) / CP2_ENGINE.name).write_text(src.replace(real, "return True", 1), encoding="utf-8")
-        mutant = cp2_probe(Path(tmp) / CP2_ENGINE.name)
-    caught = sorted(m[0] for m in cp2_fact_mismatches(order, data, mutant["measured"]) if m[1] == "identity")
-    check("[CP2-X10] teeth: an engine that checks sub-agent identity on every CLI is caught on the other three",
-          real in src and caught == ["codex", "copilot", "gemini"], caught)
+        scripts = cp2_scratch_layout(tmp)
+        (scripts / CP2_ENGINE.name).write_text(src.replace(real, "return True", 1), encoding="utf-8")
+        mutant = cp2_probe(scripts / CP2_ENGINE.name)
+    caught = sorted(m[0] for m in cp2_fact_mismatches(mhosts, data, mutant["measured"]) if m[1] == "identity")
+    check("[CP2-X10] teeth: an engine that checks sub-agent identity on every CLI is caught on the other four "
+          "(OpenCode included)", real in src and caught == ["codex", "copilot", "gemini", "opencode"], caught)
 
 
 # ---- CP2 adversarial round 3: sub-agent identity checked against each CLI's real hook payload ----
@@ -677,15 +693,27 @@ def cp2_identity_problems(probe):
     return out
 
 
+def cp2_scratch_layout(tmp):
+    """Copy the engine's sibling scripts into tmp/scripts and the plugin template into tmp/assets (the engine finds
+    its template at ../assets from its own folder, which the OpenCode probe renders); returns tmp/scripts."""
+    scripts, assets = Path(tmp) / "scripts", Path(tmp) / "assets"
+    scripts.mkdir(), assets.mkdir()
+    for sib in CP2_ENGINE.parent.glob("*.py"):
+        (scripts / sib.name).write_text(sib.read_text(encoding="utf-8"), encoding="utf-8")
+    for asset in (CP2_ENGINE.parent.parent / "assets").glob("*"):
+        if asset.is_file():
+            (assets / asset.name).write_bytes(asset.read_bytes())
+    return scripts
+
+
 def cp2_engine_variant(tmp, old, new):
     """A copy of the engine (and its sibling scripts) in tmp with one exact text replaced; its path."""
     src = CP2_ENGINE.read_text(encoding="utf-8")
     if old not in src:
         raise RuntimeError(f"engine text to mutate not found: {old!r}")
-    for sib in CP2_ENGINE.parent.glob("*.py"):
-        (Path(tmp) / sib.name).write_text(sib.read_text(encoding="utf-8"), encoding="utf-8")
-    (Path(tmp) / CP2_ENGINE.name).write_text(src.replace(old, new, 1), encoding="utf-8")
-    return Path(tmp) / CP2_ENGINE.name
+    scripts = cp2_scratch_layout(tmp)
+    (scripts / CP2_ENGINE.name).write_text(src.replace(old, new, 1), encoding="utf-8")
+    return scripts / CP2_ENGINE.name
 
 
 def cp2_real_payload_checks():
