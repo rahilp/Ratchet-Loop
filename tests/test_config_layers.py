@@ -514,7 +514,7 @@ def x08_user_config_matches_config_from_user_without_global():
     d, env = project({"human_review": "end"})
     cases = [{}, {"human_review": "end"}, {"review_depth": m.OLD_DEFAULT_REVIEW_DEPTH},
              {"review_depth": {"low": 1}, "role_models": {"ratchet-implementer": "y"}, "host_models": {"anthropic": {"standard": "z"}}},
-             {"providers": [{"id": "a"}], "standards": ["s"], "ui_reviewers": {"visual": ["q"]}}]
+             {"providers": [{"id": "a", "preset": "codex"}], "standards": ["s"], "ui_reviewers": {"visual": ["q"]}}]
     for i, c in enumerate(cases):
         project_path(d).write_text(json.dumps(c))
         with th.InProcessCall(m, d, env, RESET_GLOBALS, LOCK_WAIT_CAP):

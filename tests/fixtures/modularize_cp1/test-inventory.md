@@ -185,6 +185,10 @@ tree, never loads it as a module itself): 10 files
   commands really do, and a full model id gets one answer in the hint and the refusal. Its source-scan case reads
   ratchet.py's text with `ENGINE.read_text` and `ast.parse` to check the `_check_agent_choices` docstring; it never
   loads ratchet.py with `spec_from_file_location` itself, so it matches only the source-text/AST pattern.
+- `test_ffl_provider_shape.py`: fast-follow cleanups CP3: a wrongly shaped providers[] field in either settings file is
+  refused with one line naming the file and field, no command prints a traceback, and the repair commands still run.
+  Its structural cases read ratchet.py's text with `ENGINE.read_text` and `ast.parse` / `ast.walk` to find every
+  provider field the engine reads and every sub-command; it never loads ratchet.py with `spec_from_file_location` itself.
 
 ## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 13 files
 

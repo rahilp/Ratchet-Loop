@@ -180,14 +180,18 @@ class Ctx:
         (id unique and non-empty, a known preset or a command, model/company/cost non-empty strings, variant a
         string, for_risk a list of low/normal/high, prefer_for a list of lenses, stdin a boolean), role_models,
         host_models (with alternates), ui_reviewers and agents ('model' or 'provider/model', split at the first '/' so a model may hold more) name-to-value maps, and
-        host_provider."""
+        host_provider. Each providers[] field (id, command, model, variant, for_risk, prefer_for, stdin, and a
+        whole entry that is not an object) is shape-checked at load, for the machine-wide file here and for the
+        project's file in the merge step (_merge_layers). While `config --set/--unset` runs (self.repairing), this
+        function leaves the machine-wide host_models and providers[] check to that merge step, so a bad file that
+        the command is not writing can be set aside and the command still repairs the other one."""
         p = self.global_config_path
         absent = object()  # not p.exists(): that reads a file in an unreadable folder as "no file"
         g = read_json(p, absent)
         if g is absent:
             return {}
-        if self.repairing and isinstance(g, dict):  # host_models is judged by user_config, which can set the file aside
-            self.check_global_config({k: v for k, v in g.items() if k != "host_models"})
+        if self.repairing and isinstance(g, dict):  # host_models and providers are judged by user_config, which can set the file aside
+            self.check_global_config({k: v for k, v in g.items() if k not in ("host_models", "providers")})
             return g
         return self.check_global_config(g)
 
@@ -202,7 +206,12 @@ class Ctx:
         """The rules global_config() applies to what it read, also applied by `config --global --set` to what it is
         about to write, so a file Ratchet writes always loads. Returns g, or stops naming the file and the setting.
         `config --set` / `--unset` on the project's file passes its own `path` and the provider-and-model part of the
-        candidate with project=True (the same shape rules; the project's providers may carry paid consent)."""
+        candidate with project=True (the same shape rules; the project's providers may carry paid consent).
+        The providers[] fields (for_risk, command, prefer_for, stdin, model, variant, id, and a whole entry that is
+        not an object) are checked here for BOTH layers: global_config() calls this for the machine-wide file at
+        load, and _merge_layers calls it with project=True for each layer's host_models and providers. In repair mode
+        the machine-wide providers[] check is not made by global_config() but left to that merge step, so a bad
+        non-target file can be set aside."""
         p = path or self.global_config_path
         if not isinstance(g, dict):
             die(f"{p} must hold a JSON object of settings (got {type(g).__name__}). Fix or delete that file, then run "
@@ -435,8 +444,8 @@ class Ctx:
 
     def user_config(self, project=None, glob=None, check_roles=True, strict=(), write_path=None):
         """The merge below, plus the repair rule: while `config --set/--unset` runs (self.repairing), a file other than
-        the one being written (write_path; none once the write is done) that fails on a wrong-shaped host_models or an
-        unknown provider in `agents` is read as empty for this command, so the command that repairs one file is never
+        the one being written (write_path; none once the write is done) that fails on a wrong-shaped host_models or
+        providers[] entry, or an unknown provider in `agents`, is read as empty for this command, so the command that repairs one file is never
         stopped by the other. Every other problem, and every problem in the written file, still stops it."""
         # the files are read here (this function may read config.json), global first, as the merge checks them
         if not (self.repairing and check_roles):
@@ -455,7 +464,7 @@ class Ctx:
                 msg = buf.getvalue()
                 hit = next((str(q) for q in (self.global_config_path, self.config_path)
                             if str(q) in msg and str(q) != str(write_path) and str(q) not in skip), None)
-                if not (hit and ("'host_models" in msg or _UNKNOWN_PROVIDER_PHRASE in msg)):
+                if not (hit and ("'host_models" in msg or "'providers" in msg or _UNKNOWN_PROVIDER_PHRASE in msg)):
                     sys.stderr.write(msg)
                     raise
                 skip.add(hit)
@@ -473,7 +482,10 @@ class Ctx:
         file's `agents` and `role_models` are checked (_check_role_settings, _check_agent_choices) and a wrong one stops
         naming the file. A role set by `role_models` in one file replaces that role's `agents` value from the file
         below it; an `agents` value above a lower `role_models` one keeps it as the fallback for when the `agents`
-        choice cannot apply on this host (resolve_role picks, a file holding both for one role is refused)."""
+        choice cannot apply on this host (resolve_role picks, a file holding both for one role is refused).
+        The shapes of `host_models` and `providers[]` (for_risk, command, prefer_for, ...) are checked per layer here
+        too (check_global_config), in both settings files, so a wrong one in the project's file or the machine-wide
+        one stops naming that file and field."""
         out = {}
         layers = ((glob, self.global_config_path), (project or {}, self.config_path))
         layers = tuple(({}, path) if str(path) in skip else (layer, path) for layer, path in layers)
@@ -482,8 +494,11 @@ class Ctx:
             if check_roles:
                 self._check_role_settings(layer, path)
                 self._check_provider_keys(layer, path)
-                if "host_models" in layer:  # the shape the machine-wide file is held to, applied to the project's file too
-                    self.check_global_config({"host_models": layer["host_models"]}, path=path, project=True)
+                # the shape the machine-wide file is held to, applied to the project's file too (and, while a repair
+                # runs, to the machine-wide one, which global_config() leaves to this check so it can be set aside)
+                shaped = {k: layer[k] for k in ("host_models", "providers") if k in layer}
+                if shaped:
+                    self.check_global_config(shaped, path=path, project=True)
             # a role named by `agents` or `role_models` in this layer replaces the other key's value from a lower one
             rm = layer.get("role_models")
             if isinstance(out.get("agents"), dict) and isinstance(rm, dict):
@@ -1840,6 +1855,7 @@ def cmd_brief(args):
         die(f"'{args.role}' is not a valid role for brief. Valid roles: {', '.join(ROLE_ORDER)} (or an agent name "
             f"from agents/, with or without the 'ratchet-' prefix).")
     ctx = Ctx(find_root())
+    cfg = ctx.config()  # first: a damaged settings file stops the command before any line of the brief is printed
     plan = ctx.plan()
     if args.cp:
         if not plan or not plan.get("checkpoints"):
@@ -1850,7 +1866,6 @@ def cmd_brief(args):
         header = f"Brief for the {role} (no checkpoint yet)"
     print(header)
     print("")
-    cfg = ctx.config()
     bad = agent_model_problem(ctx, cfg, _ENGINE_ROLE.get(role, role))
     if bad:  # a misspelled model is refused where work starts, not at load (so it stays repairable)
         die(bad)
@@ -3312,6 +3327,24 @@ def _write_providers(ctx, plist):
     write_json(ctx.config_path, user)
 
 
+def _check_new_provider(ctx, pv):
+    """Stops `providers --add` with one plain line, before anything is written or any consent is used, when the new
+    entry has a field the loader would refuse (--for-risk not low/normal/high, --command not a list of non-empty
+    strings). It runs the loader's own check (check_global_config) on the entry, so a file Ratchet writes always loads."""
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(buf):
+            ctx.check_global_config({"providers": [pv]}, path=ctx.config_path, project=True)
+    except SystemExit:
+        msg = buf.getvalue().strip()
+        m = re.search(r"'providers\[0\]\.(\w+)' (must be .*?) \(got", msg)
+        if not m:
+            sys.stderr.write(buf.getvalue())
+            raise
+        flag = "--" + m.group(1).replace("_", "-")
+        die(f"{flag} {m.group(2)}. Nothing was added.")
+
+
 def _paid_provider_reply(model) -> str:
     """The one exact reply that pays for a per-use (or unknown-cost) model, named in `ask paid-provider`'s
     question. Never a generic listed yes (APPROVAL_REPLIES): this spends the developer's money, so the reply
@@ -3442,6 +3475,7 @@ def cmd_providers(args):
                 die(f"--prefer-for takes a comma list of lenses from {', '.join(LENSES)}; "
                     f"{', '.join(repr(x) for x in bad) or repr(args.prefer_for)} is not one of them. Nothing was added.")
             pv["prefer_for"] = list(dict.fromkeys(lenses))
+        _check_new_provider(ctx, pv)
         if not provider_company(pv):
             die(f"Can't tell which company's model '{args.add}' runs. Give --model (a model name from that tool) "
                 "or --company.")
