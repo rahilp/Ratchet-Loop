@@ -713,6 +713,7 @@ python3 tests/test_trust_cp5_d.py
 python3 tests/test_trust_cp5_e.py
 python3 tests/test_trust_cp5_regression.py
 python3 tests/test_ui_capture_lint.py
+python3 tests/test_ui_capture_stub.py
 python3 tests/test_ui_capture_viewport.py
 python3 tests/test_viewer.py
 python3 tests/test_waiting.py

@@ -18,9 +18,9 @@ snapshots, the design file and the scope — never the project's code, instructi
            the host's sub-agents: the staged folders and the follow-up `combine` command are printed.
   stage    Only stage the isolated folders (for host sub-agents).
   combine  Merge reviewer JSON files into combined.json.
-  lint     Warn about browser cases the capture spec cannot show (read-only). Run it on the capture spec and the test
-           plan BEFORE review or stage; review and stage do not run it. Exit 0 with WARN lines is not all-clear:
-           fix each named gap in the capture spec first.
+  lint     Warn about browser cases the capture spec cannot show (read-only; --scaffold adds a marked stub state per
+           gap). Run it on the capture spec and the test plan BEFORE review or stage; review and stage do not run
+           it. Exit 0 with WARN lines is not all-clear: fix each named gap in the capture spec first.
 
 Inside an active Ratchet run, `review` and `stage` stamp and sign the capture manifest for the checkpoint's UI round,
 and everything written is signed for that round. Outside a run (no .ratchet folder, or no active run) they still work
@@ -718,8 +718,58 @@ def cmd_lint(a):
     if not (isinstance(plan, list) or (isinstance(plan, dict) and isinstance(plan.get("cases"), list))):
         hint = "; the --spec and --cases paths look swapped" if isinstance(plan, dict) and "states" in plan else ""
         sys.exit(f"lint: {a.cases} is not a test plan (expected a list of cases or an object with a cases list){hint}")
-    for g in capture_gaps(plan, spec):
+    gaps = capture_gaps(plan, spec)
+    for g in gaps:
         print(f"WARN {g['case']}: {g['detail']}")
+    if a.scaffold:
+        scaffold_stubs(a.spec, spec, plan, gaps)
+
+
+def _stub_locked(spec: dict):
+    """The step id when its capture spec is locked after a failed UI round (gates.ui.frozen), else None. None means not
+    locked, including outside an active Ratchet run, and the caller then writes. Inside a run, a spec that names no
+    `checkpoint` is refused, and an unreadable run state exits with the engine's own message."""
+    ctx = _active_run(_engine())
+    if ctx is None:
+        return None
+    cp = spec.get("checkpoint")
+    if not isinstance(cp, str) or not cp:
+        sys.exit("scaffold: the capture spec must name its step (a `checkpoint` field), so nothing was written.")
+    gate = (((ctx.state().get("checkpoints") or {}).get(cp) or {}).get("gates") or {}).get("ui") or {}
+    return cp if gate.get("frozen") else None
+
+
+def scaffold_stubs(spec_path: str, spec: dict, plan, gaps: list[dict]):
+    """Append one marked stub state `stub-<case id>` to the capture spec for each gap case that has none yet. Existing
+    states are never altered; nothing is written when there is nothing to add, while the step's spec is locked, or
+    when the lock cannot be checked."""
+    cases = plan.get("cases") if isinstance(plan, dict) else plan
+    by_id = {c.get("id"): c for c in cases if isinstance(c, dict)}
+    states = spec.setdefault("states", [])
+    have = {st.get("name") for st in states if isinstance(st, dict)}
+    new = []
+    for g in gaps:
+        cid = g["case"]
+        if cid == "(no id)" or f"stub-{cid}" in have:
+            continue
+        have.add(f"stub-{cid}")
+        stub = {"name": f"stub-{cid}", "stub": True, "cases": [cid],
+                "scope": f"STUB, UNREVIEWED: add the journey that demonstrates {cid} ({g['title']}), then remove stub",
+                "journey": [], "reference": {"path": ""}, "app": {"path": ""}}
+        if isinstance(by_id.get(cid, {}).get("viewport"), dict):
+            stub["viewport"] = by_id[cid]["viewport"]
+        new.append(stub)
+    if not new:
+        print("scaffold: nothing to add")
+        return
+    cp = _stub_locked(spec)
+    if cp:
+        sys.exit(f"scaffold: {spec_path} is locked after a failed UI round, so no stubs were written. If the capture "
+                 f"spec itself is wrong, explain why to the user and run `ratchet.py ask ui-respec {cp}`.")
+    states.extend(new)
+    Path(spec_path).write_text(json.dumps(spec, indent=2, ensure_ascii=False) + "\n")
+    for st in new:
+        print(f"scaffold: added {st['name']}")
 
 
 def main():
@@ -741,7 +791,9 @@ def main():
     c.add_argument("--checkpoint"); c.add_argument("--manifest", help="capture manifest (carries the fingerprint)")
     c.set_defaults(fn=cmd_combine)
     l = sp.add_parser("lint", help="warn about browser cases the capture spec cannot show")
-    l.add_argument("--spec", required=True); l.add_argument("--cases", required=True); l.set_defaults(fn=cmd_lint)
+    l.add_argument("--spec", required=True); l.add_argument("--cases", required=True)
+    l.add_argument("--scaffold", action="store_true", help="add a marked stub state to the spec for each case it cannot show")
+    l.set_defaults(fn=cmd_lint)
     a = p.parse_args()
     a.fn(a)
 

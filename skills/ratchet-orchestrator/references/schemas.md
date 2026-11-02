@@ -263,6 +263,8 @@ Consumed by `ratchet-ui-compare/scripts/capture.mjs`.
 
 `viewport` (`{width, height}`) is optional on the spec and on each state, and `width` or `height` may be left out. For width and for height separately, a state's own value beats the spec's value, which beats the default (1280 wide, 800 high), so the `empty-phone` state above is captured at 390x800. `capture.mjs` captures the reference and the app of a state at that state's resolved viewport and stores it on the state in `manifest.json` as `"viewport": {"width": 390, "height": 800}`. `ui_review.py` ends each state's heading in the reviewers' evidence with `, viewport: 390x800`, so a reviewer judges each state at its own width. A spec with no per-state `viewport` behaves as before: every state uses the spec's `viewport`.
 
+A state may also carry `stub: true`, which `ui_review.py lint --scaffold` writes for a browser case the spec cannot show. It means the state is unreviewed: its `scope` must start with `STUB, UNREVIEWED`, its `journey` and its `reference` and `app` paths are empty until they are filled in, `cases` lists the id of the gap case, and `viewport` is copied only when that case has one. A capture manifest state entry includes `stub` only when it is true, and `cases` only when it is an array.
+
 Step verbs: `goto`, `click`, `fill`+`value`, `press`, `hover`, `select`+`value`, `check`, `uncheck`, `wait` (ms), `waitFor` (selector), `scroll` (selector or `bottom`). The same `journey` is replayed on both targets for the behaviour reviewer, with a screenshot after every step.
 
 ## 6. UI review JSON

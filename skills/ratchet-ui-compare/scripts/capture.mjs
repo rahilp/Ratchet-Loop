@@ -198,7 +198,8 @@ async function main() {
       captureTarget(browser, spec, state, "reference", dir),
       captureTarget(browser, spec, state, "app", dir),
     ]);
-    manifest.states.push({ name: state.name, scope: state.scope || "", viewport: stateViewport(spec, state), dir, reference: ref, app });
+    manifest.states.push({ name: state.name, scope: state.scope || "", viewport: stateViewport(spec, state), dir, reference: ref, app,
+      ...(state.stub ? { stub: true } : {}), ...(Array.isArray(state.cases) ? { cases: state.cases } : {}) });
     const warn = [ref, app].filter((r) => r.fatal || r.steps.some((s) => !s.ok));
     console.log(`${warn.length ? "!" : "✓"} ${state.name}: ref=${ref.fatal || "ok"} app=${app.fatal || "ok"}` +
       `${ref.consoleErrors.length + app.consoleErrors.length ? `  console errors: ref ${ref.consoleErrors.length}, app ${app.consoleErrors.length}` : ""}`);

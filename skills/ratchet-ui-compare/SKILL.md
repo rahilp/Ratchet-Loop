@@ -23,6 +23,7 @@ Schema: `ratchet-orchestrator/references/schemas.md` §5. Rules:
 - **Scope** = this checkpoint's `ui_scope`. The scope grows with each checkpoint: a skeleton checkpoint judges only the nav and title, even though the reference shows the full screen.
 - **journey**: 2–6 steps that exercise what this checkpoint added (open dialog → submit empty → see validation). The same steps run on both sides.
 - **Width**: the spec-level `viewport` is the default for every state. A state that must be shown at another width (a phone state beside desktop states) sets its own `viewport` (`{width, height}`, either side optional); see schemas.md §5.
+- **Missing cases**: before capture or review, run `python3 $UIC/ui_review.py lint --spec $RUN/states/CPn.json --cases $RUN/tests/CPn.json --scaffold`. Each browser case the spec cannot show gets a WARN line, and with `--scaffold` a stub state (`stub: true`, scope starting `STUB, UNREVIEWED`) is added for it. Exit 0 with WARN lines is not all-clear: fill in each stub's journey and paths (and remove `stub`) before reviewers run; a stub is unreviewed. Without `--scaffold` lint only reads. If the spec is frozen after a failed UI round, nothing is written; follow the ui-respec steps for the frozen spec (see the frozen-spec bullet below) before changing it.
 - `mask` anything nondeterministic (clocks, avatars from the network, charts with live data).
 - Login steps go under `login.app` (credentials come from `app-scout.json`).
 
