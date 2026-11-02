@@ -139,7 +139,7 @@ Spawn `ratchet-test-runner` (it runs `$RATCHET behavior CPn`), or run it yoursel
 
 **Step 4: Gate 2, UI** (only if `gates.ui`). Follow the **`ratchet-ui-compare`** skill:
 make sure the app is running → write `states/CPn.json` (scope limited to what this checkpoint built — the scope grows with each checkpoint) → `ui_review.py lint --spec states/CPn.json --cases tests/CPn.json --scaffold` → `capture.mjs` → `ui_review.py review` (two isolated reviewers, visual + behavior, from a provider other than the host when available, that never see project instructions; exit code 4 means spawn the host's own reviewer sub-agents and `combine`) → `$RATCHET ui-record CPn --review <combined.json>`.
-- INVALID means the screenshots weren't in the same state. Fix the capture spec, not the app, and redo.
+- INVALID means the screenshots weren't in the same state, or (a reason starting `INSUFFICIENT-EVIDENCE:`) a browser case could not be judged from the captured evidence. Either way fix the capture spec `states/CPn.json`, not the app code or the implementer, and redo.
 - `lint` checks that every browser case has a capture state; each gap gets a WARN line, and with `--scaffold` a stub state (`stub: true`, scope starting `STUB, UNREVIEWED`) is added for it. Exit 0 with WARN lines is not all-clear: fix each named gap and remove `stub` once the state is real, since a stub is unreviewed. Without `--scaffold` lint only reads. If the capture spec is frozen after a failed UI round nothing is written; `$RATCHET ask ui-respec CPn`.
 - FAIL → spawn `ratchet-implementer` with the blocking differences → re-run Gate 1 (`$RATCHET behavior CPn`) → redo Gate 2.
 

@@ -200,6 +200,11 @@ def stage(manifest: dict, design: Path | None, scope: str, cases: Path | None, k
         if bc:
             (td / "browser-cases.json").write_text(json.dumps(bc, indent=2))
             lines.append("Browser-only test cases you must also judge: browser-cases.json")
+            lines.append("If you cannot judge a case from the captured evidence (no state shows it, its journey steps are "
+                         "missing, or the width is wrong), do not report a difference for it. List it in "
+                         "`insufficient_evidence` as {case, state, missing}: the case id, the state, and what is missing.")
+            lines.append("Use `insufficient_evidence` only for a case with no usable evidence captured. Never use it for a "
+                         "failure you saw: if the evidence shows a case failing, report it as a normal difference.")
     (td / "INPUT.md").write_text("\n".join(lines) + "\n")
     return td
 

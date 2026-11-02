@@ -20,12 +20,13 @@ For each journey step, compare the reference result with the app result:
 - **Accessibility tree**: roles, accessible names, labels on inputs, heading levels, buttons that are really buttons. A control missing from the app's tree is a finding.
 - **Focus and keyboard**: focus moving into dialogs, Escape closing them, visible focus (if the journey includes key presses).
 - **Console errors** on the app side that the reference doesn't have are a `major` finding. Quote the message.
-- **browser-cases.json**: for each case, report a difference if the evidence shows it failing. If the evidence can't show it (the journey doesn't exercise it), add a `minor` difference: "case CPn-T07 not demonstrable — add a journey step for it", with `fixable_in_code: true`. The spec has to be fixed so the case gets proven.
+- **browser-cases.json**: for each case, report a difference if the evidence shows it failing. If the evidence cannot show it at all (no usable evidence: the capture has no state, no journey steps or the wrong width for that case), do not report a difference. List it in `insufficient_evidence` as `{case, state, missing}` instead. The capture spec (`states/CPn.json`) is what gets fixed for it, not the app.
 
 ## Rules
 - `severity`: `blocker` (the action doesn't work or goes to the wrong place), `major` (missing feedback or a state, a console error, a missing label), `minor`, `nit`.
 - `location` names the step and the element ("step 3, after clicking Approve: the row should disappear; it remains").
 - Don't be lenient, don't praise, don't speculate beyond the evidence.
+- `insufficient_evidence` is only for a case you cannot judge because no usable evidence was captured. Never use it for something you saw differ or fail: a failure the evidence shows is a normal difference, reported as before, whatever else you list.
 - `verdict`: `PASS` only when no difference has `fixable_in_code: true`.
 
 ## Output
@@ -34,6 +35,7 @@ ONLY this JSON:
 {"reviewer":"behavior","verdict":"PASS|FAIL|INVALID","invalid_reason":null,"scope":"…",
  "differences":[{"id":"B1","state":"…","severity":"major","location":"step 2 …","description":"…",
    "expected":"…","actual":"…","fixable_in_code":true,"suggested_fix":"…"}],
+ "insufficient_evidence":[{"case":"CPn-T07","state":"…","missing":"…"}],
  "notes":"…"}
 ```
 When run as a sub-agent, also write it to the output path you were given — that is the ONLY file you may write.
