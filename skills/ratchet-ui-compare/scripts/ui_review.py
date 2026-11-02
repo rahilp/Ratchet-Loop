@@ -15,12 +15,15 @@ Every reviewer works inside a temp folder that holds ONLY the screenshots, the a
 snapshots, the design file and the scope — never the project's code, instructions or chat history.
 
   review   Run both roles. Exit 0 = combined.json written. Exit 4 = one or both roles must be done by
-           the host's sub-agents: the staged folders and the follow-up `combine` command are printed.
-  stage    Only stage the isolated folders (for host sub-agents).
+           the host's sub-agents: the staged folders and the follow-up `combine` command are printed. Refuses (before
+           anything is written or any reviewer starts) while the capture holds an unfilled stub state.
+  stage    Only stage the isolated folders (for host sub-agents); a stub state is marked there as a stub, no evidence.
   combine  Merge reviewer JSON files into combined.json.
   lint     Warn about browser cases the capture spec cannot show (read-only; --scaffold adds a marked stub state per
-           gap). Run it on the capture spec and the test plan BEFORE review or stage; review and stage do not run
-           it. Exit 0 with WARN lines is not all-clear: fix each named gap in the capture spec first.
+           gap). Run it on the capture spec and the test plan BEFORE review or stage. With --cases, review and stage run
+           the same check on the capture manifest and print the same WARN lines on stderr before any reviewer starts
+           (warn only). A --cases that cannot be read or is not a test plan stops review and stage.
+           Exit 0 with WARN lines is not all-clear: fix each named gap in the capture spec first.
 
 Inside an active Ratchet run, `review` and `stage` stamp and sign the capture manifest for the checkpoint's UI round,
 and everything written is signed for that round. Outside a run (no .ratchet folder, or no active run) they still work
@@ -152,6 +155,9 @@ def stage(manifest: dict, design: Path | None, scope: str, cases: Path | None, k
         own = st.get("viewport") if isinstance(st.get("viewport"), dict) else {}
         w, h = own.get("width", top.get("width")), own.get("height", top.get("height"))
         lines.append(f"## State `{st['name']}` — scope: {st.get('scope') or scope}, viewport: {w}x{h}")
+        if st.get("stub") is True:  # a scaffolded stub nobody filled in: no screenshots or steps are listed for it
+            lines += ["- STUB, UNREVIEWED: no evidence; do not judge it as passing", ""]
+            continue
         for side in ("reference", "app"):
             rec = st[side]
             if rec.get("fatal"):
@@ -473,8 +479,67 @@ def _open_stage_round(cp):
     return ctx, st, n, _ui_key(eng, ctx, st, cp, n)
 
 
+def _manifest_as_spec(manifest: dict) -> dict:
+    """The capture manifest in the shape capture_gaps reads: each state's journey is its own list of steps, else the
+    steps its captured journey records ran (app side, then reference side)."""
+    states = []
+    for st in manifest.get("states") if isinstance(manifest.get("states"), list) else []:
+        if not isinstance(st, dict):
+            continue
+        st = dict(st)
+        if not any(_valid_step(x) for x in (st.get("journey") if isinstance(st.get("journey"), list) else [])):
+            st["journey"] = []
+            for side in ("app", "reference"):
+                rec = st.get(side) if isinstance(st.get(side), dict) else {}
+                recs = rec.get("journey") if isinstance(rec.get("journey"), list) else []
+                steps = [j.get("step") for j in recs if isinstance(j, dict)]
+                if any(_valid_step(x) for x in steps):
+                    st["journey"] = steps
+                    break
+        states.append(st)
+    return dict(manifest, states=states)
+
+
+def _plan_problem(plan):
+    """Why `plan` is not a test plan (a list of cases, or an object with a cases list), else None."""
+    if isinstance(plan, list) or (isinstance(plan, dict) and isinstance(plan.get("cases"), list)):
+        return None
+    hint = "; the --spec and --cases paths look swapped" if isinstance(plan, dict) and "states" in plan else ""
+    return f"is not a test plan (expected a list of cases or an object with a cases list){hint}"
+
+
+def _precheck(manifest: dict, cases_path):
+    """Warn on stderr (the `lint` wording) about each browser case the capture manifest cannot show. Warn only. No
+    --cases, or a plan with no browser cases, means no check. A --cases that is given but cannot be read or is not a
+    test plan stops the command (fail closed): the reviewers must not start with the capture check silently skipped."""
+    if not cases_path:
+        return
+    try:
+        plan = json.loads(Path(cases_path).read_text())
+        why = _plan_problem(plan)
+    except (OSError, ValueError) as e:
+        why = f"cannot be read ({type(e).__name__})"
+    if why:
+        sys.exit(f"the capture check could not run: {cases_path} {why}. Fix the --cases plan path, then run again.")
+    for g in capture_gaps(plan, _manifest_as_spec(manifest)):
+        print(f"WARN {g['case']}: {g['detail']}", file=sys.stderr, flush=True)
+
+
+def _refuse_stubs(manifest: dict):
+    """Exit before anything is written or started while a capture state is still a scaffolded stub (stub: true)."""
+    names = [str(st.get("name")) for st in manifest.get("states", []) if isinstance(st, dict) and st.get("stub") is True]
+    if names:
+        cp = manifest.get("checkpoint")
+        spec = f"states/{cp}.json" if isinstance(cp, str) and cp else "the capture spec"
+        sys.exit(f"review: the capture still holds {len(names)} unfilled stub state(s): {', '.join(names)}. A stub has no "
+                 f"evidence and is never reviewed. Fill in its journey in {spec}, remove its `stub` mark, capture again, "
+                 "then review.")
+
+
 def cmd_review(a):
     manifest = json.loads(Path(a.manifest).read_text())
+    _precheck(manifest, a.cases)    # warns first, so a stub refusal still shows every other gap
+    _refuse_stubs(manifest)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     design = resolve_design(a.design)
@@ -562,6 +627,7 @@ def _compared(manifest: dict) -> dict:
 def cmd_stage(a):
     """Stage isolated inputs for the host's own sub-agent reviewers."""
     manifest = json.loads(Path(a.manifest).read_text())
+    _precheck(manifest, a.cases)
     manifest["review_scope"] = a.scope
     rnd = _open_stage_round(manifest.get("checkpoint"))
     if rnd:  # the reviewers' files are judged against this manifest, so it is stamped and signed like `review` does
