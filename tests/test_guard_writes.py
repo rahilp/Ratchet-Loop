@@ -14,6 +14,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -380,7 +381,7 @@ def t11_jq_read_with_stderr_silenced_allowed():
 def t12_docs_state_the_redirect_and_loop_rule():
     root = ENGINE.parents[1]  # .../skills/ratchet-orchestrator
     repo_root = ENGINE.parents[3]  # the project root (this worktree)
-    readme = (repo_root / "README.md").read_text()
+    readme = README_DOCS.read_text()
     skill = (root / "SKILL.md").read_text()
     schemas = (root / "references" / "schemas.md").read_text()
     docs = readme + "\n" + skill + "\n" + schemas
@@ -527,7 +528,7 @@ def x02_each_doc_independently_states_every_write_rule():
     root = ENGINE.parents[1]
     repo_root = ENGINE.parents[3]
     docs = {
-        "README.md": (repo_root / "README.md").read_text(),
+        "README.md": README_DOCS.read_text(),
         "SKILL.md": (root / "SKILL.md").read_text(),
         "schemas.md": (root / "references" / "schemas.md").read_text(),
     }

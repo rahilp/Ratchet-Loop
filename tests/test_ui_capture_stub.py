@@ -20,6 +20,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}. A case that raises is recorded as failed, never dropped.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import datetime as dt
 import hashlib
@@ -40,7 +41,7 @@ SCRIPTS = ROOT / "skills" / "ratchet-ui-compare" / "scripts"
 UI_REVIEW = SCRIPTS / "ui_review.py"
 CAPTURE = SCRIPTS / "capture.mjs"
 RATCHET_PY = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
-README = ROOT / "README.md"
+README = README_DOCS
 INVENTORY = HERE / "fixtures" / "modularize_cp1" / "test-inventory.md"
 THIS = Path(__file__).resolve()
 

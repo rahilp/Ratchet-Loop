@@ -52,6 +52,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import datetime as dt
 import json
@@ -684,7 +685,7 @@ TESTS.append(("CP2-T12", t12_json_matches_markdown_with_no_cost_or_token_keys))
 
 
 def t13_docs_describe_receipt():
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     skill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text()
     schemas = (ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md").read_text()
     check("[CP2-T13] README's command table lists `receipt`", "receipt" in readme, "")

@@ -43,6 +43,7 @@ Writes a per-test JSON report to $RATCHET_TEST_REPORT when that env var is set:
 {"cases": [{"id": "CP4-T01", "status": "passed"|"failed"|"skipped", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -257,7 +258,7 @@ def cp4_t05():
 def cp4_t06():
     print("CP4-T06: README documents both of this lane's load-aware test files, and test_docs.py's own doc "
           "check passes for every tests/test_*.py file on disk")
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     files = test_docs.cp6_tests_on_disk()
     check("[CP4-T06] setup: tests/test_load_determinism.py (this file) is itself among the files test_docs.py "
           "found on disk", "test_load_determinism.py" in files, files)

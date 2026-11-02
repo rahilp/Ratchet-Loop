@@ -19,6 +19,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import hashlib
 import json
@@ -422,7 +423,7 @@ def t19_listing_changes_nobody():
 
 
 def t20_readme_lists_file():
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     section = readme.split("### Running the tests", 1)[-1]
     n = len(re.findall(r"^python3 tests/test_models_explain\.py$", section, re.M))
     check("[CP4-T20] the README 'Running the tests' block lists python3 tests/test_models_explain.py exactly once",

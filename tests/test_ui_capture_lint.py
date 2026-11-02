@@ -18,6 +18,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 yet) is recorded as failed, never dropped.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import copy
 import json
@@ -35,7 +36,7 @@ import _tmp                                             # noqa: E402
 
 SCRIPTS = ROOT / "skills" / "ratchet-ui-compare" / "scripts"
 UI_REVIEW = SCRIPTS / "ui_review.py"
-README = ROOT / "README.md"
+README = README_DOCS
 INVENTORY = HERE / "fixtures" / "modularize_cp1" / "test-inventory.md"
 THIS = Path(__file__).resolve()
 

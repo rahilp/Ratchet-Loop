@@ -23,6 +23,7 @@ reported, not fixed: this step changes no reply behavior.
 
 Each case id appears in its check names as [CP1-Txx] / [CP1-Xxx].
 """
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 import ast
 import contextlib
 import importlib.util
@@ -37,7 +38,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
-README = ROOT / "README.md"
+README = README_DOCS
 INVENTORY = ROOT / "tests" / "fixtures" / "modularize_cp1" / "test-inventory.md"
 THIS_FILE = Path(__file__).resolve()
 NEW_TEST_LINE = "python3 tests/test_hook_codex_contract.py"

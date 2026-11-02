@@ -22,6 +22,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -518,7 +519,7 @@ def _section(text, start, end):
 def cp3_t15_docs_describe_the_done_means_finding_field_everywhere():
     """[CP3-T15] The docs describe the done_means finding field in every place the rule shows up."""
     schemas = (ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md").read_text()
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     oskill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text()
     s7 = _section(schemas, "## 7. Adversarial review JSON", "## 8.")
     check("[CP3-T15] schemas.md section 7 documents the done_means finding field", "done_means" in s7, s7[:200])

@@ -25,6 +25,7 @@ Writes a per-case JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import datetime as dt
 import importlib.util
@@ -1151,7 +1152,7 @@ def t16_nothing_is_pushed_while_ratchet_files_are_merged():
 def t17_docs_state_the_rules():
     """[CP3-T17] The docs state the rules for each Ratchet shared file."""
     cid = "CP3-T17"
-    docs = {"README.md": REPO / "README.md", "SKILL.md": REPO / "skills/ratchet-orchestrator/SKILL.md",
+    docs = {"README.md": README_DOCS, "SKILL.md": REPO / "skills/ratchet-orchestrator/SKILL.md",
             "schemas.md": REPO / "skills/ratchet-orchestrator/references/schemas.md"}
     groups = {
         "config.json merged key by key": (r"key by key|key-by-key|per key|each key|top-level key",),

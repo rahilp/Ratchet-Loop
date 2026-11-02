@@ -19,6 +19,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import importlib.util
 import json
@@ -322,7 +323,7 @@ def t20_reading_writes_nothing():
 
 
 def t21_readme():
-    lines = (ROOT / "README.md").read_text().splitlines()
+    lines = README_DOCS.read_text().splitlines()
     start = next((i for i, l in enumerate(lines) if re.match(r"#+\s*Running the tests", l)), None)
     section = []
     for l in lines[(start or 0) + 1:] if start is not None else []:

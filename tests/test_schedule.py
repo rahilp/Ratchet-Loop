@@ -35,6 +35,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import contextlib
 import copy
@@ -54,7 +55,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
 STATUS_TEXT_PATH = SCRIPTS / "status_text.py"
-README_PATH = ROOT / "README.md"
+README_PATH = README_DOCS
 INVENTORY_PATH = HERE / "fixtures" / "modularize_cp1" / "test-inventory.md"
 sys.path.insert(0, str(HERE))
 import _tmp                     # noqa: E402

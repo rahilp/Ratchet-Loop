@@ -19,6 +19,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import hashlib
 import json
@@ -504,7 +505,7 @@ def t21_earlier_steps_hold():
 
 
 def t22_readme_lists_file():
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     section = readme.split("### Running the tests", 1)[-1]
     check("[CP3-T22] the README 'Running the tests' block lists python3 tests/test_agents_config.py",
           re.search(r"^python3 tests/test_agents_config\.py$", section, re.M) is not None)
@@ -664,7 +665,7 @@ def x08_set_prints_note_and_readme_sentence():
     out = text(r)
     check("[CP3-X08] config --set succeeds and prints a note that the choice cannot apply",
           r.returncode == 0 and "agents.fixer" in out and "ratchet-fixer" in out and "can't apply" in out, out[:300])
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     check("[CP3-X08] the README says an unknown role in role_models stops the command",
           "unknown role in `role_models`" in readme and "stops the command" in readme)
 

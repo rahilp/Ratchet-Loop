@@ -30,6 +30,7 @@ skip. Writes a per-test JSON report to RATCHET_TEST_REPORT when set: {"cases": [
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -291,7 +292,7 @@ def t08_paid_options_name_tool_provider_model_and_say_ask_first():
 
 def t09_docs_describe_opencode_discovery():
     skill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text()
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     m = re.search(r"\n3\.\s+\*\*Check who else can review.*?(?=\n4\.\s+\*\*)", skill, re.S)
     step3 = m.group(0) if m else ""
     check("[CP1-T09] SKILL.md Phase A step 3 exists (setup: found the numbered step to check)", bool(step3), skill[:200])

@@ -26,6 +26,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set:
 {"cases": [{"id": "CP3-T01", "status": "passed"|"failed"|"error", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -616,7 +617,7 @@ def t16():
 
 
 DOCS = {
-    "README.md": ROOT / "README.md",
+    "README.md": README_DOCS,
     "SKILL.md": ROOT / "skills/ratchet-orchestrator/SKILL.md",
     "schemas.md": ROOT / "skills/ratchet-orchestrator/references/schemas.md",
 }

@@ -31,6 +31,7 @@ inside try/except, so a crash is a failed case, never a silent drop. Writes a pe
 RATCHET_TEST_REPORT when set: {"cases": [{"id": "CP3-T01", "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import datetime
 import json
@@ -581,7 +582,7 @@ def t12_a_good_review_that_merely_quotes_the_limit_message_does_not_bench_the_pr
 
 @case("CP3-T13")
 def t13_docs_describe_quota_benches_reset_times_and_the_retest_setting():
-    docs = {"README.md": ROOT / "README.md",
+    docs = {"README.md": README_DOCS,
             "SKILL.md": ROOT / "skills/ratchet-orchestrator/SKILL.md",
             "schemas.md": ROOT / "skills/ratchet-orchestrator/references/schemas.md"}
     texts = {k: v.read_text() for k, v in docs.items()}

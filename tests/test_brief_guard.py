@@ -24,6 +24,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import re
@@ -277,7 +278,7 @@ def _cli_says(text, cli, enforced):
 
 
 def t10_docs_state_which_clis_enforce_this():
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     skill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text()
     schemas = (ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md").read_text()
     for label, text in (("README.md", readme), ("SKILL.md", skill), ("schemas.md", schemas)):
@@ -340,7 +341,7 @@ def tx03_readme_table_row_states_enforcement():
     """[CP3-X03] CP3-T10 accepts a prose mention anywhere near the CLI's name, so a table with no enforcement
     column would still pass it. The done_when asks for this in the per-CLI table itself: check the table row,
     not prose, naming each CLI."""
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     rows = [l for l in readme.splitlines() if l.strip().startswith("|")]
     claude_rows = [l for l in rows if "Claude Code" in l]
     check("[CP3-X03] README's per-CLI table has a row for Claude Code that itself says the objective check is "

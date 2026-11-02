@@ -34,6 +34,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -713,7 +714,7 @@ def cp1_t13_table_appears_only_at_the_final_review():
 
 def cp1_t14_docs_describe_the_table():
     """[CP1-T14] The docs describe the table in every place that described the old prompts."""
-    files = {"README.md": ROOT / "README.md",
+    files = {"README.md": README_DOCS,
              "SKILL.md": ROOT / "skills/ratchet-orchestrator/SKILL.md",
              "schemas.md": ROOT / "skills/ratchet-orchestrator/references/schemas.md"}
     text = {k: p.read_text() for k, p in files.items()}

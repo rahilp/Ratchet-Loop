@@ -24,6 +24,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -379,7 +380,7 @@ def t13_brief_stays_read_only():
 def t14_docs_point_at_the_section_and_the_full_files():
     planner_md = (ROOT / "agents" / "ratchet-checkpoint-planner.md").read_text()
     skill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text()
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     schemas = (ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md").read_text()
     check("[CP1-T14] the checkpoint-planner agent describes the 'What earlier work says' section",
           re.search(r"what earlier work says", planner_md, re.I) is not None, "")

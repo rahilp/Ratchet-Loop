@@ -90,6 +90,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import contextlib
 import json
@@ -925,7 +926,7 @@ def t22_a_mid_round_failure_hands_the_slot_to_the_same_lens():
 
 def t23_the_docs_describe_the_fix_round():
     docs = {
-        "README.md": ROOT / "README.md",
+        "README.md": README_DOCS,
         "ratchet-adversarial-loop/SKILL.md": ROOT / "skills/ratchet-adversarial-loop/SKILL.md",
         "ratchet-orchestrator/SKILL.md": ROOT / "skills/ratchet-orchestrator/SKILL.md",
         "schemas.md": ROOT / "skills/ratchet-orchestrator/references/schemas.md",
@@ -952,7 +953,7 @@ def t23_the_docs_describe_the_fix_round():
     check("[CP5-T23] schemas.md names the round's small_fix flag and its new kind field",
           "small_fix" in schemas and re.search(r"\bkind\b", schemas) is not None
           and re.search(r"after a block|after-a-block", schemas, re.I) is not None, "schemas.md")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = README_DOCS.read_text(encoding="utf-8")
     m = re.search(r"Later rounds cost less(.{0,4000})", readme, re.S)
     para = (m.group(1) if m else "").lower()
     check("[CP5-T23] README's 'Later rounds cost less' section covers both the small fix after approval and the "

@@ -24,6 +24,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import ast
 import json
@@ -39,7 +40,7 @@ ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
 # CP7 moved _related_spec_items out of ratchet.py into plan_support.py (see tests/test_modularize_cp7.py,
 # CP7-T12); _func_docstring now reads it there instead, same rule, same docstring, new home only.
 PLAN_SUPPORT = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "plan_support.py"
-README = ROOT / "README.md"
+README = README_DOCS
 
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT / "skills" / "ratchet-orchestrator" / "scripts"))

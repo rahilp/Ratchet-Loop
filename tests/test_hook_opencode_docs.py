@@ -91,6 +91,7 @@ Wording the lints accept (plain, stable phrases; the implementer should match th
               sentence that says the Codex reply format was 'checked against' something names stop.rs, 75a4146 and the
               Codex hooks docs page, and says older Codex versions were not checked.
 """
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 import os
 import re
 import subprocess
@@ -102,7 +103,7 @@ import _tmp  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
-README = ROOT / "README.md"
+README = README_DOCS
 SKILL = ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md"
 SCHEMAS = ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md"
 INVENTORY = ROOT / "tests" / "fixtures" / "modularize_cp1" / "test-inventory.md"
@@ -125,7 +126,7 @@ def check(name, cond, detail=""):
 
 def read(p):
     try:
-        return Path(p).read_text(encoding="utf-8")
+        return (p if isinstance(p, Path) else Path(p)).read_text(encoding="utf-8")
     except OSError:
         return ""
 

@@ -16,12 +16,14 @@ ROOT = Path(__file__).resolve().parents[1]
 # Temp folders come from tests/_tmp.py, like every other suite, so they (and the background probes tied to them) are
 # removed however this script ends, and probe children inherit a TMPDIR the helper owns. CP5-T20 holds this lint's
 # imports to the stdlib, and "_tmp" is in that allow-list because _tmp.py itself imports only the stdlib, which
-# tests/test_cleanup.py checks ([CP1-X03]). Bytecode writes are turned off only to keep a run inside a private repo
+# tests/test_cleanup.py checks ([CP1-X03]). "_docs" (README.md plus the docs/ pages as one text) is allowed too: it
+# imports only pathlib. Bytecode writes are turned off only to keep a run inside a private repo
 # copy (CP5-T20) from leaving a __pycache__ behind in that copy, not to hide the import.
 sys.path.insert(0, str(ROOT / "tests"))
 _DONT_WRITE_BYTECODE, sys.dont_write_bytecode = sys.dont_write_bytecode, True
 try:
     import _tmp
+    from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 finally:
     sys.dont_write_bytecode = _DONT_WRITE_BYTECODE
 PASS = FAIL = 0
@@ -234,7 +236,7 @@ def l_no_contradiction(sect):  # T10
 
 def cp2_docs_lint():
     print("CP2: README states what each CLI enforces")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = README_DOCS.read_text(encoding="utf-8")
     sect = hsection(readme, r"Using it with Codex, Gemini or Copilot")
     hooks_test_path = ROOT / "tests" / "test_hooks.py"
     hooks_test_src = hooks_test_path.read_text(encoding="utf-8") if hooks_test_path.exists() else ""
@@ -2017,7 +2019,7 @@ def cp5_frontmatter_problems(docs):
 
 
 def stdlib_only(path):
-    ok = {"re", "sys", "traceback", "pathlib", "ast", "os", "subprocess", "tempfile", "json", "shutil", "textwrap", "hashlib", "time", "_tmp"}
+    ok = {"re", "sys", "traceback", "pathlib", "ast", "os", "subprocess", "tempfile", "json", "shutil", "textwrap", "hashlib", "time", "_tmp", "_docs"}
     bad = []
     for n in ast.walk(ast.parse(Path(path).read_text(encoding="utf-8"))):
         mods = [a.name for a in n.names] if isinstance(n, ast.Import) else [n.module or ""] if isinstance(n, ast.ImportFrom) else []
@@ -2505,7 +2507,7 @@ def cp6_manifest_problems(text):
 
 
 def cp6_docs_lint():
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = README_DOCS.read_text(encoding="utf-8")
     good = ('# R\n\n> Please install Ratchet Loop for me in Claude Code, Codex, Gemini CLI or GitHub Copilot CLI, and start it.\n\n'
             '## Install\nSay the sentence above.\n\n## Common tasks\n'
             '> Check that the hooks are installed.\n> Give me the viewer link.\n> Who is reviewing this, and can other reviewers be used?\n'
@@ -2549,7 +2551,7 @@ def cp6_docs_lint():
           cp6_tests_documented(good, ["test_hooks.py"]) and not cp6_tests_documented(good, ["test_hooks.py", "test_zzz.py"])
           and not cp6_tests_documented(good.replace("## Command reference", "## Commands"), ["test_hooks.py"]))
     # T06
-    files = [ROOT / "README.md", ROOT / "install.sh"] + sorted((ROOT / "skills").glob("*/SKILL.md")) + sorted((ROOT / "agents").glob("*.md"))
+    files = [README_DOCS, ROOT / "install.sh"] + sorted((ROOT / "skills").glob("*/SKILL.md")) + sorted((ROOT / "agents").glob("*.md"))
     hits = [p.name for p in files if re.search(r"other agent clis?", p.read_text(encoding="utf-8"), re.I)]
     check("[CP6-T06] no README, install.sh, SKILL.md or agent file mentions 'Other agent CLIs'", not hits, hits)
     check("[CP6-T06] README has no #other-agent-clis anchor, and every heading it refers to by quoted name or anchor exists",
@@ -2599,7 +2601,7 @@ import subprocess
 
 
 def cp7_read(rel):
-    return (ROOT / rel).read_text(encoding="utf-8")
+    return (README_DOCS if rel == "README.md" else ROOT / rel).read_text(encoding="utf-8")
 
 
 def cp7_bullet(text, start):
@@ -2608,7 +2610,7 @@ def cp7_bullet(text, start):
 
 
 def cp7_doc_files():
-    return ([ROOT / "README.md", ROOT / "skills/ratchet-orchestrator/references/schemas.md"]
+    return ([README_DOCS, ROOT / "skills/ratchet-orchestrator/references/schemas.md"]
             + sorted((ROOT / "skills").glob("*/SKILL.md")) + sorted((ROOT / "agents").glob("*.md")))
 
 
@@ -2798,7 +2800,7 @@ SECTIONS = [s for s in SECTIONS]
 
 def cp5_adv12_unrecorded_reply_docs():
     print("CP5 adv round 12: README and the orchestrator skill say a reply can go unrecorded and must be sent again")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = README_DOCS.read_text(encoding="utf-8")
     skill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text(encoding="utf-8")
     sec = readme.split("### Saying yes, and saying no", 1)[-1].split("\n## ", 1)[0]
     check("[CP5-X62] README's 'Saying yes, and saying no' says a reply can go unrecorded when Ratchet's own records "

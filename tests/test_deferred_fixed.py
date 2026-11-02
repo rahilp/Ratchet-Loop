@@ -37,6 +37,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -394,7 +395,7 @@ TESTS.append(("CP1-T10", t10_accepted_findings_stay_in_their_own_section))
 
 
 def t11_docs_describe_mark_fixed():
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     skill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text()
     schemas = (ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md").read_text()
     check("[CP1-T11] README's command table lists `mark-fixed`",

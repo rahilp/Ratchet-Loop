@@ -21,6 +21,7 @@ test_hooks.py, test_hook_list_payload.py and test_hooks_status.py on their own, 
 not repeated here (re-running them inside this file cost about 95 seconds). T16 only checks they exist and that
 run_all.py would pick them up.
 """
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 import json
 import os
 import re
@@ -31,7 +32,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
-README = ROOT / "README.md"
+README = README_DOCS
 THIS_FILE = Path(__file__).resolve()
 NEW_TEST_LINE = "python3 tests/test_hook_codex_payloads.py"
 PASS, FAIL = 0, 0

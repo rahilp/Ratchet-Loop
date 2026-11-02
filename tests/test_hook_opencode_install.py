@@ -33,6 +33,7 @@ Where OpenCode looks for plugins (checked 2026-10-31 against github.com/anomalyc
 Each case id appears in its check names as [CP3-Txx]. When RATCHET_TEST_REPORT is set, one JSON entry per planned case
 ({"cases": [{"id", "status", "message"}]}) is written there.
 """
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 import json
 import os
 import re
@@ -46,7 +47,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
 SKILL = ROOT / "skills" / "ratchet-orchestrator"
 INSTALL_SH = ROOT / "install.sh"
-README = ROOT / "README.md"
+README = README_DOCS
 THIS_FILE = Path(__file__).resolve()
 NEW_TEST_LINE = "python3 tests/test_hook_opencode_install.py"
 HEADER = "// Ratchet Loop OpenCode plugin, written by ratchet.py install-hooks"

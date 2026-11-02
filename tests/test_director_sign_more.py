@@ -28,6 +28,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -708,7 +709,7 @@ def _director_doc_checks(label, sec):
 
 
 def t22_docs_list_both_actions():
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     para = next((p for p in readme.split("\n\n") if "Director-signed approvals" in p), "")
     _director_doc_checks("README director paragraph", para)
     skill = (ROOT / "skills/ratchet-orchestrator/SKILL.md").read_text()

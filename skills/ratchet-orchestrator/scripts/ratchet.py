@@ -16810,7 +16810,7 @@ OPENCODE_HEADER = "// Ratchet Loop OpenCode plugin, written by ratchet.py instal
 OPENCODE_ENGINE_SLOT = "__RATCHET_ENGINE_PATH__"
 OPENCODE_TEMPLATE = SKILL_DIR / "assets" / "opencode-plugin.js"
 
-# What Ratchet enforces on each host CLI today. This is the one source for the per-CLI table in README.md
+# What Ratchet enforces on each host CLI today. This is the one source for the per-CLI table in docs/how-it-works.md
 # ("Using it with Codex, Gemini or Copilot"); tests/test_docs.py renders that table from it cell by cell and
 # checks every fact against the code that does the work:
 #   records   the guard hook blocks hand-edits to .ratchet/ state and evidence (build_hook_config, decide_guard)

@@ -31,6 +31,7 @@ Writes a per-test JSON report to $RATCHET_TEST_REPORT when that env var is set:
 {"cases": [{"id": "CP1-T01", "status": "passed"|"failed"|"skipped", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import concurrent.futures
 import json
@@ -51,7 +52,7 @@ import _tmp  # noqa: E402
 from run_all import kill_tree  # noqa: E402
 
 RUN_ALL = ROOT / "tests" / "run_all.py"
-README = ROOT / "README.md"
+README = README_DOCS
 
 PASS = FAIL = 0
 CASE_STATUS: dict = {}

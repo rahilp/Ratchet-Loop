@@ -20,6 +20,7 @@ case, never a crash or a skip. Writes a per-test JSON report to RATCHET_TEST_REP
 {"cases": [{"id": "CP2-T04", "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -293,7 +294,7 @@ def t09_flat_rate_model_needs_no_question():
 
 def t10_docs_describe_the_paid_provider_question():
     skill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text()
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     schemas = (ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md").read_text()
     m = re.search(r"\n3\.\s+\*\*Check who else can review.*?(?=\n4\.\s+\*\*)", skill, re.S)
     step3 = m.group(0) if m else ""

@@ -26,6 +26,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set:
 {"cases": [{"id": "CP4-T01", "status": "passed"|"failed"|"error", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import atexit
 import json
@@ -47,7 +48,7 @@ import _tmp  # noqa: E402
 import trust_helpers as tt  # noqa: E402  (ENGINE, make_env, rx, git, now_dt, guard)
 import test_signing as ts  # noqa: E402  (open_round, record_host_review, write_tests2)
 
-README = ROOT / "README.md"
+README = README_DOCS
 SKILL = ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md"
 SCHEMAS = ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md"
 
@@ -502,7 +503,7 @@ def evidence(d) -> Path:
 
 def read(p) -> str:
     try:
-        return Path(p).read_text(errors="replace")
+        return (p if isinstance(p, Path) else Path(p)).read_text(errors="replace")
     except OSError:
         return ""
 

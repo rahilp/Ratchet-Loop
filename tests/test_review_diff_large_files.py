@@ -33,6 +33,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import contextlib
 import importlib.util
@@ -169,7 +170,7 @@ def _code_lines(n, tag, changed=False, marker=None):
 
 
 def _rewrite_every_second_line(path, marker):
-    text = Path(path).read_text()
+    text = (path if isinstance(path, Path) else Path(path)).read_text()
     lines = text.split("\n")
     trailing_blank = bool(lines) and lines[-1] == ""
     body = lines[:-1] if trailing_blank else lines
@@ -804,7 +805,7 @@ MOD_STILL_BLOCKS = [r"(real\s+)?modification", r"(too large|over the (size )?lim
 
 
 def t19_docs_describe_the_large_file_summary():
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     schemas = (ROOT / "skills/ratchet-orchestrator/references/schemas.md").read_text()
     for name, text in (("README.md", readme), ("skills/ratchet-orchestrator/references/schemas.md", schemas)):
         check(f"[CP1-T19] {name} describes the honest one-line summary for a huge pure add or delete",

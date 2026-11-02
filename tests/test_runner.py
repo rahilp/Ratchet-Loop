@@ -24,6 +24,7 @@ Writes a per-test JSON report to $RATCHET_TEST_REPORT when that env var is set:
 without making a single check (X01 to X03 where there is no /proc, say) is "skipped", never "passed".
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -340,7 +341,7 @@ def t07_clean_not_flagged():
 
 def t08_readme_points_to_run_all():
     print("CP3-T08: README points to run_all.py for the full regression run")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = README_DOCS.read_text(encoding="utf-8")
     check("[CP3-T08] README.md tells a developer to run `python3 tests/run_all.py`",
           "python3 tests/run_all.py" in readme, "")
     idx = readme.find("python3 tests/run_all.py")

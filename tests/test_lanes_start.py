@@ -23,6 +23,7 @@ Writes a per-case JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -751,7 +752,7 @@ def t20_nothing_else_is_touched():
 
 def t21_docs_name_the_command():
     cid = "CP7-T21"
-    docs = {"README.md": ROOT / "README.md", "SKILL.md": ROOT / "skills/ratchet-orchestrator/SKILL.md",
+    docs = {"README.md": README_DOCS, "SKILL.md": ROOT / "skills/ratchet-orchestrator/SKILL.md",
             "schemas.md": ROOT / "skills/ratchet-orchestrator/references/schemas.md"}
     txt = {k: p.read_text() for k, p in docs.items()}
     for k, t in txt.items():

@@ -20,6 +20,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when set:
   {"cases": [{"id": "CP3-T01", "status": "passed"|"failed", "message": "..."}]}
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -41,7 +42,7 @@ import test_flaky as tf  # noqa: E402  (set_regression_command_confirmed, flaky_
 import trust_helpers as tt  # noqa: E402  (ENGINE)
 
 ENGINE = tt.ENGINE
-README = ROOT / "README.md"
+README = README_DOCS
 SKILL = ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md"
 
 PASS = FAIL = 0
