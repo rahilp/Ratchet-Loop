@@ -127,7 +127,8 @@ def drop_schedule_output(text):
     top-level `schedule` key of a `status --json` document, ONLY a top-level `stall` key of a `next` document (the
     one with an `action` key and no `schedule` key), each when `text` is exactly that dict re-dumped the way the
     engine writes it (indent 2, trailing newline), and ONLY the lines of plain output that START with
-    'Projected finish:' or 'STALL:'. Text of any other shape is returned untouched, so a mismatch still fails loudly.
+    'Projected finish:', 'STALL:', 'Critical path:' or 'One more review round:' (CP4 of the same lane adds the last
+    two). Text of any other shape is returned untouched, so a mismatch still fails loudly.
     Applied to BOTH sides of the pinned-engine byte-compares in tests/test_modularize_cp4..cp8.py."""
     if not isinstance(text, str):
         return text
@@ -146,7 +147,8 @@ def drop_schedule_output(text):
             del parsed["stall"]
             changed = True
         return json.dumps(parsed, indent=2) + "\n" if changed else text
-    return "".join(ln for ln in text.splitlines(keepends=True) if not ln.startswith(("Projected finish:", "STALL:")))
+    return "".join(ln for ln in text.splitlines(keepends=True) if not ln.startswith(
+        ("Projected finish:", "STALL:", "Critical path:", "One more review round:")))
 
 
 def _stop(proc) -> None:

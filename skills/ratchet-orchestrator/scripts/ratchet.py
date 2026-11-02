@@ -89,7 +89,7 @@ from status_text import (plain_reason, blocked_options, plain_now, waiting_quest
                          exit_code_only_line, exit_code_only_note, _lines_word, done_means_table,
                          _finish_block_lines, _finish_blockers, _finish_held, _finish_legacy_note,
                          _finish_integrity_lines, _unproven_finish_lines, _accepted_lines,
-                         _apply_accepted_lines, HELD_AGAIN_PREFIX, schedule_status, stall_view)
+                         _apply_accepted_lines, HELD_AGAIN_PREFIX, schedule_status, stall_view, path_lines)
 import run_records  # noqa: E402  (module object: offers run_records.py's own live _IN_HOOK/_HOOK_ENV_ADVISORY
                      # views THIS exact, currently-executing module's own namespace -- a no-op if some OTHER
                      # ratchet.py instance in this same process already bound first; see run_records.py's own
@@ -2554,6 +2554,8 @@ def cmd_status_text(ctx: Ctx):
         print(question_line(q))
     if sched["line"]:
         print(sched["line"])
+    for line in path_lines(sched, st.get("phase")):  # the critical path and what one more review round costs
+        print(line)
     if _finish_pending(st):
         # CP4: the finish is held while an approved done-means line is unproven (never for a plan approved before
         # this rule, which gets the plain note instead), or while a checkpoint or test plan changed after approval

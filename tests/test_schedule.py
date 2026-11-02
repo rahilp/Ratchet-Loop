@@ -1604,10 +1604,10 @@ def test_CP2_T14_taking_the_new_lines_out_leaves_the_old_bytes_exactly():
         raw1, raw2 = c.run(pin, d1, ["status"]).stdout, c.run(c.ENGINE, d2, ["status"]).stdout
         n1, n2 = c._normalize_clone_text(raw1, d1, d2), c._normalize_clone_text(raw2, d2, d1)
         added = [ln for ln in n2.splitlines(keepends=True) if ln.startswith(S2_PREFIX)]
-        rest = "".join(ln for ln in n2.splitlines(keepends=True) if not ln.startswith(S2_PREFIX))
+        rest, base = c.drop_schedule_output(n2), c.drop_schedule_output(n1)
         check("without the normalizer the raw `status` outputs on F3 differ (the normalizer is needed)", n1 != n2, None)
-        check("the raw outputs differ by exactly the schedule lines and nothing else", bool(added) and rest == n1,
-              (added, rest[-200:], n1[-200:]))
+        check("the raw outputs differ by exactly the schedule lines and nothing else", bool(added) and rest == base,
+              (added, rest[-200:], base[-200:]))
         rn = c.run(c.ENGINE, c.clone(f3), ["next"])
         try:
             nj = json.loads(rn.stdout)
@@ -2373,11 +2373,14 @@ def test_CP3_T18_a_stall_changes_no_existing_status_or_next_field():
         a.pop("stall", None)
         b.pop("stall", None)
         check("next: every field but `stall` is identical", a == b, [(k, a.get(k), b.get(k)) for k in set(a) | set(b) if a.get(k) != b.get(k)][:3])
-    ts, tt = s3_strip(o.rp.stdout, d, twin), s3_strip(ot.rp.stdout, twin, d)
-    only = [ln for ln in ts.splitlines(keepends=True) if ln.startswith(S3_TAG)]
-    rest = "".join(ln for ln in ts.splitlines(keepends=True) if not ln.startswith(S3_TAG))
-    check("the stalled status text is the unstalled text plus exactly one STALL line", len(only) == 1 and rest == tt and tt != "",
-          (only, rest[-150:], tt[-150:]))
+    c = s2c()
+    full_s = c._normalize_clone_text(o.rp.stdout, d, twin)
+    full_t = c._normalize_clone_text(ot.rp.stdout, twin, d)
+    only = [ln for ln in full_s.splitlines(keepends=True) if ln.startswith(S3_TAG)]
+    twin_only = [ln for ln in full_t.splitlines(keepends=True) if ln.startswith(S3_TAG)]
+    rest, tt = c.drop_schedule_output(full_s), c.drop_schedule_output(full_t)
+    check("the stalled status text is the unstalled text plus exactly one STALL line",
+          len(only) == 1 and not twin_only and rest == tt and tt != "", (only, twin_only, rest[-150:], tt[-150:]))
 
 
 def s3_stop(d):
@@ -2452,6 +2455,634 @@ def test_CP3_T21_gate_counters_and_limits_are_the_same_in_a_stalled_run():
     b.pop("stall", None)
     check("next (apart from `stall`) is identical: action, options, limits and counters",
           a == b, [(k, a.get(k), b.get(k)) for k in set(a) | set(b) if a.get(k) != b.get(k)][:3])
+
+
+# ================================================================================================ CP4 section
+# CP4: critical path versus time off it. Black-box through the CLI (status, status --json, next) on small synthetic
+# 3-step projects (a clone of one shared base, like CP2/CP3); every time is written relative to the real clock when the
+# fixture is built, and a "so far" figure is checked against the window the real clock moved through while the three
+# commands ran (+/- 2 seconds), never against a fixed number. Option A is pinned (director's decision):
+#   critical path = each step's started_at..completed_at (the current step: started_at..now); outside it = created_at ..
+#   first step's started_at (planning and approval) plus every gap completed_at(n)..started_at(n+1) (waits between
+#   steps); time blocked inside a step stays inside it; one more review round = the mean gap between consecutive
+#   gates.adversarial.rounds[].at WITHIN one step (a gap that is negative is skipped).
+#   `status --json`: inside the existing `schedule` object (no new top-level key, no per-checkpoint key):
+#     critical_path {seconds, steps: [{id, seconds, finished}], fields: [state.json names]}
+#       (a step with an unreadable time is left out of the sum and named as unreadable: an `unreadable` list of ids on
+#        critical_path, or an `unreadable` flag / null seconds on its step entry)
+#     outside {seconds, planning_seconds, waits_seconds, fields}
+#     review_round {seconds (mean gap or null), gaps (count it rests on), enough_data (true from one gap), finish_if_one_more
+#        (projected finish moved by one round's cost, or null), fields}
+#     parallel_recorded = false
+#   plain `status`: a line starting 'Critical path:' (durations as '3h 40m', the receipt's style), a line carrying the
+#   outside time (it says 'outside'), a sentence with 'no parallel' and `lanes`, and a line starting 'One more review round:'.
+#   Every added plain line must START with one of the four prefixes tests/_tmp.py's shared drop_schedule_output drops
+#   ('Projected finish:', 'STALL:', 'Critical path:', 'One more review round:'): the byte-pin suites (cp4..cp8) compare
+#   plain `status` text and drop only those lines. CP4-T18 compares plain `status` with the pinned engine after dropping.
+
+S4_CRIT = "Critical path:"
+S4_ROUND = "One more review round:"
+S4_TOL = 2
+S4_DEFAULT = ((240, 180, (235, 215, 185)), (165, 105, ()), (100, None, ()))
+S4_DUR = re.compile(r"\b\d+\s*(?:h|m|hours?|minutes?)\b", re.I)
+S4_NO_DEADLINE = re.compile(r"deadline|on time|will finish by", re.I)
+
+
+def s4_dur(sec):
+    """A span as the receipt writes it ('4h 17m', '38m'): the engine's _plain_duration."""
+    sec = max(0, int(sec or 0))
+    days, rem = divmod(sec, 86400)
+    hours, rem = divmod(rem, 3600)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if days or hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{rem // 60}m")
+    return " ".join(parts)
+
+
+def s4_base():
+    """The shared throwaway project a CP4 case clones: an approved 3-step run (phase building)."""
+    if "s4" not in _S2:
+        g = s2c().g
+        d = g.project("sched4", cps=3, config=["max_adversarial_rounds_run=10"])
+        g.approve_plan(d)
+        _S2["s4"] = d
+    return _S2["s4"]
+
+
+def s4_fx(created=270, steps=S4_DEFAULT, phase="building", edit=None):
+    """A clone of the base whose state.json is rewritten relative to now. `created` is minutes ago; `steps` holds one
+    (started_ago, completed_ago, round_agos) per step CP1.. in minutes ago (None = not yet; steps not listed are
+    not started). A completed step is done, a started one in progress, the rest pending; the current step is the first
+    that is not done. Steps with `round_agos` get gates.adversarial.rounds[] with those `at` times (and attempts)."""
+    c = s2c()
+    d = c.clone(s4_base())
+
+    def fn(st):
+        now = datetime.now(timezone.utc)
+        st["created_at"] = iso(now - M(created))
+        cur, total = None, 0
+        for i, cid in enumerate(list(st["checkpoints"])):
+            started, completed, rounds = steps[i] if i < len(steps) else (None, None, ())
+            cp = st["checkpoints"][cid]
+            adv = cp["gates"]["adversarial"]
+            if rounds:
+                adv["rounds"] = [{"round": n + 1, "at": iso(now - M(a))} for n, a in enumerate(rounds)]
+                adv["attempts"] = len(rounds)
+                total += len(rounds)
+            cp["started_at"] = iso(now - M(started)) if started is not None else None
+            cp["completed_at"] = iso(now - M(completed)) if completed is not None else None
+            if completed is not None:
+                cp["status"], cp["step"] = "done", "complete"
+                for gt in cp["gates"].values():
+                    if isinstance(gt, dict):
+                        gt["status"] = "passed"
+            else:
+                cp["status"], cp["step"] = ("in_progress" if started is not None else "pending"), "tests"
+                if cur is None:
+                    cur = cid
+        st["current"] = cur
+        st["adv_rounds_total"] = total
+        st["phase"] = phase
+        if edit:
+            edit(st)
+
+    c.mutate(d, fn)
+    return d
+
+
+def s4_cmds(d):
+    """s3_cmds with the real-clock window (t0, t1) the three commands ran in."""
+    t0 = datetime.now(timezone.utc)
+    o = s3_cmds(d)
+    o.t0, o.t1 = t0, datetime.now(timezone.utc)
+    return o
+
+
+def s4_win(o, start_iso, base=0):
+    """(low, high) seconds a 'so far' figure may show: `base` plus the time since `start_iso`, for any clock reading
+    inside the window the commands ran in."""
+    s = pt(start_iso)
+    if s is None:
+        return (float("inf"), float("-inf"))
+    return (base + (o.t0 - s).total_seconds() - S4_TOL, base + (o.t1 - s).total_seconds() + S4_TOL)
+
+
+def s4_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def s4_in(v, rng):
+    return s4_num(v) and rng[0] <= v <= rng[1]
+
+
+def s4_near(v, want, tol=S4_TOL):
+    return s4_num(v) and abs(v - want) <= tol
+
+
+def s4_parts(o, label):
+    """(schedule, critical_path, outside, review_round) of the parsed status --json; an empty dict for a missing part
+    (a failed check each)."""
+    sch = o.j.get("schedule") if isinstance(o.j, dict) else None
+    sch = sch if isinstance(sch, dict) else {}
+    out = []
+    for k in ("critical_path", "outside", "review_round"):
+        v = sch.get(k)
+        check(f"{label}: status --json has schedule.{k} as an object", isinstance(v, dict), v)
+        out.append(v if isinstance(v, dict) else {})
+    return (sch, *out)
+
+
+def s4_with(text, prefix):
+    return [ln for ln in text.splitlines() if ln.startswith(prefix)]
+
+
+def s4_chain_line(text, figure=None):
+    """The 'Critical path:' line (the one carrying `figure` when given), or None."""
+    for ln in s4_with(text, S4_CRIT):
+        if figure is None or figure in ln:
+            return ln
+    return None
+
+
+def s4_round_line(text):
+    lines = s4_with(text, S4_ROUND)
+    return lines[0] if len(lines) == 1 else None
+
+
+def s4_outside_line(text, figure, chain_figure=None):
+    """A plain line (not the Projected finish line) that says 'outside' and carries `figure`, and not the chain's own
+    figure: the outside time on its own line."""
+    for ln in text.splitlines():
+        if ln.startswith("Projected finish:") or "outside" not in ln.lower() or figure not in ln:
+            continue
+        if chain_figure is None or chain_figure not in ln:
+            return ln
+    return None
+
+
+def s4_walk(v, path=""):
+    """Every (path, number) in a nested value."""
+    if isinstance(v, dict):
+        for k, x in v.items():
+            yield from s4_walk(x, f"{path}.{k}")
+    elif isinstance(v, list):
+        for i, x in enumerate(v):
+            yield from s4_walk(x, f"{path}[{i}]")
+    elif s4_num(v):
+        yield path, v
+
+
+def s4_unreadable(cp):
+    ids = set()
+    if isinstance(cp.get("unreadable"), list):
+        ids.update(str(x) for x in cp["unreadable"])
+    for e in cp.get("steps") or []:
+        if isinstance(e, dict) and (e.get("unreadable") or e.get("seconds") is None):
+            ids.add(e.get("id"))
+    return ids
+
+
+def s4_steps(cp):
+    return [e for e in (cp.get("steps") or []) if isinstance(e, dict)]
+
+
+def s4_sentences(text):
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n", text) if s.strip()]
+
+
+@case("CP4-T01")
+def test_CP4_T01_status_splits_step_time_from_time_outside_the_steps():
+    d = s4_fx()
+    o = s4_cmds(d)
+    s3_exit(o, "3-step run")
+    sch, cp, ou, rr = s4_parts(o, "3-step run")
+    st = s3_state(d)
+    rng = s4_win(o, st["checkpoints"]["CP3"]["started_at"], 7200)
+    check("critical_path.seconds is 13200 (60m + 60m + 100m so far)", s4_in(cp.get("seconds"), rng), (cp.get("seconds"), rng))
+    steps = s4_steps(cp)
+    check("critical_path.steps has one entry per step, CP1 CP2 CP3", [e.get("id") for e in steps] == ["CP1", "CP2", "CP3"],
+          steps)
+    if len(steps) == 3:
+        check("CP1 and CP2 are 3600 seconds each and finished",
+              all(s4_near(e.get("seconds"), 3600) and e.get("finished") is True for e in steps[:2]), steps[:2])
+        check("CP3 is about 6000 seconds so far and not finished",
+              s4_in(steps[2].get("seconds"), s4_win(o, st["checkpoints"]["CP3"]["started_at"])) and steps[2].get("finished") is False,
+              steps[2])
+    line = s4_chain_line(o.rp.stdout, "3h 40m")
+    check("plain status has a 'Critical path:' line showing 3h 40m", line is not None, s4_with(o.rp.stdout, S4_CRIT))
+    check("that line says the current step is counted so far", line is not None and "so far" in line.lower(), line)
+
+
+@case("CP4-T02")
+def test_CP4_T02_planning_approval_and_waits_between_steps_count_as_outside_time():
+    d = s4_fx()
+    o = s4_cmds(d)
+    s3_exit(o, "3-step run")
+    sch, cp, ou, rr = s4_parts(o, "3-step run")
+    check("outside.planning_seconds is 1800 (created_at to CP1 started)", s4_near(ou.get("planning_seconds"), 1800), ou)
+    check("outside.waits_seconds is 1200 (15m + 5m between steps)", s4_near(ou.get("waits_seconds"), 1200), ou)
+    check("outside.seconds is 3000", s4_near(ou.get("seconds"), 3000), ou)
+    rng = s4_win(o, s3_state(d)["checkpoints"]["CP3"]["started_at"], 7200)
+    check("none of those 50 minutes is inside critical_path.seconds (it stays at the steps' own 13200)",
+          s4_in(cp.get("seconds"), rng), (cp.get("seconds"), rng))
+    line = s4_outside_line(o.rp.stdout, "50m", "3h 40m")
+    check("plain status shows 50m outside the steps on a line of its own, apart from the chain figure", line is not None,
+          o.rp.stdout[-700:])
+
+
+@case("CP4-T03")
+def test_CP4_T03_the_two_parts_add_up_to_the_runs_own_elapsed_time():
+    d = s4_fx()
+    o = s4_cmds(d)
+    s3_exit(o, "3-step run")
+    sch, cp, ou, rr = s4_parts(o, "3-step run")
+    rng = s4_win(o, s3_state(d)["created_at"])
+    total = cp.get("seconds") + ou.get("seconds") if s4_num(cp.get("seconds")) and s4_num(ou.get("seconds")) else None
+    check("critical_path.seconds + outside.seconds equals now minus created_at (16200 seconds)", s4_in(total, rng), (total, rng))
+
+
+@case("CP4-T04")
+def test_CP4_T04_plain_and_json_show_the_same_numbers():
+    steps_b = ((190, 140, (180, 165)), (130, 80, ()), (70, None, ()))
+    for label, d in (("default run", s4_fx()), ("a second run with other numbers", s4_fx(created=200, steps=steps_b))):
+        o = s4_cmds(d)
+        s3_exit(o, label)
+        sch, cp, ou, rr = s4_parts(o, label)
+        want_c, want_o, want_r = (s4_dur(x.get("seconds")) for x in (cp, ou, rr))
+        check(f"{label}: the plain Critical path line shows the JSON figure {want_c}", s4_chain_line(o.rp.stdout, want_c) is not None,
+              (want_c, s4_with(o.rp.stdout, S4_CRIT)))
+        check(f"{label}: the plain outside line shows the JSON figure {want_o}",
+              s4_outside_line(o.rp.stdout, want_o, want_c) is not None, (want_o, o.rp.stdout[-500:]))
+        rl = s4_round_line(o.rp.stdout)
+        check(f"{label}: the plain One more review round line shows the JSON figure {want_r}",
+              rl is not None and want_r in rl and s4_num(rr.get("seconds")), (want_r, rl))
+
+
+@case("CP4-T05")
+def test_CP4_T05_status_says_one_run_records_no_parallel_work_and_points_to_lanes():
+    d = s4_fx()
+    o = s4_cmds(d)
+    s3_exit(o, "3-step run")
+    sch, cp, ou, rr = s4_parts(o, "3-step run")
+    lines = [ln for ln in o.rp.stdout.splitlines() if "parallel" in ln.lower()]
+    check("plain status has a sentence saying this run records no parallel side-work and naming `lanes`",
+          any("no parallel" in ln.lower() and "lanes" in ln.lower() for ln in lines), lines)
+    check("schedule.parallel_recorded is false", sch.get("parallel_recorded") is False, sch.get("parallel_recorded"))
+    shown = [ln for ln in o.rp.stdout.splitlines() if ln.startswith((S4_CRIT, S4_ROUND)) or "parallel" in ln.lower()]
+    claims = [ln for ln in shown if re.search(r"\b(saved|saves|saving|hidden|hides|hiding)\b", ln, re.I)]
+    check("the schedule text never claims time was saved or hidden by parallel work", not claims and bool(shown), (claims, shown))
+
+
+@case("CP4-T06")
+def test_CP4_T06_time_blocked_inside_a_step_stays_on_the_critical_path():
+    def blocked(st):
+        st["blocked_from"] = "building"
+        st["blocked_reason"] = "CP3: 3 adversarial rounds used without approval"
+        st["awaiting_since"] = iso(datetime.now(timezone.utc) - M(30))
+
+    d = s4_fx(phase="blocked", edit=blocked)
+    o = s4_cmds(d)
+    s3_exit(o, "blocked run")
+    sch, cp, ou, rr = s4_parts(o, "blocked run")
+    check("(sanity) the run is blocked", o.j.get("phase") == "blocked" if isinstance(o.j, dict) else False, None)
+    rng = s4_win(o, s3_state(d)["checkpoints"]["CP3"]["started_at"], 7200)
+    check("critical_path.seconds still counts CP3 from started_at to now, the 30m blocked inside it",
+          s4_in(cp.get("seconds"), rng), (cp.get("seconds"), rng))
+    check("the 30 blocked minutes are not moved to outside.seconds (still 3000)", s4_near(ou.get("seconds"), 3000), ou)
+    ok = [s for s in s4_sentences(o.rp.stdout)
+          if "blocked" in s.lower() and "counted" in s.lower() and ("inside" in s.lower() or "within" in s.lower())]
+    check("the plain text says blocked time is counted inside the step", bool(ok), s4_sentences(o.rp.stdout)[-8:])
+
+
+@case("CP4-T07")
+def test_CP4_T07_one_more_review_round_costs_the_average_gap_between_a_steps_rounds():
+    d = s4_fx()
+    o = s4_cmds(d)
+    s3_exit(o, "CP1 rounds at 0, 20m and 50m")
+    sch, cp, ou, rr = s4_parts(o, "CP1 rounds at 0, 20m and 50m")
+    check("review_round.seconds is 1500 (mean of 20m and 30m)", s4_near(rr.get("seconds"), 1500), rr)
+    check("review_round.gaps is 2", rr.get("gaps") == 2 and not isinstance(rr.get("gaps"), bool), rr.get("gaps"))
+    check("review_round.enough_data is true", rr.get("enough_data") is True, rr.get("enough_data"))
+    rl = s4_round_line(o.rp.stdout)
+    check("exactly one plain line starts 'One more review round:'", rl is not None, s4_with(o.rp.stdout, S4_ROUND))
+    check("it says about 25m", rl is not None and "25m" in rl, rl)
+    check("it says the figure rests on 2 gaps in this run", rl is not None and re.search(r"\b2 gaps\b", rl) is not None, rl)
+
+
+@case("CP4-T08")
+def test_CP4_T08_gaps_are_counted_inside_each_step_only_never_across_steps():
+    steps = ((385, 330, (380, 360, 340)), (320, 230, (290, 240)), (220, None, ()))
+    o = s4_cmds(s4_fx(created=400, steps=steps))
+    s3_exit(o, "rounds in two steps")
+    sch, cp, ou, rr = s4_parts(o, "rounds in two steps")
+    check("review_round.gaps is 3 (20m, 20m in CP1 and 50m in CP2; the step change is no gap)", rr.get("gaps") == 3, rr)
+    check("review_round.seconds is 1800 (a mean over all consecutive rounds would be 2100)",
+          s4_near(rr.get("seconds"), 1800), rr)
+
+
+@case("CP4-T09")
+def test_CP4_T09_one_recorded_round_is_not_enough_to_estimate_a_rounds_cost():
+    steps = ((240, 180, (235,)), (165, 105, ()), (100, None, ()))
+    o = s4_cmds(s4_fx(steps=steps))
+    s3_exit(o, "one round only")
+    sch, cp, ou, rr = s4_parts(o, "one round only")
+    check("review_round.seconds is null, gaps 0, enough_data false",
+          rr.get("seconds") is None and "seconds" in rr and rr.get("gaps") == 0 and rr.get("enough_data") is False, rr)
+    rl = s4_round_line(o.rp.stdout)
+    check("the 'One more review round:' line says there is not enough data yet", rl is not None and "not enough data" in rl.lower(), rl)
+    check("and shows no minutes or hours figure for it", rl is not None and not S4_DUR.search(rl), rl)
+
+
+@case("CP4-T10")
+def test_CP4_T10_no_review_round_at_all_gives_the_same_honest_answer():
+    steps = ((240, 180, ()), (165, 105, ()), (100, None, ()))
+    o = s4_cmds(s4_fx(steps=steps))
+    s3_exit(o, "no rounds")
+    sch, cp, ou, rr = s4_parts(o, "no rounds")
+    check("review_round.seconds is null, gaps 0, enough_data false",
+          rr.get("seconds") is None and "seconds" in rr and rr.get("gaps") == 0 and rr.get("enough_data") is False, rr)
+    rl = s4_round_line(o.rp.stdout)
+    check("the 'One more review round:' line says there is not enough data yet and shows no figure",
+          rl is not None and "not enough data" in rl.lower() and not S4_DUR.search(rl), rl)
+    check("the Critical path line is still printed", s4_chain_line(o.rp.stdout) is not None, o.rp.stdout[-400:])
+    check("the outside time is still printed", s4_outside_line(o.rp.stdout, "50m", "3h 40m") is not None, o.rp.stdout[-500:])
+
+
+@case("CP4-T11")
+def test_CP4_T11_status_says_where_the_finish_would_move_if_the_limit_were_raised_by_one():
+    steps = ((240, 180, (235, 215, 185)), (165, 105, (160, 135)), (100, None, ()))
+    d = s4_fx(steps=steps)
+    for _ in range(3):   # the projected finish is rounded to 5 minutes: run again if the calls straddled a rounding mark
+        o = s4_cmds(d)
+        sch, cp, ou, rr = s4_parts(o, "rounds on CP1 and CP2")
+        fim = s3_when(rr.get("finish_if_one_more"))
+        if fim is not None and fim.strftime("%Y-%m-%d %H:%M") in (s4_round_line(o.rp.stdout) or ""):
+            break
+    s3_exit(o, "rounds on CP1 and CP2")
+    check("review_round.seconds is 1500 (25m)", s4_near(rr.get("seconds"), 1500), rr)
+    eta = sch.get("eta") if isinstance(sch.get("eta"), dict) else {}
+    fin = s3_when(eta.get("finish"))
+    check("(sanity) a rough projected finish exists with two finished steps", fin is not None, eta)
+    check("review_round.finish_if_one_more is a UTC time", fim is not None, rr.get("finish_if_one_more"))
+    if fin is not None and fim is not None:
+        check("finish_if_one_more is the projected finish plus one round's cost (25m)",
+              abs((fim - fin).total_seconds() - 1500) <= 5, ((fim - fin).total_seconds(), eta.get("finish"), rr.get("finish_if_one_more")))
+        rl = s4_round_line(o.rp.stdout) or ""
+        check("the 'One more review round:' line names the later time", fim.strftime("%Y-%m-%d %H:%M") in rl, rl)
+
+
+@case("CP4-T12")
+def test_CP4_T12_no_finished_step_means_no_moved_finish_is_invented():
+    o = s4_cmds(s4_fx(created=90, steps=((60, None, (50, 30)),)))
+    s3_exit(o, "first step still running")
+    sch, cp, ou, rr = s4_parts(o, "first step still running")
+    check("review_round.seconds is 1200 (20m) and gaps 1", s4_near(rr.get("seconds"), 1200) and rr.get("gaps") == 1, rr)
+    check("finish_if_one_more is null", "finish_if_one_more" in rr and rr.get("finish_if_one_more") is None, rr)
+    rl = s4_round_line(o.rp.stdout)
+    check("the line shows the 20m per-round cost", rl is not None and "20m" in rl, rl)
+    check("and says no estimate yet instead of a time", rl is not None and "no estimate yet" in rl.lower() and not S2_CLOCK.search(rl), rl)
+
+
+@case("CP4-T13")
+def test_CP4_T13_a_run_with_no_step_started_shows_no_critical_path_yet():
+    d = s4_fx(created=10, steps=())
+    o = s4_cmds(d)
+    s3_exit(o, "nothing started")
+    sch, cp, ou, rr = s4_parts(o, "nothing started")
+    check("critical_path.seconds is 0", cp.get("seconds") == 0 and s4_num(cp.get("seconds")), cp)
+    check("no step entry has time or is finished",
+          all(e.get("seconds") in (0, None) and not e.get("finished") for e in s4_steps(cp)), cp.get("steps"))
+    rng = s4_win(o, s3_state(d)["created_at"])
+    check("outside.seconds is about 600, all of it planning", s4_in(ou.get("seconds"), rng) and s4_in(ou.get("planning_seconds"), rng)
+          and s4_near(ou.get("waits_seconds"), 0), ou)
+    line = s4_chain_line(o.rp.stdout)
+    check("plain text says no step has started", line is not None and re.search(r"no step (has )?(yet )?started", line, re.I) is not None, line)
+    check("and does not present 0m as a chain", line is not None and re.search(r"\b0m\b", line) is None, line)
+
+
+@case("CP4-T14")
+def test_CP4_T14_a_finished_run_shows_full_totals_not_so_far():
+    steps = ((280, 220, ()), (215, 120, (200, 185)), (110, 20, ()))
+    o = s4_cmds(s4_fx(created=300, steps=steps, phase="awaiting_final_review"))
+    s3_exit(o, "finished run")
+    sch, cp, ou, rr = s4_parts(o, "finished run")
+    check("critical_path.seconds is the three spans, 60m + 95m + 90m = 14700", s4_near(cp.get("seconds"), 14700), cp.get("seconds"))
+    st = s4_steps(cp)
+    check("three entries, none unfinished", len(st) == 3 and all(e.get("finished") is True for e in st), st)
+    line = s4_chain_line(o.rp.stdout, "4h 5m")
+    check("the plain Critical path line shows 4h 5m", line is not None, s4_with(o.rp.stdout, S4_CRIT))
+    check("and does not say 'so far'", line is not None and "so far" not in line.lower(), line)
+    check("the review-round line is still present", s4_round_line(o.rp.stdout) is not None, s4_with(o.rp.stdout, S4_ROUND))
+    check("review_round.seconds is 900 over 1 gap", s4_near(rr.get("seconds"), 900) and rr.get("gaps") == 1, rr)
+
+
+@case("CP4-T15")
+def test_CP4_T15_bad_timestamps_degrade_without_a_crash():
+    steps = ((240, 180, (235, 215, 195)), (165, 105, ()), (60, None, ()))
+
+    def bad(st):
+        st["checkpoints"]["CP2"]["started_at"] = "not-a-date"
+        del st["checkpoints"]["CP3"]["started_at"]
+        st["checkpoints"]["CP1"]["gates"]["adversarial"]["rounds"][1]["at"] = None
+
+    o, clean = s4_cmds(s4_fx(steps=steps, edit=bad)), s4_cmds(s4_fx(steps=steps))
+    s3_exit(o, "bad timestamps")
+    s3_exit(clean, "clean twin")
+    sch, cp, ou, rr = s4_parts(o, "bad timestamps")
+    check("only the readable step is summed: critical_path.seconds is 3600", s4_near(cp.get("seconds"), 3600), cp.get("seconds"))
+    check("CP2 and CP3 are listed as unreadable, not guessed", {"CP2", "CP3"} <= s4_unreadable(cp), cp)
+    check("CP1 is still listed with its 3600 seconds, finished",
+          any(e.get("id") == "CP1" and s4_near(e.get("seconds"), 3600) and e.get("finished") is True for e in s4_steps(cp)), cp.get("steps"))
+    check("no seconds figure under schedule is negative",
+          all(v >= 0 for part in (cp, ou, rr) for _, v in s4_walk(part)), [(p, v) for part in (cp, ou, rr) for p, v in s4_walk(part) if v < 0])
+    check("the plain Critical path line shows only the readable 1h 0m", s4_chain_line(o.rp.stdout, s4_dur(3600)) is not None,
+          s4_with(o.rp.stdout, S4_CRIT))
+    check("`next` equals what the same fixture with clean timestamps gives",
+          o.n is not None and clean.n is not None and o.n == clean.n, (o.rn.stdout[-300:], clean.rn.stdout[-300:]))
+
+
+@case("CP4-T16")
+def test_CP4_T16_clock_skew_never_shows_negative_time():
+    steps = ((240, 250, ()), (165, 105, (160, 140, 150)), (100, None, ()))
+    o = s4_cmds(s4_fx(steps=steps))
+    s3_exit(o, "skewed times")
+    sch, cp, ou, rr = s4_parts(o, "skewed times")
+    neg = [(p, v) for part in (cp, ou, rr) for p, v in s4_walk(part) if v < 0]
+    check("every number under schedule is 0 or more", not neg and bool(cp) and bool(rr), neg)
+    check("the skewed gap is skipped: gaps is 1 and seconds 1200 (the 20m pair only)",
+          rr.get("gaps") == 1 and s4_near(rr.get("seconds"), 1200), rr)
+    lines = [ln for ln in o.rp.stdout.splitlines() if ln.startswith((S4_CRIT, S4_ROUND)) or "outside" in ln.lower()]
+    check("no plain schedule line shows a negative duration", bool(lines) and not any(re.search(r"-\s*\d+\s*[hm]\b", ln) for ln in lines), lines)
+
+
+@case("CP4-T17")
+def test_CP4_T17_wording_claims_no_deadline_and_names_its_source_fields():
+    d = s4_fx()
+    o = s4_cmds(d)
+    s3_exit(o, "3-step run")
+    sch, cp, ou, rr = s4_parts(o, "3-step run")
+    mine = [ln for ln in o.rp.stdout.splitlines() if ln.startswith((S4_CRIT, S4_ROUND)) or "parallel" in ln.lower()
+            or s4_outside_line(ln, "50m", "3h 40m")]
+    check("(sanity) the schedule lines are there to be checked (Critical path, outside, round, parallel)",
+          s4_chain_line(o.rp.stdout) is not None and s4_round_line(o.rp.stdout) is not None
+          and s4_outside_line(o.rp.stdout, "50m", "3h 40m") is not None and any("parallel" in ln.lower() for ln in mine), mine)
+    bad = [ln for ln in mine if S4_NO_DEADLINE.search(ln)]
+    check("no schedule line says 'deadline', 'on time' or 'will finish by'", not bad, bad)
+    st = s3_state(d)
+    for name, part, need in (("critical_path", cp, ("started_at", "completed_at")), ("outside", ou, ("created_at", "started_at")),
+                             ("review_round", rr, ("rounds", ".at"))):
+        fields = part.get("fields")
+        check(f"{name}.fields is a list of names", isinstance(fields, list) and bool(fields) and all(isinstance(x, str) for x in fields), fields)
+        if not isinstance(fields, list):
+            continue
+        for want in need:
+            check(f"{name}.fields names a state.json field with {want!r}", any(want in str(x) for x in fields), fields)
+        missing = [x for x in fields if isinstance(x, str) and not source_exists(x, st, {})]
+        check(f"{name}.fields lists only fields this run's state.json really has", not missing, missing)
+
+
+@case("CP4-T18")
+def test_CP4_T18_existing_status_json_keys_and_values_are_unchanged():
+    c = s2c()
+    d = s4_fx()
+    st = s3_state(d)
+    o = s4_cmds(d)
+    s3_exit(o, "3-step run")
+    sch, cp, ou, rr = s4_parts(o, "3-step run")
+    check("(sanity) the new critical-path numbers are present, so this compares the built engine",
+          s4_num(cp.get("seconds")) and s4_num(ou.get("seconds")), (cp, ou))
+    try:
+        base = set(json.loads(S2_BASELINE.read_text()))
+    except (OSError, ValueError) as e:
+        base = set()
+        check("the pinned baseline key list parses", False, str(e))
+    if isinstance(o.j, dict):
+        check("the top-level keys are exactly the baseline keys plus 'schedule'", set(o.j) == base | {"schedule"},
+              (sorted(set(o.j) - base - {"schedule"}), sorted(base - set(o.j))))
+        done = sum(1 for x in st["checkpoints"].values() if x.get("status") == "done")
+        want = {"phase": st["phase"], "current": st["current"], "done": done, "total": len(st["checkpoints"]),
+                "awaiting_since": st.get("awaiting_since"), "updated_at": st.get("updated_at"), "stop_ok": False}
+        diff = [(k, o.j.get(k), v) for k, v in want.items() if o.j.get(k) != v]
+        check("phase, current, done, total, awaiting_since, updated_at and stop_ok equal what state.json implies", not diff, diff)
+        check("the per-checkpoint dicts are one per step with their state.json status and step",
+              [(x.get("id"), x.get("status"), x.get("step")) for x in o.j.get("checkpoints") or []]
+              == [(k, v["status"], v["step"]) for k, v in st["checkpoints"].items()], o.j.get("checkpoints"))
+    with s2_pinned("cp4t18") as pin:
+        d1 = c.clone(d)
+        r1 = c.run(pin, d1, ["status", "--json"])
+        j1 = s3_json(r1.stdout)
+        check("(sanity) the pinned engine prints JSON", j1 is not None, r1.stdout[-200:])
+        if j1 is not None and isinstance(o.j, dict):
+            a, b = dict(j1), dict(o.j)
+            for x in (a, b):
+                for k in ("root", "viewer_url"):
+                    x.pop(k, None)
+            b.pop("schedule", None)
+            diff = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+            check("every field but `schedule` equals the pinned engine's value, per-checkpoint dicts included", not diff,
+                  [(k, a.get(k), b.get(k)) for k in diff][:3])
+        r1, r2, p1, p2 = s2_pair(d, ["status"], pin)
+        check("plain `status` equals the pinned engine's once the schedule lines are dropped (any other new line fails)",
+              r1.returncode == r2.returncode == 0 and p1 == p2, (p1[-250:], p2[-250:]))
+
+
+@case("CP4-T19")
+def test_CP4_T19_next_keeps_every_field_and_value():
+    d = s4_fx()
+    o = s4_cmds(d)
+    s3_exit(o, "3-step run")
+    check("(sanity) status shows the new Critical path line on this run, so this compares the built engine",
+          s4_chain_line(o.rp.stdout) is not None, o.rp.stdout[-300:])
+    with s2_pinned("cp4t19") as pin:
+        r1, r2, p1, p2 = s2_pair(d, ["next"], pin)
+    a, b = s3_json(p1), s3_json(p2)
+    check("`next` prints a JSON object on both engines", a is not None and b is not None, (p1[-150:], p2[-150:]))
+    if a is not None and b is not None:
+        check("(sanity) it is the building step's next action", a.get("phase") == "building" and "action" in a, sorted(a))
+        check("every key and value equals the pinned engine's (apart from the CP3 `stall` key)", a == b,
+              [(k, a.get(k), b.get(k)) for k in sorted(set(a) | set(b)) if a.get(k) != b.get(k)][:3])
+    check("`next` exits with the pinned engine's code", r1.returncode == r2.returncode, (r1.returncode, r2.returncode))
+    raw = o.rn.stdout.lower()
+    check("`next` holds no critical-path or review-round-cost text", "critical path" not in raw and "one more review round" not in raw, raw[-300:])
+    keys = list(o.n or {})
+    check("`next` has no critical-path, schedule or review-round key", not [k for k in keys if re.search(r"critical|review_round|schedule|outside", k)], keys)
+
+
+@case("CP4-T20")
+def test_CP4_T20_status_only_reads_the_run_record_is_untouched():
+    c = s2c()
+    d = s4_fx()
+    p = Path(d) / ".ratchet" / "runs" / "f" / "state.json"
+    first = s4_cmds(d)
+    check("(sanity) the Critical path line is visible, so this checks the built engine",
+          s4_chain_line(first.rp.stdout) is not None and isinstance(s4_parts(first, "3-step run")[1].get("seconds"), (int, float)), None)
+    raw, tree = p.read_bytes(), s2_tree_hash(d)
+    before = {k: (v["gates"], v["status"], v["step"]) for k, v in s3_state(d)["checkpoints"].items()}
+    for args in (["status"], ["status", "--json"], ["next"]) * 2:
+        r = c.run(c.ENGINE, d, args)
+        check(f"`{' '.join(args)}` exits 0", r.returncode == 0, (r.returncode, r.stderr[-200:]))
+    check("state.json is byte-identical", p.read_bytes() == raw, None)
+    check("state.json, config.json and the evidence folder are unchanged", s2_tree_hash(d) == tree, None)
+    after = {k: (v["gates"], v["status"], v["step"]) for k, v in s3_state(d)["checkpoints"].items()}
+    check("every checkpoint's gate status and attempts are the same", after == before, None)
+
+
+@case("CP4-X01")
+def test_CP4_X01_wait_after_a_finished_step_is_outside_time_up_to_now_and_not_on_the_chain():
+    # CP1 finished, CP2 not started, run still live (awaiting a step review): the wait counts outside, up to now.
+    outs = []
+    for done_ago in (90, 30):
+        steps = ((done_ago + 35, done_ago, ()),)
+        d = s4_fx(created=done_ago + 60, steps=steps, phase="awaiting_step_review")
+        o = s4_cmds(d)
+        s3_exit(o, f"waiting since {done_ago}m ago")
+        sch, cp, ou, rr = s4_parts(o, f"waiting since {done_ago}m ago")
+        st = s3_state(d)
+        chain = 35
+        check(f"[finished {done_ago}m ago] the chain stays at the step's own span ({chain}m) and does not grow with the wait",
+              s4_near(cp.get("seconds"), chain * 60), cp.get("seconds"))
+        rng = s4_win(o, st["checkpoints"]["CP1"]["completed_at"])
+        check(f"[finished {done_ago}m ago] outside.waits_seconds runs from the finish to now", s4_in(ou.get("waits_seconds"), rng),
+              (ou.get("waits_seconds"), rng))
+        check(f"[finished {done_ago}m ago] planning_seconds is 1500 (25m)", s4_near(ou.get("planning_seconds"), 1500), ou)
+        rng2 = s4_win(o, st["checkpoints"]["CP1"]["completed_at"], 1500)
+        check(f"[finished {done_ago}m ago] outside.seconds is planning plus the wait", s4_in(ou.get("seconds"), rng2), (ou.get("seconds"), rng2))
+        want = s4_dur(1500 + done_ago * 60)
+        line = s4_outside_line(o.rp.stdout, want, s4_dur(chain * 60))
+        check(f"[finished {done_ago}m ago] the plain outside line shows {want}", line is not None, o.rp.stdout[-600:])
+        outs.append((cp.get("seconds"), ou.get("waits_seconds")))
+    if len(outs) == 2 and all(s4_num(x) for pair in outs for x in pair):
+        check("the chain is the same whether the wait is 90m or 30m, while the wait itself differs by 60m",
+              abs(outs[0][0] - outs[1][0]) <= S4_TOL and s4_near(outs[0][1] - outs[1][1], 3600, 4), outs)
+
+
+@case("CP4-X02")
+def test_CP4_X02_an_open_step_of_a_stopped_run_is_closed_at_updated_at_not_at_now():
+    # created 300m ago; CP1 290..260; CP2 started 250m ago, never completed; the run stopped 180m ago.
+    steps = ((290, 260, ()), (250, None, ()))
+    for phase in ("cancelled", "done"):
+        def stop(st):
+            st["updated_at"] = iso(datetime.now(timezone.utc) - M(180))
+
+        d = s4_fx(created=300, steps=steps, phase=phase, edit=stop)
+        o = s4_cmds(d)
+        s3_exit(o, f"{phase} run with an open step")
+        sch, cp, ou, rr = s4_parts(o, f"{phase} run with an open step")
+        st = s3_state(d)
+        span = (pt(st["updated_at"]) - pt(st["checkpoints"]["CP2"]["started_at"])).total_seconds()
+        check(f"[{phase}] (sanity) the open step ran 70m before the run stopped", abs(span - 4200) <= S4_TOL, span)
+        check(f"[{phase}] critical_path.seconds is CP1 (30m) plus CP2 up to updated_at (70m), 6000, not up to now",
+              s4_near(cp.get("seconds"), 1800 + span), (cp.get("seconds"), 1800 + span))
+        two = [e for e in s4_steps(cp) if e.get("id") == "CP2"]
+        check(f"[{phase}] the open step is listed at its updated_at span and not finished",
+              len(two) == 1 and s4_near(two[0].get("seconds"), span) and two[0].get("finished") is False, two)
+        fields = cp.get("fields") if isinstance(cp.get("fields"), list) else []
+        check(f"[{phase}] critical_path.fields names updated_at and phase", "updated_at" in fields and "phase" in fields, fields)
+        line = s4_chain_line(o.rp.stdout, s4_dur(1800 + span))
+        check(f"[{phase}] the plain Critical path line shows {s4_dur(1800 + span)}", line is not None, s4_with(o.rp.stdout, S4_CRIT))
 
 
 # ================================================================================================ runner

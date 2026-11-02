@@ -827,9 +827,122 @@ def stall_view(st, cfg, now):
             "budget_minutes": r["budget_minutes"], "since": r["since"], "since_event": r["since_event"], "message": text}
 
 
+def path_numbers(st, plan_ids, now) -> dict:
+    """The critical path (each step from its started_at to its completed_at; the open one to `now`), the time outside
+    it (created_at to the first step's start, plus the waits between one step's finish and the next one's start) and
+    the cost of one more review round (the mean gap between consecutive gates.adversarial.rounds[].at inside one
+    step), from state.json alone. {critical_path, outside, review_round}; review_round.finish_if_one_more is None here
+    (schedule_status fills it from the projected finish). A time that cannot be read is left out, never guessed,
+    and no figure is negative. Time blocked stays inside its step: the record does not log when a block started."""
+    st = st if isinstance(st, dict) else {}
+    cps = st.get("checkpoints") if isinstance(st.get("checkpoints"), dict) else {}
+    ids = list(plan_ids or [])
+    live = st.get("phase") not in ("done", "cancelled")
+    end_open = now if live else _sched_time(st.get("updated_at"))
+    steps, spans, bad, total, gaps = [], {}, [], 0, []
+    open_used = False  # an open step was closed at `now` (live run) or at updated_at (done/cancelled run)
+    for cid in ids:
+        c = cps.get(cid) if isinstance(cps.get(cid), dict) else {}
+        done = c.get("status") == "done"
+        if not (done or c.get("started_at") or c.get("status") == "in_progress"):
+            steps.append({"id": cid, "seconds": 0, "finished": False, "started": False, "unreadable": False})
+        else:
+            a = _sched_time(c.get("started_at"))
+            b = _sched_time(c.get("completed_at")) if done else end_open
+            open_used = open_used or not done
+            if a is None or b is None:
+                bad.append(cid)
+                steps.append({"id": cid, "seconds": None, "finished": done, "started": True, "unreadable": True})
+            else:
+                sec = int(max(0, (b - a).total_seconds()))
+                total += sec
+                spans[cid] = (a, b)
+                steps.append({"id": cid, "seconds": sec, "finished": done, "started": True, "unreadable": False})
+        adv = (c.get("gates") or {}).get("adversarial") if isinstance(c.get("gates"), dict) else None
+        rounds = adv.get("rounds") if isinstance(adv, dict) and isinstance(adv.get("rounds"), list) else []
+        at = [_sched_time(r.get("at")) if isinstance(r, dict) else None for r in rounds]
+        gaps += [(y - x).total_seconds() for x, y in zip(at, at[1:]) if x is not None and y is not None and y >= x]
+    created = _sched_time(st.get("created_at"))
+    planning = None
+    plan_open = False  # planning ran to `now` / updated_at because the first step never started
+    if created is not None and steps:
+        if steps[0]["id"] in spans:
+            planning = int(max(0, (spans[steps[0]["id"]][0] - created).total_seconds()))
+        elif not steps[0]["started"] and end_open is not None:
+            planning = int(max(0, (end_open - created).total_seconds()))
+            plan_open = True
+    waits = 0
+    for i in range(len(steps) - 1):
+        if steps[i]["id"] not in spans:
+            continue
+        nxt = steps[i + 1]
+        if nxt["id"] in spans:
+            waits += int(max(0, (spans[nxt["id"]][0] - spans[steps[i]["id"]][1]).total_seconds()))
+        elif not nxt["started"] and live:  # waiting between steps right now, e.g. a step review in `each` mode
+            waits += int(max(0, (now - spans[steps[i]["id"]][1]).total_seconds()))
+    mean = int(round(sum(gaps) / len(gaps))) if gaps else None
+    cp_fields = ["checkpoints[].started_at", "checkpoints[].completed_at"]
+    out_fields = ["created_at", "checkpoints[].started_at", "checkpoints[].completed_at"]
+    if open_used:
+        cp_fields.append("phase")
+    out_fields.append("phase")  # whether a step is still waiting to start right now depends on the run's phase
+    if not live and open_used:
+        cp_fields.append("updated_at")
+    if not live and plan_open:
+        out_fields.append("updated_at")
+    return {"critical_path": {"seconds": total, "steps": steps, "unreadable": bad, "fields": cp_fields},
+            "outside": {"seconds": (planning or 0) + waits, "planning_seconds": planning, "waits_seconds": waits,
+                        "fields": out_fields},
+            "review_round": {"seconds": mean, "gaps": len(gaps), "enough_data": bool(gaps), "finish_if_one_more": None,
+                             "fields": ["checkpoints[].gates.adversarial.rounds[].at"]}}
+
+
+def path_lines(sched, phase) -> list:
+    """The plain lines `status` prints for the critical path: the chain, the time outside it (with the note that a
+    run records no parallel side-work) and what one more review round costs. Each starts 'Critical path:' or 'One
+    more review round:'. [] when the schedule has no such numbers or the plan has no steps."""
+    cp = sched.get("critical_path") if isinstance(sched, dict) else None
+    ou, rr = sched.get("outside"), sched.get("review_round")
+    if not (isinstance(cp, dict) and isinstance(ou, dict) and isinstance(rr, dict) and cp.get("steps")):
+        return []
+    dur = _ratchet_module()._plain_duration
+    steps = cp["steps"]
+    if not any(s["started"] for s in steps):
+        chain = "Critical path: no step has started yet, so the chain of steps has no time to measure."
+    else:
+        chain = f"Critical path: {dur(cp['seconds'])} in the steps (each from its start to its finish"
+        if any(s["started"] and not s["finished"] and not s["unreadable"] for s in steps):
+            chain += ", the current step counted so far"
+        chain += ")"
+        if cp.get("unreadable"):
+            chain += f"; time unreadable, left out: {', '.join(cp['unreadable'])}"
+        if phase == "blocked":
+            chain += "; time blocked is counted inside the step, because the record does not log when a block started"
+        chain += "."
+    plan = "planning and approval unreadable" if ou["planning_seconds"] is None else \
+        f"planning and approval {dur(ou['planning_seconds'])}"
+    outside = (f"Critical path: {dur(ou['seconds'])} outside it ({plan}, waits between steps {dur(ou['waits_seconds'])}). "
+               "This run records no parallel side-work; `lanes` shows work running in parallel.")
+    if not rr["enough_data"]:
+        more = ("One more review round: not enough data yet (a step needs at least 2 review rounds recorded to "
+                "measure one).")
+    else:
+        n = rr["gaps"]
+        more = (f"One more review round: about {dur(rr['seconds'])} (the average gap between a step's review rounds, "
+                f"resting on {n} {'gap' if n == 1 else 'gaps'} in this run); ")
+        if rr["finish_if_one_more"]:
+            more += f"one more round would move the projected finish to {rr['finish_if_one_more']}."
+        elif sched.get("steps_left") == 0:
+            more += "no steps are left to build, so there is no finish to move."
+        else:
+            more += "no estimate yet of the finish it would move."
+    return [chain, outside, more]
+
+
 def schedule_status(st, plan, cfg, now) -> dict:
-    """What `status` and `status --json` show as the projected finish: {steps_left, eta, rounds, sources, line, stall}
-    (stall: see stall_view).
+    """What `status` and `status --json` show as the projected finish: {steps_left, eta, rounds, sources, line, stall,
+    critical_path, outside, review_round, parallel_recorded} (stall: see stall_view; the last four: see path_numbers,
+    and parallel_recorded is always False -- a single run records no parallel side-work).
     `line` is the one plain 'Projected finish:' line and `eta`/`rounds` carry the same numbers (eta: finish, earliest,
     latest as 'YYYY-MM-DD HH:MM UTC', label, based_on_steps; rounds: expected, used, run_limit, over_limit; both null
     until a step has finished). Everything is null (steps_left 0 or null, sources empty) when no step is left or the
@@ -840,9 +953,10 @@ def schedule_status(st, plan, cfg, now) -> dict:
     r = schedule_numbers(st, ids, cfg, now)
     left = r["left"]
     stall = stall_view(st, cfg, now)
+    path = path_numbers(st, ids, now)
     if not left or st.get("phase") in ("cancelled", "done"):
         return {"steps_left": 0 if not left else None, "eta": None, "rounds": None, "sources": [], "line": None,
-                "stall": stall}
+                "stall": stall, **path, "parallel_recorded": False}
     eta = rounds = None
     if r["finish"]:
         eta = {"finish": _sched_clock(_sched_time(r["finish"])), "earliest": _sched_clock(_sched_time(r["earliest"])),
@@ -857,5 +971,11 @@ def schedule_status(st, plan, cfg, now) -> dict:
             text += f" ({used} of the run's {limit} rounds used so far)"
     head = f"{left} {'step' if left == 1 else 'steps'} left; "
     line = f"Projected finish: {head}{text}. Worked out from these state.json fields: {', '.join(r['sources'])}"
-    return {"steps_left": left, "eta": eta, "rounds": rounds, "sources": r["sources"], "line": line, "stall": stall}
+    rr = path["review_round"]
+    if r["finish"] and rr["seconds"] is not None:  # the projected finish moved by one round's cost, added once
+        moved = _sched_round(_sched_time(r["finish"]) + _dt.timedelta(seconds=rr["seconds"]), now)
+        rr["finish_if_one_more"] = _sched_clock(moved)
+        rr["fields"] = rr["fields"] + [x for x in r["sources"] if x != "max_adversarial_rounds_run"]  # a setting, not a state field
+    return {"steps_left": left, "eta": eta, "rounds": rounds, "sources": r["sources"], "line": line, "stall": stall,
+            **path, "parallel_recorded": False}
 
