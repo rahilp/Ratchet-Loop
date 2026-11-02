@@ -114,7 +114,7 @@ writing the objective by hand. This is enforced only on Claude Code: the guard h
 prefix) launched during a build (`building` or `blocked`) whose prompt is missing this objective text, naming the
 `brief` command to fix it; a prompt carrying it, however re-wrapped, always passes, and an unreadable plan fails
 the check open. Codex, Gemini and Copilot give hooks no way to see a sub-agent launch at all, so this check is not
-enforced on those three; it is documented here, not built there. For the planner, `brief` also ends with a
+enforced on those three. OpenCode's guard does see a sub-agent launch (the `task` tool), but `_brief_guard` only checks Claude Code, so the check is not enforced there either; it is documented here, not built there. For the planner, `brief` also ends with a
 "What earlier work says" section, built by the engine itself from records already on disk: recent
 `.ratchet/learnings.md` bullets, the findings earlier (non-active) runs saved for later that nobody accepted yet,
 and the limits the user already accepted, most relevant to the new feature first then newest, each part capped
@@ -497,7 +497,7 @@ A machine-wide file, `config.json` in Ratchet's per-user folder (default `~/.con
 
 ## 10. Hooks
 
-`ratchet.py hook <stop|prompt|guard> --host auto|claude|codex|gemini|copilot` is the single entry point every agent CLI calls. Written by `install-hooks` (or the plugin's `hooks/hooks.json`):
+`ratchet.py hook <stop|prompt|guard> --host auto|claude|codex|gemini|copilot|opencode` is the single entry point every agent CLI calls (`--host auto` never picks `opencode`). Written by `install-hooks` (or the plugin's `hooks/hooks.json`):
 
 | host | config file (project / user) | stop | prompt | guard |
 |---|---|---|---|---|
@@ -505,6 +505,7 @@ A machine-wide file, `config.json` in Ratchet's per-user folder (default `~/.con
 | codex | `.codex/hooks.json` / `~/.codex/hooks.json` | Stop | UserPromptSubmit | PreToolUse |
 | gemini | `.gemini/settings.json` / `~/.gemini/settings.json` | AfterAgent | BeforeAgent | BeforeTool |
 | copilot | `.github/hooks/ratchet.json` / `~/.copilot/hooks/ratchet.json` | agentStop | userPromptSubmitted | preToolUse |
+| opencode | `.opencode/plugins/ratchet.js` / `~/.config/opencode/plugins/ratchet.js` (the user path moves with `OPENCODE_CONFIG_DIR` or `XDG_CONFIG_HOME`) | session.idle (best-effort) | chat.message | tool.execute.before |
 
 **OpenCode (a plugin host, not a hook-config host).** `ratchet.py install-hooks --host opencode` writes one plugin file, `.opencode/plugins/ratchet.js` (project) or `ratchet.js` in the user's OpenCode plugins folder (`--scope user`), instead of editing a hook config; it is never part of `--host all`, and `uninstall` removes only a file that carries Ratchet's header line. Its three events map to `hook guard|prompt|stop --host opencode`: guard = `tool.execute.before`, prompt = `chat.message`, stop = `session.idle` delivered to the `event` hook (best-effort, see below). The host is always given explicitly: `--host auto` never picks OpenCode. A wrong command line (`hook nonsense --host opencode`, `--host opencodee`) is an ordinary usage error (non-zero exit, text on stderr), never a block reply.
 - Input: one JSON object on stdin, read like the other hosts' (`cwd`, `session_id`, `prompt`, `tool_name`, `tool_input`). The guard handler sends `hook_event_name` (`tool.execute.before`), `session_id`, `call_id`, `cwd` (the project directory OpenCode gave the plugin), `tool_name` and `tool_input` exactly as OpenCode passes its arguments: `filePath` (write, edit, read, lsp), `patchText` (apply_patch), `pattern` and `path` (glob, grep), `command` and `workdir` (bash). Empty stdin, text that is not JSON and a bare JSON list are read as `{}`.

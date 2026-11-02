@@ -330,5 +330,10 @@ keep them working:
   provider-cost/question logic into `provider_discovery.py`, this file's text-based check must be
   re-pointed to also cover that new module.
 
+A later hook-dialect step adds one more doc-only reader (it never loads or parses ratchet.py):
+
+- `test_hook_opencode_docs.py` — OpenCode step 8: reads README.md, SKILL.md and schemas.md as text, and
+  runs the real `install-hooks --host opencode` in throwaway folders, to check the hook copy is honest about OpenCode.
+
 A file this checkpoint's own fixture deliberately matches neither live-grep pattern (confirmed
 live, with its own check) and is correctly absent from every list above.

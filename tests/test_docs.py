@@ -2333,7 +2333,7 @@ def cp5_docs_lint():
 import json
 
 CMD_RX = r"\./install\.sh|python3\s+\S|claude --plugin-dir|ratchet\.py"
-CLAUDE_ONLY_RX = r"/plugin\b|claude --plugin-dir|AskUserQuestion"
+CLAUDE_ONLY_RX = r"(?<!@opencode)/plugin\b|claude --plugin-dir|AskUserQuestion"
 REF_HEAD_RX = re.compile(r"(?im)^(#{2,3})\s+[^\n]*\breference\b[^\n]*$")
 
 
@@ -2574,6 +2574,13 @@ def cp6_docs_lint():
     check("[CP6-T08] teeth: a Claude-only phrase in a sentence or the primary text is rejected, but allowed inside the reference section",
           cp6_neutral_ok(good) and not cp6_neutral_ok(good.replace("and start it.", "and start it with /plugin install."))
           and cp6_neutral_ok(good + "\nUse `claude --plugin-dir x` here.\n"))
+    check("[CP6-T08] teeth: the OpenCode package name @opencode/plugin is allowed, but a bare /plugin, @claude/plugin, x/plugin, "
+          "claude --plugin-dir and AskUserQuestion in the primary text are still rejected",
+          cp6_neutral_ok(good.replace("and start it.", "and start it (the v2 plugin API is `@opencode/plugin`)."))
+          and all(not cp6_neutral_ok(good.replace("and start it.", "and start it with " + bad + "."))
+                  for bad in ("/plugin install", "@claude/plugin", "x/plugin", "claude --plugin-dir x", "AskUserQuestion"))
+          and re.search(CLAUDE_ONLY_RX, "@opencode/plugin") is None
+          and all(re.search(CLAUDE_ONLY_RX, t) for t in ("/plugin", "@claude/plugin", "x/plugin", "claude --plugin-dir x", "AskUserQuestion")))
     # T17
     probs = cp6_manifest_problems(readme)
     check("[CP6-T17] both manifests parse with the same name and version, mention checkpoints and gates, the README lists both, and its install sentence names no missing file",
