@@ -18,7 +18,9 @@ snapshots, the design file and the scope — never the project's code, instructi
            the host's sub-agents: the staged folders and the follow-up `combine` command are printed. Refuses (before
            anything is written or any reviewer starts) while the capture holds an unfilled stub state.
   stage    Only stage the isolated folders (for host sub-agents); a stub state is marked there as a stub, no evidence.
-  combine  Merge reviewer JSON files into combined.json.
+  combine  Merge reviewer JSON files into combined.json. A case a reviewer could not judge from the captured evidence
+           (`insufficient_evidence`), or a stub state, makes the result INVALID (FAIL while a real difference blocks):
+           the fix is in the capture spec, never the app's code.
   lint     Warn about browser cases the capture spec cannot show (read-only; --scaffold adds a marked stub state per
            gap). Run it on the capture spec and the test plan BEFORE review or stage. With --cases, review and stage run
            the same check on the capture manifest and print the same WARN lines on stderr before any reviewer starts
@@ -52,6 +54,7 @@ PLUGIN_ROOT = HERE.parents[2]  # .../ratchet-loop
 ENGINE = PLUGIN_ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
 PROVIDER_VENDOR = {"claude": "anthropic", "codex": "openai", "gemini": "google"}
 AGENT_DIRS = [PLUGIN_ROOT / "agents", Path.home() / ".claude" / "agents", Path.cwd() / ".claude" / "agents"]
+IE_PREFIX = "INSUFFICIENT-EVIDENCE:"  # starts the invalid_reason of a review whose only problem is unjudged cases
 
 REVIEW_SCHEMA = {
     "type": "object",
@@ -74,6 +77,11 @@ REVIEW_SCHEMA = {
                     "fixable_in_code": {"type": "boolean"}, "suggested_fix": {"type": "string"},
                 },
             },
+        },
+        "insufficient_evidence": {
+            "type": "array",
+            "items": {"type": "object", "required": ["case", "missing"], "properties": {
+                "case": {"type": "string"}, "state": {"type": "string"}, "missing": {"type": "string"}}},
         },
         "notes": {"type": "string"},
     },
@@ -155,7 +163,7 @@ def stage(manifest: dict, design: Path | None, scope: str, cases: Path | None, k
         own = st.get("viewport") if isinstance(st.get("viewport"), dict) else {}
         w, h = own.get("width", top.get("width")), own.get("height", top.get("height"))
         lines.append(f"## State `{st['name']}` — scope: {st.get('scope') or scope}, viewport: {w}x{h}")
-        if st.get("stub") is True:  # a scaffolded stub nobody filled in: no screenshots or steps are listed for it
+        if _is_stub(st):  # a scaffolded stub nobody filled in: no screenshots or steps are listed for it
             lines += ["- STUB, UNREVIEWED: no evidence; do not judge it as passing", ""]
             continue
         for side in ("reference", "app"):
@@ -371,18 +379,114 @@ def _current_fingerprint():
         return None
 
 
+def _is_stub(st) -> bool:
+    """A capture state marked as a scaffolded stub. Any `stub` value except absent, false or null counts (fail closed)."""
+    return isinstance(st, dict) and st.get("stub") is not None and st.get("stub") is not False
+
+
+def _stub_states(spec) -> list:
+    """The stub states of a capture manifest or capture spec."""
+    states = spec.get("states") if isinstance(spec, dict) else None
+    return [st for st in states if _is_stub(st)] if isinstance(states, list) else []
+
+
+def _text(x, limit: int = 200) -> str:
+    """One printable line from reviewer-written text: control characters become spaces and long text is cut."""
+    s = " ".join("".join(c if c.isprintable() else " " for c in str(x)).split())
+    return s if len(s) <= limit else s[:limit] + "..."
+
+
+def _unjudged_entry(e) -> dict:
+    """A reviewer's insufficient_evidence entry as {case, state, missing} of plain text. Nothing else is kept, and an
+    entry with no usable case id says it could not be read. A bare non-empty string is read as the case id. Never
+    raises."""
+    if isinstance(e, str) and e.strip():
+        return {"case": _text(e), "state": "",
+                "missing": "this entry could not be read (not an object with case, state and missing)"}
+    e = e if isinstance(e, dict) else {}
+    got = {k: (_text(e[k]) if isinstance(e.get(k), str) else "") for k in ("case", "state", "missing")}
+    if not got["case"]:
+        got["missing"] = "this entry could not be read (no case id)" + (f": {got['missing']}" if got["missing"] else "")
+    return dict(got, missing=got["missing"] or "no detail given")
+
+
+def _unjudged_raw(r: dict) -> list:
+    """A review's insufficient_evidence as a list of raw entries. Absent, null or [] means none; a bare string is one
+    entry; any other non-list counts as one unreadable entry (fail closed: a malformed list must still block the gate)."""
+    got = r.get("insufficient_evidence")
+    if got is None or got == []:
+        return []
+    return got if isinstance(got, list) else [got if isinstance(got, str) else None]
+
+
+def _stub_entry(st: dict) -> dict:
+    """The unjudged entry for a stub state: its first case, with every listed case named in the text."""
+    cases = st.get("cases") if isinstance(st.get("cases"), list) else []
+    cases = [_text(c) for c in cases if isinstance(c, str) and c.strip()]
+    more = f" (it stands for cases {', '.join(cases)})" if len(cases) > 1 else ""
+    return {"case": cases[0] if cases else "(no case listed)", "state": _text(st.get("name", "")),
+            "missing": f"unfilled stub with no evidence{more}: fill in its journey or remove the stub"}
+
+
+def _spec_name(cp) -> str:
+    """How the capture spec file of step `cp` is named in a message."""
+    return f"the capture spec states/{cp}.json" if isinstance(cp, str) and cp else "the capture spec (states/<step>.json)"
+
+
+def _unjudged_lines(entries: list) -> str:
+    """The unjudged entries as one line of text, one 'case X in state Y: what is missing' per entry."""
+    return "; ".join(f"case {e['case'] or '?'} in state {e['state'] or '?'}: {e['missing']}" for e in entries)
+
+
+def _lock_note(cp, frozen: bool, failing: bool = False) -> str:
+    """The one sentence on whether the capture spec can still be changed, for every message that sends a reader to it.
+    `frozen`: a failed UI round froze the spec (gates.ui.frozen; always False outside a Ratchet run, so nothing is called
+    locked then). `failing`: the review is a FAIL, which will lock the spec once recorded. Empty when neither applies."""
+    ask = f"explain why to the user and run `ratchet.py ask ui-respec {cp or '<step>'}`"
+    if frozen:
+        return f"The capture spec is locked after an earlier failed UI round; if it must change, {ask}."
+    if failing:
+        return f"A failed UI round in a Ratchet run locks the capture spec; after that, to change it, {ask}."
+    return ""
+
+
+class _Combined(dict):
+    """What combine() returns: the combined review (its keys are exactly what is written to combined.json) plus one fact
+    that is not part of the file: `unjudged_only`, true when the unjudged cases alone made the review INVALID, so
+    `_print_unjudged` need not guess that from the wording of the reason."""
+    unjudged_only = False
+
+
+def _blocks(d: dict, block_on_nits: bool) -> bool:
+    """Whether `ratchet.py ui-record` would count this difference as blocking (its _ui_verdict, mirrored line by line;
+    CP5-X1 compares the two so they cannot drift apart)."""
+    sev = str(d.get("severity", "")).lower()
+    if not d.get("fixable_in_code", True) and sev in ("minor", "nit"):
+        return False
+    return not (sev == "nit" and not block_on_nits)
+
+
 def combine(reviews: list[dict], checkpoint: str | None, manifest_fp: str | None = None,
-            compared: dict | None = None, check_fp: bool = True) -> dict:
+            compared: dict | None = None, check_fp: bool = True, stub_states: list | None = None,
+            block_on_nits: bool = True, spec_frozen: bool = False) -> dict:
     """Merge reviewer files. Every input must be a review of the CURRENT code: its own fingerprint (stamped by
     `review` before the reviewers ran) or the capture manifest's fingerprint must equal the working tree's now.
-    `check_fp` is False only for an unsigned ad-hoc comparison outside a Ratchet run (no code version is tracked)."""
+    `check_fp` is False only for an unsigned ad-hoc comparison outside a Ratchet run (no code version is tracked).
+    `stub_states` are the capture states marked as stubs; `block_on_nits` is the run's ui_block_on_nits; `spec_frozen`
+    says a failed UI round already froze the capture spec (gates.ui.frozen) and only changes the wording of the reason.
+    Cases a reviewer could not judge (`insufficient_evidence`) and stub states are listed apart from `differences`.
+    Rank: a reviewer's own INVALID; else, when something is unjudged or a stub: FAIL if a difference blocks as
+    `ui-record` counts it (`_blocks`; every difference kept as is), otherwise INVALID (a capture spec problem); else, as
+    before: FAIL when any difference is code-fixable, otherwise PASS. The two blocking rules differ on purpose: the
+    ui-record rule is used only when something is unjudged or a stub, so a review with nothing unjudged keeps the
+    result it always had."""
     now_fp = _current_fingerprint() if check_fp else None
     for r in reviews if check_fp else []:
         fp = r.get("fingerprint") or manifest_fp
         if not fp or (now_fp and fp != now_fp):
             raise SystemExit(f"Refusing to combine: the {r.get('reviewer', '?')} review is not of the current code "
                              f"(review {str(fp)[:10]} vs now {str(now_fp)[:10]}). Capture and review again.")
-    diffs, invalid, names = [], [], []
+    diffs, invalid, names, unjudged = [], [], [], []
     for r in reviews:
         name = r.get("reviewer", "?")
         names.append(name)
@@ -390,11 +494,53 @@ def combine(reviews: list[dict], checkpoint: str | None, manifest_fp: str | None
             invalid.append(f"{name}: {r.get('invalid_reason') or 'states do not match'}")
         for d in r.get("differences", []) or []:
             diffs.append(dict(d, reviewer=name))
+        unjudged += [_unjudged_entry(e) for e in _unjudged_raw(r)]
+    unjudged += [_stub_entry(st) for st in stub_states or [] if isinstance(st, dict)]
+    # keep the first of identical entries: the same stub can come from the manifest and the spec file, and two
+    # reviewers can name the same case
+    unjudged = [e for i, e in enumerate(unjudged) if e not in unjudged[:i]]
     fixable = [d for d in diffs if d.get("fixable_in_code", True)]
-    verdict = "INVALID" if invalid else ("FAIL" if fixable else "PASS")
-    return {"checkpoint": checkpoint, "fingerprint": now_fp, "compared": compared, "reviewers": names, "verdict": verdict,
-            "invalid_reason": "; ".join(invalid) or None, "differences": diffs,
-            "summary": f"{len(fixable)} code-fixable difference(s) across {len(names)} reviewer(s)"}
+    reason = "; ".join(invalid) or None
+    unjudged_only = False
+    if invalid:
+        verdict = "INVALID"
+    elif unjudged and any(_blocks(d, block_on_nits) for d in diffs):
+        verdict = "FAIL"
+    elif unjudged:
+        verdict = "INVALID"
+        unjudged_only = True
+        lock = _lock_note(checkpoint, spec_frozen)  # frozen: ui-record refuses a changed spec without ui-respec
+        fix = (f"{lock} Then fix" if lock else "Fix") + (f" {_spec_name(checkpoint)} (add the missing state, journey "
+                                                         "steps or width, or fill in or remove a stub state)")
+        reason = (f"{IE_PREFIX} {len(unjudged)} case(s) could not be judged from the captured evidence. This is a "
+                  f"problem with the capture spec, not the app's code. {fix}, capture again, then review. "
+                  + _unjudged_lines(unjudged))
+    else:
+        verdict = "FAIL" if fixable else "PASS"
+    out = _Combined({"checkpoint": checkpoint, "fingerprint": now_fp, "compared": compared, "reviewers": names,
+                     "verdict": verdict, "invalid_reason": reason, "differences": diffs,
+                     "summary": f"{len(fixable)} code-fixable difference(s) across {len(names)} reviewer(s)"})
+    out.unjudged_only = unjudged_only
+    if unjudged:
+        out["insufficient_evidence"] = unjudged
+    return out
+
+
+def _print_unjudged(comb: dict, frozen: bool = False):
+    """Say where the unjudged cases of a combined review are fixed: the capture spec, never the implementer. `frozen`:
+    a failed UI round already froze the spec (read from the run's state, so False outside a Ratchet run)."""
+    un = comb.get("insufficient_evidence")
+    if not isinstance(un, list) or not un:
+        return
+    if getattr(comb, "unjudged_only", False):
+        print(comb["invalid_reason"])  # the unjudged cases alone made it INVALID: that reason says where to fix them
+        return
+    cp = comb.get("checkpoint")
+    print(f"Not code differences, so not for the implementer: {len(un)} case(s) could not be judged from the captured "
+          f"evidence. Fix {_spec_name(cp)}: {_unjudged_lines(un)}")
+    note = _lock_note(cp, frozen, comb.get("verdict") == "FAIL")
+    if note:
+        print(note)
 
 
 UNSIGNED = ("unsigned: written by ui_review.py outside a Ratchet run, for an ad-hoc comparison only; "
@@ -526,11 +672,11 @@ def _precheck(manifest: dict, cases_path):
 
 
 def _refuse_stubs(manifest: dict):
-    """Exit before anything is written or started while a capture state is still a scaffolded stub (stub: true)."""
-    names = [str(st.get("name")) for st in manifest.get("states", []) if isinstance(st, dict) and st.get("stub") is True]
+    """Exit before anything is written or started while a capture state is marked as a stub (any `stub` value except
+    absent, false or null; see _is_stub)."""
+    names = [str(st.get("name")) for st in _stub_states(manifest)]
     if names:
-        cp = manifest.get("checkpoint")
-        spec = f"states/{cp}.json" if isinstance(cp, str) and cp else "the capture spec"
+        spec = _spec_name(manifest.get("checkpoint"))
         sys.exit(f"review: the capture still holds {len(names)} unfilled stub state(s): {', '.join(names)}. A stub has no "
                  f"evidence and is never reviewed. Fill in its journey in {spec}, remove its `stub` mark, capture again, "
                  "then review.")
@@ -609,7 +755,9 @@ def cmd_review(a):
     if not a.keep:
         for t in staged.values():
             shutil.rmtree(t, ignore_errors=True)
-    comb = combine(results, cp, fp_at_start, _compared(manifest), check_fp=bool(rnd))
+    frozen = bool(rnd) and _ui_frozen(st, cp)
+    comb = combine(results, cp, fp_at_start, _compared(manifest), check_fp=bool(rnd), stub_states=_stub_states(manifest),
+                   block_on_nits=bool(ctx.config().get("ui_block_on_nits", True)) if rnd else True, spec_frozen=frozen)
     if rnd:
         _write_signed(out / "combined.json", comb, rnd)
     else:
@@ -617,6 +765,7 @@ def cmd_review(a):
         (out / "combined.json").write_text(json.dumps(comb, indent=2))
     print(f"combined: {out / 'combined.json'} → {comb['verdict']} ({comb['summary']})"
           + ("" if rnd else " [UNSIGNED: ad-hoc comparison, not for ratchet.py ui-record]"))
+    _print_unjudged(comb, frozen)
 
 
 def _compared(manifest: dict) -> dict:
@@ -658,11 +807,13 @@ def cmd_combine(a):
                 sys.exit(f"Refusing to combine: {p} is not a review (a JSON object).")
             reviews.append(r)
         man = json.loads(Path(a.manifest).read_text()) if a.manifest else {}
-        comb = combine(reviews, cp, None, _compared(man) if a.manifest else None, check_fp=False)
+        comb = combine(reviews, cp, None, _compared(man) if a.manifest else None, check_fp=False,
+                       stub_states=_stub_states(man))
         comb["unsigned"] = UNSIGNED
         Path(a.out).write_text(json.dumps(comb, indent=2))
         print(f"combined → {comb['verdict']} ({comb['summary']}) [UNSIGNED: ad-hoc comparison, not for ratchet.py "
               "ui-record]")
+        _print_unjudged(comb)
         return
     ctx, st, n = got
     key = _ui_key(eng, ctx, st, cp, n)
@@ -706,11 +857,18 @@ def cmd_combine(a):
     why = eng.ui_manifest_problem(key, cp, n, man)
     if why:
         sys.exit(f"Refusing to combine: the capture manifest {a.manifest} does not count: {why}.")
-    comb = combine(reviews, cp, man.get("fingerprint"), _compared(man))
+    try:  # the spec file ui-record hashes: a stub in it counts even when the stamped manifest dropped the mark
+        spec = json.loads((ctx.run_dir() / "states" / f"{cp}.json").read_text())
+    except (OSError, ValueError):
+        spec = None
+    frozen = _ui_frozen(st, cp)
+    comb = combine(reviews, cp, man.get("fingerprint"), _compared(man), stub_states=_stub_states(man) + _stub_states(spec),
+                   block_on_nits=bool(settings.get("ui_block_on_nits", True)), spec_frozen=frozen)
     if unconfirmed:
         comb["unconfirmed"] = unconfirmed
     _write_signed(Path(a.out), comb, (ctx, st, n, key))
     print(f"combined → {comb['verdict']} ({comb['summary']})")
+    _print_unjudged(comb, frozen)
 
 
 def _case_key(x) -> str:
@@ -791,6 +949,12 @@ def cmd_lint(a):
         scaffold_stubs(a.spec, spec, plan, gaps)
 
 
+def _ui_frozen(state: dict, cp) -> bool:
+    """Whether a failed UI round froze step `cp`'s capture spec (gates.ui.frozen in the run's state). Read only."""
+    gate = (((state.get("checkpoints") or {}).get(cp) or {}).get("gates") or {}).get("ui") or {}
+    return bool(gate.get("frozen"))
+
+
 def _stub_locked(spec: dict):
     """The step id when its capture spec is locked after a failed UI round (gates.ui.frozen), else None. None means not
     locked, including outside an active Ratchet run, and the caller then writes. Inside a run, a spec that names no
@@ -801,8 +965,7 @@ def _stub_locked(spec: dict):
     cp = spec.get("checkpoint")
     if not isinstance(cp, str) or not cp:
         sys.exit("scaffold: the capture spec must name its step (a `checkpoint` field), so nothing was written.")
-    gate = (((ctx.state().get("checkpoints") or {}).get(cp) or {}).get("gates") or {}).get("ui") or {}
-    return cp if gate.get("frozen") else None
+    return cp if _ui_frozen(ctx.state(), cp) else None
 
 
 def scaffold_stubs(spec_path: str, spec: dict, plan, gaps: list[dict]):
