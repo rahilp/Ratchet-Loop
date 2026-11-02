@@ -123,10 +123,11 @@ _OWNER = os.getpid()      # a forked child must never clean up its parent's fold
 
 
 def drop_schedule_output(text):
-    """The one shared normalizer for the schedule-awareness lane's additions to `status`: drops ONLY the
-    top-level `schedule` key of a `status --json` document (when `text` is exactly that dict re-dumped the way
-    the engine writes it: indent 2, trailing newline) and ONLY the lines of plain output that START with
-    'Projected finish:'. Text of any other shape is returned untouched, so a mismatch still fails loudly.
+    """The one shared normalizer for the schedule-awareness lane's additions to `status` and `next`: drops ONLY the
+    top-level `schedule` key of a `status --json` document, ONLY a top-level `stall` key of a `next` document (the
+    one with an `action` key and no `schedule` key), each when `text` is exactly that dict re-dumped the way the
+    engine writes it (indent 2, trailing newline), and ONLY the lines of plain output that START with
+    'Projected finish:' or 'STALL:'. Text of any other shape is returned untouched, so a mismatch still fails loudly.
     Applied to BOTH sides of the pinned-engine byte-compares in tests/test_modularize_cp4..cp8.py."""
     if not isinstance(text, str):
         return text
@@ -135,11 +136,17 @@ def drop_schedule_output(text):
     except ValueError:
         parsed = None
     if isinstance(parsed, dict):
-        if "schedule" in parsed and text == json.dumps(parsed, indent=2) + "\n":
+        if text != json.dumps(parsed, indent=2) + "\n":
+            return text
+        changed = False
+        if "schedule" in parsed:
             del parsed["schedule"]
-            return json.dumps(parsed, indent=2) + "\n"
-        return text
-    return "".join(ln for ln in text.splitlines(keepends=True) if not ln.startswith("Projected finish:"))
+            changed = True
+        elif "stall" in parsed and "action" in parsed:  # `next` output (status --json has `next`, not `action`)
+            del parsed["stall"]
+            changed = True
+        return json.dumps(parsed, indent=2) + "\n" if changed else text
+    return "".join(ln for ln in text.splitlines(keepends=True) if not ln.startswith(("Projected finish:", "STALL:")))
 
 
 def _stop(proc) -> None:

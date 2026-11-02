@@ -786,6 +786,9 @@ def t13_status_and_next_json_carry_same_fields():
             n1, n2 = json.loads(r1.stdout), json.loads(r2.stdout)
         except json.JSONDecodeError:
             n1 = n2 = None
+        if n1 is not None and n2 is not None:
+            # CP3 of the schedule-awareness lane: the one new top-level `stall` key of `next`, dropped on both sides
+            n1, n2 = json.loads(drop_schedule_output(r1.stdout)), json.loads(drop_schedule_output(r2.stdout))
         check(f"[CP8-T13] {name}: both sides' `next` output parse", n1 is not None and n2 is not None, (name,))
         if n1 is not None and n2 is not None:
             check(f"[CP8-T13] {name}: `next`'s full value set is unchanged by the module move", n1 == n2,

@@ -781,7 +781,7 @@ def step_stall(st, cfg, now):
     marks = []
     t = _sched_time(c.get("started_at"))
     if t is not None:
-        marks.append(t)
+        marks.append((t, "step start"))
     hist = st.get("history") if isinstance(st.get("history"), list) else []
     for e in hist:
         if not isinstance(e, dict):
@@ -790,10 +790,13 @@ def step_stall(st, cfg, now):
         if (ev in progress and e.get("cp") == cur) or ev in ("resumed", "unblocked"):
             t = _sched_time(e.get("at"))
             if t is not None:
-                marks.append(t)
+                marks.append((t, ev))
     if not marks:
         return None
-    since = max(marks)
+    since, since_event = marks[0]
+    for t, ev in marks[1:]:
+        if t >= since:  # the latest mark; on a tie the history entry, which says more than the step start
+            since, since_event = t, ev
     budget, note = stall_budget(cfg)
     elapsed = int((now - since).total_seconds())
     if elapsed <= budget * 60:
@@ -803,11 +806,30 @@ def step_stall(st, cfg, now):
     text = (f"STALL: {cur} has been {plain} for {_ratchet_module()._plain_duration(elapsed)} with no gate progress "
             f"(budget {budget} minutes, since {_sched_clock(since)})")
     return {"cp": cur, "step": step, "elapsed_seconds": elapsed, "since": _sched_iso(since),
-            "budget_minutes": budget, "note": note, "text": text}
+            "since_event": since_event, "budget_minutes": budget, "note": note, "text": text}
+
+
+def stall_view(st, cfg, now):
+    """The STALL warning as `status --json` (schedule.stall) and `next` (stall) carry it: None when nothing is stalled,
+    else {checkpoint, step, elapsed_minutes, budget_minutes, since, since_event, message}. `message` is the one plain
+    'STALL: ...' line `status` prints; it also names a declared wait (`ratchet.py wait`) and a budget setting that
+    was ignored. Pure apart from reading the wait through the engine's live_wait."""
+    r = step_stall(st, cfg, now)
+    if r is None:
+        return None
+    text = r["text"]
+    if r.get("note"):
+        text += f"; {r['note']}"
+    w = _ratchet_module().live_wait(st)
+    if w:
+        text += f"; a wait is declared: {w['reason']} (until {w['until'][:16].replace('T', ' ')} UTC)"
+    return {"checkpoint": r["cp"], "step": r["step"], "elapsed_minutes": r["elapsed_seconds"] // 60,
+            "budget_minutes": r["budget_minutes"], "since": r["since"], "since_event": r["since_event"], "message": text}
 
 
 def schedule_status(st, plan, cfg, now) -> dict:
-    """What `status` and `status --json` show as the projected finish: {steps_left, eta, rounds, sources, line}.
+    """What `status` and `status --json` show as the projected finish: {steps_left, eta, rounds, sources, line, stall}
+    (stall: see stall_view).
     `line` is the one plain 'Projected finish:' line and `eta`/`rounds` carry the same numbers (eta: finish, earliest,
     latest as 'YYYY-MM-DD HH:MM UTC', label, based_on_steps; rounds: expected, used, run_limit, over_limit; both null
     until a step has finished). Everything is null (steps_left 0 or null, sources empty) when no step is left or the
@@ -817,8 +839,10 @@ def schedule_status(st, plan, cfg, now) -> dict:
     ids = [c["id"] for c in (cps if isinstance(cps, list) else []) if isinstance(c, dict) and isinstance(c.get("id"), str)]
     r = schedule_numbers(st, ids, cfg, now)
     left = r["left"]
+    stall = stall_view(st, cfg, now)
     if not left or st.get("phase") in ("cancelled", "done"):
-        return {"steps_left": 0 if not left else None, "eta": None, "rounds": None, "sources": [], "line": None}
+        return {"steps_left": 0 if not left else None, "eta": None, "rounds": None, "sources": [], "line": None,
+                "stall": stall}
     eta = rounds = None
     if r["finish"]:
         eta = {"finish": _sched_clock(_sched_time(r["finish"])), "earliest": _sched_clock(_sched_time(r["earliest"])),
@@ -833,5 +857,5 @@ def schedule_status(st, plan, cfg, now) -> dict:
             text += f" ({used} of the run's {limit} rounds used so far)"
     head = f"{left} {'step' if left == 1 else 'steps'} left; "
     line = f"Projected finish: {head}{text}. Worked out from these state.json fields: {', '.join(r['sources'])}"
-    return {"steps_left": left, "eta": eta, "rounds": rounds, "sources": r["sources"], "line": line}
+    return {"steps_left": left, "eta": eta, "rounds": rounds, "sources": r["sources"], "line": line, "stall": stall}
 

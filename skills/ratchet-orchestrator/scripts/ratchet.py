@@ -89,7 +89,7 @@ from status_text import (plain_reason, blocked_options, plain_now, waiting_quest
                          exit_code_only_line, exit_code_only_note, _lines_word, done_means_table,
                          _finish_block_lines, _finish_blockers, _finish_held, _finish_legacy_note,
                          _finish_integrity_lines, _unproven_finish_lines, _accepted_lines,
-                         _apply_accepted_lines, HELD_AGAIN_PREFIX, schedule_status)
+                         _apply_accepted_lines, HELD_AGAIN_PREFIX, schedule_status, stall_view)
 import run_records  # noqa: E402  (module object: offers run_records.py's own live _IN_HOOK/_HOOK_ENV_ADVISORY
                      # views THIS exact, currently-executing module's own namespace -- a no-op if some OTHER
                      # ratchet.py instance in this same process already bound first; see run_records.py's own
@@ -2543,15 +2543,17 @@ def cmd_status_text(ctx: Ctx):
     print(f"Run: {st['slug']}  -  {st['feature']}")
     print(f"Phase: {PHASE_PLAIN.get(st.get('phase'), st.get('phase'))}")
     print(plain_now(ctx, st, plan))
+    sched = schedule_status(st, plan, ctx.config(), _dt.datetime.now(_dt.timezone.utc))
+    if sched["stall"]:  # CP3: the STALL warning, right after the Phase / "Working on" lines
+        print(sched["stall"]["message"])
     director = _director_next(ctx, st)
     if director:
         print(director)
     q = waiting_question(ctx, st)
     if q:
         print(question_line(q))
-    sched_line = schedule_status(st, plan, ctx.config(), _dt.datetime.now(_dt.timezone.utc))["line"]
-    if sched_line:
-        print(sched_line)
+    if sched["line"]:
+        print(sched["line"])
     if _finish_pending(st):
         # CP4: the finish is held while an approved done-means line is unproven (never for a plan approved before
         # this rule, which gets the plain note instead), or while a checkpoint or test plan changed after approval
@@ -15474,6 +15476,8 @@ def cmd_next(args):
     na = next_action(ctx, st)
     na["question"] = waiting_question(ctx, st)
     na["wait"] = live_wait(st)  # what the owner chat said it is waiting on (`ratchet.py wait`), until when
+    # CP3: the STALL warning (null when none); added here, never in next_action, which the Stop hook and viewer call
+    na["stall"] = stall_view(st, ctx.config(), _dt.datetime.now(_dt.timezone.utc))
     hs = hooks_view(ctx)
     hw = hooks_warning(ctx, hs)
     if hw and na.get("phase") not in ("planning",):

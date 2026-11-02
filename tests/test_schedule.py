@@ -1803,6 +1803,657 @@ def test_CP2_T18_schemas_section_9_shows_the_schedule_field_and_calls_it_an_esti
     check("the section has a sentence saying the schedule is an estimate, not a deadline", len(mine) >= 1, None)
 
 
+# ================================================================================================ CP3 section
+# CP3: the STALL warning. Black-box through the CLI on the same small synthetic projects as CP2 (s2_fx clones; the engine
+# has no fake clock, so every time is written relative to the real clock when the fixture is built). "Fixture B" = phase
+# building, CP1 'Step 1' done after 3 hours, CP2 'Step 2' current at step `implement` (which status words as "building
+# it") and started N minutes ago. Pinned shape of the new output (the implementer chooses the wording around it):
+#   plain `status`: one line that STARTS with "STALL:" after the "Phase:" and "Working on" lines (only when a stall fires);
+#   `status --json`: schedule.stall, ALWAYS present inside `schedule` (null or {checkpoint, step, elapsed_minutes,
+#     budget_minutes, since, since_event, message}); no new top-level key besides `schedule`, no per-checkpoint key;
+#   `next`: a new top-level `stall` key, always present (null or the same object).
+# `since` is accepted as UTC ISO text or as "YYYY-MM-DD HH:MM UTC" (the two spellings the engine already uses).
+# The one pre-existing crash this section stays clear of: a building run whose current step has no checkpoint entry makes
+# `status --json` and `next` raise KeyError in next_action today (the engine without CP3), so T17 asks only plain `status`.
+
+S3_TAG = "STALL:"
+S3_DUR = re.compile(r"(?:(\d+)\s*(?:h|hrs?|hours?)\s*(?:and\s*)?)?(\d+)\s*(?:m|mins?|minutes?)\b", re.I)
+S3_PHASES = ("paused", "blocked", "awaiting_plan_approval", "awaiting_checkpoint_review", "awaiting_final_review",
+             "planning", "done", "cancelled")
+
+
+def s3_phase_fields(st, ph):
+    """The extra state fields the real engine sets alongside each non-building phase."""
+    if ph == "paused":
+        st.update(paused_from="building", blocked_reason="paused")
+    elif ph == "blocked":
+        st.update(blocked_from="building", blocked_reason="CP2: 3 adversarial rounds used without approval")
+    elif ph == "awaiting_checkpoint_review":
+        st["review_target"] = "CP2"
+    elif ph == "cancelled":
+        st["blocked_reason"] = "cancelled by the user"
+
+
+def s3_fx(started=100, step="implement", phase="building", history=(), edit=None, adv_total=0, attempts2=None):
+    """Fixture B: a clone with CP1 done (3 hours) and CP2 current at `step`, started `started` minutes ago. `history`
+    is a list of (minutes_ago, event, cp_or_None) entries appended after the project's own history."""
+    def e(st):
+        now = datetime.now(timezone.utc)
+        cp = st["checkpoints"]["CP2"]
+        cp["step"] = step
+        if attempts2 is not None:
+            cp["gates"]["adversarial"]["attempts"] = attempts2
+        h = st["history"] if isinstance(st.get("history"), list) else []
+        for ago, ev, who in history:
+            ent = {"at": iso(now - M(ago)), "event": ev}
+            if who:
+                ent["cp"] = who
+            h.append(ent)
+        st["history"] = h
+        s3_phase_fields(st, phase)
+        if edit:
+            edit(st)
+    return s2_fx(spans=(M(180),), attempts=(1,), cur=M(started), phase=phase, adv_total=adv_total, edit=e)
+
+
+def s3_state(d):
+    return json.loads((Path(d) / ".ratchet" / "runs" / "f" / "state.json").read_text())
+
+
+def s3_cfg_path(d):
+    return Path(d) / ".ratchet" / "config.json"
+
+
+def s3_set_cfg(d, key, value, absent=False):
+    p = s3_cfg_path(d)
+    cf = json.loads(p.read_text())
+    if absent:
+        cf.pop(key, None)
+    else:
+        cf[key] = value
+    p.write_text(json.dumps(cf, indent=2))
+
+
+def s3_json(text):
+    try:
+        v = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def s3_cmds(d, engine=None):
+    """status, status --json and next, each run once: .rp/.rj/.rn are the results, .j/.n the parsed JSON (or None)."""
+    c = s2c()
+    eng = engine or c.ENGINE
+    o = types.SimpleNamespace()
+    o.rp, o.rj, o.rn = (c.run(eng, d, a) for a in (["status"], ["status", "--json"], ["next"]))
+    o.j, o.n = s3_json(o.rj.stdout), s3_json(o.rn.stdout)
+    return o
+
+
+def s3_exit(o, label):
+    for name, r in (("status", o.rp), ("status --json", o.rj), ("next", o.rn)):
+        check(f"{label}: `{name}` exits 0 with no traceback", r.returncode == 0 and "Traceback" not in r.stderr,
+              (r.returncode, r.stderr[-200:]))
+    check(f"{label}: `status --json` and `next` print JSON objects", o.j is not None and o.n is not None,
+          (o.rj.stdout[-100:], o.rn.stdout[-100:]))
+
+
+def s3_lines(text):
+    return [ln for ln in text.splitlines() if ln.startswith(S3_TAG)]
+
+
+def s3_sj(o):
+    """(present, value) of schedule.stall in the parsed status --json."""
+    sch = o.j.get("schedule") if isinstance(o.j, dict) else None
+    if not isinstance(sch, dict) or "stall" not in sch:
+        return False, None
+    return True, sch["stall"]
+
+
+def s3_nj(o):
+    """(present, value) of the top-level `stall` in the parsed next output."""
+    if not isinstance(o.n, dict) or "stall" not in o.n:
+        return False, None
+    return True, o.n["stall"]
+
+
+def s3_none(o, label):
+    """No stall anywhere: no STALL text, schedule.stall present and null, next.stall present and null."""
+    check(f"{label}: plain `status` has no STALL text", "STALL" not in o.rp.stdout, o.rp.stdout[:300])
+    present, val = s3_sj(o)
+    check(f"{label}: `status --json` has schedule.stall, and it is null", present and val is None, (present, val))
+    present, val = s3_nj(o)
+    check(f"{label}: `next` carries the key `stall`, and it is null", present and val is None, (present, val))
+    check(f"{label}: no STALL text in the `next` output", "STALL" not in o.rn.stdout, o.rn.stdout[:200])
+
+
+def s3_mins(text):
+    """Every duration in a text ('1h 40m', '1 hour 40 minutes', '45 minutes') as whole minutes."""
+    return [int(h or 0) * 60 + int(m) for h, m in S3_DUR.findall(text or "")]
+
+
+def s3_has_mins(text, want, tol=2):
+    return any(abs(x - want) <= tol for x in s3_mins(text))
+
+
+def s3_when(v):
+    """A stall time as an aware datetime, from UTC ISO text or from 'YYYY-MM-DD HH:MM UTC'; None otherwise."""
+    return pt(v) or s2_pclock(v)
+
+
+def s3_near(v, when, tol=60):
+    d = s3_when(v)
+    return d is not None and abs((d - when).total_seconds()) <= tol
+
+
+def s3_obj(label, name, v, cp="CP2", step="implement", budget=90, minutes=None):
+    """Checks the shape of a stall object; returns it as a dict (empty when it is not an object)."""
+    check(f"{label}: {name} is an object", isinstance(v, dict), v)
+    v = v if isinstance(v, dict) else {}
+    check(f"{label}: {name}.checkpoint is {cp!r} and .step is {step!r}", (v.get("checkpoint"), v.get("step")) == (cp, step),
+          (v.get("checkpoint"), v.get("step")))
+    check(f"{label}: {name}.budget_minutes is {budget}", v.get("budget_minutes") == budget, v.get("budget_minutes"))
+    el = v.get("elapsed_minutes")
+    check(f"{label}: {name}.elapsed_minutes is a whole number", isinstance(el, int) and not isinstance(el, bool), el)
+    if minutes is not None:
+        check(f"{label}: {name}.elapsed_minutes is {minutes} (within 1 minute)",
+              isinstance(el, int) and abs(el - minutes) <= 1, el)
+    return v
+
+
+def s3_fires(o, label, minutes, budget=90, since=None, since_event=None):
+    """The stall fires in all three outputs. Returns (status stall dict, next stall dict, the STALL line or None)."""
+    s3_exit(o, label)
+    lines = s3_lines(o.rp.stdout)
+    check(f"{label}: plain `status` has exactly one line starting 'STALL:'", len(lines) == 1, lines)
+    present, sv = s3_sj(o)
+    check(f"{label}: `status --json` has schedule.stall", present, o.j and o.j.get("schedule"))
+    sv = s3_obj(label, "schedule.stall", sv, budget=budget, minutes=minutes)
+    present, nv = s3_nj(o)
+    check(f"{label}: `next` carries the key `stall`", present, o.n and sorted(o.n))
+    nv = s3_obj(label, "next.stall", nv, budget=budget, minutes=minutes)
+    if since is not None:
+        check(f"{label}: schedule.stall.since is {since.isoformat()} (the moment the clock started)",
+              s3_near(sv.get("since"), since), sv.get("since"))
+        check(f"{label}: next.stall.since is the same moment", s3_near(nv.get("since"), since), nv.get("since"))
+    if since_event is not None:
+        ev = sv.get("since_event")
+        ok = isinstance(ev, str) and (since_event in ev.lower() if since_event == "start" else ev == since_event)
+        check(f"{label}: schedule.stall.since_event names {since_event!r}", ok, ev)
+    return sv, nv, (lines[0] if len(lines) == 1 else None)
+
+
+def s3_line_facts(label, line, minutes, since, budget=90, nope=()):
+    """What a STALL line must tell: the step, how long, since when, and none of the durations in `nope`."""
+    if line is None:
+        check(f"{label}: there is a STALL line to read", False, None)
+        return
+    check(f"{label}: the line names CP2", "CP2" in line, line)
+    check(f"{label}: the line words the step the way status does ('building it')", "building it" in line, line)
+    check(f"{label}: the line gives the time elapsed (about {minutes} minutes)", s3_has_mins(line, minutes), line)
+    for bad in nope:
+        check(f"{label}: the line does not give {bad} minutes", not s3_has_mins(line, bad), line)
+    clocks = [s2_pclock(x) for x in S2_CLOCK.findall(line)]
+    check(f"{label}: the line says when progress was last recorded ({since.strftime('%Y-%m-%d %H:%M')} UTC)",
+          any(c3 is not None and abs((c3 - since).total_seconds()) <= 120 for c3 in clocks), line)
+
+
+def s3_started(d, cp="CP2"):
+    return s3_when(s3_state(d)["checkpoints"][cp].get("started_at"))
+
+
+def s3_hist_time(d, event, cp="CP2"):
+    for e in s3_state(d)["history"]:
+        if isinstance(e, dict) and e.get("event") == event and e.get("cp") == cp:
+            return s3_when(e.get("at"))
+    return None
+
+
+def s3_run_hist_time(d, event):
+    for e in reversed(s3_state(d)["history"]):
+        if isinstance(e, dict) and e.get("event") == event:
+            return s3_when(e.get("at"))
+    return None
+
+
+@case("CP3-T01")
+def test_CP3_T01_a_step_stuck_over_90_minutes_shows_a_stall_line_near_the_top():
+    d = s3_fx(started=100)
+    o = s3_cmds(d)
+    sv, nv, line = s3_fires(o, "100 minutes", 100)
+    lines = o.rp.stdout.splitlines()
+    pi = next((i for i, ln in enumerate(lines) if ln.startswith("Phase:")), None)
+    wi = next((i for i, ln in enumerate(lines) if ln.startswith("Working on")), None)
+    si = next((i for i, ln in enumerate(lines) if ln.startswith(S3_TAG)), None)
+    check("(fixture sanity) status prints a Phase line and a 'Working on' line", pi is not None and wi is not None, lines[:6])
+    check("the STALL line comes after the Phase and 'Working on' lines and within the first few lines",
+          si is not None and pi is not None and wi is not None and si > pi and si > wi and si <= pi + 4, (pi, wi, si))
+    s3_line_facts("100 minutes", line, 100, s3_started(d), nope=(180, 185))
+
+
+@case("CP3-T02")
+def test_CP3_T02_just_under_the_budget_prints_no_stall_anywhere():
+    d = s3_fx(started=89)
+    o = s3_cmds(d)
+    s3_exit(o, "89 minutes")
+    s3_none(o, "89 minutes")
+    check("(sanity) no empty STALL heading or bare marker is printed", not re.search(r"(?mi)^\s*stall\b", o.rp.stdout),
+          o.rp.stdout[:200])
+
+
+@case("CP3-T03")
+def test_CP3_T03_just_over_the_budget_does_fire():
+    d = s3_fx(started=91)
+    o = s3_cmds(d)
+    sv, nv, line = s3_fires(o, "91 minutes", 91)
+    check("the text names the 90 minute budget", line is not None and s3_has_mins(line, 90, 0), line)
+    check("schedule.stall and next.stall carry the same checkpoint, step and budget",
+          (sv.get("checkpoint"), sv.get("step"), sv.get("budget_minutes"))
+          == (nv.get("checkpoint"), nv.get("step"), nv.get("budget_minutes")), (sv, nv))
+
+
+@case("CP3-T04")
+def test_CP3_T04_status_json_carries_the_stall_in_schedule_stall_with_the_agreed_fields():
+    c = s2c()
+    d = s3_fx(started=100)
+    o = s3_cmds(d)
+    s3_exit(o, "stalled")
+    with s2_pinned("cp3t04") as pin:
+        p = s3_json(c.run(pin, c.clone(d), ["status", "--json"]).stdout)
+    check("(sanity) the pinned engine's `status --json` parses", p is not None, None)
+    if o.j is not None and p is not None:
+        check("the only new top-level key is `schedule`; no top-level `stall`",
+              set(o.j) - set(p) == {"schedule"} and "stall" not in o.j, (sorted(set(o.j) - set(p)), sorted(set(p) - set(o.j))))
+        new = [sorted(set(a) ^ set(b)) for a, b in zip(o.j.get("checkpoints") or [], p.get("checkpoints") or [])]
+        check("no checkpoint entry gets a new key", all(not x for x in new) and
+              len(o.j.get("checkpoints") or []) == len(p.get("checkpoints") or []), new)
+    present, sv = s3_sj(o)
+    check("`status --json` has schedule.stall", present, o.j and o.j.get("schedule"))
+    sv = s3_obj("stalled", "schedule.stall", sv, minutes=100)
+    check("schedule.stall.since is CP2's started_at", s3_near(sv.get("since"), s3_started(d)), (sv.get("since"), s3_started(d)))
+    ev = sv.get("since_event")
+    check("schedule.stall.since_event names the step start", isinstance(ev, str) and "start" in ev.lower(), ev)
+    msg = sv.get("message")
+    check("schedule.stall.message is a non-empty text that names CP2", isinstance(msg, str) and msg.strip() != "" and "CP2" in msg, msg)
+
+
+@case("CP3-T05")
+def test_CP3_T05_next_carries_the_same_stall_and_leaves_its_other_fields_as_they_were():
+    d, twin = s3_fx(started=100), s3_fx(started=10)
+    o, ot = s3_cmds(d), s3_cmds(twin)
+    sv, nv, _line = s3_fires(o, "stalled", 100)
+    check("next.stall equals schedule.stall (checkpoint, step, since, budget; elapsed within 1 minute)",
+          all(nv.get(k) == sv.get(k) for k in ("checkpoint", "step", "since", "budget_minutes"))
+          and isinstance(nv.get("elapsed_minutes"), int) and isinstance(sv.get("elapsed_minutes"), int)
+          and abs(nv["elapsed_minutes"] - sv["elapsed_minutes"]) <= 1, (nv, sv))
+    s3_exit(ot, "twin")
+    present, val = s3_nj(ot)
+    check("the twin's `stall` is present and null", present and val is None, (present, val))
+    if o.n is not None and ot.n is not None:
+        a, b = dict(o.n), dict(ot.n)
+        a.pop("stall", None)
+        b.pop("stall", None)
+        check("after dropping `stall`, both outputs have the same keys", set(a) == set(b), sorted(set(a) ^ set(b)))
+        for k in ("phase", "checkpoint", "step", "action", "stop_ok"):
+            check(f"next.{k} is the same in both", a.get(k) == b.get(k), (a.get(k), b.get(k)))
+        check("next.stop_ok is false in both", a.get("stop_ok") is False and b.get("stop_ok") is False,
+              (a.get("stop_ok"), b.get("stop_ok")))
+
+
+@case("CP3-T06")
+def test_CP3_T06_new_gate_progress_restarts_the_clock():
+    d = s3_fx(started=200, history=[(20, "implemented", "CP2")])
+    o = s3_cmds(d)
+    s3_exit(o, "progress 20 minutes ago")
+    s3_none(o, "progress 20 minutes ago")
+    check("(sanity) the step as a whole really is older than the budget", datetime.now(timezone.utc) - s3_started(d) > M(150), None)
+
+
+@case("CP3-T07")
+def test_CP3_T07_the_stall_is_counted_from_the_last_progress_and_says_which_one():
+    d = s3_fx(started=300, history=[(200, "tests_written", "CP2"), (100, "red", "CP2")])
+    o = s3_cmds(d)
+    red = s3_hist_time(d, "red")
+    sv, nv, line = s3_fires(o, "last progress 100 minutes ago", 100, since=red, since_event="red")
+    check("next.stall.since_event is 'red' too", nv.get("since_event") == "red", nv.get("since_event"))
+    s3_line_facts("last progress 100 minutes ago", line, 100, red, nope=(200, 300))
+
+
+@case("CP3-T08")
+def test_CP3_T08_progress_of_another_step_or_a_non_progress_entry_does_not_restart_the_clock():
+    d = s3_fx(started=120, history=[(5, "behavior_passed", "CP1"), (5, "note", "CP2")])
+    o = s3_cmds(d)
+    sv, nv, _line = s3_fires(o, "other-step progress and a note", 120, since=s3_started(d), since_event="start")
+
+
+@case("CP3-T09")
+def test_CP3_T09_a_pause_followed_by_a_resume_restarts_the_clock():
+    c = s2c()
+    d = s3_fx(started=300, history=[(200, "paused", None), (5, "resumed", None)])
+    o = s3_cmds(d)
+    s3_exit(o, "resumed 5 minutes ago")
+    s3_none(o, "resumed 5 minutes ago")
+
+    def move(st):
+        now = datetime.now(timezone.utc)
+        for e in st["history"]:
+            if isinstance(e, dict) and e.get("event") == "resumed":
+                e["at"] = iso(now - M(100))
+    c.mutate(d, move)
+    o2 = s3_cmds(d)
+    s3_fires(o2, "resumed 100 minutes ago", 100, since=s3_run_hist_time(d, "resumed"), since_event="resumed")
+
+
+@case("CP3-T10")
+def test_CP3_T10_unblocking_a_blocked_run_also_restarts_the_clock():
+    c = s2c()
+    d = s3_fx(started=300, history=[(200, "blocked", None), (10, "unblocked", None)])
+    o = s3_cmds(d)
+    s3_exit(o, "unblocked 10 minutes ago")
+    s3_none(o, "unblocked 10 minutes ago")
+
+    def move(st):
+        now = datetime.now(timezone.utc)
+        for e in st["history"]:
+            if isinstance(e, dict) and e.get("event") == "unblocked":
+                e["at"] = iso(now - M(100))
+    c.mutate(d, move)
+    o2 = s3_cmds(d)
+    s3_fires(o2, "unblocked 100 minutes ago", 100, since=s3_run_hist_time(d, "unblocked"), since_event="unblocked")
+
+
+@case("CP3-T11")
+def test_CP3_T11_a_run_that_is_not_building_never_shows_a_stall_whatever_the_step_age():
+    c = s2c()
+    with s2_pinned("cp3t11") as pin:
+        for ph in S3_PHASES:
+            d = s3_fx(started=300, phase=ph)
+            o = s3_cmds(d)
+            s3_exit(o, ph)
+            s3_none(o, ph)
+            before = s3_json(c.run(pin, c.clone(d), ["next"]).stdout)
+            check(f"{ph}: (sanity) the pinned engine prints this phase's `next`", before is not None, None)
+            if before is not None and o.n is not None:
+                for k in ("phase", "action", "stop_ok"):
+                    check(f"{ph}: next.{k} is what the pinned engine printed", o.n.get(k) == before.get(k),
+                          (o.n.get(k), before.get(k)))
+
+
+@case("CP3-T12")
+def test_CP3_T12_a_building_run_with_no_current_step_shows_no_stall_and_does_not_crash():
+    def nocur(st):
+        st["current"] = None
+        for e in st["history"]:
+            if isinstance(e, dict):
+                e["at"] = iso(datetime.now(timezone.utc) - M(600))
+    d = s3_fx(started=300, edit=nocur)
+    o = s3_cmds(d)
+    s3_exit(o, "no current step")
+    s3_none(o, "no current step")
+    act = (o.n or {}).get("action")
+    check("`next` still says there is no current checkpoint",
+          isinstance(act, str) and "no current checkpoint" in act.lower(), act)
+
+
+@case("CP3-T13")
+def test_CP3_T13_setting_stall_budget_minutes_to_45_changes_the_budget():
+    c = s2c()
+    d = s3_fx(started=50)
+    r = c.run(c.ENGINE, d, ["config", "--set", "stall_budget_minutes=45"])
+    check("`config --set stall_budget_minutes=45` is accepted (exit 0, not refused as unknown)",
+          r.returncode == 0 and "unknown" not in (r.stdout + r.stderr).lower(), (r.returncode, r.stdout[-200:], r.stderr[-200:]))
+    check("the setting is stored as 45", s3_json(s3_cfg_path(d).read_text()) is not None
+          and s3_json(s3_cfg_path(d).read_text()).get("stall_budget_minutes") == 45, None)
+    o = s3_cmds(d)
+    sv, nv, line = s3_fires(o, "budget 45, 50 minutes in", 50, budget=45)
+    check("the STALL text says the 45 minute budget", line is not None and s3_has_mins(line, 45, 0), line)
+    r = c.run(c.ENGINE, d, ["config", "--set", "stall_budget_minutes=60"])
+    check("`config --set stall_budget_minutes=60` is accepted", r.returncode == 0, (r.returncode, r.stderr[-200:]))
+    o = s3_cmds(d)
+    s3_exit(o, "budget 60, 50 minutes in")
+    s3_none(o, "budget 60, 50 minutes in")
+    s3_none(s3_cmds(s3_fx(started=50)), "no setting, 50 minutes in")
+
+
+@case("CP3-T14")
+def test_CP3_T14_changing_the_stall_budget_needs_no_approve_changes_and_moves_no_gate():
+    c = s2c()
+    d = s3_fx(started=60)
+    before = s3_json(s3_cfg_path(d).read_text())
+    r = c.run(c.ENGINE, d, ["config", "--set", "stall_budget_minutes=45"])
+    check("`config --set stall_budget_minutes=45` exits 0", r.returncode == 0, (r.returncode, r.stdout[-200:], r.stderr[-200:]))
+    after = s3_json(s3_cfg_path(d).read_text())
+    check("every other config value is unchanged (only stall_budget_minutes is new)",
+          before is not None and after == dict(before, stall_budget_minutes=45), (before, after))
+    o = s3_cmds(d)
+    s3_exit(o, "after the change")
+    n = o.n or {}
+    check("next is still the building action for CP2",
+          (n.get("phase"), n.get("checkpoint"), n.get("step")) == ("building", "CP2", "implement")
+          and str(n.get("action", "")).startswith("CP2: spawn ratchet-implementer"), n)
+    check("the run is not held: stop_ok false, no question, no warning of pending changes",
+          n.get("stop_ok") is False and n.get("question") is None, (n.get("stop_ok"), n.get("question")))
+    check("status --json is still building and not waiting on anyone",
+          (o.j or {}).get("phase") == "building" and (o.j or {}).get("waiting_on") is None, (o.j or {}).get("phase"))
+    blob = (r.stdout + r.stderr + o.rp.stdout + o.rn.stdout).lower()
+    check("nothing mentions approve-changes or changes pending",
+          "approve-changes" not in blob and "changes pending" not in blob and "approved plan files" not in blob, blob[:300])
+    check("(link to the feature) with the 45 minute budget the 60 minute old step now shows a stall",
+          isinstance(s3_nj(o)[1], dict) and (s3_nj(o)[1] or {}).get("budget_minutes") == 45, s3_nj(o))
+
+
+@case("CP3-T15")
+def test_CP3_T15_a_nonsense_stall_budget_falls_back_to_90_and_status_says_so():
+    d = s3_fx(started=100)
+    for v in (0, -30, "soon", True, None):
+        s3_set_cfg(d, "stall_budget_minutes", v)
+        label = f"stall_budget_minutes={v!r}"
+        o = s3_cmds(d)
+        sv, nv, line = s3_fires(o, label, 100, budget=90)
+        blob = (line or "") + " " + json.dumps(sv)
+        check(f"{label}: the output says plainly that stall_budget_minutes could not be used and 90 is in use",
+              "stall_budget_minutes" in blob and re.search(r"\b90\b", blob) is not None
+              and re.search(r"ignor|invalid|not (?:a )?(?:valid|usable|positive)|could not|cannot|fall", blob, re.I) is not None, blob)
+    d2 = s3_fx(started=60)
+    s3_set_cfg(d2, "stall_budget_minutes", 0)
+    o = s3_cmds(d2)
+    s3_exit(o, "value 0, 60 minutes in")
+    s3_none(o, "value 0, 60 minutes in")
+
+
+@case("CP3-T16")
+def test_CP3_T16_a_live_declared_wait_does_not_hide_the_stall_and_is_named():
+    c = s2c()
+    g = c.g
+    d = s3_fx(started=100)
+    g.say(d, "I will wait for the long test run")
+    r = g.rx(d, "wait", "--for", "long test run", "--minutes", "30", "--session", "s-owner")
+    check("(setup) `ratchet.py wait` is accepted", r.returncode == 0, (r.returncode, r.stdout[-200:], r.stderr[-200:]))
+
+    def back(st):
+        now = datetime.now(timezone.utc)
+        if isinstance(st.get("wait"), dict):
+            st["wait"]["set_at"], st["wait"]["until"] = iso(now - M(10)), iso(now + M(20))
+        # the wait must be the newest event: back-date the fixture's own seconds-old history entries to before it
+        for ent in st.get("history") or []:
+            t = pt(ent.get("at")) if isinstance(ent, dict) else None
+            if t is not None and t > now - M(10):
+                ent["at"] = iso(now - M(12))
+    c.mutate(d, back)
+    o = s3_cmds(d)
+    sv, nv, line = s3_fires(o, "stalled while waiting", 100)
+    check("the STALL line mentions the declared wait", line is not None and
+          (re.search(r"\bwait", line, re.I) is not None or "long test run" in line), line)
+    w = (o.n or {}).get("wait")
+    check("next.wait still holds the wait and its reason", isinstance(w, dict) and w.get("reason") == "long test run", w)
+    with s2_pinned("cp3t16") as pin:
+        before = s3_json(c.run(pin, c.clone(d), ["next"]).stdout)
+    check("(sanity) the pinned engine prints this `next`", before is not None, None)
+    if before is not None and o.n is not None:
+        check("next.stop_ok is what it was without the stall", o.n.get("stop_ok") == before.get("stop_ok"),
+              (o.n.get("stop_ok"), before.get("stop_ok")))
+        check("next.wait equals the pinned engine's", o.n.get("wait") == before.get("wait"), (o.n.get("wait"), before.get("wait")))
+
+
+@case("CP3-T17")
+def test_CP3_T17_broken_or_missing_timestamps_degrade_quietly():
+    c = s2c()
+    try:
+        saved = set(json.loads(S2_BASELINE.read_text()))
+    except (OSError, ValueError):
+        saved = set()
+    check("(sanity) the saved status --json baseline has keys", len(saved) > 5, saved)
+
+    def start(v):
+        def f(st):
+            st["checkpoints"]["CP2"]["started_at"] = v
+        return f
+
+    def hist_bad(st):
+        st["history"].append({"at": "not-a-time", "event": "red", "cp": "CP2"})
+
+    def hist_not_list(st):
+        st["history"] = "oops"
+
+    quiet = (("started_at missing", start(None), 100), ("started_at 'yesterday-ish'", start("yesterday-ish"), 100),
+             ("started_at 2 hours in the future", lambda st: st["checkpoints"]["CP2"].update(
+                 started_at=iso(datetime.now(timezone.utc) + M(120))), 100))
+    for label, edit, _m in quiet:
+        o = s3_cmds(s3_fx(started=100, edit=edit))
+        s3_exit(o, label)
+        s3_none(o, label)
+        if o.j is not None:
+            check(f"{label}: every existing status --json key still prints", saved <= set(o.j), sorted(saved - set(o.j)))
+        if o.n is not None:
+            check(f"{label}: next still has phase, checkpoint, step and action",
+                  all(k in o.n for k in ("phase", "checkpoint", "step", "action")), sorted(o.n))
+    for label, edit in (("a history entry with an unreadable time", hist_bad), ("history is not a list", hist_not_list)):
+        d = s3_fx(started=100, edit=edit)
+        o = s3_cmds(d)
+        s3_fires(o, label + " beside a valid start", 100, since=s3_started(d), since_event="start")
+        if o.j is not None:
+            check(f"{label}: every existing status --json key still prints", saved <= set(o.j), sorted(saved - set(o.j)))
+    d = s3_fx(started=100, edit=lambda st: st["checkpoints"].pop("CP2"))
+    r = c.run(c.ENGINE, d, ["status"])
+    check("the current step's checkpoint entry missing: plain `status` exits 0 with no traceback and no STALL",
+          r.returncode == 0 and "Traceback" not in r.stderr and "STALL" not in r.stdout, (r.returncode, r.stderr[-200:], r.stdout[:200]))
+    check("(same variant) plain `status` still prints its Phase line", "Phase:" in r.stdout, r.stdout[:200])
+
+
+def s3_strip(text, d, other):
+    """A plain-status text with this clone's own path normalized and the lines that depend on the step's start time
+    (the CP2 projected finish) removed; STALL lines are left in."""
+    t = s2c()._normalize_clone_text(text, d, other)
+    return "".join(ln for ln in t.splitlines(keepends=True) if not ln.startswith(S2_PREFIX))
+
+
+def s3_twins(step="implement", attempts2=None, adv_total=0):
+    return (s3_fx(started=100, step=step, attempts2=attempts2, adv_total=adv_total),
+            s3_fx(started=10, step=step, attempts2=attempts2, adv_total=adv_total))
+
+
+@case("CP3-T18")
+def test_CP3_T18_a_stall_changes_no_existing_status_or_next_field():
+    d, twin = s3_twins()
+    o, ot = s3_cmds(d), s3_cmds(twin)
+    s3_fires(o, "stalled", 100)
+    s3_exit(ot, "twin")
+    if o.j is not None and ot.j is not None:
+        a, b = dict(o.j), dict(ot.j)
+        for x in (a, b):
+            for k in ("root", "viewer_url", "schedule"):
+                x.pop(k, None)
+        diff = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+        check("status --json: every field but `schedule` is identical in the stalled and the unstalled project", not diff,
+              [(k, a.get(k), b.get(k)) for k in diff][:3])
+    if o.n is not None and ot.n is not None:
+        a, b = dict(o.n), dict(ot.n)
+        a.pop("stall", None)
+        b.pop("stall", None)
+        check("next: every field but `stall` is identical", a == b, [(k, a.get(k), b.get(k)) for k in set(a) | set(b) if a.get(k) != b.get(k)][:3])
+    ts, tt = s3_strip(o.rp.stdout, d, twin), s3_strip(ot.rp.stdout, twin, d)
+    only = [ln for ln in ts.splitlines(keepends=True) if ln.startswith(S3_TAG)]
+    rest = "".join(ln for ln in ts.splitlines(keepends=True) if not ln.startswith(S3_TAG))
+    check("the stalled status text is the unstalled text plus exactly one STALL line", len(only) == 1 and rest == tt and tt != "",
+          (only, rest[-150:], tt[-150:]))
+
+
+def s3_stop(d):
+    c = s2c()
+    payload = json.dumps({"cwd": str(d), "session_id": "s-owner", "hook_event_name": "Stop"})
+    return subprocess.run([sys.executable, str(c.ENGINE), "hook", "stop", "--host", "claude"], cwd=str(d),
+                          capture_output=True, text=True, env=c.g.ENV, timeout=60, input=payload)
+
+
+@case("CP3-T19")
+def test_CP3_T19_the_stop_hook_decides_the_same_with_and_without_a_stall():
+    c = s2c()
+    d, twin = s3_twins()
+    check("(sanity) the stalled twin really shows a stall in `next`", isinstance(s3_nj(s3_cmds(d))[1], dict), None)
+    r1, r2 = s3_stop(d), s3_stop(twin)
+    check("(sanity) the stop is held while the step is unfinished (exit 2 in both)", r1.returncode == 2 == r2.returncode,
+          (r1.returncode, r2.returncode, r1.stderr[-200:]))
+    n1 = (c._normalize_clone_text(r1.stdout, d, twin), c._normalize_clone_text(r1.stderr, d, twin))
+    n2 = (c._normalize_clone_text(r2.stdout, twin, d), c._normalize_clone_text(r2.stderr, twin, d))
+    check("the hook gives the same exit code, decision and reason text with and without the stall",
+          r1.returncode == r2.returncode and n1 == n2, (n1, n2))
+    check("no STALL text enters the hook output", "STALL" not in r1.stdout + r1.stderr, (r1.stdout + r1.stderr)[:300])
+    for label, dd in (("stalled", d), ("twin", twin)):
+        log = Path(dd) / ".ratchet" / "hook-errors.log"
+        check(f"{label}: the hook error log stays empty", (not log.exists()) or log.read_text() == "", None)
+        crashes = Path(dd) / ".ratchet" / "hook-crashes"
+        marks = [p.name for p in crashes.iterdir() if ".crash." in p.name] if crashes.is_dir() else []
+        check(f"{label}: no hook crash is recorded", not marks, marks)
+
+
+@case("CP3-T20")
+def test_CP3_T20_checking_status_and_next_is_read_only():
+    c = s2c()
+    d = s3_fx(started=100)
+    p = Path(d) / ".ratchet" / "runs" / "f" / "state.json"
+    first = s3_cmds(d)
+    check("(sanity) the stall is visible in all three outputs",
+          len(s3_lines(first.rp.stdout)) == 1 and isinstance(s3_sj(first)[1], dict) and isinstance(s3_nj(first)[1], dict), None)
+    raw, hist_len, stamp, tree = p.read_bytes(), len(s3_state(d)["history"]), s3_state(d).get("updated_at"), s2_tree_hash(d)
+    for args in (["status"], ["status", "--json"], ["next"]) * 2:
+        r = c.run(c.ENGINE, d, args)
+        check(f"`{' '.join(args)}` exits 0", r.returncode == 0, (r.returncode, r.stderr[-200:]))
+    check("state.json is byte-identical after checking", p.read_bytes() == raw, None)
+    check("no history entry was added (a warning is not a logged event)", len(s3_state(d)["history"]) == hist_len,
+          (hist_len, len(s3_state(d)["history"])))
+    check("updated_at is unchanged", s3_state(d).get("updated_at") == stamp, (stamp, s3_state(d).get("updated_at")))
+    check("state.json, config.json and the evidence folder are unchanged", s2_tree_hash(d) == tree, None)
+
+
+@case("CP3-T21")
+def test_CP3_T21_gate_counters_and_limits_are_the_same_in_a_stalled_run():
+    d, twin = s3_twins(step="adversarial", attempts2=2, adv_total=2)
+    o, ot = s3_cmds(d), s3_cmds(twin)
+    s3_exit(o, "stalled at adversarial")
+    s3_exit(ot, "twin at adversarial")
+    check("the stalled run shows its stall (it is the only difference)", len(s3_lines(o.rp.stdout)) == 1
+          and isinstance(s3_sj(o)[1], dict) and isinstance(s3_nj(o)[1], dict), (s3_lines(o.rp.stdout), s3_sj(o), s3_nj(o)))
+    if o.j is None or ot.j is None or o.n is None or ot.n is None:
+        return
+
+    def gates(j):
+        return [(x.get("id"), x.get("status"), x.get("step"), x.get("gates")) for x in j.get("checkpoints") or []]
+    check("(sanity) two review rounds are recorded on CP2's adversarial gate and in the run total",
+          o.j.get("adv_rounds_used") == 2 and ((o.j["checkpoints"][1].get("gates") or {}).get("adversarial") or {}).get("attempts") == 2,
+          (o.j.get("adv_rounds_used"), o.j["checkpoints"][1].get("gates")))
+    check("attempts, rounds and every gate entry are identical", gates(o.j) == gates(ot.j), (gates(o.j), gates(ot.j)))
+    for k in ("adv_rounds_used", "blocked_reason", "blocked_reason_plain", "accept_note", "waiting_on", "stop_ok", "phase", "step",
+              "current", "next", "approval_mode"):
+        check(f"status --json {k} is identical", o.j.get(k) == ot.j.get(k), (o.j.get(k), ot.j.get(k)))
+    a, b = dict(o.n), dict(ot.n)
+    a.pop("stall", None)
+    b.pop("stall", None)
+    check("next (apart from `stall`) is identical: action, options, limits and counters",
+          a == b, [(k, a.get(k), b.get(k)) for k in set(a) | set(b) if a.get(k) != b.get(k)][:3])
+
+
 # ================================================================================================ runner
 # Keep this block last. Later checkpoints add their own section (with @case registrations) above it.
 
