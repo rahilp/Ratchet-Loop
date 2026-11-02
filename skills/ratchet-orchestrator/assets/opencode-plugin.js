@@ -51,7 +51,10 @@
 // Edit nothing here: `ratchet.py install-hooks --host opencode` rewrites this file, and removes it with --uninstall.
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 
 const RATCHET_ENGINE = __RATCHET_ENGINE_PATH__;
 const GUARD_ARGS = "hook guard --host opencode".split(" ");
@@ -234,6 +237,41 @@ export const RatchetPlugin = async (ctx) => {
   try {
     const given = ctx && (ctx.directory || ctx.worktree);
     if (typeof given === "string" && given) project = given;
+  } catch (e) {
+    void e;
+  }
+  // Say at load that the plugin is in, and warn once when its engine file is gone (the guard, prompt and stop then do
+  // nothing, so a developer must be told). Fire-and-forget through OpenCode's log; a failed write never matters and
+  // nothing here can throw, so OpenCode still loads the plugin.
+  const logLine = (level, message) => {
+    try {
+      const sent = ctx && ctx.client && ctx.client.app && ctx.client.app.log({ body: { service: "ratchet", level, message } });
+      if (sent && typeof sent.catch === "function") sent.catch(() => {});
+    } catch (e) {
+      void e;
+    }
+  };
+  logLine("info", `Ratchet plugin loaded (engine: ${RATCHET_ENGINE})`);
+  try {
+    if (!existsSync(RATCHET_ENGINE)) {
+      let scope = "project or --scope user, whichever folder this plugin file is in";
+      try {
+        // User scope first: a file under $OPENCODE_CONFIG_DIR/plugins is the user copy even when that folder itself is
+        // called .opencode (install-hooks resolves --scope user the same way). Otherwise a .opencode/plugins folder is the project's.
+        const here = resolve(fileURLToPath(import.meta.url));
+        let inUser = false;
+        if (process.env.OPENCODE_CONFIG_DIR) {
+          const rel = relative(resolve(process.env.OPENCODE_CONFIG_DIR, "plugins"), here);
+          inUser = rel !== "" && rel !== ".." && !rel.startsWith(".." + sep) && !isAbsolute(rel);
+        }
+        scope = !inUser && /[\\/]\.opencode[\\/]plugins[\\/][^\\/]*$/.test(here) ? "project" : "user";
+      } catch (e) {
+        void e;
+      }
+      const warning = `Ratchet engine not found at ${RATCHET_ENGINE}: Ratchet's protections are not running. Re-run install-hooks --host opencode --scope ${scope}.`;
+      logLine("warn", warning);
+      console.error(warning);
+    }
   } catch (e) {
     void e;
   }

@@ -19502,6 +19502,18 @@ def cmd_doctor(args):
     found = [f"{scope}: {p}" for scope in ("project", "user")
              if _opencode_is_ours(p := opencode_plugin_path(scope, root))]
     print(f"  {OPENCODE_HOST:<8} " + ("; ".join(found) if found else "not installed"))
+    for scope in ("project", "user"):
+        plug = opencode_plugin_path(scope, root)
+        if not _opencode_is_ours(plug):
+            continue
+        try:
+            m = re.search(r'^const RATCHET_ENGINE = ("(?:[^"\\]|\\.)*");', plug.read_text(encoding="utf-8"), re.M)
+            eng = ast.literal_eval(m.group(1)).encode("utf-16", "surrogatepass").decode("utf-16") if m else ""
+        except (OSError, ValueError, SyntaxError):
+            eng = ""
+        if eng and not Path(eng).exists():
+            print(f"  ! opencode plugin ({scope}): engine {eng} is missing, so Ratchet's OpenCode protections are not "
+                  f"running. Run: install-hooks --host opencode --scope {scope}")
     hb = read_heartbeat(root)
     hb_file = root / RATCHET_DIR / "hook-heartbeat.json"
     try:

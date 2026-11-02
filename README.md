@@ -602,6 +602,8 @@ python3 tests/test_hook_list_payload.py
 python3 tests/test_hook_opencode_guard.py
 python3 tests/test_hook_opencode_install.py
 python3 tests/test_hook_opencode_prompt.py
+python3 tests/test_hook_opencode_scope.py
+python3 tests/test_hook_opencode_smoke.py
 python3 tests/test_hook_opencode_stop.py
 python3 tests/test_hook_opencode_stop_extra.py
 python3 tests/test_hooks.py
