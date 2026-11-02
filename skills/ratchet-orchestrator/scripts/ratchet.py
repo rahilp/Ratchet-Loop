@@ -89,7 +89,8 @@ from status_text import (plain_reason, blocked_options, plain_now, waiting_quest
                          exit_code_only_line, exit_code_only_note, _lines_word, done_means_table,
                          _finish_block_lines, _finish_blockers, _finish_held, _finish_legacy_note,
                          _finish_integrity_lines, _unproven_finish_lines, _accepted_lines,
-                         _apply_accepted_lines, HELD_AGAIN_PREFIX, schedule_status, stall_view, path_lines)
+                         _apply_accepted_lines, HELD_AGAIN_PREFIX, schedule_status, stall_view, path_lines,
+                         review_budget_line)
 import run_records  # noqa: E402  (module object: offers run_records.py's own live _IN_HOOK/_HOOK_ENV_ADVISORY
                      # views THIS exact, currently-executing module's own namespace -- a no-op if some OTHER
                      # ratchet.py instance in this same process already bound first; see run_records.py's own
@@ -3169,6 +3170,10 @@ def cmd_plan_summary(args):
           f"and kind of review count once, not twice; a round nobody reviewed yet costs nothing to replace; and "
           f"from round {converge_after + 1} on, a minor finding alone no longer blocks (it is still recorded, see "
           f"`ratchet.py deferred`).")
+    print(review_budget_line(plan, st, cfg))  # CP5: what the plan's review rounds add up to, next to the run-wide limit
+    pf = schedule_status(st, plan, cfg, _dt.datetime.now(_dt.timezone.utc))["line"]  # the very line `status` prints
+    if pf:
+        print(pf)
     print(f"\nQuick paths: a step whose actual changes are docs only skips its review round entirely "
           f"(the test files naming those docs run instead); once a step's review has approved, a doc edit "
           f"made after that approval re-runs the test files naming that doc instead of opening a new review "

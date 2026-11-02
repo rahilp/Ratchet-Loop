@@ -3085,6 +3085,591 @@ def test_CP4_X02_an_open_step_of_a_stopped_run_is_closed_at_updated_at_not_at_no
         check(f"[{phase}] the plain Critical path line shows {s4_dur(1800 + span)}", line is not None, s4_with(o.rp.stdout, S4_CRIT))
 
 
+# ================================================================================================ CP5 section
+# CP5: `plan-summary` shows the plan's review budget and the same projected-finish line as `status`. Black-box through
+# the CLI (plan-summary, status, status --json, next, reviewers) on small synthetic 4-step projects on DEFAULT config
+# (6 review rounds per step, 30 for the whole run), cloned per case like CP2/CP4; every time is written relative to the
+# real clock. The pinned engine at 30b2b55 is the "before" for the unchanged-behavior cases. Pinned shape (the
+# implementer chooses the wording around it):
+#   plan-summary prints, AFTER the 'Review rules:' paragraph, a line that STARTS 'Review budget:' (steps, per-step
+#     limit, the total = sum of every step's limit with a raised cap_raised_to counted instead of the default, the
+#     run-wide limit; says a round limit is not a time budget; says the run-wide limit stops the run first when the
+#     total is bigger than it; mentions a raised step limit) and, while a step is left, the one 'Projected finish:'
+#     line `status` prints (the same helper: character for character). Both prefixes are dropped by the shared
+#     drop_schedule_output in tests/_tmp.py, so the plan-summary byte pins (cp8) stay byte-identical otherwise.
+# Two unplanned cases (director-ordered fixes folded into this step): CP5-X01 (the schemas.md section 9 `schedule`
+# example lists the same `fields` / `sources` lists as the engine writes) and CP5-X02 (a stopped run does not say
+# 'counted so far' and ends its review-round line as a complete sentence).
+
+S5_BUDGET = "Review budget:"
+S5_RULES = "Review rules:"
+S5_LANE_BASE = "87851f48b9482c3f47f27a14d609a033925a92da"   # the commit CP5 started from (CP4's landing commit)
+S5_NO_DEADLINE = re.compile(r"deadline|guarantee|will finish by", re.I)
+S5_NOT_TIME = re.compile(r"\bnot\b[^.;]{0,60}\b(time|how long)\b|\b(time|how long)\b[^.;]{0,60}\bnot\b", re.I)
+S5_STOPS_FIRST = re.compile(r"\bstop\w*\b[^.;]{0,80}\bfirst\b|\bfirst\b[^.;]{0,80}\bstop", re.I)
+S5_HHMM = re.compile(r"\b\d\d:\d\d\b")
+S5_PINS = ("test_modularize_cp4.py", "test_modularize_cp5.py", "test_modularize_cp6.py", "test_modularize_cp7.py",
+           "test_modularize_cp8.py")
+
+
+def s5_proj(key, cps=4, config=None, approve=True):
+    """Registers (once) a throwaway project under `key` in the shared base table and returns the key: s2_fx(base=key)
+    and s2_base(key) then clone it. Default config unless `config` (['name=value', ...]) is given."""
+    if key not in _S2:
+        g = s2c().g
+        d = g.project(f"s5{key}", cps=cps, config=config or [])
+        if approve:
+            g.approve_plan(d)
+        _S2[key] = d
+    return key
+
+
+def s5_a4():
+    return s5_proj("s5a4")
+
+
+def s5_p4():
+    return s5_proj("s5p4", approve=False)
+
+
+def s5_ps(d, engine=None):
+    c = s2c()
+    return c.run(engine or c.ENGINE, d, ["plan-summary"])
+
+
+def s5_with(text, prefix):
+    return [ln for ln in text.splitlines() if ln.startswith(prefix)]
+
+
+def s5_ok(r, label):
+    check(f"{label}: plan-summary exits 0 with no traceback", r.returncode == 0 and "Traceback" not in r.stderr,
+          (r.returncode, r.stderr[-300:]))
+
+
+def s5_para(text, prefix=S5_BUDGET):
+    """The 'Review budget:' text: its line and any lines under it up to a blank line or a 'Projected finish:' line.
+    None when the text has no line starting with `prefix`; a second such line is not folded in."""
+    out, on = [], False
+    for ln in text.splitlines():
+        if ln.startswith(prefix) and not on:
+            on = True
+        elif on and (not ln.strip() or ln.startswith("Projected finish:") or ln.startswith(prefix)):
+            break
+        if on:
+            out.append(ln)
+    return "\n".join(out) if on else None
+
+
+def s5_budget(r, label):
+    """The budget text of a plan-summary result (None, with a failed check, unless there is exactly one such line)."""
+    s5_ok(r, label)
+    lines = s5_with(r.stdout, S5_BUDGET)
+    check(f"{label}: plan-summary prints exactly one line starting 'Review budget:'", len(lines) == 1, lines)
+    if len(lines) != 1:
+        return None
+    return s5_para(r.stdout)
+
+
+def s5_after_rules(text, prefix):
+    """Whether the first line starting `prefix` comes after the line starting 'Review rules:'."""
+    lines = text.splitlines()
+    rules = [i for i, ln in enumerate(lines) if ln.startswith(S5_RULES)]
+    at = [i for i, ln in enumerate(lines) if ln.startswith(prefix)]
+    return bool(rules) and bool(at) and at[0] > rules[0]
+
+
+def s5_step_count(text):
+    return len([ln for ln in text.splitlines() if re.match(r"\d+\. ", ln)])
+
+
+def s5_pf(text):
+    return s5_with(text, "Projected finish:")
+
+
+def s5_num_in(para, *nums):
+    return [n for n in nums if not s2_has_num(para, n)]
+
+
+@case("CP5-T01")
+def test_CP5_T01_plan_summary_shows_the_plans_review_round_budget_next_to_the_run_wide_limit():
+    d = s2_base(s5_a4())
+    r = s5_ps(d)
+    para = s5_budget(r, "approved 4-step plan")
+    steps = s5_step_count(r.stdout)
+    check("(sanity) plan-summary lists the 4 steps", steps == 4, steps)
+    if para is None:
+        return
+    low = para.lower()
+    check("the budget line comes after the 'Review rules:' paragraph", s5_after_rules(r.stdout, S5_BUDGET),
+          [ln[:40] for ln in r.stdout.splitlines() if ln.startswith((S5_RULES, S5_BUDGET))])
+    check("the budget gives 24 rounds in total (4 steps x 6)", s2_has_num(para, 24), para)
+    check("the budget gives the run-wide limit 30", s2_has_num(para, 30), para)
+    check("the step count in the budget is the 4 steps listed above it", s2_has_num(para, steps) and "step" in low, para)
+    check("the budget says it is the run-wide limit", re.search(r"run|whole|overall|all steps", low) is not None, para)
+    check("24 rounds are under the run-wide 30, so the budget does not say the run-wide limit stops the run first",
+          S5_STOPS_FIRST.search(para) is None, para)
+
+
+@case("CP5-T02")
+def test_CP5_T02_the_budget_line_says_plainly_that_a_round_limit_is_not_a_time_budget():
+    r = s5_ps(s2_base(s5_a4()))
+    para = s5_budget(r, "approved 4-step plan")
+    if para is None:
+        return
+    low = para.lower()
+    body = low[len(S5_BUDGET):]
+    check("the text is about review rounds and their limit", "round" in body and re.search(r"limit|cap|allow", body) is not None,
+          para)
+    check("it says in plain words that a round limit is not how long the rounds take or how much time is left",
+          S5_NOT_TIME.search(body) is not None, para)
+    check("it does not use the word 'deadline'", "deadline" not in low, para)
+    check("it promises no finish time (no clock time, no 'finish by')",
+          S2_CLOCK.search(para) is None and S5_HHMM.search(para) is None and S5_NO_DEADLINE.search(para) is None, para)
+
+
+@case("CP5-T03")
+def test_CP5_T03_changed_limits_change_the_budget_numbers():
+    key = s5_proj("s5l3", config=["max_adversarial_rounds=3", "max_adversarial_rounds_run=9"])
+    d = s2_base(key)
+    p = Path(d) / ".ratchet" / "config.json"
+    before = p.read_bytes()
+    r = s5_ps(d)
+    para = s5_budget(r, "limits 3 and 9")
+    if para is not None:
+        check("the budget shows 12 rounds (4 x 3) and the run-wide limit 9", not s5_num_in(para, 12, 9), para)
+        check("it does not show the defaults 24 and 30",
+              not s2_has_num(para, 24) and not s2_has_num(para, 30), para)
+    cf = json.loads(p.read_text())
+    check("the config values read back unchanged (3 and 9)",
+          cf.get("max_adversarial_rounds") == 3 and cf.get("max_adversarial_rounds_run") == 9, cf)
+    check(".ratchet/config.json is byte-identical after plan-summary", p.read_bytes() == before, None)
+    # the default plan right beside it still says 24 and 30
+    para0 = s5_budget(s5_ps(s2_base(s5_a4())), "default limits")
+    check("with the default limits the same plan shows 24 and 30 (the numbers follow the config)",
+          para0 is not None and not s5_num_in(para0, 24, 30), para0)
+
+
+@case("CP5-T04")
+def test_CP5_T04_a_one_step_plan_reports_a_budget_of_one_step():
+    d = s2_base(s5_proj("s5one", cps=1))
+    r = s5_ps(d)
+    para = s5_budget(r, "1-step plan")
+    check("(sanity) plan-summary lists 1 step", s5_step_count(r.stdout) == 1, s5_step_count(r.stdout))
+    if para is None:
+        return
+    low = para.lower()
+    check("the budget says 1 step, not '1 steps'", re.search(r"\b1 step\b", low) is not None
+          and re.search(r"\b1 steps\b", low) is None, para)
+    check("it gives 6 rounds in total and the run-wide limit 30", not s5_num_in(para, 6, 30), para)
+    check("it does not say 0 steps or 0 rounds", re.search(r"\b0 (steps?|rounds?)\b", low) is None, para)
+    check("6 rounds are under the run-wide 30, so it does not say the run-wide limit stops the run first",
+          S5_STOPS_FIRST.search(para) is None, para)
+
+
+@case("CP5-T05")
+def test_CP5_T05_a_raised_limit_on_one_step_is_reflected_in_the_budget():
+    def raise_cap(st):
+        st["checkpoints"]["CP2"]["gates"]["adversarial"]["cap_raised_to"] = 9
+    d = s2_fx(cur=M(1), base=s5_a4(), edit=raise_cap)
+    check("(fixture) step 2 really has cap_raised_to 9 in state.json",
+          s3_state(d)["checkpoints"]["CP2"]["gates"]["adversarial"].get("cap_raised_to") == 9, None)
+    para = s5_budget(s5_ps(d), "step 2 raised to 9")
+    if para is None:
+        return
+    low = para.lower()
+    check("the budget total is 27 (6 + 9 + 6 + 6)", s2_has_num(para, 27), para)
+    check("it mentions that a step has a raised limit", "raised" in low or "raise" in low, para)
+    check("the run-wide limit 30 is still shown", s2_has_num(para, 30), para)
+    check("27 rounds are under the run-wide 30, so it does not say the run-wide limit stops the run first",
+          S5_STOPS_FIRST.search(para) is None, para)
+    # without the raised cap the same plan has no such mention
+    plain = s5_budget(s5_ps(s2_base(s5_a4())), "no raised step")
+    check("with no raised limit the budget does not mention a raised limit",
+          plain is not None and "raise" not in plain.lower(), plain)
+
+
+@case("CP5-T06")
+def test_CP5_T06_per_step_budget_bigger_than_the_run_wide_limit_is_called_out():
+    d = s2_base(s5_proj("s5six", cps=6))
+    r = s5_ps(d)
+    check("(sanity) plan-summary lists 6 steps", s5_step_count(r.stdout) == 6, s5_step_count(r.stdout))
+    para = s5_budget(r, "6-step plan")
+    if para is None:
+        return
+    low = para.lower()
+    check("the budget shows both 36 and the run-wide limit 30", not s5_num_in(para, 36, 30), para)
+    check("it says in plain words that the run-wide limit is the one that stops the run first",
+          S5_STOPS_FIRST.search(para) is not None and re.search(r"run-?wide|whole run|entire run|for the run|run's", low) is not None,
+          para)
+
+
+@case("CP5-T07")
+def test_CP5_T07_before_any_step_has_finished_plan_summary_says_there_is_no_time_estimate_yet():
+    for label, d in (("approved, nothing finished", s2_fx(cur=M(1), base=s5_a4())),
+                     ("still in planning (not approved)", s2_base(s5_p4()))):
+        r = s5_ps(d)
+        s5_ok(r, label)
+        st = s2c().run(s2c().ENGINE, d, ["status"])
+        lines = s5_pf(r.stdout)
+        check(f"{label}: plan-summary prints exactly one 'Projected finish:' line", len(lines) == 1, lines)
+        if len(lines) != 1:
+            continue
+        line = lines[0]
+        low = line.lower()
+        check(f"{label}: the line says there is no estimate yet", "no estimate yet" in low, line)
+        check(f"{label}: no clock time, range or 'finish by' is printed",
+              S2_CLOCK.search(line) is None and S5_HHMM.search(line) is None and "between" not in low
+              and "finish by" not in low, line)
+        check(f"{label}: it counts the 4 steps left", s2_has_num(line, 4) and "left" in low, line)
+        check(f"{label}: it is the very wording `status` uses", s5_pf(st.stdout) == lines, (s5_pf(st.stdout), lines))
+        check(f"{label}: it sits after the 'Review rules:' paragraph", s5_after_rules(r.stdout, "Projected finish:"), None)
+
+
+@case("CP5-T08")
+def test_CP5_T08_after_a_step_finishes_plan_summary_shows_statuss_projected_finish_line_word_for_word():
+    c = s2c()
+    for label, d, left, rough in (
+            ("1 finished (40m), 3 left", s2_fx(spans=(M(40),), attempts=(1,), cur=M(5), adv_total=1, base=s5_a4()), 3, True),
+            ("3 finished, 1 left", s2_fx(spans=(M(20), M(40), M(60)), attempts=(1, 2, 1), cur=M(1), adv_total=4,
+                                         base=s5_a4()), 1, False)):
+        for _ in range(3):  # the two calls can straddle a 5-minute mark of the rounded finish
+            r = s5_ps(d)
+            st = c.run(c.ENGINE, d, ["status"])
+            if s5_pf(r.stdout) == s5_pf(st.stdout):
+                break
+        s5_ok(r, label)
+        a, b = s5_pf(r.stdout), s5_pf(st.stdout)
+        check(f"{label}: plan-summary prints exactly one 'Projected finish:' line", len(a) == 1, a)
+        check(f"{label}: status prints exactly one 'Projected finish:' line", len(b) == 1, b)
+        if len(a) != 1 or len(b) != 1:
+            continue
+        line, low = a[0], a[0].lower()
+        check(f"{label}: the plan-summary line is identical, character for character, to status's", a == b, (a, b))
+        check(f"{label}: it gives a UTC clock time", S2_CLOCK.search(line) is not None and "UTC" in line, line)
+        check(f"{label}: it gives a range", "between" in low, line)
+        check(f"{label}: it names the state.json fields it came from", "state.json" in low and "checkpoints[]" in line, line)
+        check(f"{label}: it counts {left} steps left", s2_has_num(line, left) and "left" in low, line)
+        if rough:
+            check(f"{label}: it is labelled rough", "rough" in low, line)
+        else:
+            check(f"{label}: it is labelled an estimate and not rough", "estimate" in low and "rough" not in low, line)
+        check(f"{label}: it sits after the 'Review rules:' paragraph", s5_after_rules(r.stdout, "Projected finish:"), None)
+
+
+@case("CP5-T09")
+def test_CP5_T09_plan_summary_shows_no_projected_finish_when_no_step_is_left():
+    d = s2_fx(spans=(M(60),) * 4, attempts=(1,) * 4, phase="awaiting_final_review", base=s5_a4())
+    c = s2c()
+    st = c.run(c.ENGINE, d, ["status"])
+    check("(sanity) status shows no 'Projected finish:' line when every step is done", s5_pf(st.stdout) == [], s5_pf(st.stdout))
+    r = s5_ps(d)
+    s5_ok(r, "every step done")
+    check("plan-summary prints no 'Projected finish:' line", s5_pf(r.stdout) == [], s5_pf(r.stdout))
+    check("and no line with a clock time after the 'Review rules:' paragraph",
+          not any(S2_CLOCK.search(ln) for ln in r.stdout.splitlines()), None)
+    para = s5_budget(r, "every step done")
+    if para is not None:
+        check("the budget line is still shown, with 24 and 30", not s5_num_in(para, 24, 30), para)
+
+
+@case("CP5-T10")
+def test_CP5_T10_plan_summary_does_not_claim_a_hard_deadline_anywhere():
+    c = s2c()
+    fx = (("0 finished", s2_fx(cur=M(1), base=s5_a4())),
+          ("1 finished", s2_fx(spans=(M(40),), attempts=(1,), cur=M(5), adv_total=1, base=s5_a4())),
+          ("3 finished", s2_fx(spans=(M(20), M(40), M(60)), attempts=(1, 2, 1), cur=M(1), adv_total=4, base=s5_a4())))
+    with s2_pinned("cp5t10") as pin:
+        for label, d in fx:
+            d1, d2 = c.clone(d), c.clone(d)
+            r1, r2 = c.run(pin, d1, ["plan-summary"]), c.run(c.ENGINE, d2, ["plan-summary"])
+            old = set(c._normalize_clone_text(r1.stdout, d1, d2).splitlines())
+            new = [ln for ln in c._normalize_clone_text(r2.stdout, d2, d1).splitlines() if ln not in old]
+            check(f"{label}: plan-summary exits 0", r2.returncode == 0, r2.stderr[-200:])
+            check(f"{label}: the built engine added a 'Review budget:' line (so there is something to read)",
+                  any(ln.startswith(S5_BUDGET) for ln in new), new)
+            for ln in new:
+                check(f"{label}: new line has no 'deadline', 'guarantee' or 'will finish by': {ln[:50]!r}",
+                      S5_NO_DEADLINE.search(ln) is None, ln)
+                times = S5_HHMM.findall(ln)
+                check(f"{label}: every clock time in the new line is UTC: {ln[:50]!r}",
+                      len(times) == len(S2_CLOCK.findall(ln)), ln)
+                if ln.startswith("Projected finish:") and times:
+                    check(f"{label}: a shown finish time is labelled rough or an estimate",
+                          re.search(r"rough|estimate", ln, re.I) is not None, ln)
+            if label == "0 finished":
+                check("0 finished: no clock time in any new line", not any(S5_HHMM.search(ln) for ln in new), new)
+
+
+@case("CP5-T11")
+def test_CP5_T11_everything_plan_summary_printed_before_is_still_there_byte_for_byte():
+    c = s2c()
+    fx = (("in planning", s2_base(s5_p4())), ("approved", s2_base(s5_a4())),
+          ("1 step finished", s2_fx(spans=(M(40),), attempts=(1,), cur=M(5), adv_total=1, base=s5_a4())))
+    with s2_pinned("cp5t11") as pin:
+        for label, d in fx:
+            r1, r2, o1, o2 = s2_pair(d, ["plan-summary"], pin)
+            check(f"{label}: plan-summary exits with the same code (0) on both engines",
+                  r1.returncode == r2.returncode == 0, (r1.returncode, r2.returncode, r2.stderr[-200:]))
+            check(f"{label}: stdout is byte-identical once the 'Review budget:' / 'Projected finish:' lines are dropped",
+                  o1 == o2, (o1[-250:], o2[-250:]))
+            check(f"{label}: the built plan-summary really prints a 'Review budget:' line (so the normalizer is exercised)",
+                  any(ln.startswith(S5_BUDGET) for ln in r2.stdout.splitlines()), r2.stdout[-300:])
+            check(f"{label}: without the normalizer the raw outputs differ",
+                  c._normalize_clone_text(r2.stdout, d, d) != c._normalize_clone_text(r1.stdout, d, d), None)
+            for marker in ("Review rules:", "Quick paths:", "Models:"):
+                check(f"{label}: '{marker}' is still printed", any(ln.startswith(marker) for ln in r2.stdout.splitlines()), None)
+
+
+def s5_removed(path):
+    d = subprocess.run(["git", "diff", "--numstat", S5_LANE_BASE, "--", path], cwd=str(ROOT), capture_output=True,
+                       text=True, timeout=60)
+    parts = d.stdout.split()
+    return d.returncode, (int(parts[1]) if len(parts) >= 3 and parts[1].isdigit() else (0 if not d.stdout.strip() else None))
+
+
+@case("CP5-T12")
+def test_CP5_T12_the_pinned_output_tests_only_gained_a_normalizer_no_existing_check_changed():
+    c = s2c()
+    drop = _tmp.drop_schedule_output
+    check("the byte-pin suite uses the one shared normalizer from tests/_tmp.py",
+          getattr(c, "drop_schedule_output", None) is drop, getattr(c, "drop_schedule_output", None))
+    old = ("Plan: x (4 steps)\n\n1. Step 1\n   Done when: works\n\n"
+           "Review rules: after round 1, only the kind of review that still has an open blocker is asked again.\n\n"
+           "Quick paths: a step whose actual changes are docs only skips its review round entirely.\n\nModels: m\n")
+    added = "Review budget: 4 steps x 6 rounds = 24, run-wide 30.\nProjected finish: 4 steps left; no estimate yet.\n"
+    withnew = old.replace("\n\nQuick paths:", "\n" + added + "\nQuick paths:")
+    check("(sanity) the sample really differs once the two lines are added", withnew != old, None)
+    check("a 'Review budget:' line and a 'Projected finish:' line are dropped, everything else stays exactly",
+          drop(withnew) == old, drop(withnew))
+    only_budget = old.replace("Models: m\n", "Review budget: x\nModels: m\n")
+    check("a 'Review budget:' line alone is dropped", drop(only_budget) == old, drop(only_budget))
+    near = ("The review budget: is mid-sentence\nNote: Review budget: mid-line\n Review budget: indented\n"
+            "Review  budget: two spaces\nreview budget: lower case\nReview budgets: plural\nthe budget is 24 rounds\n"
+            "Projected  finish: two spaces\n")
+    check("near-miss lines that only mention 'budget', mid-sentence, indented or in another case, are all kept",
+          drop(near) == near, drop(near))
+    check("a pinned output with an extra non-budget line is NOT equal after normalizing",
+          drop(old + "Something new\n") != old, None)
+    # the real thing: every line the built plan-summary adds is one the normalizer drops, and only those
+    d = s2_base(s5_a4())
+    raw = s5_ps(d).stdout
+    cut = drop(raw)
+    gone = [ln for ln in raw.splitlines() if ln not in cut.splitlines()]
+    check("the built plan-summary prints a 'Review budget:' line", any(ln.startswith(S5_BUDGET) for ln in gone), raw[-300:])
+    check("every line the normalizer takes out of the real output starts with one of the two prefixes",
+          bool(gone) and all(ln.startswith((S5_BUDGET, "Projected finish:")) for ln in gone), gone)
+    if not S2_RUN_DIR.exists():
+        check("(not in this lane's run: the diff-scope check is skipped, as cp8's own T17 does)", True)
+        return
+    r = subprocess.run(["git", "cat-file", "-e", S5_LANE_BASE + "^{commit}"], cwd=str(ROOT), capture_output=True)
+    if r.returncode != 0:
+        check("(the CP5 base commit is not in this checkout: the diff-scope check is skipped)", True)
+        return
+    for name in S5_PINS:
+        rc, removed = s5_removed("tests/" + name)
+        check(f"git diff of tests/{name} against its CP5 base removes no line (additions only)", rc == 0 and removed == 0,
+              (rc, removed))
+
+
+@case("CP5-T13")
+def test_CP5_T13_asking_for_plan_summary_changes_nothing_in_the_run_and_no_other_output():
+    c = s2c()
+    d = s2_fx(spans=(M(40),), attempts=(1,), cur=M(5), adv_total=1, base=s5_a4())
+    sp = Path(d) / ".ratchet" / "runs" / "f" / "state.json"
+    bytes0, tree0 = sp.read_bytes(), s2_tree_hash(d)
+    cfg0 = (Path(d) / ".ratchet" / "config.json").read_bytes()
+    rp0, rj0, rn0 = (c.run(c.ENGINE, d, a) for a in (["status"], ["status", "--json"], ["next"]))
+    j0, n0 = s3_json(rj0.stdout), s3_json(rn0.stdout)
+    check("(sanity) status --json and next parse before", j0 is not None and n0 is not None, None)
+    for _ in range(3):  # the two plan-summary calls can straddle a 5-minute mark of the rounded finish
+        p1, p2 = s5_ps(d), s5_ps(d)
+        if p1.stdout == p2.stdout:
+            break
+    s5_ok(p1, "first call")
+    s5_ok(p2, "second call")
+    check("plan-summary prints a 'Review budget:' line and a 'Projected finish:' line on this run",
+          len(s5_with(p1.stdout, S5_BUDGET)) == 1 and len(s5_pf(p1.stdout)) == 1, p1.stdout[-300:])
+    check("plan-summary output is the same both times (same projected-finish line)", p1.stdout == p2.stdout and bool(p1.stdout), None)
+    check("state.json is byte-identical", sp.read_bytes() == bytes0, None)
+    check("state.json, evidence and config are unchanged (tree hash)", s2_tree_hash(d) == tree0, None)
+    check(".ratchet/config.json is byte-identical", (Path(d) / ".ratchet" / "config.json").read_bytes() == cfg0, None)
+    rp1, rj1, rn1 = (c.run(c.ENGINE, d, a) for a in (["status"], ["status", "--json"], ["next"]))
+    j1, n1 = s3_json(rj1.stdout), s3_json(rn1.stdout)
+    if j0 is not None and j1 is not None:
+        a, b = dict(j0), dict(j1)
+        a.pop("schedule", None)
+        b.pop("schedule", None)
+        diff = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+        check("status --json: every existing key has the same value as before", not diff, [(k, a.get(k), b.get(k)) for k in diff][:3])
+    if n0 is not None and n1 is not None:
+        a, b = dict(n0), dict(n1)
+        a.pop("stall", None)
+        b.pop("stall", None)
+        diff = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+        check("next: every existing field has the same value as before", not diff, [(k, a.get(k), b.get(k)) for k in diff][:3])
+    check("plain status is the same as before once the schedule lines are dropped",
+          _tmp.drop_schedule_output(rp0.stdout) == _tmp.drop_schedule_output(rp1.stdout), None)
+    check("all three commands exit 0 after", rp1.returncode == rj1.returncode == rn1.returncode == 0,
+          (rp1.returncode, rj1.returncode, rn1.returncode))
+
+
+@case("CP5-T14")
+def test_CP5_T14_the_review_limits_themselves_still_act_as_before():
+    # The pinned engine cannot be driven through `reviewers` (it borrows the current run_records.py), so the
+    # pre-change behavior is pinned as fixed expectations read from it: a step that has used the per-step limit (6) is
+    # blocked with the 6-rounds-used reason and exit 2, a step one round short of it opens a round.
+    c = s2c()
+    base = s2_base(s5_a4())
+    for att, want_rc, want_phase in ((6, 2, "blocked"), (5, 0, "building")):
+        d = c.clone(base)
+
+        def used(st, att=att):
+            cp = st["checkpoints"]["CP1"]
+            cp["step"] = "adversarial"
+            cp["gates"]["adversarial"]["attempts"] = att
+            st["adv_rounds_total"] = att
+        c.mutate(d, used)
+        para = s5_budget(s5_ps(d), f"{att} rounds used")
+        check(f"[{att} used] plan-summary shows the budget (6 per step, 24 in all, run-wide 30) before the round is asked for",
+              para is not None and not s5_num_in(para, 6, 24, 30), para)
+        r = c.run(c.ENGINE, d, ["reviewers", "CP1", "--json"])
+        st = s3_state(d)
+        check(f"[{att} used] the next round request exits {want_rc} with no traceback",
+              r.returncode == want_rc and "Traceback" not in r.stderr, (r.returncode, r.stderr[-300:]))
+        check(f"[{att} used] the run is {want_phase} afterwards", st["phase"] == want_phase, st["phase"])
+        check(f"[{att} used] the step ends on 6 attempts and the run on 6 rounds (round 6 opens at 5 used; at 6 used nothing opens)",
+              (st["checkpoints"]["CP1"]["gates"]["adversarial"].get("attempts"), st.get("adv_rounds_total")) == (6, 6),
+              (st["checkpoints"]["CP1"]["gates"]["adversarial"].get("attempts"), st.get("adv_rounds_total")))
+        if att == 6:
+            reason = "CP1: 6 adversarial rounds used without approval \u2014 needs a human/director decision."
+            check("[6 used] the refusal message and the block reason are the 6-rounds-used ones",
+                  reason in r.stderr and st.get("blocked_reason") == reason, (r.stderr[-300:], st.get("blocked_reason")))
+        else:
+            check("[5 used] a review round was opened for CP1", s3_json(r.stdout) is not None
+                  and s3_json(r.stdout).get("checkpoint") == "CP1", r.stdout[:200])
+        rc = c.run(c.ENGINE, d, ["config"])
+        cf = s3_json(rc.stdout) or {}
+        check(f"[{att} used] max_adversarial_rounds and max_adversarial_rounds_run still read 6 and 30",
+              (cf.get("max_adversarial_rounds"), cf.get("max_adversarial_rounds_run")) == (6, 30),
+              (cf.get("max_adversarial_rounds"), cf.get("max_adversarial_rounds_run")))
+
+
+@case("CP5-T15")
+def test_CP5_T15_plan_summary_without_a_plan_still_fails_the_same_way():
+    c = s2c()
+    d = s2_base("noplan")
+    with s2_pinned("cp5t15") as pin:
+        r1, r2 = c.run(pin, c.clone(d), ["plan-summary"]), c.run(c.ENGINE, c.clone(d), ["plan-summary"])
+    check("(sanity) the pinned engine refuses with 'There is no plan yet'",
+          r1.returncode != 0 and "There is no plan yet" in r1.stdout + r1.stderr, (r1.returncode, r1.stderr[-200:]))
+    check("the built plan-summary exits non-zero", r2.returncode != 0, r2.returncode)
+    check("it exits with the pinned engine's code", r2.returncode == r1.returncode, (r1.returncode, r2.returncode))
+    check("it says 'There is no plan yet'", "There is no plan yet" in r2.stdout + r2.stderr, r2.stderr[-200:])
+    check("stdout and stderr are the pinned engine's, byte for byte", (r2.stdout, r2.stderr) == (r1.stdout, r1.stderr),
+          ((r1.stdout, r1.stderr), (r2.stdout, r2.stderr)))
+    check("it prints no 'Review budget:' or 'Projected finish:' line",
+          "Review budget:" not in r2.stdout + r2.stderr and "Projected finish:" not in r2.stdout + r2.stderr, None)
+
+
+def s5_ex_lists(v, path=""):
+    """Every (dotted path, list of names) under a `fields` or `sources` key of a nested value."""
+    if isinstance(v, dict):
+        for k, x in v.items():
+            p = f"{path}.{k}" if path else k
+            if k in ("fields", "sources") and isinstance(x, list):
+                yield p, x
+            else:
+                yield from s5_ex_lists(x, p)
+
+
+def s5_at(v, path):
+    for k in path.split("."):
+        v = v.get(k) if isinstance(v, dict) else None
+    return v
+
+
+@case("CP5-X01")
+def test_CP5_X01_schemas_section_9_schedule_example_lists_the_same_fields_the_engine_writes():
+    try:
+        doc_text = S2_SCHEMAS.read_text(encoding="utf-8")
+    except OSError as e:
+        check("schemas.md is readable", False, str(e))
+        return
+    m = re.search(r"^## 9\. .*?(?=^## 10\. )", doc_text, re.S | re.M)
+    check("(fixture sanity) schemas.md has a section 9", m is not None)
+    if m is None:
+        return
+    blk = re.search(r"```json\n(.*?)```", m.group(0), re.S)
+    try:
+        ex = json.loads(blk.group(1)) if blk else None
+    except ValueError:
+        ex = None
+    check("the section 9 status --json example parses and has a `schedule` object",
+          isinstance(ex, dict) and isinstance(ex.get("schedule"), dict), None)
+    if not (isinstance(ex, dict) and isinstance(ex.get("schedule"), dict)):
+        return
+    # a live building run of the example's shape: two finished steps, one open current step, a step with 3 rounds
+    o = s4_cmds(s4_fx())
+    s3_exit(o, "live fixture")
+    real = o.j.get("schedule") if isinstance(o.j, dict) else None
+    check("(fixture sanity) the live schedule has review-round data and a moved finish",
+          isinstance(real, dict) and isinstance(real.get("review_round"), dict)
+          and real["review_round"].get("enough_data") is True and real["review_round"].get("finish_if_one_more"),
+          (real or {}).get("review_round"))
+    if not isinstance(real, dict):
+        return
+    lists = list(s5_ex_lists(ex["schedule"]))
+    paths = [p for p, _ in lists]
+    for need in ("critical_path.fields", "outside.fields", "review_round.fields", "sources"):
+        check(f"the example shows a {need} list", need in paths, paths)
+    for p, got in lists:
+        want = s5_at(real, p)
+        check(f"the example's schedule.{p} equals the list the engine writes for a live run of that shape",
+              isinstance(want, list) and got == want, ("example:", got, "engine:", want))
+
+
+@case("CP5-X02")
+def test_CP5_X02_a_stopped_run_does_not_say_counted_so_far_and_ends_its_round_line_as_a_sentence():
+    # created 300m ago; CP1 290..260 with 2 rounds; CP2 started 250m ago, 3 rounds, never completed; run stopped 180m ago.
+    steps = ((290, 260, (285, 270)), (250, None, (240, 230, 215)))
+    for phase in ("cancelled", "done"):
+        def stop(st):
+            st["updated_at"] = iso(datetime.now(timezone.utc) - M(180))
+
+        o = s4_cmds(s4_fx(created=300, steps=steps, phase=phase, edit=stop))
+        label = f"{phase} run with an open step"
+        s3_exit(o, label)
+        sch, cp, ou, rr = s4_parts(o, label)
+        check(f"[{phase}] (sanity) the schedule is the stopped-run one: no steps left to project, review rounds measured",
+              sch.get("steps_left") in (None, 0) and rr.get("enough_data") is True and s4_near(rr.get("seconds"), 800), (sch.get("steps_left"), rr))
+        chain = s4_chain_line(o.rp.stdout, s4_dur(6000))
+        check(f"[{phase}] the Critical path line carries the stopped total 1h 40m", chain is not None,
+              s4_with(o.rp.stdout, S4_CRIT))
+        if chain is not None:
+            check(f"[{phase}] the chain line does not say the current step is 'counted so far' (the step was closed at updated_at)",
+                  "so far" not in chain.lower(), chain)
+        more = s4_round_line(o.rp.stdout)
+        check(f"[{phase}] there is one 'One more review round:' line", more is not None, s4_with(o.rp.stdout, S4_ROUND))
+        if more is not None:
+            low = more.lower()
+            check(f"[{phase}] it still gives the measured cost of a round (13m)", s4_dur(800) in more, more)
+            check(f"[{phase}] it has no dangling 'finish it would move' fragment", "finish it would move" not in low
+                  and "no estimate yet of" not in low, more)
+            check(f"[{phase}] it does not promise a moved projected finish for a run that has stopped",
+                  "would move the projected finish" not in low, more)
+            check(f"[{phase}] it is a complete sentence", more.rstrip().endswith((".", "!", ")")) and
+                  not more.rstrip().endswith(("would move.", "it would move", ";")), more)
+    # a live run still counts its current step "so far" and still says what a round would do to the finish
+    o = s4_cmds(s4_fx())
+    s3_exit(o, "live run")
+    chain = s4_chain_line(o.rp.stdout)
+    check("[live] the chain line still says the current step is 'counted so far'",
+          chain is not None and "counted so far" in chain, s4_with(o.rp.stdout, S4_CRIT))
+    more = s4_round_line(o.rp.stdout)
+    check("[live] the round line still says one more round would move the projected finish",
+          more is not None and "would move the projected finish" in more, more)
+
+
 # ================================================================================================ runner
 # Keep this block last. Later checkpoints add their own section (with @case registrations) above it.
 

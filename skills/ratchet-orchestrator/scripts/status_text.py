@@ -912,7 +912,10 @@ def path_lines(sched, phase) -> list:
     else:
         chain = f"Critical path: {dur(cp['seconds'])} in the steps (each from its start to its finish"
         if any(s["started"] and not s["finished"] and not s["unreadable"] for s in steps):
-            chain += ", the current step counted so far"
+            if phase in ("done", "cancelled"):  # the open step was closed at updated_at, not counted up to now
+                chain += ", an unfinished step counted up to when the run stopped"
+            else:
+                chain += ", the current step counted so far"
         chain += ")"
         if cp.get("unreadable"):
             chain += f"; time unreadable, left out: {', '.join(cp['unreadable'])}"
@@ -934,9 +937,43 @@ def path_lines(sched, phase) -> list:
             more += f"one more round would move the projected finish to {rr['finish_if_one_more']}."
         elif sched.get("steps_left") == 0:
             more += "no steps are left to build, so there is no finish to move."
+        elif phase in ("done", "cancelled"):
+            more += "the run has stopped, so there is no finish to move."
         else:
             more += "no estimate yet of the finish it would move."
     return [chain, outside, more]
+
+
+def review_budget_line(plan, st, cfg) -> str:
+    """The one plain 'Review budget:' line `plan-summary` prints: how many steps the plan has, how many review rounds
+    each may use (config max_adversarial_rounds; a step's own gates.adversarial.cap_raised_to counted instead where
+    it is set), the total, and the run-wide limit (max_adversarial_rounds_run). Says a round limit is not a time
+    budget, and that the run-wide limit stops the run first when the total is bigger than it. Pure."""
+    cps = plan.get("checkpoints") if isinstance(plan, dict) else None
+    cps = [c for c in (cps if isinstance(cps, list) else []) if isinstance(c, dict)]
+    cfg = cfg if isinstance(cfg, dict) else {}
+    per = _sched_int(cfg.get("max_adversarial_rounds"))
+    run = _sched_int(cfg.get("max_adversarial_rounds_run"))
+    state = (st.get("checkpoints") if isinstance(st, dict) else None) or {}
+    caps, raised = [], []
+    for c in cps:
+        sc = state.get(c.get("id")) if isinstance(state, dict) else None
+        adv = ((sc or {}).get("gates") or {}).get("adversarial") if isinstance(sc, dict) else None
+        r = _sched_int(adv.get("cap_raised_to")) if isinstance(adv, dict) else None
+        if r:
+            raised.append((c.get("id"), r))
+        caps.append(r or per or 0)
+    n = len(cps)
+    total = sum(caps)
+    head = f"Review budget: {n} {'step' if n == 1 else 'steps'}, each allowed up to {per} review rounds"
+    if raised:
+        head += "; " + ", ".join(f"{i} has a raised limit of {r}" for i, r in raised)
+    head += f", {total} rounds in all; the whole run is allowed {run} rounds"
+    tail = ""
+    if run is not None and total > run:
+        tail = " The run-wide limit is the one that stops the run first, because the total is bigger than it."
+    return (head + "." + tail + " A round limit says how many rounds are allowed, not how long they take or how much "
+            "time is left.")
 
 
 def schedule_status(st, plan, cfg, now) -> dict:
