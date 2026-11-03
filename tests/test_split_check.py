@@ -677,7 +677,7 @@ def t07_test_signing_still_passes():
 def t08_readme_names_new_files():
     print("CP2-T08: README's test list names the new files, not the retired one")
     try:
-        readme = read_current(str(README.relative_to(ROOT)))
+        readme = README.read_text()  # README.md plus the docs/ pages, where the test list now lives
     except OSError as e:
         check("[CP2-T08] setup: README.md is readable at the CP2 split commit", False, str(e))
         return
