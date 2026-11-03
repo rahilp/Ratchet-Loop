@@ -33,6 +33,7 @@ Fix round 2:
       question, the prompt hook; the refusal drops the pending question
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import re
@@ -348,7 +349,7 @@ def cp4_x16_none_mode_run_needs_the_final_approval_once_the_block_clears():
 def cp4_x17_docs_state_the_rules_the_fixes_added():
     """[CP4-X17] The docs state the none-mode rule, the per-reason ways forward and the each-mode table."""
     skill = (ROOT / "skills/ratchet-orchestrator/SKILL.md").read_text(encoding="utf-8")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = README_DOCS.read_text(encoding="utf-8")
     schemas = (ROOT / "skills/ratchet-orchestrator/references/schemas.md").read_text(encoding="utf-8")
     none_re = re.compile(r"finishes only (?:through|when)[^.]*approv", re.I)
     for name, text in (("SKILL.md", skill), ("README.md", readme), ("schemas.md", schemas)):

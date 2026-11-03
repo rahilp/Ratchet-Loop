@@ -21,6 +21,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -619,7 +620,7 @@ def _windows(text, needle, width=1800):
 
 
 def cp6_t16_docs_describe_the_policy():
-    docs = {"README.md": ROOT / "README.md",
+    docs = {"README.md": README_DOCS,
             "SKILL.md": ROOT / "skills/ratchet-orchestrator/SKILL.md",
             "schemas.md": ROOT / "skills/ratchet-orchestrator/references/schemas.md"}
     never = (("plan approval", r"plan approval|approve-plan|plan"), ("scope", r"scope|feedback"),

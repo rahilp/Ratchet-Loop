@@ -26,6 +26,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -1133,7 +1134,7 @@ SCHEMAS_FEEDBACK_RE = re.compile(
 
 def cp4_x07_docs_tell_agents_about_the_blocked_finish_and_the_old_run_note():
     """[CP4-X07] The docs tell agents about the blocked finish and the old-run note."""
-    files = {"README.md": ROOT / "README.md",
+    files = {"README.md": README_DOCS,
              "SKILL.md": ROOT / "skills/ratchet-orchestrator/SKILL.md",
              "schemas.md": ROOT / "skills/ratchet-orchestrator/references/schemas.md"}
     text = {k: p.read_text() for k, p in files.items()}

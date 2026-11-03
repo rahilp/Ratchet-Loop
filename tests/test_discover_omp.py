@@ -17,6 +17,7 @@ failed case, never a crash or a skip. Writes a per-test JSON report to RATCHET_T
 {"cases": [{"id": "CP3-T01", "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import importlib.util
 import json
@@ -362,7 +363,7 @@ def t08_pi_under_needs_model_crush_gets_no_preset():
 
 def t09_docs_list_the_new_presets():
     skill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text()
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     schemas = (ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md").read_text()
     check("[CP3-T09] schemas.md's provider/preset reference mentions Oh My Pi (omp)",
           re.search(r"Oh My Pi", schemas, re.I) is not None and re.search(r"\bomp\b", schemas) is not None, "")

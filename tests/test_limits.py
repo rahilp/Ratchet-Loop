@@ -37,6 +37,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import re
@@ -437,7 +438,7 @@ def t10_raised_cap_is_scoped_to_its_own_step():
 
 
 def t11_docs_describe_the_rules():
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     orch_skill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text()
     adv_skill = (ROOT / "skills" / "ratchet-adversarial-loop" / "SKILL.md").read_text()
     schemas = (ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md").read_text()

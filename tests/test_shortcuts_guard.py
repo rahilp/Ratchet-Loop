@@ -26,6 +26,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import hashlib
 import json
@@ -637,7 +638,7 @@ def _doc_checks(label, text, agent=False):
 
 def cp7_t13_docs_explain_the_guard_table():
     """[CP7-T13] The docs tell agents what the guard table is and that rows are only ever added."""
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     skill = (ROOT / "skills/ratchet-orchestrator/SKILL.md").read_text()
     schemas = (ROOT / "skills/ratchet-orchestrator/references/schemas.md").read_text()
     _doc_checks("README.md", readme)

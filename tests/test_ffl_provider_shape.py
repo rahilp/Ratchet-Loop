@@ -34,6 +34,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import ast
 import json
@@ -57,7 +58,7 @@ CASE_MESSAGES: dict = {}
 PASS = FAIL = 0
 ID_RE = re.compile(r"\[(CP3-[TX]\d+)\]")
 
-README = ROOT / "README.md"
+README = README_DOCS
 SKILL = ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md"
 SCHEMAS = ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md"
 ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"

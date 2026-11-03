@@ -19,6 +19,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import re
@@ -249,7 +250,7 @@ def t08_unknown_cpn_refused_valid_cpn_named():
 
 def t09_docs_describe_the_brief_command():
     skill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text()
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     schemas = (ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md").read_text()
     check("[CP2-T09] the orchestrator skill tells the orchestrator to start every spawn prompt with "
           "`ratchet.py brief CPn --role <role>`'s output instead of writing the objective by hand",

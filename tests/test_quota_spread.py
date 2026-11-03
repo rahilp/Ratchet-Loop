@@ -25,6 +25,7 @@ inside try/except, so a crash is a failed case, never a silent drop. Writes a pe
 RATCHET_TEST_REPORT when set: {"cases": [{"id": "CP5-T01", "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -476,7 +477,7 @@ def cp5_t13_providers_add_accepts_a_lens_preference_and_refuses_an_unknown_lens(
 
 @case("CP5-T14")
 def cp5_t14_the_docs_describe_the_lens_preference_and_the_ordering():
-    files = {"README.md": ROOT / "README.md",
+    files = {"README.md": README_DOCS,
              "skills/ratchet-orchestrator/SKILL.md": ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md",
              "skills/ratchet-orchestrator/references/schemas.md":
                  ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md"}

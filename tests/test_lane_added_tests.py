@@ -20,6 +20,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -755,7 +756,7 @@ def t12_earlier_steps_tests_stay_locked_in_a_later_step():
 def _docs_name_the_non_python_limit():
     """True when README.md or schemas.md has one sentence that says, for a test file outside Python, that an
     extra (unplanned) test written before the red run stays frozen. The wording is free; the four ideas are not."""
-    docs = [ROOT / "README.md", ROOT / "skills/ratchet-orchestrator/references/schemas.md"]
+    docs = [README_DOCS, ROOT / "skills/ratchet-orchestrator/references/schemas.md"]
     lang = re.compile(r"non-python|outside python|other language|any other test file|not python|javascript", re.I)
     extra = re.compile(r"unplanned|extra test|extras|not planned|not in the plan|isn't planned|lane-added|"
                        r"test (?:the )?(?:run|lane) added|added during the run", re.I)

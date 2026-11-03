@@ -35,6 +35,7 @@ inside try/except, so a crash is a failed case, never a silent drop. Writes a pe
 RATCHET_TEST_REPORT when set: {"cases": [{"id": "CP7-T01", "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -902,7 +903,7 @@ def t13_a_cli_that_ignores_format_json_and_prints_plain_text_is_read_as_before()
 
 @case("CP7-T14")
 def t14_the_docs_and_the_test_list_describe_the_new_opencode_behavior():
-    docs = {"README.md": ROOT / "README.md",
+    docs = {"README.md": README_DOCS,
             "orchestrator SKILL.md": ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md",
             "adversarial-loop SKILL.md": ROOT / "skills" / "ratchet-adversarial-loop" / "SKILL.md",
             "schemas.md": ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md"}

@@ -31,6 +31,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -44,7 +45,7 @@ ROOT = HERE.parent
 
 PLANNER_DOC = ROOT / "agents" / "ratchet-checkpoint-planner.md"
 SKILL_DOC = ROOT / "skills" / "ratchet-tdd-planner" / "SKILL.md"
-README_DOC = ROOT / "README.md"
+README_DOC = README_DOCS
 SCRIPT_PATH = "skills/ratchet-checkpoint-planner/scripts/impact_analysis.py"
 MODE_GREEN = "greenfield-create"
 MODE_BROWN = "brownfield-modify"
@@ -101,7 +102,7 @@ def check(cid, name, cond, detail=""):
 # ---- doc helpers -----------------------------------------------------------------------------------------------
 
 def read(p) -> str:
-    return Path(p).read_text(encoding="utf-8", errors="replace")
+    return (p if isinstance(p, Path) else Path(p)).read_text(encoding="utf-8", errors="replace")
 
 
 def squash(s: str) -> str:

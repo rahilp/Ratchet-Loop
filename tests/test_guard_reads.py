@@ -14,6 +14,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -402,7 +403,7 @@ def t20_reserved_variable_refusal_not_loosened_by_read_only_allowance():
 def t21_docs_say_what_the_guard_allows_and_still_refuses():
     root = ENGINE.parents[1]  # .../skills/ratchet-orchestrator
     repo_root = ENGINE.parents[3]  # the project root (this worktree)
-    readme = (repo_root / "README.md").read_text()
+    readme = README_DOCS.read_text()
     skill = (root / "SKILL.md").read_text()
     schemas = (root / "references" / "schemas.md").read_text()
     docs = readme + "\n" + skill + "\n" + schemas

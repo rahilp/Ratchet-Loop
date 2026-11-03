@@ -14,6 +14,7 @@ providers=[] so no real agent CLI runs) and tests/test_specs.py's direct calls i
 Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {"cases": [{"id": "CP1-T01",
 "status": "passed"|"failed", "message": "..."}]}.
 """
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 import copy
 import json
 import re
@@ -385,7 +386,7 @@ def t13_plan_extend_refuses_dropped_objective():
 
 ROOT = HERE.parent
 DOC_PATHS = {
-    "README.md": ROOT / "README.md",
+    "README.md": README_DOCS,
     "schemas.md": ROOT / "skills/ratchet-orchestrator/references/schemas.md",
     "ratchet-checkpoint-planner.md": ROOT / "agents/ratchet-checkpoint-planner.md",
     "ratchet-orchestrator SKILL.md": ROOT / "skills/ratchet-orchestrator/SKILL.md",

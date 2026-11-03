@@ -24,6 +24,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -383,7 +384,7 @@ def _section9(text):
 
 
 def cp5_t09_docs_state_one_order():
-    docs = {"README.md": (ROOT / "README.md").read_text(),
+    docs = {"README.md": README_DOCS.read_text(),
             "SKILL.md": (ROOT / "skills/ratchet-orchestrator/SKILL.md").read_text(),
             "schemas.md section 9": _section9((ROOT / "skills/ratchet-orchestrator/references/schemas.md").read_text())}
     for name, text in docs.items():

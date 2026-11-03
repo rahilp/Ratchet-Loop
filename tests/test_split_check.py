@@ -20,6 +20,7 @@ This suite writes a per-test JSON report to $RATCHET_TEST_REPORT when that env v
 {"cases": [{"id": "CP2-T01", "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import ast
 import copy
@@ -56,7 +57,7 @@ CP1_COMMIT = "f624da15927cd62059a7710ca0b989c934befe82"
 # fails here and now, not just at the moment of the split.
 CP2_COMMIT = "5f394c1d2197a96f5754a8f14a75ee3f83206ceb"
 OLD_FILE = "tests/test_trust.py"
-README = ROOT / "README.md"
+README = README_DOCS
 SPEC = ROOT / "openspec/specs/close-ratchet-s-trust-holes-reviews-only-count-f/spec.md"
 HELPERS_FILE = HERE / "trust_helpers.py"
 

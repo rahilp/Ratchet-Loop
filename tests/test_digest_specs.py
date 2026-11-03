@@ -38,6 +38,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -403,7 +404,7 @@ def t12_mixed_tools_ranked_together_under_one_cap():
 
 def t13_docs_describe_the_related_specs_list():
     planner_md = (ROOT / "agents" / "ratchet-checkpoint-planner.md").read_text()
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     schemas = (ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md").read_text()
     check("[CP2-T13] the checkpoint-planner agent says the brief lists related recorded specs with their paths",
           re.search(r"brief.{0,400}(related|list).{0,200}spec", planner_md, re.I | re.S) is not None

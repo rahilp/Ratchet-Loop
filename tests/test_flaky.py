@@ -25,6 +25,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when set:
   {"cases": [{"id": "CP6-T01", "status": "passed"|"failed", "message": "..."}]}
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -423,7 +424,7 @@ def t11_timeout_once_not_twice():
 
 def t12_docs_describe_both_rules():
     print("CP6-T12: docs describe both the flaky-test allowance and the cut-off retry")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = README_DOCS.read_text(encoding="utf-8")
     schemas = (ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md").read_text(encoding="utf-8")
     skill = (ROOT / "skills" / "ratchet-adversarial-loop" / "SKILL.md").read_text(encoding="utf-8")
     retry_re = re.compile(r"retr(?:y|ied).{0,25}once|once.{0,25}retr(?:y|ied)", re.I | re.S)

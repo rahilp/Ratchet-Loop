@@ -19,6 +19,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -400,7 +401,7 @@ def cp2_t16_docs_carry_the_rule():
     skill = (ROOT / "skills/ratchet-tdd-planner/SKILL.md").read_text()
     agent = (ROOT / "agents/ratchet-test-planner.md").read_text()
     schemas = (ROOT / "skills/ratchet-orchestrator/references/schemas.md").read_text()
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     every_line = re.compile(r"(every|each)[^\n]{0,60}done.means[^\n]{0,40}line[^\n]{0,160}(at least one|one or more|"
                             r"a case|one case|a test case)", re.I)
     refuses = re.compile(r"plan-submit[^\n]{0,200}refus|refus[^\n]{0,200}plan-submit", re.I)

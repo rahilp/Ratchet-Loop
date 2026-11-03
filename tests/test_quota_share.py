@@ -23,6 +23,7 @@ inside try/except, so a crash is a failed case, never a silent drop. Writes a pe
 RATCHET_TEST_REPORT when set: {"cases": [{"id": "CP6-T01", "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -499,7 +500,7 @@ def cp6_t11_a_damaged_shared_record_does_not_stall_a_lane_or_lose_later_counting
 
 @case("CP6-T12")
 def cp6_t12_the_docs_describe_the_per_provider_share_and_its_setting():
-    files = {"README.md": ROOT / "README.md",
+    files = {"README.md": README_DOCS,
              "skills/ratchet-orchestrator/references/schemas.md":
                  ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md"}
     for name, path in files.items():

@@ -22,6 +22,7 @@ Writes a per-test JSON report to $RATCHET_TEST_REPORT when that env var is set:
 {"cases": [{"id": "CP3-T01", "status": "passed"|"failed"|"error"|"skipped", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import datetime as dt
 import json
@@ -303,7 +304,7 @@ def doc_section(text, heading_re=CI_HEADING_RE):
     return "".join(lines[start:end])
 
 
-README_TEXT = (ROOT / "README.md").read_text(encoding="utf-8")
+README_TEXT = README_DOCS.read_text(encoding="utf-8")
 SKILL_TEXT = (ROOT / "skills/ratchet-orchestrator/SKILL.md").read_text(encoding="utf-8")
 SCHEMAS_TEXT = (ROOT / "skills/ratchet-orchestrator/references/schemas.md").read_text(encoding="utf-8")
 README_CI_SECTION = doc_section(README_TEXT)

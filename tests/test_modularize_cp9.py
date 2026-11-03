@@ -28,6 +28,7 @@ per-test JSON report to $RATCHET_TEST_REPORT when that env var happens to be set
 consistency with every sibling test_modularize_cpN.py file.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -43,7 +44,7 @@ ROOT = HERE.parent
 SCRIPT_DIR = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
 SCHEMAS_MD = ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md"
 MODULES_MD = ROOT / "skills" / "ratchet-orchestrator" / "references" / "modules.md"
-README = ROOT / "README.md"
+README = README_DOCS
 SKILL_MD = ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md"
 
 # Lane M's own run directory. It exists only inside M's own worktree/run; on integrated main it is

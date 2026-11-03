@@ -21,6 +21,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -494,7 +495,7 @@ def t13_round_limit_offers_accept_finding_as_lettered_option():
 
 # ------------------------------------------------------------------------------------------------ CP3-T14: docs
 
-README_MD = ROOT / "README.md"
+README_MD = README_DOCS
 ORCH_SKILL_MD = ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md"
 SCHEMAS_MD = ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md"
 

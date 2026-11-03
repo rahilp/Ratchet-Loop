@@ -15,6 +15,7 @@ against the fake CLI or (for host sub-agent reviews) simulated entirely through 
 Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set (Ratchet's own gate uses this file
 to grade this checkpoint): {"cases": [{"id": "CP7-T01", "status": "passed"|"failed", "message": "..."}]}.
 """
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 import json
 import os
 import re
@@ -574,7 +575,7 @@ def t13_handtyped_ui_review_refused():
 
 def t14_readme_review_checks_row():
     print("CP7-T14: the README's review-checks row matches what each CLI now enforces")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = README_DOCS.read_text(encoding="utf-8")
     check("[CP7-T14] README says a script-signed review is required, or a host sub-agent review is accepted",
           re.search(r"script-signed review|signed review", readme, re.I) is not None, readme[:0])
     check("[CP7-T14] README says only Claude Code confirms the sub-agent writer",

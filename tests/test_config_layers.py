@@ -16,6 +16,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -400,7 +401,7 @@ def t14_only_the_global_file_in_use_counts():
 
 
 def t15_readme_lists_the_test_file():
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     section = readme.split("### Running the tests", 1)[-1]
     check("[CP1-T15] the README 'Running the tests' section lists python3 tests/test_config_layers.py",
           re.search(r"^python3 tests/test_config_layers\.py$", section, re.M) is not None)

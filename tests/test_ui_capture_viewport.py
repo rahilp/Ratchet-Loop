@@ -19,6 +19,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set: {
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import json
 import os
@@ -35,7 +36,7 @@ import _tmp                                             # noqa: E402
 
 CAPTURE = ROOT / "skills" / "ratchet-ui-compare" / "scripts" / "capture.mjs"
 UI_REVIEW = ROOT / "skills" / "ratchet-ui-compare" / "scripts" / "ui_review.py"
-README = ROOT / "README.md"
+README = README_DOCS
 INVENTORY = HERE / "fixtures" / "modularize_cp1" / "test-inventory.md"
 THIS = Path(__file__).resolve()
 

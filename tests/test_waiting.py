@@ -27,6 +27,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when set:
   {"cases": [{"id": "CP4-T01", "status": "passed"|"failed", "message": "..."}]}
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import datetime as _dt
 import json
@@ -370,7 +371,7 @@ def t09_oversized_reviewer_marked_unavailable():
 
 
 def t10_docs_describe_wait():
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     skill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text()
     check("[CP4-T10] README.md mentions the `wait` command", "ratchet.py wait" in readme, "not found in README.md")
     check("[CP4-T10] README.md describes ending a turn to wait on background work without a blocked stop",
@@ -481,7 +482,7 @@ def t13_mid_sentence_mention_is_still_recorded():
     check("[CP4-T13] the recorded line's prompt text is the message itself (not dropped, not altered)",
           bool(lines) and lines[-1].get("prompt") == msg, lines[-1] if lines else None)
 
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     skill = (ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md").read_text()
     lead_pat = re.compile(
         r"(lead|leads|leading|starts?|begins?)[\s\S]{0,250}"

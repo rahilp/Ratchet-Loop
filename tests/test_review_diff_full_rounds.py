@@ -38,6 +38,7 @@ Writes a per-test JSON report to RATCHET_TEST_REPORT when set: {"cases": [{"id":
 "status": "passed"|"failed", "message": "..."}]}.
 """
 from __future__ import annotations
+from _docs import README_DOCS  # README.md plus the docs/ pages, read as one text
 
 import ast
 import json
@@ -1010,7 +1011,7 @@ def _bad_add_claim(text):
 
 
 def t20_docs_describe_the_full_round_rule():
-    readme = (ROOT / "README.md").read_text()
+    readme = README_DOCS.read_text()
     skill = (ROOT / "skills/ratchet-adversarial-loop/SKILL.md").read_text()
     docstring = ER.collect_diff.__doc__ or ""
     for name, text in (("README.md", readme),
