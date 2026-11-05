@@ -369,20 +369,27 @@ def t04_providers_output_unchanged():
     finally:
         pinned_script.unlink(missing_ok=True)
 
-    check("[CP5-T04] setup: both runs produced the same number of command results",
-          len(current_out) == len(pinned_out), (len(current_out), len(pinned_out)))
-    for (label, cur_rc, cur_out, cur_err), (plabel, pin_rc, pin_out, pin_err) in zip(current_out, pinned_out):
-        check(f"[CP5-T04] `{label}` exits the same code before and after the move", cur_rc == pin_rc,
-              (label, cur_rc, pin_rc))
-        check(f"[CP5-T04] `{label}`'s stdout is byte-identical before and after the move", cur_out == pin_out,
-              (label, pin_out, cur_out))
-        check(f"[CP5-T04] `{label}`'s stderr is byte-identical before and after the move", cur_err == pin_err,
-              (label, pin_err, cur_err))
-
-    _ISO_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+\+00:00")
+    # `providers --check all` prints each provider's last-probe time at minute resolution
+    # (ratchet.py ~3595: `... ({str(at)[:16]}Z)`), and config.json/provider-status.json carry the per-use
+    # paid-OK time in full ISO. Those differ between the two sequential runs by wall-clock alone -- never
+    # because of the move -- so both forms are normalized away before every byte-compare. The pattern needs
+    # the literal `T` between date and time, so it never matches a stable model name or provider id.
+    _ISO_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:\.\d+)?)?(?:\+00:00|Z)?")
 
     def _normalize_times(text):
         return _ISO_RE.sub("<at>", text) if text is not None else None
+
+    check("[CP5-T04] setup: both runs produced the same number of command results",
+          len(current_out) == len(pinned_out), (len(current_out), len(pinned_out)))
+    for (label, cur_rc, cur_out, cur_err), (plabel, pin_rc, pin_out, pin_err) in zip(current_out, pinned_out):
+        cur_o, pin_o = _normalize_times(cur_out), _normalize_times(pin_out)
+        cur_e, pin_e = _normalize_times(cur_err), _normalize_times(pin_err)
+        check(f"[CP5-T04] `{label}` exits the same code before and after the move", cur_rc == pin_rc,
+              (label, cur_rc, pin_rc))
+        check(f"[CP5-T04] `{label}`'s stdout is byte-identical before and after the move (each run's own "
+              "wall-clock probe timestamp normalized away)", cur_o == pin_o, (label, pin_o, cur_o))
+        check(f"[CP5-T04] `{label}`'s stderr is byte-identical before and after the move (each run's own "
+              "wall-clock probe timestamp normalized away)", cur_e == pin_e, (label, pin_e, cur_e))
 
     for relpath in (".ratchet/config.json", ".ratchet/provider-status.json"):
         cp_, pp_ = d_current / relpath, d_pinned / relpath
