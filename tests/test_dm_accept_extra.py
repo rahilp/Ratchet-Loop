@@ -40,6 +40,7 @@ import test_dm_finish as fin         # noqa: E402  (fixtures and helpers of the 
 import test_dm_table as dt           # noqa: E402  (_segs, _verdict, _has_id)
 import test_dm_accept as acc         # noqa: E402  (Projects A and D, the accept flow, table readers)
 import test_receipt_proof as rp      # noqa: E402  (_write_report)
+from _docs import docs_text          # noqa: E402
 
 PASS = FAIL = 0
 CASE_STATUS: dict[str, bool] = {}
@@ -241,7 +242,7 @@ def cp5_x24_docs_tie_the_accept_line_claims_to_accept_line_and_state_the_held_ag
     """[CP5-X24] The docs' accept-line claims are anchored to accept-line and describe the held-again rule."""
     for name in DOC_CHECKS:
         try:
-            text = (ROOT / name).read_text()
+            text = docs_text(ROOT) if name == "README.md" else (ROOT / name).read_text()
         except OSError as e:
             check(f"[CP5-X24] {name} can be read", False, str(e))
             continue

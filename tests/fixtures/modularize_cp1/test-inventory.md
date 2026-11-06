@@ -308,7 +308,7 @@ tree, never loads it as a module itself): 10 files
   Separately reads `ENGINE.read_text()` and `ast.parse`s it to check the Codex citation comment sits, as comments
   only, in the block just above `HOOK_HOSTS`.
 
-## Kind 4 — brief-named, but don't literally match either live-grep pattern today: 2 files
+## Kind 4 — brief-named, but don't literally match either live-grep pattern today: 3 files
 
 The brief names 5 files; 3 are in the Kind 1-3 lists above. These 2 depend on ratchet.py's on-disk
 text exactly the same way, but via a path expression that isn't the literal variable name `ENGINE`

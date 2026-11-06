@@ -37,6 +37,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import _tmp                      # noqa: E402
+from _docs import docs_text     # noqa: E402
 import test_gates as g           # noqa: E402  (rx, say, approve_plan, open_round, write_review, R0, git, ENV, ENGINE)
 import test_dm_finish as fin     # noqa: E402  (fixtures and helpers of the CP4 finish hold)
 import test_dm_table as dt       # noqa: E402  (mutate, _segs, _table)
@@ -974,7 +975,7 @@ def cp5_x20_the_docs_describe_how_to_accept_an_unproven_line():
     """[CP5-X20] The docs describe how to accept an unproven line."""
     for name in ("README.md", "skills/ratchet-orchestrator/SKILL.md", "skills/ratchet-orchestrator/references/schemas.md"):
         try:
-            text = (ROOT / name).read_text()
+            text = docs_text(ROOT) if name == "README.md" else (ROOT / name).read_text()
         except OSError as e:
             check(f"[CP5-X20] {name} can be read", False, str(e))
             continue

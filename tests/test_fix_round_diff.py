@@ -69,6 +69,7 @@ import _tmp                     # noqa: E402,F401
 import test_gates as g          # noqa: E402
 import test_providers as tp     # noqa: E402  (EXT: external_review.py)
 import test_fix_round as tf     # noqa: E402  (project / round / fake-CLI helpers)
+from _docs import docs_text    # noqa: E402
 
 g.ENV["RATCHET_FAKE_LOADAVG"] = "0"
 
@@ -775,7 +776,7 @@ def t21_an_other_provider_fix_review_end_to_end_is_accepted_at_ten_seconds():
 # ------------------------------------------------------------------------------------------------ CP6-T22
 
 def _read(rel):
-    return (ROOT / rel).read_text()
+    return docs_text(ROOT) if rel == "README.md" else (ROOT / rel).read_text()
 
 
 def _paragraphs(text):
