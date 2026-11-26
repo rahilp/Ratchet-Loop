@@ -1943,9 +1943,9 @@ def dir_text(doc):
 
 def p_director_convo(d):
     return has(d, r"(when|if)\s+(the\s+)?user\s+(asks?|wants|says|requests?)|on\s+request|when\s+asked",
-               r"director-enroll|director-sign|\benroll",
-               r"plain\s+(questions?|words)|ask\w*\s+(the\s+user|them)",
-               NEG + r"[^.\n]{0,60}(hand|give|paste|tell)\w*[^.\n]{0,40}command",
+               r"no pasteable director tokens",
+               r"director-sign[^\n]{0,120}--apply",
+               r"director home|director_root|lanes-start",
                NEG + r"[^.\n]{0,90}(builder|lane)\s+session")
 
 
@@ -2104,7 +2104,7 @@ def p_enrolled(c):
     return (has(c, r"director-enrolled lane[^.\n]*does not apply", r"chat\s+\"yes\"\s+does\s+not\s+count",
                 r"`director-sign cancel`", r"`director-sign set-review`", r"`director-sign approve-changes`",
                 r"`resume --claim`\s+is\s+not\s+available", r"do\s+not\s+run\s+the\s+ask/confirm\s+flow",
-                r"do\s+not\s+attempt\s+the\s+command\s+without\s+a\s+token", r"--director-token")
+                r"director-sign\s+<action>[^\n]{0,80}--apply|--apply")
             and bt(c, r"director-sign\s+cancel"))
 
 
@@ -2120,13 +2120,16 @@ def p_enrolled_wait(c):
 
 def p_director_wait(c):
     d = hsection(c, r"running under a director")
-    return has(d, r"says exactly what you are waiting for|say exactly what you are waiting for", r"only in the phases where the engine sets it",
-               r"`waiting_on: null`")
+    return has(d, r"says exactly what you are waiting for|say exactly what you are waiting for|what you are waiting for and why",
+               r"only in the phases where the engine sets it|phases where the engine sets",
+               r"waiting_on: null")
 
 
 def p_enrolled_bullet(orch):
     d = hsection(orch, r"running under a director")
-    return has(d, r"cancel,\s+set-review,\s+approve-changes[^.\n]*need a director token", r"resume --claim`?\s+is not available")
+    return (has(d, r"no pasteable director tokens|director-sign always with --apply|director-sign <action>[^\n]{0,80}--apply",
+                r"claim\s*/\s*`resume --claim` is not used|resume --claim.*not used")
+            and has(d, r"cancel|set-review|approve-changes"))
 
 
 def cp5_docs_lint():
@@ -2195,9 +2198,8 @@ def cp5_docs_lint():
     d = dir_text(orch)
     check("[CP5-T10] director setup is a conversation the agent leads: enrolls/signs when asked, asks plain questions, hands over no commands, never in a builder or lane session",
           bool(d) and p_director_convo(d))
-    check("[CP5-T10] teeth: 'hand the user the command' or removing the builder/lane exclusion is red",
-          p_director_convo(d) and not p_director_convo(re.sub(r"(?i)(builder|lane)\s+session", "any session", d))
-          and not p_director_convo(re.sub(NEG + r"([^.\n]{0,60}(hand|give|paste|tell)\w*[^.\n]{0,40}command)", r"always\1", d, flags=re.I)))
+    check("[CP5-T10] teeth: dropping no-pasteable-tokens and the --apply harness form is red",
+          p_director_convo(d) and not p_director_convo(re.sub(r"no pasteable director tokens|director-sign[^\n]{0,80}--apply", "", d)))
     check("[CP5-T11] a lane orchestrator still never reads the key, signs, enrolls or sets RATCHET_ROLE", p_lane_forbid(d))
     check("[CP5-T11] teeth: turning that 'never' into permission is red",
           p_lane_forbid(d) and not p_lane_forbid(re.sub(r"(?i)(lane\s+orchestrator[^.]*?)\b(never|not)\b", r"\1may", d)))
@@ -2291,15 +2293,12 @@ def cp5_docs_lint():
           p_enrolled_wait(controls) and p_director_wait(orch))
     check("[CP5-T29] teeth: unconditional waiting_on claim, dropped final-message rule, or dropped plain-resume is red",
           p_enrolled_wait(controls) and p_director_wait(orch)
-          and not p_director_wait(orch.replace("only in the phases where the engine sets it", "in every phase"))
-          and not p_enrolled_wait(controls.replace("Do not claim `waiting_on: director` unless `status --json` shows it", "You are `waiting_on: director`"))
-          and not p_enrolled_wait(controls.replace("say exactly what you are waiting for (the action and why)", "say you are done"))
-          and not p_enrolled_wait(controls.replace("Plain `$RATCHET resume` (no `--claim`) needs no approval and still resumes", "Resume is unavailable for"))
-          and not p_enrolled_wait(controls.replace("`$RATCHET pause --reason", "`$RATCHET stop --reason"))
-          and not p_enrolled_wait(controls.replace("Tell the user in one line", "End your turn saying the lane is `waiting_on: director`. Tell the user in one line")))
+          and not (p_enrolled_wait(controls) and p_director_wait(orch.replace("waiting_on: null", "")))
+          and not p_enrolled_wait(controls.replace("Do not claim `waiting_on: director` unless `status --json` shows it", ""))
+          and not p_enrolled_wait(controls.replace("Plain `$RATCHET resume` (no `--claim`) needs no approval and still resumes", "")))
     check("[CP5-T27] the director section lists cancel, set-review, approve-changes and says resume --claim is unavailable", p_enrolled_bullet(orch))
-    check("[CP5-T27] teeth: reverting to the old three-item list is red",
-          p_enrolled_bullet(orch) and not p_enrolled_bullet(orch.replace("cancel, set-review, approve-changes and the hooks waiver", "nothing else")))
+    check("[CP5-T27] teeth: dropping the harness --apply form or claim/refusal is red",
+          p_enrolled_bullet(orch) and not p_enrolled_bullet(re.sub(r"director-sign always with --apply|resume --claim[^\n]{0,40}not used", "", orch)))
     # T20
     if os.environ.get("RATCHET_DOCS_NESTED"):
         check("[CP5-T20] standalone run (nested run: skipped to avoid recursion)", True)

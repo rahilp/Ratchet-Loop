@@ -414,15 +414,13 @@ def _director_fin2(name, failed=True):
     assert r.returncode == 0, _out(r)
     assert th.cp3_state(d)["phase"] == "awaiting_final_review", th.cp3_state(d)["phase"]
     denv = dict(env, RATCHET_ROLE="director")
-    rk = th.rx(d, denv, "director-key")
-    en = th.rx(d, denv, "director-enroll")
+    home, rk, en = th.director_enroll(d, denv)
     assert rk.returncode == 0 and en.returncode == 0, _out(rk) + _out(en)
-    return d, env, denv
+    return d, env, denv, home
 
 
-def _director_token(d, denv):
-    sg = th.rx(d, denv, "director-sign", "human-approve")
-    return sg, (sg.stdout.strip().splitlines()[-1] if sg.stdout.strip() else "")
+def _director_apply(d, denv, home, *args):
+    return th.director_sign_apply(d, denv, home, *args)
 
 
 # ---- the docs-only last step (lane B's quick path) --------------------------------------------------
@@ -518,13 +516,14 @@ def cp4_t02_yes_given_before_the_line_went_unproven_does_not_finish():
 
 def cp4_t03_director_cannot_sign_a_finish_past_an_unproven_line():
     """[CP4-T03] The director cannot sign a finish past an unproven line either."""
-    d, env, denv = _director_fin2("t03")
-    sg, tok = _director_token(d, denv)
-    check("[CP4-T03] setup: director-sign human-approve prints a token", sg.returncode == 0 and bool(tok), _out(sg))
-    r = th.rx(d, env, "human-approve", "--director-token", tok)
-    out = _refused("[CP4-T03]", r, "human-approve --director-token")
+    d, env, denv, home = _director_fin2("t03")
+    sg = _director_apply(d, denv, home, "human-approve")
+    check("[CP4-T03] director-sign human-approve --apply is refused past an unproven line", sg.returncode != 0, _out(sg))
+    out = _out(sg)
     _names("[CP4-T03]", out, 2, LINE2, "the refusal")
     _failed_reason("[CP4-T03]", out, "CP1-T02", "the refusal")
+    r = th.rx(d, env, "human-approve", "--director-token", "forged-token")
+    check("[CP4-T03] human-approve --director-token is refused on an enrolled lane", r.returncode != 0, _out(r))
     check("[CP4-T03] the refusal does not tell the agent to ask the user to reply yes",
           not re.search(r"reply (?:with )?(?:yes|one of)|ask human-approve|listed yes", out, re.I), out[-900:])
     st = th.cp3_state(d)
@@ -535,7 +534,7 @@ def cp4_t03_director_cannot_sign_a_finish_past_an_unproven_line():
 
 def cp4_t04_director_approval_still_finishes_a_proven_run():
     """[CP4-T04] The director's approval still finishes a run whose every line is proven."""
-    d, env, denv = _director_fin2("t04", failed=False)
+    d, env, denv, home = _director_fin2("t04", failed=False)
     _dsay(d, env, YES)
     chat = th.rx(d, env, "human-approve")
     cout = _refused("[CP4-T04]", chat, "a chat yes without a token")
@@ -543,10 +542,10 @@ def cp4_t04_director_approval_still_finishes_a_proven_run():
           re.search(r"director[- ]enrolled|director token|director-sign", cout, re.I) is not None, cout[-600:])
     check("[CP4-T04] the chat refusal is not a done-means block", BLOCKED_RE.search(cout) is None and LINE2 not in cout,
           cout[-600:])
-    sg, tok = _director_token(d, denv)
-    check("[CP4-T04] setup: director-sign human-approve prints a token", sg.returncode == 0 and bool(tok), _out(sg))
-    r = th.rx(d, env, "human-approve", "--director-token", tok)
-    check("[CP4-T04] human-approve --director-token succeeds", _clean(r), _out(r))
+    sg = _director_apply(d, denv, home, "human-approve")
+    check("[CP4-T04] director-sign human-approve --apply succeeds", _clean(sg), _out(sg))
+    r = th.rx(d, env, "human-approve", "--director-token", "forged-token")
+    check("[CP4-T04] human-approve --director-token on an enrolled lane is refused", r.returncode != 0, _out(r))
     st = th.cp3_state(d)
     check("[CP4-T04] phase is done", st.get("phase") == "done", st.get("phase"))
     ev = [e for e in (st.get("history") or []) if isinstance(e, dict) and e.get("event") == "approved"]
@@ -601,7 +600,7 @@ def cp4_t06_status_json_carries_the_block_for_director_and_agent():
     check("[CP4-T06] (user lane) `next` says the same, with no ask instruction",
           _clean(rn) and BLOCKED_RE.search(_out(rn)) is not None and ASK_INSTRUCTION_RE.search(_out(rn)) is None,
           _out(rn)[-900:])
-    dd, env, denv = _director_fin2("t06")
+    dd, env, denv, _ = _director_fin2("t06")
     rj2 = th.rx(dd, env, "status", "--json")
     j2 = json.loads(rj2.stdout) if _clean(rj2) else {}
     check("[CP4-T06] (director lane) status --json exits 0 and parses", _clean(rj2) and isinstance(j2, dict), _out(rj2)[-400:])
@@ -910,12 +909,13 @@ def cp4_x01_refused_approval_leaves_every_counter_untouched():
     new = _events(st)[n0:]
     check("[CP4-X01] the only new history lines are refusals: no 'approved' or 'unblocked' event",
           "approved" not in new and "unblocked" not in new, new)
-    dd, env, denv = _director_fin2("x01")
+    dd, env, denv, home = _director_fin2("x01")
     dbefore = _counters(th.cp3_state(dd))
     dn0 = len(th.cp3_state(dd).get("history") or [])
-    _, tok = _director_token(dd, denv)
-    r = th.rx(dd, env, "human-approve", "--director-token", tok)
-    check("[CP4-X01] the director-token human-approve is refused", r.returncode != 0, _out(r)[-400:])
+    r_apply = _director_apply(dd, denv, home, "human-approve")
+    r = th.rx(dd, env, "human-approve", "--director-token", "forged-token")
+    check("[CP4-X01] director human-approve --apply and --director-token are both refused past an unproven line",
+          r_apply.returncode != 0 and r.returncode != 0, (_out(r_apply)[-400:], _out(r)[-400:]))
     dst = th.cp3_state(dd)
     check("[CP4-X01] after the director refusal every counter equals its recorded value", _counters(dst) == dbefore,
           (dbefore, _counters(dst)))

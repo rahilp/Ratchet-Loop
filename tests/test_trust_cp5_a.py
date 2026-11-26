@@ -216,23 +216,23 @@ SECTIONS.append(("CP5", cp5_pre_upgrade_run_can_continue))
 
 
 def cp5_director_signed_approval_skips_chat_question():
-    print("CP5: a director-signed approval still works without any chat question being printed")
+    print("CP5: a director-sign --apply approval still works without any chat question being printed")
 
-    # --- T09: a director token approves the plan with no `ask` step and no chat reply at all -------------------------
+    # --- T09: director-sign approve-plan --apply approves with no `ask` step and no chat reply at all ---------------
     env = make_env("claude")
     d, tp = cp5_plan(env)
     denv = dict(env, RATCHET_ROLE="director")
-    rk = rx(d, denv, "director-key")
-    en = rx(d, denv, "director-enroll")
-    sg = rx(d, denv, "director-sign", "approve-plan")
-    tok = sg.stdout.strip().splitlines()[-1] if sg.stdout.strip() else ""
-    assert rk.returncode == 0 and en.returncode == 0 and sg.returncode == 0 and tok, (rk.stderr, en.stderr, sg.stderr)
+    home, rk, en = trust_helpers.director_enroll(d, denv)
     st_before = json.loads((Path(d) / ".ratchet/runs/f/state.json").read_text())
     check("[CP5-T09] precondition: no question was ever asked and no chat reply was ever recorded for this plan",
           "pending" not in st_before, st_before)
-    r = rx(d, env, "approve-plan", "--director-token", tok)
-    check("[CP5-T09] the director-signed token approves the plan with no ask step and no chat reply required",
-          r.returncode == 0 and cp3_state(d)["phase"] == "building", (r.returncode, r.stderr, cp3_state(d)["phase"]))
+    sg = trust_helpers.director_sign_apply(d, denv, home, "approve-plan")
+    assert rk.returncode == 0 and en.returncode == 0 and sg.returncode == 0, (rk.stderr, en.stderr, sg.stderr)
+    check("[CP5-T09] director-sign approve-plan --apply advances the run with no ask step and no chat reply required",
+          cp3_state(d)["phase"] == "building", (sg.returncode, sg.stderr, cp3_state(d)["phase"]))
+    r = rx(d, env, "approve-plan", "--director-token", "forged-token")
+    check("[CP5-T09] approve-plan --director-token on the enrolled lane is refused",
+          r.returncode != 0 and cp3_state(d)["phase"] == "building", (r.returncode, r.stderr))
 
 
 SECTIONS.append(("CP5", cp5_director_signed_approval_skips_chat_question))

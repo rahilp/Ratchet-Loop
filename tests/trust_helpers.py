@@ -892,3 +892,22 @@ def cp5r12_director(home_dir, denv, lane, *args):
     cp4x_guard_tool(home_dir, denv, "Bash", {"command": f"python3 {LAUNCHER} --root {lane} {' '.join(args)}"},
                     session="s-director")
     return rx(home_dir, denv, "--root", str(lane), *args)
+
+
+def director_harness_home(prefix="ratchet-dhome-"):
+    return Path(_tmp.mkdtemp(prefix=prefix))
+
+
+def director_lane_cmd(lane, denv, home, *args):
+    return rx(home, denv, "--root", str(lane), *args)
+
+
+def director_enroll(lane, denv, home=None):
+    home = home or director_harness_home()
+    rk = director_lane_cmd(lane, denv, home, "director-key")
+    en = director_lane_cmd(lane, denv, home, "director-enroll")
+    return home, rk, en
+
+
+def director_sign_apply(lane, denv, home, *sign_args):
+    return director_lane_cmd(lane, denv, home, "director-sign", *sign_args, "--apply")

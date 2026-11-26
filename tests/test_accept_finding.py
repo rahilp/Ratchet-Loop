@@ -633,8 +633,7 @@ def _blocked_round_unconfirmed(name):
 def x03_director_mode_refuses_chat_accept_needs_director_token():
     d, env, tp, rnd, rid = _blocked_round_unconfirmed("x03")
     denv = dict(env, RATCHET_ROLE="director")
-    rk = th.rx(d, denv, "director-key")
-    en = th.rx(d, denv, "director-enroll")
+    home, rk, en = th.director_enroll(d, denv)
     check("[CP3-X03] (setup) director-key and director-enroll succeed", rk.returncode == 0 and en.returncode == 0,
           (rk.stderr, en.stderr))
     r_ask = th.rx(d, env, "ask", "accept-finding", "CP1", "F1")
@@ -645,17 +644,16 @@ def x03_director_mode_refuses_chat_accept_needs_director_token():
     out = r_chat.stdout + r_chat.stderr
     check("[CP3-X03] a chat 'accept: <reason>' reply is refused in a director-enrolled lane",
           r_chat.returncode != 0, out)
-    check("[CP3-X03] the refusal says a director token is needed",
+    check("[CP3-X03] the refusal says the director must sign",
           bool(re.search(r"director[- ]enrolled|director token|director-sign", out, re.I)), out)
     check("[CP3-X03] F1 is still open: the chat reply accepted nothing", by_id(open_findings(d), "F1") is not None,
           open_findings(d))
-    sg = th.rx(d, denv, "director-sign", "accept-finding")
-    tok = sg.stdout.strip().splitlines()[-1] if sg.stdout.strip() else ""
-    check("[CP3-X03] (setup) director-sign accept-finding produces a token", sg.returncode == 0 and tok,
-          sg.stdout + sg.stderr)
-    r_tok = th.rx(d, env, "accept-finding", "CP1", "--director-token", tok, "--reason", "director accepted this limit")
-    check("[CP3-X03] the director-signed token accepts the finding with the director's own reason",
-          r_tok.returncode == 0, r_tok.stdout + r_tok.stderr)
+    r_tok = th.rx(d, env, "accept-finding", "CP1", "--director-token", "forged", "--reason", "director accepted this limit")
+    check("[CP3-X03] accept-finding --director-token on an enrolled lane is refused",
+          r_tok.returncode != 0, r_tok.stdout + r_tok.stderr)
+    sg = th.director_sign_apply(d, denv, home, "accept-finding", "CP1", "--ids", "F1", "--reason", "director accepted this limit")
+    check("[CP3-X03] director-sign accept-finding … --apply accepts the finding",
+          sg.returncode == 0, sg.stdout + sg.stderr)
     e1 = by_id(deferred_findings(d), "F1")
     check("[CP3-X03] F1 is recorded accepted by the director, with the director's own reason",
           bool(e1) and e1.get("accepted") is True and e1.get("accepted_by") == "director"
@@ -1220,28 +1218,25 @@ def x16_duplicate_ids_from_one_reviewer_get_their_own_open_ids():
 def x17_director_token_without_reason_is_refused_and_not_consumed():
     d, env, tp, rnd, rid = _blocked_round_unconfirmed("x17")
     denv = dict(env, RATCHET_ROLE="director")
-    rk = th.rx(d, denv, "director-key")
-    en = th.rx(d, denv, "director-enroll")
+    home, rk, en = th.director_enroll(d, denv)
     check("[CP3-X17] (setup) director-key and director-enroll succeed", rk.returncode == 0 and en.returncode == 0,
           (rk.stderr, en.stderr))
     th.rx(d, env, "ask", "accept-finding", "CP1", "F1")
-    sg = th.rx(d, denv, "director-sign", "accept-finding")
-    tok = sg.stdout.strip().splitlines()[-1] if sg.stdout.strip() else ""
-    check("[CP3-X17] (setup) director-sign accept-finding produces a token", sg.returncode == 0 and tok,
-          sg.stdout + sg.stderr)
-    r_no_reason = th.rx(d, env, "accept-finding", "CP1", "--director-token", tok)
-    out = r_no_reason.stdout + r_no_reason.stderr
-    check("[CP3-X17] accept-finding with a director token but no --reason is refused",
-          r_no_reason.returncode != 0, out)
-    check("[CP3-X17] the refusal names --reason as what is missing", "--reason" in out, out)
+    sg0 = th.director_sign_apply(d, denv, home, "accept-finding", "CP1", "--ids", "F1")
+    out0 = sg0.stdout + sg0.stderr
+    check("[CP3-X17] director-sign accept-finding --apply without --reason is refused", sg0.returncode != 0, out0)
+    check("[CP3-X17] the refusal names --reason as what is missing", "--reason" in out0, out0)
     check("[CP3-X17] nothing was accepted: F1 is still open", by_id(open_findings(d), "F1") is not None,
           open_findings(d))
     st = th.cp3_state(d)
-    check("[CP3-X17] the question is still pending: the forgotten --reason did not spend the token",
+    check("[CP3-X17] the question is still pending",
           (st.get("pending") or {}).get("action") == "accept-finding", st.get("pending"))
-    r_tok = th.rx(d, env, "accept-finding", "CP1", "--director-token", tok, "--reason", "director accepted this limit")
-    check("[CP3-X17] the SAME token plus --reason now succeeds", r_tok.returncode == 0,
+    r_tok = th.rx(d, env, "accept-finding", "CP1", "--director-token", "forged", "--reason", "director accepted this limit")
+    check("[CP3-X17] accept-finding --director-token on the lane is refused", r_tok.returncode != 0,
           r_tok.stdout + r_tok.stderr)
+    sg = th.director_sign_apply(d, denv, home, "accept-finding", "CP1", "--ids", "F1", "--reason", "director accepted this limit")
+    check("[CP3-X17] director-sign accept-finding with --reason and --apply now succeeds", sg.returncode == 0,
+          sg.stdout + sg.stderr)
     e1 = by_id(deferred_findings(d), "F1")
     check("[CP3-X17] F1 is recorded accepted by the director, with the director's own reason",
           bool(e1) and e1.get("accepted") is True and e1.get("accepted_by") == "director", e1)

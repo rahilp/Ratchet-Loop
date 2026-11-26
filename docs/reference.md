@@ -162,6 +162,7 @@ python3 tests/test_dm_table.py
 python3 tests/test_docs.py
 python3 tests/test_docs_accuracy.py
 python3 tests/test_engine_split.py
+python3 tests/test_director_redesign.py
 python3 tests/test_flaky.py
 python3 tests/test_feedback_fixes.py
 python3 tests/test_ffl_provider_add.py

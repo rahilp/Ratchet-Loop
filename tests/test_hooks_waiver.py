@@ -11,6 +11,7 @@ enforcement hooks never fired", because the user's yes can only be recorded when
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -181,6 +182,26 @@ def full_waive(d, text=GO, *extra):
     a = ask(d)
     say(d, text)
     return a, rx(d, "hooks-waive", *extra)
+
+
+def director_home():
+    return Path(_tmp.mkdtemp(prefix="ratchet-hw-dhome-"))
+
+
+def director_rx(home, d, *args, env=None):
+    """Director harness command against a lane (`--root <lane>`), from a separate checkout."""
+    m = trust_helpers.cp5y_load_engine()
+    denv = env or dict(ENV, RATCHET_ROLE="director")
+    with _FAST_LOCK, _FastCall(m, home, denv) as r:
+        m.main(["--root", str(d), *args])
+    return r
+
+
+def enrolled_hooks_waive_apply(d):
+    home = director_home()
+    director_rx(home, d, "director-key")
+    director_rx(home, d, "director-enroll")
+    return director_rx(home, d, "director-sign", "hooks-waive", "--apply")
 
 
 def refused(r):
@@ -499,21 +520,19 @@ def main():
     fire_stop(d)
     check("[CP2-T23] no warning once an enforcement hook has fired", not next_json(d).get("warning"), next_json(d))
 
-    print("[CP2-T24] a director token for hooks-waive is single use")
+    print("[CP2-T24] hooks-waive via director-sign --apply; lane --director-token is refused")
     d = project("t24")
-    DENV = dict(ENV, RATCHET_ROLE="director")
-    rx(d, "director-key", env=DENV)
-    en = rx(d, "director-enroll", env=DENV)
-    sg = rx(d, "director-sign", "hooks-waive", env=DENV)
-    tok = sg.stdout.strip().splitlines()[-1] if sg.stdout.strip() else ""
-    check("[CP2-T24] token signed", en.returncode == 0 and sg.returncode == 0 and tok, (en.stderr, sg.stderr))
-    r = rx(d, "hooks-waive", "--director-token", tok)
-    check("[CP2-T24] first use waives", r.returncode == 0 and waived(d), r.stderr + r.stdout)
+    sg = enrolled_hooks_waive_apply(d)
+    check("[CP2-T24] director-sign hooks-waive --apply waives", sg.returncode == 0 and waived(d), (sg.stderr, sg.stdout))
+    r_tok = rx(d, "hooks-waive", "--director-token", "abc123")
+    check("[CP2-T24] hooks-waive --director-token on an enrolled lane is refused",
+          refused(r_tok) and re.search(r"no longer accepted|director-token", out(r_tok), re.I) is not None,
+          (r_tok.stdout, r_tok.stderr))
     fire_stop(d)
     rx(d, "status")  # state write clears the waiver once enforcement fires
     clear_hb(d)
-    r = rx(d, "hooks-waive", "--director-token", tok)
-    check("[CP2-T24] replaying the spent token is refused and does not waive", refused(r) and not waived(d),
+    r = rx(d, "hooks-waive", "--director-token", "abc123")
+    check("[CP2-T24] replaying --director-token still does not waive", refused(r) and not waived(d),
           (r.stdout, r.stderr, hk(d)))
 
     print("[CP2-T26] a request to install hooks is not consent to skip them")
@@ -538,21 +557,14 @@ def main():
     def n_of(d):
         return json.loads((d / ".ratchet/runs/f/state.json").read_text()).get("hooks_waive_n", 0)
 
-    def token_for(d):
-        denv = dict(ENV, RATCHET_ROLE="director")
-        rx(d, "director-key", env=denv)
-        rx(d, "director-enroll", env=denv)
-        sg = rx(d, "director-sign", "hooks-waive", env=denv)
-        return sg.stdout.strip().splitlines()[-1] if sg.stdout.strip() else ""
-
     d = project("t28")
-    tok = token_for(d)
     n0 = n_of(d)
-    r = rx(d, "hooks-waive", "--director-token", tok)
-    check("[CP2-T28] token use waives and bumps the counter", r.returncode == 0 and waived(d) and n_of(d) == n0 + 1,
-          (r.stderr, n0, n_of(d)))
-    r = rx(d, "hooks-waive", "--director-token", tok)  # waiver still active, no awaiting_since: replay
-    check("[CP2-T28] replaying the spent token while the waiver is active is refused", refused(r), (r.stdout, r.stderr))
+    sg = enrolled_hooks_waive_apply(d)
+    check("[CP2-T28] director-sign hooks-waive --apply waives",
+          sg.returncode == 0 and waived(d), (sg.stderr, n0, n_of(d)))
+    r = rx(d, "hooks-waive", "--director-token", "abc123")  # waiver still active
+    check("[CP2-T28] hooks-waive --director-token while the waiver is active is refused", refused(r),
+          (r.stdout, r.stderr))
     d = project("t28b")
     full_waive(d)
     n0 = n_of(d)
@@ -733,17 +745,12 @@ def main():
     check("[CP2-T32] 'yes with hooks' is neither a waiver nor a plan approval (extra words make it unclear)",
           refused(r) and sj(d).get("phase") == "awaiting_plan_approval", (r.stdout, r.stderr))
 
-    print("[CP2-T36] director-sign hooks-waive works in the phases where it is offered")
+    print("[CP2-T36] director-sign hooks-waive --apply works in the phases where it is offered")
     for nm, appr in (("t36b", True), ("t36p", False)):
         d = project(nm, approved=appr)
-        denv = dict(ENV, RATCHET_ROLE="director")
-        rx(d, "director-key", env=denv)
-        rx(d, "director-enroll", env=denv)
-        sg = rx(d, "director-sign", "hooks-waive", env=denv)
-        tok = sg.stdout.strip().splitlines()[-1] if sg.stdout.strip() else ""
-        r = rx(d, "hooks-waive", "--director-token", tok)
-        check(f"[CP2-T36] token signed in {sj(d).get('phase')} waives", sg.returncode == 0 and r.returncode == 0
-              and waived(d), (sg.stderr, r.stderr))
+        sg = enrolled_hooks_waive_apply(d)
+        check(f"[CP2-T36] director-sign hooks-waive --apply in {sj(d).get('phase')} waives",
+              sg.returncode == 0 and waived(d), (sg.stderr, sg.stdout))
 
     print("[CP2-T37] the user's reply is stored with the waiver")
     d = project("t37")
