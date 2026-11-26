@@ -50,6 +50,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
+LAUNCHER = SCRIPT_DIR / "ratchet.py"
 VIEWER_TEMPLATE = SKILL_DIR / "assets" / "viewer.html"
 sys.path.insert(0, str(SCRIPT_DIR))
 # Lets a deferred, call-time-only lookup from inside engine_utils.py (its _read_record/_write_record/
@@ -3316,7 +3317,7 @@ def _retry_command() -> str:
     quoted for a POSIX shell), so a refusal can say exactly what to run again and running it as written works."""
     import shlex
     args = list(_ENGINE_ARGV) if _ENGINE_ARGV is not None else list(sys.argv[1:])
-    return shlex.join([sys.executable or "python3", str(Path(__file__).resolve()), *args])
+    return shlex.join([sys.executable or "python3", str(LAUNCHER), *args])
 
 
 def _die_record_busy(p: Path, lost: str):
@@ -16536,7 +16537,7 @@ def _spawn_background(argv: list, log: Path, env_extra=None) -> int:
         kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     else:
         kw["start_new_session"] = True
-    return subprocess.Popen([sys.executable, str(Path(__file__).resolve()), *argv], **kw).pid
+    return subprocess.Popen([sys.executable, str(LAUNCHER), *argv], **kw).pid
 
 
 def _start_server(kind, root: Path, state_file: Path, bind, port, token_mode, public_host, extra=()):
@@ -16955,7 +16956,7 @@ def _heartbeat(root: Path, event: str, host: str):
         pass
 
 
-ENGINE_PATH = str(Path(__file__).resolve())
+ENGINE_PATH = str(LAUNCHER)
 
 # The prompt and stop hooks keep their own append-only records in the run folder (never state.json, which only a
 # command holding the state lock writes): the engine reads them.
@@ -19344,7 +19345,7 @@ def run_hook(event: str, host_arg: str | None) -> int:
 # ---- installing the hooks into each host ------------------------------------------------
 
 def _hook_cmd(host, event):
-    return f'python3 "{Path(__file__).resolve()}" hook {event} --host {host}'
+    return f'python3 "{LAUNCHER}" hook {event} --host {host}'
 
 
 def hook_config_path(host: str, scope: str, root: Path) -> Path:

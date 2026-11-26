@@ -67,10 +67,27 @@ def t06_no_internal_loader_points_at_launcher():
           not bad, bad)
 
 
+def t07_emitted_paths_name_launcher():
+    spec = importlib.util.spec_from_file_location("ratchet_engine_split_paths", ENGINE)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    check("[S-T07] ENGINE_PATH is the launcher",
+          Path(m.ENGINE_PATH).resolve() == LAUNCHER.resolve(), m.ENGINE_PATH)
+    check("[S-T07] LAUNCHER constant points at ratchet.py",
+          Path(m.LAUNCHER).resolve() == LAUNCHER.resolve(), getattr(m, "LAUNCHER", None))
+    hook = m._hook_cmd("claude", "guard")
+    check("[S-T07] _hook_cmd embeds ratchet.py not ratchet_engine.py",
+          "ratchet.py" in hook and "ratchet_engine.py" not in hook, hook)
+    retry = m._retry_command()
+    check("[S-T07] _retry_command names the launcher",
+          "ratchet.py" in retry and "ratchet_engine.py" not in retry, retry)
+
+
 CASES = [
     ("S-T01", t01_files_exist), ("S-T02", t02_launcher_is_tiny), ("S-T03", t03_engine_defines_main),
     ("S-T04", t04_launcher_help), ("S-T05", t05_inprocess_loads_engine_file),
     ("S-T06", t06_no_internal_loader_points_at_launcher),
+    ("S-T07", t07_emitted_paths_name_launcher),
 ]
 
 
