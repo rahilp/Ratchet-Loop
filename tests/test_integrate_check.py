@@ -35,6 +35,7 @@ import _tmp  # noqa: E402
 import trust_helpers as th  # noqa: E402
 
 ROOT = HERE.parent
+LAUNCHER = th.LAUNCHER
 ENGINE = th.ENGINE
 PASS = FAIL = 0
 CASE_STATUS: dict[str, bool] = {}
@@ -128,7 +129,7 @@ class World:
     def run(self, target, *extra, role="director", env=None, cwd=None, dry=True):
         e = env or (self.denv if role == "director" else self.env)
         args = ["--root", str(self.main), "integrate", str(target), *(["--dry-run"] if dry else []), *extra]
-        return subprocess.run([sys.executable, str(ENGINE), *args], cwd=cwd or self.main, capture_output=True,
+        return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=cwd or self.main, capture_output=True,
                               text=True, env=e)
 
 
@@ -463,7 +464,7 @@ def t15_guard_blocks_a_builder_from_running_integrate():
 
     def guard(cmd):
         payload = {"cwd": str(p), "tool_name": "Bash", "tool_input": {"command": cmd}}
-        return subprocess.run([sys.executable, str(ENGINE), "hook", "guard", "--host", "claude"], cwd=p, text=True,
+        return subprocess.run([sys.executable, str(LAUNCHER), "hook", "guard", "--host", "claude"], cwd=p, text=True,
                               capture_output=True, env=w.env, input=json.dumps(payload))
 
     for cmd in ("python3 ratchet.py integrate ../lane-a --dry-run",

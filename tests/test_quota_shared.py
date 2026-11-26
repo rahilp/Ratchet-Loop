@@ -181,7 +181,7 @@ class Lane:
         return g.rx(self.dir, *args, env=self.m.env, fast=fast)
 
     def popen(self, *args):
-        return subprocess.Popen([sys.executable, str(g.ENGINE), *args], cwd=self.dir, env=self.m.env,
+        return subprocess.Popen([sys.executable, str(g.LAUNCHER), *args], cwd=self.dir, env=self.m.env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def open_round(self):

@@ -86,7 +86,9 @@ import _tmp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 README = README_DOCS
 THIS_FILE = Path(__file__).resolve()
 NEW_TEST_LINE = "python3 tests/test_hook_opencode_stop.py"
@@ -183,7 +185,7 @@ class World:
         return env
 
     def sh(self, *args, stdin=None, env_extra=None, timeout=180):
-        return subprocess.run([sys.executable, str(ENGINE), *args], cwd=str(self.proj), input=stdin,
+        return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=str(self.proj), input=stdin,
                               capture_output=True, text=True, env=self.env(**(env_extra or {})), timeout=timeout)
 
 
@@ -736,7 +738,7 @@ def retargeted_plugin(w, stem, engine_path, src=None):
 
     def sub(m):
         try:
-            if json.loads(m.group(0)) == str(ENGINE):
+            if json.loads(m.group(0)) == str(LAUNCHER):
                 hits[0] += 1
                 return json.dumps(str(engine_path))
         except ValueError:
@@ -761,7 +763,7 @@ def stubbed(w, cfg, stem="stubbed"):
 REF_JS = r'''
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-const ENGINE = __ENGINE__;
+const ENGINE = __LAUNCHER__;
 const O = __OPTS__;
 const PREFIX = "[RATCHET PLUGIN TURN - NOT USER INPUT]";
 const STOP = "hook stop --host opencode".split(" ");
@@ -910,7 +912,7 @@ def ref_plugin(w, engine, **over):
     """The reference stop plugin (everything right) with `over` options changed, pointed at `engine`."""
     bad = [k for k in over if k not in GOOD]
     assert not bad, bad
-    src = REF_JS.replace("__ENGINE__", json.dumps(str(engine))).replace("__OPTS__", json.dumps({**GOOD, **over}))
+    src = REF_JS.replace("__LAUNCHER__", json.dumps(str(engine))).replace("__OPTS__", json.dumps({**GOOD, **over}))
     d = w.s.work / "refs"
     d.mkdir(exist_ok=True)
     p = d / f"{w.s.next('ref')}.js"
@@ -1123,7 +1125,7 @@ def make_waiting(w, sid="ses_main"):
     pl = {"hook_event_name": "chat.message", "session_id": sid, "cwd": str(w.proj), "prompt": "go on please",
           "message_id": "msg_w1"}
     _must(w.sh("hook", "prompt", "--host", "opencode", stdin=json.dumps(pl)))
-    cmd = f'python3 {ENGINE} wait --for "a background build"'
+    cmd = f'python3 {LAUNCHER} wait --for "a background build"'
     _must(w.sh("hook", "guard", "--host", "opencode", stdin=json.dumps(
         {"tool_name": "bash", "tool_input": {"command": cmd}, "cwd": str(w.proj), "session_id": sid})))
     _must(w.sh("wait", "--for", "a background build"))
@@ -1216,7 +1218,7 @@ def case_t05():
     print("[CP6-T05] real progress restarts the in-a-row count")
     w = fresh()
     (w.proj / "t.test.js").write_text("it('[CP1-T01] x', () => {})\n")
-    steps = [idle(), idle(), exec_step(sys.executable, str(ENGINE), "tests-written", "CP1")] + [idle() for _ in range(5)]
+    steps = [idle(), idle(), exec_step(sys.executable, str(LAUNCHER), "tests-written", "CP1")] + [idle() for _ in range(5)]
     o = drive(w, [run_of(w.plugin, steps, prompt={"mode": "resolve", "echo": True})])
     emit("CP6-T05", v_t05(o))
     sw = stub_world()
@@ -1841,7 +1843,7 @@ def host_enforcement():
     env = scrubbed_env()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     with _tmp.mkdtemp(prefix="ratchet-ocstop-probe-") as cwd:
-        r = subprocess.run([sys.executable, "-c", code, str(ENGINE)], cwd=cwd, capture_output=True, text=True, env=env,
+        r = subprocess.run([sys.executable, "-c", code, str(LAUNCHER)], cwd=cwd, capture_output=True, text=True, env=env,
                            timeout=180)
     if r.returncode != 0:
         return None

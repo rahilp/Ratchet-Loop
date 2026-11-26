@@ -17,7 +17,7 @@ from pathlib import Path
 import _tmp
 import trust_helpers
 from trust_helpers import (
-    ENGINE, HAVE_PTY, check, cp3_state, cp4_answer_correct, cp4_awaiting_review, cp4_find_code, cp4_human_log_lines,
+    ENGINE, LAUNCHER, HAVE_PTY, check, cp3_state, cp4_answer_correct, cp4_awaiting_review, cp4_find_code, cp4_human_log_lines,
     cp4_pty_run, cp4_say_yes, cp4_unapproved_plan, cp4x_guard_tool, engine, engine_env, errors_path, fire_guard,
     install, js, make_env, now_dt, project, prompt_payload, rx, stop_payload,
 )
@@ -330,7 +330,7 @@ def cp4_adv_round1_role_backstop():
     out = Path(_tmp.mkdtemp(prefix="ratchet-trust-x01-"))
     script = out / "x.sh"
     body = ("export RATCHET_ROLE=director\n"
-            + "".join(f'"{sys.executable}" "{ENGINE}" {cmd} > "{out}/{name}.out" 2> "{out}/{name}.err"; '
+            + "".join(f'"{sys.executable}" "{LAUNCHER}" {cmd} > "{out}/{name}.out" 2> "{out}/{name}.err"; '
                       f'echo $? > "{out}/{name}.rc"\n'
                       for name, cmd in (("key", "director-key"), ("enroll", "director-enroll"),
                                         ("sign", "director-sign approve-plan"))))
@@ -362,7 +362,7 @@ def cp4_adv_round1_role_backstop():
     py_body = ("import os, subprocess, sys\n"
                "os.environ['RATCHET_ROLE'] = 'director'\n"
                f"for a in (['director-key'], ['director-enroll'], ['director-sign', 'approve-plan']):\n"
-               f"    r = subprocess.run([sys.executable, {str(ENGINE)!r}, '--root', {str(d)!r}, *a],"
+               f"    r = subprocess.run([sys.executable, {str(LAUNCHER)!r}, '--root', {str(d)!r}, *a],"
                " capture_output=True, text=True)\n"
                "    print(a[0], r.returncode)\n")
     py.write_text(py_body)
@@ -388,7 +388,7 @@ def cp4_adv_round1_role_backstop():
     denv = dict(env, RATCHET_ROLE="director")  # the director's agent CLI was started with it: its hooks have it
     steps = []
     for args in (["director-key"], ["director-enroll"], ["director-sign", "approve-plan"]):
-        cmd = f"python3 {ENGINE} --root {d} {' '.join(args)}"
+        cmd = f"python3 {LAUNCHER} --root {d} {' '.join(args)}"
         g = cp4x_guard_tool(home_dir, denv, "Bash", {"command": cmd}, session="s-director")
         steps.append((g.returncode, rx(home_dir, denv, "--root", str(d), *args)))
     tok = steps[-1][1].stdout.strip().splitlines()[-1] if steps[-1][1].stdout.strip() else ""
@@ -406,7 +406,7 @@ def cp4_adv_round1_role_backstop():
     dproj = Path(_tmp.mkdtemp(prefix="ratchet-trust-dproj-"))
     (dproj / ".ratchet").mkdir()
     denv = dict(env, RATCHET_ROLE="director")
-    g = cp4x_guard_tool(dproj, denv, "Bash", {"command": f"python3 {ENGINE} --root {d} director-key"},
+    g = cp4x_guard_tool(dproj, denv, "Bash", {"command": f"python3 {LAUNCHER} --root {d} director-key"},
                         session="s-director")
     rec = json.loads((dproj / ".ratchet" / "hook-env.json").read_text())
     rk = rx(dproj, denv, "--root", str(d), "director-key")
@@ -844,7 +844,7 @@ def cp4z_slow_hook(d, env, event, payload, pause=2.0):
     the exact interleaving of a hook that started first but finishes last. Returns the process once it is paused
     (or after 15 s if it never reaches the write)."""
     ready = Path(_tmp.mkdtemp(prefix="ratchet-trust-x12-")) / "ready"
-    p = subprocess.Popen([sys.executable, "-c", _CP4Z_SLOW_HOOK, str(ENGINE), str(ready), event, str(pause)],
+    p = subprocess.Popen([sys.executable, "-c", _CP4Z_SLOW_HOOK, str(LAUNCHER), str(ready), event, str(pause)],
                          cwd=str(d), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True)
     p.stdin.write(json.dumps(payload))
@@ -861,7 +861,7 @@ def cp4z_bash_payload(d, command="ls", session="s"):
 
 
 def cp4z_hook_proc(d, env, event, payload):
-    p = subprocess.Popen([sys.executable, str(ENGINE), "hook", event, "--host", "claude"], cwd=str(d), env=env,
+    p = subprocess.Popen([sys.executable, str(LAUNCHER), "hook", event, "--host", "claude"], cwd=str(d), env=env,
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     p.stdin.write(json.dumps(payload))
     p.stdin.close()

@@ -13,7 +13,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import _tmp  # noqa: E402
 
-ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 PASS = FAIL = 0
 
 
@@ -67,7 +69,7 @@ def main():
         td = _tmp.mkdtemp(prefix="ratchet-list-test-")
         try:
             r = subprocess.run(
-                [sys.executable, str(ENGINE), "hook", "stop", "--host", host_arg],
+                [sys.executable, str(LAUNCHER), "hook", "stop", "--host", host_arg],
                 cwd=td, input='["a","b"]', capture_output=True, text=True,
                 env={k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CODEX_SANDBOX", "GEMINI_CLI", "COPILOT_CLI")}
             )
@@ -103,7 +105,7 @@ def main():
     try:
         subprocess.run(["git", "init", "-q"], cwd=td, check=True)
         r = subprocess.run(
-            [sys.executable, str(ENGINE), "hook", "stop", "--host", "auto"],
+            [sys.executable, str(LAUNCHER), "hook", "stop", "--host", "auto"],
             cwd=td, input=json.dumps(codex_payload), capture_output=True, text=True,
             env={k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CODEX_SANDBOX", "GEMINI_CLI", "COPILOT_CLI")}
         )

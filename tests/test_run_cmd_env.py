@@ -5,7 +5,7 @@ the test/regression/check subprocess it launches, while vars a child legitimatel
    python3 tests/test_run_cmd_env.py
 
 Calls `_run_cmd` directly (the same direct in-process call style skills/.../ratchet.py:8038 and
-tests/test_digest_docstring.py's `import ratchet as rt` use) with a trivial helper script that dumps its own
+tests/test_digest_docstring.py's `import ratchet_engine as rt` use) with a trivial helper script that dumps its own
 os.environ to a file, so no real suite (test_install.py, a full tests/run_all.py pass) is ever shelled out to
 by this file -- running those against this repo's own worktree with RATCHET_ROOT ambient is exactly the leak
 this checkpoint fixes, and doing so here would still risk writing to this worktree's real .claude/settings.json
@@ -55,7 +55,7 @@ def _dump_env_via_run_cmd(extra_env: dict) -> dict:
     """Runs a trivial helper script through `_run_cmd` with `extra_env` added to this process's own env for the
     call, and returns the dict the child subprocess actually saw (read back from a file the child wrote
     itself) -- never the real test suites, never this worktree's real .claude/settings.json."""
-    import ratchet as rt  # noqa: E402  (imported late so a missing module never blocks collection)
+    import ratchet_engine as rt  # noqa: E402  (imported late so a missing module never blocks collection)
 
     d = Path(_tmp.mkdtemp(prefix="ratchet-run-cmd-env-"))
     out = d / "child-env.json"

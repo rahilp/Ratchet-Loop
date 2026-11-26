@@ -13,7 +13,9 @@ import sys
 import _tmp
 from pathlib import Path
 
-ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 PASS = FAIL = 0
 KEYS = {"host", "installed", "heartbeat_seen", "fresh", "enforcing", "prompt_hook", "missing"}
 VENDOR = {"claude": "anthropic", "codex": "openai", "gemini": "google", "copilot": "github"}
@@ -39,7 +41,7 @@ def make_env(host=None):
 
 
 def rx(d, env, *args, stdin=None):
-    return subprocess.run([sys.executable, str(ENGINE), *args], cwd=d, capture_output=True, text=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=d, capture_output=True, text=True,
                           env=env, input=stdin)
 
 

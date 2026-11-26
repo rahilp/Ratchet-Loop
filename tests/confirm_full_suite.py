@@ -64,7 +64,9 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 
 RUN_ALL = HERE / "run_all.py"
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 STANDARDS = ROOT / ".ratchet" / "standards.md"
 # This run's own evidence folder (same shape as tests/measure_suite_baseline.py's REAL_OUT): CP5-T02's
 # measured wall-clock is written here so it is reviewable, not just asserted and discarded.

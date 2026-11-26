@@ -38,7 +38,9 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import _tmp  # noqa: E402
 
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 ENV = {k: v for k, v in os.environ.items() if k not in ("RATCHET_ROLE", "RATCHET_HUMAN_OVERRIDE", "RATCHET_ROOT")}
 ENV["RATCHET_HOME"] = str(_tmp.mkdtemp(prefix="ratchet-ci-docs-home-"))
 ENV["RATCHET_HOST_PROVIDER"] = "anthropic"
@@ -73,7 +75,7 @@ def git(d, *a):
 
 
 def rx(d, *args, env=None):
-    return subprocess.run([sys.executable, str(ENGINE), *args], cwd=d, capture_output=True, text=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=d, capture_output=True, text=True,
                           env=env or ENV)
 
 
@@ -85,7 +87,7 @@ def say(d, text, session="s-owner"):
     with tp.open("a") as f:
         f.write(json.dumps({"type": "user", "message": {"role": "user", "content": text},
                             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
-    return subprocess.run([sys.executable, str(ENGINE), "hook", "prompt", "--host", "claude"], cwd=d, text=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), "hook", "prompt", "--host", "claude"], cwd=d, text=True,
                           capture_output=True, env=ENV,
                           input=json.dumps({"cwd": str(d), "prompt": text, "session_id": session,
                                             "transcript_path": str(tp)}))
@@ -95,7 +97,7 @@ def guard(d, tool, tool_input, cwd=None, agent=None):
     payload = {"cwd": str(cwd or d), "tool_name": tool, "tool_input": tool_input}
     if agent:
         payload.update(agent_type=agent, agent_id="a-" + agent)
-    return subprocess.run([sys.executable, str(ENGINE), "hook", "guard", "--host", "claude"], cwd=d, text=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), "hook", "guard", "--host", "claude"], cwd=d, text=True,
                           capture_output=True, env=ENV, input=json.dumps(payload))
 
 

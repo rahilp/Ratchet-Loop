@@ -41,6 +41,7 @@ import _tmp  # noqa: E402
 import trust_helpers as th  # noqa: E402
 
 ROOT = HERE.parent
+LAUNCHER = th.LAUNCHER
 ENGINE = th.ENGINE
 PASS = FAIL = 0
 CASE_STATUS: dict[str, bool] = {}
@@ -142,7 +143,7 @@ class World:
         args += list(extra)
         e = env or self.denv
         if hook:   # the director's own guard hook sees the command first
-            cmd = f"python3 {ENGINE} --root {shlex.quote(str(self.main))} {shlex.join(args)}"
+            cmd = f"python3 {LAUNCHER} --root {shlex.quote(str(self.main))} {shlex.join(args)}"
             th.cp4x_guard_tool(self.dfolder, e, "Bash", {"command": cmd}, session="s-director")
         return th.rx(self.dfolder, e, "--root", str(self.main), *args)
 
@@ -658,7 +659,7 @@ def _no_state(w, cid, what):
 def t16_only_the_director_can_start_lanes():
     cid = "CP7-T16"
     w = build()
-    cmd = f"python3 {ENGINE} --root {w.main} lanes-start --request x --lane a=b"
+    cmd = f"python3 {LAUNCHER} --root {w.main} lanes-start --request x --lane a=b"
     g = th.cp4x_guard_tool(w.main, w.env, "Bash", {"command": cmd}, session="s-builder")
     before = state_of(w)   # the guard hook itself writes its own records into main, so the snapshot comes after it
     m = (g.stderr + g.stdout).lower()

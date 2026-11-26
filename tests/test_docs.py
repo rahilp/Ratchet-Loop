@@ -333,7 +333,7 @@ import json as cp2_json
 import os as cp2_os
 import subprocess as cp2_subprocess
 
-CP2_ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+CP2_ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet_engine.py"
 CP2_CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "gemini": "Gemini", "copilot": "Copilot",
                  "opencode": "OpenCode"}
 CP2_HEADER = ["CLI", "Protects Ratchet's records", "Confirms reviewer identity", "Stop hook", "Records your replies"]
@@ -1787,7 +1787,9 @@ import subprocess
 import shutil
 import tempfile
 
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 BUILDERS = ("ratchet-implementer", "ratchet-fixer", "ratchet-test-writer")
 ENTRY_SPLIT = re.compile(r"(?m)^(?=\s*(?:[-*]\s|\d+[.)]\s|\||\*\*|#{3,6}\s))")
 # user-directed command phrasing; every hit is reported as file:line
@@ -1852,7 +1854,7 @@ def control_entries(controls):
 
 
 def engine_commands():
-    r = subprocess.run([sys.executable, str(ENGINE), "--help"], capture_output=True, text=True, timeout=60, cwd=tempfile.gettempdir())
+    r = subprocess.run([sys.executable, str(LAUNCHER), "--help"], capture_output=True, text=True, timeout=60, cwd=tempfile.gettempdir())
     m = re.search(r"\{([a-z][^}]*)\}", r.stdout)
     return set(m.group(1).split(",")) if m else set()
 
@@ -2123,7 +2125,7 @@ def cp5_docs_lint():
     orch = by.get("skills/ratchet-orchestrator/SKILL.md", "")
     controls = hsection(orch, r"control")
     cmds = engine_commands()
-    sub = subprocess.run([sys.executable, str(ENGINE), "set-review", "--help"], capture_output=True, text=True, timeout=60, cwd=tempfile.gettempdir())
+    sub = subprocess.run([sys.executable, str(LAUNCHER), "set-review", "--help"], capture_output=True, text=True, timeout=60, cwd=tempfile.gettempdir())
     setrev_help = sub.stdout
 
     def teeth(tid, label, pred_ok, pred_mut_red):

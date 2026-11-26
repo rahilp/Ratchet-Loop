@@ -13,7 +13,7 @@ T01/T02 read the docstring straight off disk with `ast` (no subprocess, no proje
 parse skills/ratchet-orchestrator/scripts/plan_support.py, find the `_related_spec_items` FunctionDef, and read
 its docstring with `ast.get_docstring`.
 
-T03 checks (a) the runtime rule is unchanged, by importing the engine module directly (`import ratchet as rt`,
+T03 checks (a) the runtime rule is unchanged, by importing the engine module directly (`import ratchet_engine as rt`,
 the same direct-call style tests/test_objective.py uses) and calling `_related_spec_items` on a plain temp
 folder (no git, no .ratchet) holding three hand-written docs/stories/*.md BMAD files -- a done one, a
 not-done one, and an oddly-cased/spaced done one -- and (b) that README.md's test list names this file with a
@@ -36,7 +36,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 # CP7 moved _related_spec_items out of ratchet.py into plan_support.py (see tests/test_modularize_cp7.py,
 # CP7-T12); _func_docstring now reads it there instead, same rule, same docstring, new home only.
 PLAN_SUPPORT = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "plan_support.py"
@@ -122,7 +124,7 @@ def t02_exact_match_rule_stated():
 # ------------------------------------------------------------------------------------------------ CP3-T03
 
 def t03a_runtime_done_rule_unchanged():
-    import ratchet as rt  # noqa: E402  (imported late so T01/T02 never need the module to exist)
+    import ratchet_engine as rt  # noqa: E402  (imported late so T01/T02 never need the module to exist)
     d = Path(_tmp.mkdtemp(prefix="ratchet-digest-docstring-"))
     _bmad_story(d, "1.1", "1.1.done.md", "T03DONE a done story", "Done")
     _bmad_story(d, "1.2", "1.2.notdone.md", "T03NOTDONE a not-done story", "In Progress")

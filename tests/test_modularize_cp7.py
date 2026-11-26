@@ -51,7 +51,9 @@ import test_digest as td  # noqa: E402  (HEADING, _section, _project_with_featur
 import test_digest_specs as tds  # noqa: E402  (SPEC_HEAD, _openspec_spec, _bmad_story)
 
 SCRIPT_DIR = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
-ENGINE = SCRIPT_DIR / "ratchet.py"
+SCRIPTS = SCRIPT_DIR
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 PLAN_SUPPORT = SCRIPT_DIR / "plan_support.py"
 sys.path.insert(0, str(SCRIPT_DIR))  # lets CP7-T12 import `ratchet` directly, the same way CP6's suite does
 
@@ -544,7 +546,7 @@ def t12_digest_docstring_repointed_to_plan_support():
           "_related_spec_items" not in top_level_defs(live_tree))
 
     try:
-        import ratchet as rt  # noqa: E402
+        import ratchet_engine as rt  # noqa: E402
     except Exception as e:
         check("[CP7-T12] ratchet.py still imports successfully after the move", False, str(e))
         return
@@ -614,7 +616,7 @@ def t14_help_status_hook_and_exit_codes_byte_identical():
         except OSError as ex:
             check(f"[CP7-T14] baseline file for `{' '.join(cmd)}` is readable", False, str(ex))
             continue
-        r = subprocess.run([sys.executable, str(ENGINE), *cmd], cwd=str(ROOT), capture_output=True, text=True,
+        r = subprocess.run([sys.executable, str(LAUNCHER), *cmd], cwd=str(ROOT), capture_output=True, text=True,
                            timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1",
                                                  PYTHON_COLORS="0"))
         check(f"[CP7-T14] `ratchet.py {' '.join(cmd)}` exits {e.get('exit_code')}, same as CP1's baseline",
@@ -630,7 +632,7 @@ def t14_help_status_hook_and_exit_codes_byte_identical():
         except (OSError, json.JSONDecodeError) as ex:
             check("[CP7-T14] the saved status --json baseline parses as JSON", False, str(ex))
             saved_status = None
-        r = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(ROOT),
+        r = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(ROOT),
                            capture_output=True, text=True, timeout=30)
         try:
             live_status = json.loads(r.stdout) if r.returncode == 0 else None
@@ -662,7 +664,7 @@ def t14_help_status_hook_and_exit_codes_byte_identical():
         pinned_src = None
     if pinned_src is not None:
         d = Path(_tmp.mkdtemp(prefix="cp7-t14-status-"))
-        r_init = subprocess.run([sys.executable, str(ENGINE), "init", "status parity cap", "--slug", "st"],
+        r_init = subprocess.run([sys.executable, str(LAUNCHER), "init", "status parity cap", "--slug", "st"],
                                 cwd=str(d), capture_output=True, text=True, timeout=30)
         check("[CP7-T14] setup: a fresh throwaway project's `init` succeeds", r_init.returncode == 0,
               (r_init.returncode, r_init.stderr))
@@ -677,7 +679,7 @@ def t14_help_status_hook_and_exit_codes_byte_identical():
             check("[CP7-T14] setup: the pre-move pinned ratchet.py's `status --json` exits 0 on the fresh "
                   "fixture", r_before.returncode == 0, (r_before.returncode, r_before.stdout[-300:],
                                                         r_before.stderr[-300:]))
-            r_after = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(d),
+            r_after = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(d),
                                      capture_output=True, text=True, timeout=30)
             check("[CP7-T14] the current ratchet.py's `status --json` exits 0 on the same fresh fixture",
                   r_after.returncode == 0, (r_after.returncode, r_after.stdout[-300:], r_after.stderr[-300:]))
@@ -692,7 +694,7 @@ def t14_help_status_hook_and_exit_codes_byte_identical():
     check("[CP7-T14] setup: a hook_reply baseline entry is recorded", bool(hook_samples), entries)
     if hook_samples:
         d = Path(_tmp.mkdtemp(prefix="cp7-t14-hook-"))
-        r_init = subprocess.run([sys.executable, str(ENGINE), "init", "hook cap", "--slug", "hk"], cwd=str(d),
+        r_init = subprocess.run([sys.executable, str(LAUNCHER), "init", "hook cap", "--slug", "hk"], cwd=str(d),
                                 capture_output=True, text=True, timeout=30)
         check("[CP7-T14] setup: a fresh throwaway project's `init` succeeds", r_init.returncode == 0,
               (r_init.returncode, r_init.stderr))
@@ -700,7 +702,7 @@ def t14_help_status_hook_and_exit_codes_byte_identical():
             state = str(d / ".ratchet" / "runs" / "hk" / "state.json")
             payload = {"sessionId": "s", "timestamp": 1, "cwd": str(d), "toolName": "edit",
                       "toolArgs": json.dumps({"path": state, "old_str": "a", "new_str": "b"})}
-            rg = subprocess.run([sys.executable, str(ENGINE), "hook", "guard", "--host", "copilot"], cwd=str(d),
+            rg = subprocess.run([sys.executable, str(LAUNCHER), "hook", "guard", "--host", "copilot"], cwd=str(d),
                                 capture_output=True, text=True, timeout=30, input=json.dumps(payload))
             check("[CP7-T14] the fresh copilot guard invocation's exit code matches CP1's recorded baseline "
                   "exit code (the JSON reply alone is not enough -- the process's own exit status must match "
@@ -740,13 +742,13 @@ def t14_help_status_hook_and_exit_codes_byte_identical():
             check(f"[CP7-T14] baseline file for failure `{' '.join(cmd)}` is readable", False, str(ex))
             continue
         if cmd and cmd[0] == "no-such-command":
-            rf = subprocess.run([sys.executable, str(ENGINE), *cmd], cwd=str(ROOT), capture_output=True,
+            rf = subprocess.run([sys.executable, str(LAUNCHER), *cmd], cwd=str(ROOT), capture_output=True,
                                 text=True, timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1",
                                                                  PYTHON_COLORS="0"))
             got = rf.stderr
         else:
             empty_dir = Path(_tmp.mkdtemp(prefix="cp7-t14-empty-"))
-            rf = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(empty_dir),
+            rf = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(empty_dir),
                                 capture_output=True, text=True, timeout=30)
             got = rf.stderr
         check(f"[CP7-T14] failure case `{' '.join(cmd)}` exits {e.get('exit_code')}, same as CP1's baseline",

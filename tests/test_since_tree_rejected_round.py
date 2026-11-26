@@ -92,7 +92,9 @@ t.check = check
 xf.check = check
 
 
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 _REBASELINE = ("import importlib.util, sys\nfrom pathlib import Path\n"
                "s = importlib.util.spec_from_file_location('ratchet_fixture', sys.argv[1])\n"
                "m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
@@ -107,7 +109,7 @@ def _corrupt_prev_round_tree(d, env, wrong_tree):
     state = json.loads(sp.read_text())
     state["checkpoints"]["CP1"]["adv_round"]["prev_round_tree"] = wrong_tree
     sp.write_text(json.dumps(state))
-    r = subprocess.run([sys.executable, "-c", _REBASELINE, str(ENGINE), str(sp)], cwd=d, env=env,
+    r = subprocess.run([sys.executable, "-c", _REBASELINE, str(LAUNCHER), str(sp)], cwd=d, env=env,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr + r.stdout
 

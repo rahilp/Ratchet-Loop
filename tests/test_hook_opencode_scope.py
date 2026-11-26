@@ -45,7 +45,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "skills" / "ratchet-orchestrator" / "assets" / "opencode-plugin.js"
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 PRE_FIX = Path("/tmp/k-plugin-before-r2.js")
 SLOT = "__RATCHET_ENGINE_PATH__"
 NODE = shutil.which("node")
@@ -123,7 +125,7 @@ class Layout:
         return json.loads(out.read_text(encoding="utf-8"))
 
     def doctor_scope(self):
-        p = subprocess.run([sys.executable, str(ENGINE), "doctor"], cwd=str(self.proj), env=self.env,
+        p = subprocess.run([sys.executable, str(LAUNCHER), "doctor"], cwd=str(self.proj), env=self.env,
                            capture_output=True, text=True, timeout=120)
         hits = re.findall(r"opencode plugin \((\w+)\): engine .* is missing.*--scope (\w+)\s*$", p.stdout, re.M)
         return hits, p.returncode

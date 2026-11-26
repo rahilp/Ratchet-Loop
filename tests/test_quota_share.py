@@ -48,6 +48,7 @@ _CUR_CASE: str | None = None
 TESTS: list = []
 ORIG_HOME = g.ENV["RATCHET_HOME"]
 PAID_OK = "2026-10-01T00:00:00Z"            # what the developer's exact OK leaves in a provider entry: a fixed date
+LAUNCHER = g.LAUNCHER
 ENGINE = g.ENGINE
 RUN_TIMEOUT = 240                          # a parallel lane's command may wait for another lane's lock or test request
 
@@ -223,7 +224,7 @@ class Lane:
         return g.rx(self.dir, *args, env=self.env)
 
     def popen(self, *args):
-        return subprocess.Popen([sys.executable, str(ENGINE), *args], cwd=self.dir, env=self.env,
+        return subprocess.Popen([sys.executable, str(LAUNCHER), *args], cwd=self.dir, env=self.env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def nudge(self):
@@ -783,7 +784,7 @@ def cp6_x08_a_reservation_released_for_a_test_request_leaves_no_start_behind():
                                                     "starts": [{"at": _xnow_iso(), "id": "other-lane:opencode-glm-both"}]}})
         a = scn.lane("lane-a", [CODEX, GLM], share=(1, 15))
         (scn.bin / "codex").write_text(FAKE.replace('reply="RATCHET-PROBE-OK"', 'reply="no thanks"'))
-        r = subprocess.run([sys.executable, "-c", XSTALE_DRIVER, str(ENGINE)], cwd=a.dir, env=a.env,
+        r = subprocess.run([sys.executable, "-c", XSTALE_DRIVER, str(LAUNCHER)], cwd=a.dir, env=a.env,
                            capture_output=True, text=True, timeout=RUN_TIMEOUT)
         rnd = parse(r)
     need("the round opens", r.returncode == 0 and len(ids(rnd)) == 1, (said(r)[-400:], ids(rnd)))

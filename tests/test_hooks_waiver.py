@@ -18,7 +18,9 @@ import _tmp
 import trust_helpers
 from pathlib import Path
 
-ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 SCRUB = ("RATCHET_ROLE", "RATCHET_HUMAN_OVERRIDE", "RATCHET_ROOT", "RATCHET_HOST_PROVIDER", "CLAUDECODE",
          "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED",
          "GEMINI_CLI", "COPILOT_CLI", "GITHUB_COPILOT_CLI", "CODEX_HOME", "COPILOT_HOME", "RATCHET_HOOKS_WAIVE")
@@ -621,7 +623,7 @@ def main():
                    "s = importlib.util.spec_from_file_location('ratchet_fixture', sys.argv[1])\n"
                    "m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
                    "m.record_chain(Path(sys.argv[2]))\n")
-        r = subprocess.run([sys.executable, "-c", snippet, str(ENGINE), str(stp(d))], cwd=d, env=ENV,
+        r = subprocess.run([sys.executable, "-c", snippet, str(LAUNCHER), str(stp(d))], cwd=d, env=ENV,
                            capture_output=True, text=True)
         assert r.returncode == 0, r.stderr + r.stdout
 

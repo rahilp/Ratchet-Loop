@@ -54,7 +54,9 @@ import test_dm_finish as fin     # noqa: E402  (_fin2, _director_fin2, _make_leg
 import test_receipt_proof as rp  # noqa: E402  (_write_report)
 
 SCRIPT_DIR = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
-ENGINE = SCRIPT_DIR / "ratchet.py"
+SCRIPTS = SCRIPT_DIR
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 STATUS_TEXT = SCRIPT_DIR / "status_text.py"
 
 # The pre-move commit for this checkpoint: CP7's own landing commit (the tip this checkpoint starts from).
@@ -216,7 +218,7 @@ def mutate(d, fn, slug="f"):
     st = json.loads(p.read_text())
     fn(st)
     p.write_text(json.dumps(st))
-    r = subprocess.run([sys.executable, "-c", REBASELINE, str(ENGINE), str(p)], cwd=str(d), env=g.ENV,
+    r = subprocess.run([sys.executable, "-c", REBASELINE, str(LAUNCHER), str(p)], cwd=str(d), env=g.ENV,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     return st
@@ -664,7 +666,7 @@ def t10_waiting_question_byte_identical():
     # `ask accept-line` is not refused (only its ANSWER needs a director token, never a chat reply), so it is
     # the one real way to get a waiting "director's answer" question_line to compare here.
     d_dir, env, denv = fin._director_fin2("cp8t10dir", failed=True)
-    rx_dir = subprocess.run([sys.executable, str(ENGINE), "ask", "accept-line", "2"], cwd=str(d_dir),
+    rx_dir = subprocess.run([sys.executable, str(LAUNCHER), "ask", "accept-line", "2"], cwd=str(d_dir),
                            capture_output=True, text=True, env=env, timeout=30)
     check("[CP8-T10] setup: `ask accept-line 2` succeeds on the director-enrolled lane", rx_dir.returncode == 0,
           rx_dir.stdout + rx_dir.stderr)
@@ -815,7 +817,7 @@ def t14_hook_reply_byte_identical():
         check("[CP8-T14] the saved hook reply baseline parses as JSON", False, str(ex))
         return
     d = Path(_tmp.mkdtemp(prefix="cp8-t14-hook-"))
-    r = subprocess.run([sys.executable, str(ENGINE), "init", "hook cap", "--slug", "hk"], cwd=str(d),
+    r = subprocess.run([sys.executable, str(LAUNCHER), "init", "hook cap", "--slug", "hk"], cwd=str(d),
                        capture_output=True, text=True, timeout=30)
     check("[CP8-T14] setup: a fresh throwaway project's `init` succeeds", r.returncode == 0,
           (r.returncode, r.stderr))
@@ -824,7 +826,7 @@ def t14_hook_reply_byte_identical():
     state = str(d / ".ratchet" / "runs" / "hk" / "state.json")
     payload = {"sessionId": "s", "timestamp": 1, "cwd": str(d), "toolName": "edit",
                "toolArgs": json.dumps({"path": state, "old_str": "a", "new_str": "b"})}
-    rg = subprocess.run([sys.executable, str(ENGINE), "hook", "guard", "--host", "copilot"], cwd=str(d),
+    rg = subprocess.run([sys.executable, str(LAUNCHER), "hook", "guard", "--host", "copilot"], cwd=str(d),
                         capture_output=True, text=True, timeout=30, input=json.dumps(payload))
     check("[CP8-T14] the fresh copilot guard invocation's exit code matches CP1's recorded baseline exit code",
           rg.returncode == hook_samples[0].get("exit_code"), (rg.returncode, hook_samples[0].get("exit_code")))
@@ -853,7 +855,7 @@ def t14_hook_reply_byte_identical():
         except OSError as ex:
             check("[CP8-T14] baseline file for `--help` is readable", False, str(ex))
         else:
-            rh = subprocess.run([sys.executable, str(ENGINE), "--help"], cwd=str(ROOT), capture_output=True,
+            rh = subprocess.run([sys.executable, str(LAUNCHER), "--help"], cwd=str(ROOT), capture_output=True,
                                 text=True, timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0",
                                                                  NO_COLOR="1", PYTHON_COLORS="0"))
             check("[CP8-T14] `ratchet.py --help` exits the same code as CP1's baseline",
@@ -882,13 +884,13 @@ def t15_known_failure_exit_codes_unchanged():
             check(f"[CP8-T15] baseline file for failure `{' '.join(cmd)}` is readable", False, str(ex))
             continue
         if cmd and cmd[0] == "no-such-command":
-            rf = subprocess.run([sys.executable, str(ENGINE), *cmd], cwd=str(ROOT), capture_output=True,
+            rf = subprocess.run([sys.executable, str(LAUNCHER), *cmd], cwd=str(ROOT), capture_output=True,
                                 text=True, timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0",
                                                                  NO_COLOR="1", PYTHON_COLORS="0"))
             got = rf.stderr
         else:
             empty_dir = Path(_tmp.mkdtemp(prefix="cp8-t15-empty-"))
-            rf = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(empty_dir),
+            rf = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(empty_dir),
                                 capture_output=True, text=True, timeout=30)
             got = rf.stderr
         check(f"[CP8-T15] failure case `{' '.join(cmd)}` exits {e.get('exit_code')}, same as CP1's baseline",

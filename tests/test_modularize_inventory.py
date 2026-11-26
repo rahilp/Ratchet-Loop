@@ -47,7 +47,9 @@ INVENTORY = FIXTURES_DIR / "test-inventory.md"
 BASELINE_DIR = FIXTURES_DIR / "baseline"
 MANIFEST = BASELINE_DIR / "manifest.json"
 APP_SCOUT = RUN_DIR / "app-scout.json"
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 
 SELF_NAME = Path(__file__).name
 MODULE_LOAD_PATTERN = r"spec_from_file_location"
@@ -355,7 +357,7 @@ def t06_status_json_captured():
     # top-level key set right now that a real `status --json` invocation gave when the baseline was captured --
     # proving the sample is verbatim from a real run, not hand-typed, without hardcoding key names here.
     try:
-        live = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(ROOT),
+        live = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)
         live_json = json.loads(live.stdout) if live.returncode == 0 else None
     except (subprocess.SubprocessError, json.JSONDecodeError):

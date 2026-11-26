@@ -30,7 +30,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 sys.path.insert(0, str(HERE))
 import _tmp                     # noqa: E402
 import test_gates as g          # noqa: E402  (project, rx, ENV, approve_plan, say)

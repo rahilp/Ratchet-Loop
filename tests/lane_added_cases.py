@@ -32,7 +32,7 @@ from __future__ import annotations
 import os
 import sys
 
-import ratchet as R
+import ratchet_engine as R
 
 _main = sys.modules.get("__main__")
 base = _main if hasattr(_main, "TESTS") and hasattr(_main, "build") else __import__("test_lane_added_tests")

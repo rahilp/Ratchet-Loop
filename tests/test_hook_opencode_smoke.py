@@ -73,7 +73,9 @@ import _tmp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 THIS_FILE = Path(__file__).resolve()
 GROUP_OF = {"load": ["CP7-T01", "CP7-T02", "CP7-T03", "CP7-T04", "CP7-T11", "CP7-T12"], "lifecycle": ["CP7-T05"],
             "bun": ["CP7-T06", "CP7-T07", "CP7-T08", "CP7-T09", "CP7-T10"], "doctor": ["CP7-T13", "CP7-T14"],
@@ -376,7 +378,7 @@ def engine_env(**extra):
 
 
 def engine(proj, *args, stdin=None, engine_path=None, timeout=180):
-    return subprocess.run([sys.executable, str(engine_path or ENGINE), *args], cwd=str(proj), input=stdin,
+    return subprocess.run([sys.executable, str(engine_path or LAUNCHER), *args], cwd=str(proj), input=stdin,
                           capture_output=True, text=True, env=engine_env(), timeout=timeout)
 
 
@@ -1356,7 +1358,7 @@ def case_t10():
 # ---- doctor cases
 
 def doctor(proj):
-    return subprocess.run([sys.executable, str(ENGINE), "doctor"], cwd=str(proj), capture_output=True, text=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), "doctor"], cwd=str(proj), capture_output=True, text=True,
                           env=engine_env(), timeout=180)
 
 
@@ -1414,12 +1416,12 @@ def case_t13():
     healthy = fresh("building", "doc-teeth")
     ho = doctor(healthy).stdout
     check("[CP7-T13] teeth: the same predicate finds nothing in a healthy install's doctor output",
-          broken_flagged(ho, str(ENGINE)) == [] and broken_flagged(ho, eng) == [])
+          broken_flagged(ho, str(LAUNCHER)) == [] and broken_flagged(ho, eng) == [])
     # the fix command carries the scope the plugin was found in (install-hooks defaults to project scope)
     check("[CP7-T13] project-scope plugin: the line says '--scope project' and never '--scope user'",
           len(scope_flagged(out, eng, "project")) >= 1 and scope_flagged(out, eng, "user") == [], broken_flagged(out, eng))
     uproj, ueng, uplug, uenv = user_scope_broken()
-    ur = subprocess.run([sys.executable, str(ENGINE), "doctor"], cwd=str(uproj), capture_output=True, text=True, env=uenv,
+    ur = subprocess.run([sys.executable, str(LAUNCHER), "doctor"], cwd=str(uproj), capture_output=True, text=True, env=uenv,
                         timeout=180)
     uout = (ur.stdout or "") + (ur.stderr or "")
     check("[CP7-T13] user-scope setup: the plugin is in the user config folder, the project has none, the engine is gone",

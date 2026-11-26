@@ -43,6 +43,7 @@ sys.path.insert(0, str(HERE))
 import _tmp  # noqa: E402
 import trust_helpers as th  # noqa: E402
 
+LAUNCHER = th.LAUNCHER
 ENGINE = th.ENGINE
 REPO = HERE.parent
 PASS = FAIL = 0
@@ -246,7 +247,7 @@ class W:
         return [json.loads(x) for x in p.read_text().splitlines() if x.strip()] if p.exists() else []
 
     def argv(self, target, *extra):
-        return [sys.executable, str(ENGINE), "--root", str(self.main), "integrate", str(target), *extra]
+        return [sys.executable, str(LAUNCHER), "--root", str(self.main), "integrate", str(target), *extra]
 
     def integrate(self, target="lane-a", *extra, timeout=150):
         return subprocess.run(self.argv(target, *extra), cwd=self.main, capture_output=True, text=True,
@@ -391,7 +392,7 @@ def say(d, env, text, session="s-owner"):
     with tp.open("a") as f:
         f.write(json.dumps({"type": "user", "message": {"role": "user", "content": text},
                             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
-    return subprocess.run([sys.executable, str(ENGINE), "hook", "prompt", "--host", "claude"], cwd=d, text=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), "hook", "prompt", "--host", "claude"], cwd=d, text=True,
                           capture_output=True, env=env,
                           input=json.dumps({"cwd": str(d), "prompt": text, "session_id": session,
                                             "transcript_path": str(tp)}))
@@ -399,7 +400,7 @@ def say(d, env, text, session="s-owner"):
 
 def guard(d, env, command):
     """What the guard says about a Bash command in the checkout `d`: (exit code, output)."""
-    r = subprocess.run([sys.executable, str(ENGINE), "hook", "guard", "--host", "claude"], cwd=d, text=True,
+    r = subprocess.run([sys.executable, str(LAUNCHER), "hook", "guard", "--host", "claude"], cwd=d, text=True,
                        capture_output=True, env=env,
                        input=json.dumps({"cwd": str(d), "tool_name": "Bash", "tool_input": {"command": command}}))
     return r.returncode, said(r)

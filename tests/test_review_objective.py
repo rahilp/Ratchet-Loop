@@ -31,7 +31,7 @@ sys.path.insert(0, str(HERE.parent / "skills" / "ratchet-orchestrator" / "script
 import _tmp  # noqa: E402
 import test_gates as g  # noqa: E402
 import test_providers as tp  # noqa: E402
-import ratchet as rt  # noqa: E402
+import ratchet_engine as rt  # noqa: E402
 
 os.environ["RATCHET_HOME"] = str(g.HOME)  # this file's direct (non-subprocess) engine calls share test_gates.py's
                                            # sandboxed per-user folder

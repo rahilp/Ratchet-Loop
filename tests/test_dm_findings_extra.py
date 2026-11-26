@@ -38,7 +38,7 @@ import test_quick_path_docs_step as qd  # noqa: E402  (_approved_docs_project, _
 import test_merge_main as mm         # noqa: E402  (build, make_main, merge_main)
 
 sys.path.insert(0, str(ROOT / "skills" / "ratchet-orchestrator" / "scripts"))
-import ratchet as rt                 # noqa: E402  (DM_LEGACY_FINDINGS_NOTE, the one note text)
+import ratchet_engine as rt                 # noqa: E402  (DM_LEGACY_FINDINGS_NOTE, the one note text)
 
 PASS = FAIL = 0
 CASE_STATUS: dict[str, bool] = {}

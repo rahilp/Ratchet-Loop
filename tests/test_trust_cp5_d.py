@@ -229,7 +229,7 @@ def cp3_first_run_plan(env):
 def cp3_director(home_dir, denv, lane, *args):
     """In-process mirror of trust_helpers.cp5r12_director."""
     m = cp5y_load_engine()
-    cp3_guard_tool(home_dir, denv, "Bash", {"command": f"python3 {ENGINE} --root {lane} {' '.join(args)}"},
+    cp3_guard_tool(home_dir, denv, "Bash", {"command": f"python3 {LAUNCHER} --root {lane} {' '.join(args)}"},
                   session="s-director")
     # replaces rx(home_dir, denv, "--root", str(lane), *args)  (trust_helpers.cp5r12_director)
     with _Cp3Call(m, home_dir, denv) as r:
@@ -309,7 +309,7 @@ def cp5r10_breaker_proc(script, marks, env, role):
     # [CP3] kept as a real subprocess: X54 proves a genuine cross-process race over one stale lock file between
     # two separate OS processes acquiring/removing it, which one Python process calling in-process functions
     # cannot reproduce.
-    return subprocess.Popen([sys.executable, str(script), str(ENGINE), role, str(marks)], env=env,
+    return subprocess.Popen([sys.executable, str(script), str(LAUNCHER), role, str(marks)], env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
@@ -403,7 +403,7 @@ def cp5_adv_round10_damaged_records_and_breaker():
               and "Traceback" not in r.stderr and (cp3_state(d).get("pending") or {}) == {},
               (r.returncode, r.stderr[-400:]))
         sp = d / ".ratchet/runs/f/state.json"
-        # replaces subprocess.run([sys.executable, "-c", prog, str(ENGINE), str(sp)], cwd=d, env=env, ...) -- that
+        # replaces subprocess.run([sys.executable, "-c", prog, str(LAUNCHER), str(sp)], cwd=d, env=env, ...) -- that
         # standalone script just loaded ratchet.py fresh and called record_chain(state.json) then printed "done";
         # m.record_chain is the SAME function on the shared cached module, so this reuses it in-process instead.
         # [CP3] deliberate, documented exception to _Cp3Call's own one-`m.main(...)`-line contract (see the class's
@@ -469,7 +469,7 @@ def cp5_adv_round10_damaged_records_and_breaker():
     f = d / "src/a.js"
     # [CP3] kept as a real subprocess: X55 proves each writer's temp file name is scoped to its OWN process id
     # (os.getpid()), which needs a genuinely separate process id to prove.
-    r = subprocess.run([sys.executable, str(script), str(ENGINE), str(d), str(f)], cwd=d, env=env,
+    r = subprocess.run([sys.executable, str(script), str(LAUNCHER), str(d), str(f)], cwd=d, env=env,
                        capture_output=True, text=True)
     try:
         out = json.loads(r.stdout.strip().splitlines()[-1])
@@ -2039,7 +2039,7 @@ def t10_source_inspection_reads_live_file():
     cp3_check("{CP3-T10} ENGINE itself still names the real, live production file on disk, and reading it now "
               "matches reading the real path directly -- never a cached/snapshotted copy",
               ENGINE.exists() and ENGINE.read_text(encoding="utf-8") == (HERE.parent / "skills" /
-              "ratchet-orchestrator" / "scripts" / "ratchet.py").read_text(encoding="utf-8"), str(ENGINE))
+              "ratchet-orchestrator" / "scripts" / "ratchet_engine.py").read_text(encoding="utf-8"), str(ENGINE))
 
 
 def t11_two_cold_runs_agree():

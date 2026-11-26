@@ -45,7 +45,9 @@ sys.path.insert(0, str(HERE))
 import _tmp  # noqa: E402
 
 SCRIPT_DIR = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
-ENGINE = SCRIPT_DIR / "ratchet.py"
+SCRIPTS = SCRIPT_DIR
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 ENGINE_UTILS = SCRIPT_DIR / "engine_utils.py"
 # CP1's tip: the commit right before any code in this run moved (confirmed by CP1-T10's git-diff-clean check).
 # This is the "pre-move" pin CP2-T01's body-diff is measured against.
@@ -240,7 +242,7 @@ def rx(cwd, *args, env=None):
     base = {k: v for k, v in os.environ.items() if k != "RATCHET_ROOT"}
     if env:
         base.update(env)
-    return subprocess.run([sys.executable, str(ENGINE), *args], cwd=str(cwd), capture_output=True, text=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=str(cwd), capture_output=True, text=True,
                           env=base, timeout=60)
 
 
@@ -709,7 +711,7 @@ def t11_baseline_still_byte_identical():
         except OSError as ex:
             check(f"[CP2-T11] baseline file for `{' '.join(cmd)}` is readable", False, str(ex))
             continue
-        r = subprocess.run([sys.executable, str(ENGINE), *cmd], cwd=str(ROOT), capture_output=True, text=True,
+        r = subprocess.run([sys.executable, str(LAUNCHER), *cmd], cwd=str(ROOT), capture_output=True, text=True,
                            timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1",
                                                  PYTHON_COLORS="0"))
         check(f"[CP2-T11] `ratchet.py {' '.join(cmd)}` exits {e.get('exit_code')}, same as CP1's baseline",
@@ -729,7 +731,7 @@ def t11_baseline_still_byte_identical():
             check("[CP2-T11] the saved status --json baseline parses as JSON", False, str(ex))
             saved_status = None
         if saved_status is not None:
-            r = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(ROOT),
+            r = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)
             try:
                 live_status = json.loads(r.stdout) if r.returncode == 0 else None
@@ -746,14 +748,14 @@ def t11_baseline_still_byte_identical():
     # a fresh hook reply, built the same way CP1's capture was: a throwaway project built with the real `init`
     # command, fed a copilot-dialect guard payload that edits that project's own state.json directly.
     d = Path(_tmp.mkdtemp(prefix="cp2-t11-hook-"))
-    r = subprocess.run([sys.executable, str(ENGINE), "init", "hook cap", "--slug", "hk"], cwd=str(d),
+    r = subprocess.run([sys.executable, str(LAUNCHER), "init", "hook cap", "--slug", "hk"], cwd=str(d),
                        capture_output=True, text=True, timeout=30)
     check("[CP2-T11] setup: a fresh throwaway project's `init` succeeds", r.returncode == 0, (r.returncode, r.stderr))
     if r.returncode == 0:
         state = str(d / ".ratchet" / "runs" / "hk" / "state.json")
         payload = {"sessionId": "s", "timestamp": 1, "cwd": str(d), "toolName": "edit",
                    "toolArgs": json.dumps({"path": state, "old_str": "a", "new_str": "b"})}
-        rg = subprocess.run([sys.executable, str(ENGINE), "hook", "guard", "--host", "copilot"], cwd=str(d),
+        rg = subprocess.run([sys.executable, str(LAUNCHER), "hook", "guard", "--host", "copilot"], cwd=str(d),
                             capture_output=True, text=True, timeout=30, input=json.dumps(payload))
         try:
             reply = json.loads(rg.stdout)
@@ -782,13 +784,13 @@ def t11_baseline_still_byte_identical():
             check(f"[CP2-T11] baseline file for failure `{' '.join(cmd)}` is readable", False, str(ex))
             continue
         if cmd and cmd[0] == "no-such-command":
-            rf = subprocess.run([sys.executable, str(ENGINE), *cmd], cwd=str(ROOT), capture_output=True,
+            rf = subprocess.run([sys.executable, str(LAUNCHER), *cmd], cwd=str(ROOT), capture_output=True,
                                 text=True, timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1",
                                                                  PYTHON_COLORS="0"))
             got = rf.stderr
         else:  # "status --json (run from a directory with no .ratchet/ at all)"
             empty_dir = Path(_tmp.mkdtemp(prefix="cp2-t11-empty-"))
-            rf = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(empty_dir),
+            rf = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(empty_dir),
                                 capture_output=True, text=True, timeout=30)
             got = rf.stderr
         check(f"[CP2-T11] failure case `{' '.join(cmd)}` exits {e.get('exit_code')}, same as CP1's baseline",

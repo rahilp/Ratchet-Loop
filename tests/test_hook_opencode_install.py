@@ -44,7 +44,9 @@ import _tmp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 SKILL = ROOT / "skills" / "ratchet-orchestrator"
 INSTALL_SH = ROOT / "install.sh"
 README = README_DOCS
@@ -195,7 +197,7 @@ class World:
         return env
 
     def sh(self, *args, stdin=None, engine=None, xdg=None, occonf=None):
-        return subprocess.run([sys.executable, str(engine or ENGINE), *args], cwd=str(self.proj), input=stdin,
+        return subprocess.run([sys.executable, str(engine or LAUNCHER), *args], cwd=str(self.proj), input=stdin,
                               capture_output=True, text=True, env=self.env(xdg, occonf), timeout=180)
 
     def install_sh(self, *args):
@@ -915,7 +917,7 @@ def host_enforcement():
     env = {k: v for k, v in os.environ.items() if not k.startswith(_STRIP_PREFIXES)}
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     with _tmp.mkdtemp(prefix="ratchet-ocinst-probe-") as cwd:
-        r = subprocess.run([sys.executable, "-c", code, str(ENGINE)], cwd=cwd, capture_output=True, text=True, env=env,
+        r = subprocess.run([sys.executable, "-c", code, str(LAUNCHER)], cwd=cwd, capture_output=True, text=True, env=env,
                            timeout=180)
     if r.returncode != 0:
         return None

@@ -31,7 +31,9 @@ import _tmp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 README = README_DOCS
 THIS_FILE = Path(__file__).resolve()
 NEW_TEST_LINE = "python3 tests/test_hook_codex_payloads.py"
@@ -70,7 +72,7 @@ class Proj:
         self.log = path / ".ratchet" / "human_log.jsonl"
 
     def sh(self, *args, stdin=None):
-        return subprocess.run([sys.executable, str(ENGINE), *args], cwd=self.path, input=stdin, capture_output=True,
+        return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=self.path, input=stdin, capture_output=True,
                               text=True, env=child_env(self.home))
 
     def run(self, event, host, text):

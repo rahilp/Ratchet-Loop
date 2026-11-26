@@ -44,6 +44,7 @@ import _tmp                     # noqa: E402
 import test_gates as g          # noqa: E402
 
 SCRIPT_DIR = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = g.LAUNCHER
 ENGINE = g.ENGINE
 ENGINE_UTILS = SCRIPT_DIR / "engine_utils.py"
 FINGERPRINT = SCRIPT_DIR / "fingerprint.py"
@@ -106,7 +107,7 @@ def rx(cwd, *args, env=None):
     base = {k: v for k, v in os.environ.items() if k != "RATCHET_ROOT"}
     if env:
         base.update(env)
-    return subprocess.run([sys.executable, str(ENGINE), *args], cwd=str(cwd), capture_output=True, text=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=str(cwd), capture_output=True, text=True,
                           env=base, timeout=60)
 
 
@@ -441,7 +442,7 @@ def t07_cli_fingerprint_output_unchanged_by_the_move():
         pinned_script.unlink(missing_ok=True)
     check("[CP3-T07] setup: the pinned pre-move ratchet.py's `fingerprint` command exits 0 on the fixture",
           r_before.returncode == 0, (r_before.returncode, r_before.stdout, r_before.stderr))
-    r_after = subprocess.run([sys.executable, str(ENGINE), "fingerprint"], cwd=d, capture_output=True, text=True,
+    r_after = subprocess.run([sys.executable, str(LAUNCHER), "fingerprint"], cwd=d, capture_output=True, text=True,
                              timeout=30)
     check("[CP3-T07] the current ratchet.py's `fingerprint` command exits 0 on the same fixture",
           r_after.returncode == 0, (r_after.returncode, r_after.stdout, r_after.stderr))
@@ -530,7 +531,7 @@ def _mutate_state(d, fn, slug="f"):
     st = json.loads(p.read_text())
     fn(st)
     p.write_text(json.dumps(st))
-    r = subprocess.run([sys.executable, "-c", _REBASELINE, str(ENGINE), str(p)], cwd=d, env=g.ENV,
+    r = subprocess.run([sys.executable, "-c", _REBASELINE, str(LAUNCHER), str(p)], cwd=d, env=g.ENV,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     return st
@@ -615,7 +616,7 @@ def t11_baseline_still_byte_identical():
         except OSError as ex:
             check(f"[CP3-T11] baseline file for `{' '.join(cmd)}` is readable", False, str(ex))
             continue
-        r = subprocess.run([sys.executable, str(ENGINE), *cmd], cwd=str(ROOT), capture_output=True, text=True,
+        r = subprocess.run([sys.executable, str(LAUNCHER), *cmd], cwd=str(ROOT), capture_output=True, text=True,
                            timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1",
                                                  PYTHON_COLORS="0"))
         check(f"[CP3-T11] `ratchet.py {' '.join(cmd)}` exits {e.get('exit_code')}, same as CP1's baseline",
@@ -632,7 +633,7 @@ def t11_baseline_still_byte_identical():
             check("[CP3-T11] the saved status --json baseline parses as JSON", False, str(ex))
             saved_status = None
         if saved_status is not None:
-            r = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(ROOT),
+            r = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)
             try:
                 live_status = json.loads(r.stdout) if r.returncode == 0 else None
@@ -647,14 +648,14 @@ def t11_baseline_still_byte_identical():
                       set(live_status) - {"schedule"} == set(saved_status), (sorted(live_status), sorted(saved_status)))
 
     d = Path(_tmp.mkdtemp(prefix="cp3-t11-hook-"))
-    r = subprocess.run([sys.executable, str(ENGINE), "init", "hook cap", "--slug", "hk"], cwd=str(d),
+    r = subprocess.run([sys.executable, str(LAUNCHER), "init", "hook cap", "--slug", "hk"], cwd=str(d),
                        capture_output=True, text=True, timeout=30)
     check("[CP3-T11] setup: a fresh throwaway project's `init` succeeds", r.returncode == 0, (r.returncode, r.stderr))
     if r.returncode == 0:
         state = str(d / ".ratchet" / "runs" / "hk" / "state.json")
         payload = {"sessionId": "s", "timestamp": 1, "cwd": str(d), "toolName": "edit",
                    "toolArgs": json.dumps({"path": state, "old_str": "a", "new_str": "b"})}
-        rg = subprocess.run([sys.executable, str(ENGINE), "hook", "guard", "--host", "copilot"], cwd=str(d),
+        rg = subprocess.run([sys.executable, str(LAUNCHER), "hook", "guard", "--host", "copilot"], cwd=str(d),
                             capture_output=True, text=True, timeout=30, input=json.dumps(payload))
         try:
             reply = json.loads(rg.stdout)
@@ -682,13 +683,13 @@ def t11_baseline_still_byte_identical():
             check(f"[CP3-T11] baseline file for failure `{' '.join(cmd)}` is readable", False, str(ex))
             continue
         if cmd and cmd[0] == "no-such-command":
-            rf = subprocess.run([sys.executable, str(ENGINE), *cmd], cwd=str(ROOT), capture_output=True,
+            rf = subprocess.run([sys.executable, str(LAUNCHER), *cmd], cwd=str(ROOT), capture_output=True,
                                 text=True, timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1",
                                                                  PYTHON_COLORS="0"))
             got = rf.stderr
         else:  # "status --json (run from a directory with no .ratchet/ at all)"
             empty_dir = Path(_tmp.mkdtemp(prefix="cp3-t11-empty-"))
-            rf = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(empty_dir),
+            rf = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(empty_dir),
                                 capture_output=True, text=True, timeout=30)
             got = rf.stderr
         check(f"[CP3-T11] failure case `{' '.join(cmd)}` exits {e.get('exit_code')}, same as CP1's baseline",

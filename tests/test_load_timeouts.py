@@ -141,7 +141,7 @@ class Run:
 def rx(d, env, *args, cap=120):
     """ratchet.py <args> in d. A run that exceeds `cap` seconds is killed (rc None)."""
     t0 = time.monotonic()
-    proc = subprocess.Popen([sys.executable, str(tt.ENGINE), *args], cwd=str(d), env=env, text=True,
+    proc = subprocess.Popen([sys.executable, str(tt.LAUNCHER), *args], cwd=str(d), env=env, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                             start_new_session=True)
     try:

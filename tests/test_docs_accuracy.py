@@ -48,9 +48,8 @@ DOCS = {
     "skills/ratchet-orchestrator/SKILL.md": ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md",
     "agents/ratchet-adversary.md": ROOT / "agents" / "ratchet-adversary.md",
 }
+LAUNCHER = tt.LAUNCHER
 ENGINE = tt.ENGINE
-
-
 def check(name, cond, detail=""):
     global PASS, FAIL
     PASS, FAIL = (PASS + 1, FAIL) if cond else (PASS, FAIL + 1)

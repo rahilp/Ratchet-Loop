@@ -81,7 +81,7 @@ def x02_sigterm_to_ratchet_stops_the_command_tree():
     w = lt.work("term")
     d, env = lt.staged(lt.hang_script(w), 30)
     (d / "src/f1.js").write_text("export const f = () => 1;\n")  # so the script reaches its hang
-    proc = subprocess.Popen([sys.executable, str(tt.ENGINE), "red", "CP1"], cwd=str(d), env=lt.idle(env),
+    proc = subprocess.Popen([sys.executable, str(tt.LAUNCHER), "red", "CP1"], cwd=str(d), env=lt.idle(env),
                             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                             start_new_session=True)
     script = child = 0
@@ -117,7 +117,7 @@ def start_hang_red(w, env, key="sig", preexec_fn=None):
     """ratchet.py `red` running the hang script, as a Popen; returns (proc, script pid, child pid, project)."""
     d, env = lt.staged(lt.hang_script(w), 30)
     (d / "src/f1.js").write_text("export const f = () => 1;\n")  # so the script reaches its hang
-    proc = subprocess.Popen([sys.executable, str(tt.ENGINE), "red", "CP1"], cwd=str(d), env=lt.idle(env),
+    proc = subprocess.Popen([sys.executable, str(tt.LAUNCHER), "red", "CP1"], cwd=str(d), env=lt.idle(env),
                             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                             start_new_session=True, preexec_fn=preexec_fn)
     script = child = 0
@@ -171,7 +171,7 @@ def x04_ignored_sighup_stays_ignored():
     assert r0.returncode == 0, r0.stderr + r0.stdout
     lt.implement(d, env)
     t0 = time.monotonic()
-    proc = subprocess.Popen([sys.executable, str(tt.ENGINE), "behavior", "CP1"], cwd=str(d), env=lt.idle(env),
+    proc = subprocess.Popen([sys.executable, str(tt.LAUNCHER), "behavior", "CP1"], cwd=str(d), env=lt.idle(env),
                             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                             start_new_session=True, preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
     t_end = time.monotonic() + 30

@@ -422,7 +422,7 @@ def t05_help_status_hook_exit_codes_unchanged():
         except OSError as ex:
             check(f"[CP5-T05] baseline file for `{' '.join(cmd)}` is readable", False, str(ex))
             continue
-        r = subprocess.run([sys.executable, str(ENGINE), *cmd], cwd=str(ROOT), capture_output=True, text=True,
+        r = subprocess.run([sys.executable, str(LAUNCHER), *cmd], cwd=str(ROOT), capture_output=True, text=True,
                            timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1",
                                                  PYTHON_COLORS="0"))
         check(f"[CP5-T05] `ratchet.py {' '.join(cmd)}` exits {e.get('exit_code')}, same as CP1's baseline",
@@ -438,7 +438,7 @@ def t05_help_status_hook_exit_codes_unchanged():
         except (OSError, json.JSONDecodeError) as ex:
             check("[CP5-T05] the saved status --json baseline parses as JSON", False, str(ex))
             saved_status = None
-        r = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(ROOT),
+        r = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(ROOT),
                            capture_output=True, text=True, timeout=30)
         try:
             live_status = json.loads(r.stdout) if r.returncode == 0 else None
@@ -474,7 +474,7 @@ def t05_help_status_hook_exit_codes_unchanged():
         d_base = g.project("cp5t05fix")
         g.approve_plan(d_base)
         health_env = dict(g.ENV)
-        radd = subprocess.run([sys.executable, str(ENGINE), "providers", "--add", "p-bench", "--command",
+        radd = subprocess.run([sys.executable, str(LAUNCHER), "providers", "--add", "p-bench", "--command",
                                json.dumps(["/bin/true", "{prompt}"]), "--model", "bench-model", "--company",
                                "acme", "--no-check"], cwd=str(d_base), capture_output=True, text=True,
                               env=health_env, timeout=30)
@@ -508,7 +508,7 @@ def t05_help_status_hook_exit_codes_unchanged():
             pinned_script_t05 = SCRIPT_DIR / f"_cp5_t05_pinned_{os.getpid()}.py.tmp"
             pinned_script_t05.write_text(pinned_src_t05)
             try:
-                r_cur = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(d_cur),
+                r_cur = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(d_cur),
                                        capture_output=True, text=True, timeout=30, env=health_env)
                 r_pin = subprocess.run([sys.executable, str(pinned_script_t05), "status", "--json"],
                                        cwd=str(d_pin), capture_output=True, text=True, timeout=30,
@@ -554,7 +554,7 @@ def t05_help_status_hook_exit_codes_unchanged():
             check("[CP5-T05] the saved hook reply baseline parses as JSON", False, str(ex))
             saved_reply = None
         d = Path(_tmp.mkdtemp(prefix="cp5-t05-hook-"))
-        r = subprocess.run([sys.executable, str(ENGINE), "init", "hook cap", "--slug", "hk"], cwd=str(d),
+        r = subprocess.run([sys.executable, str(LAUNCHER), "init", "hook cap", "--slug", "hk"], cwd=str(d),
                            capture_output=True, text=True, timeout=30)
         check("[CP5-T05] setup: a fresh throwaway project's `init` succeeds", r.returncode == 0,
               (r.returncode, r.stderr))
@@ -562,7 +562,7 @@ def t05_help_status_hook_exit_codes_unchanged():
             state = str(d / ".ratchet" / "runs" / "hk" / "state.json")
             payload = {"sessionId": "s", "timestamp": 1, "cwd": str(d), "toolName": "edit",
                        "toolArgs": json.dumps({"path": state, "old_str": "a", "new_str": "b"})}
-            rg = subprocess.run([sys.executable, str(ENGINE), "hook", "guard", "--host", "copilot"], cwd=str(d),
+            rg = subprocess.run([sys.executable, str(LAUNCHER), "hook", "guard", "--host", "copilot"], cwd=str(d),
                                 capture_output=True, text=True, timeout=30, input=json.dumps(payload))
             try:
                 reply = json.loads(rg.stdout)
@@ -588,13 +588,13 @@ def t05_help_status_hook_exit_codes_unchanged():
             check(f"[CP5-T05] baseline file for failure `{' '.join(cmd)}` is readable", False, str(ex))
             continue
         if cmd and cmd[0] == "no-such-command":
-            rf = subprocess.run([sys.executable, str(ENGINE), *cmd], cwd=str(ROOT), capture_output=True,
+            rf = subprocess.run([sys.executable, str(LAUNCHER), *cmd], cwd=str(ROOT), capture_output=True,
                                 text=True, timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0",
                                                                  NO_COLOR="1", PYTHON_COLORS="0"))
             got = rf.stderr
         else:
             empty_dir = Path(_tmp.mkdtemp(prefix="cp5-t05-empty-"))
-            rf = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(empty_dir),
+            rf = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(empty_dir),
                                 capture_output=True, text=True, timeout=30)
             got = rf.stderr
         check(f"[CP5-T05] failure case `{' '.join(cmd)}` exits {e.get('exit_code')}, same as CP1's baseline",
@@ -697,7 +697,7 @@ def t07_provider_share_window_limit():
     child = Path(_tmp.mkdtemp(prefix="cp5-t07-child-")) / "race.py"
     child.write_text(_CP5T07_CHILD)
     procs = [
-        subprocess.Popen([sys.executable, str(child), str(ENGINE), str(cfg_path), f"lane{i}",
+        subprocess.Popen([sys.executable, str(child), str(LAUNCHER), str(cfg_path), f"lane{i}",
                           str(gate / f"ready-{i}"), str(gate / "go")], env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True)
         for i in range(2)
@@ -772,7 +772,7 @@ def t08_probe_shared_claim_and_wait():
     child.write_text(_CP5T08_CHILD)
     roots = [Path(_tmp.mkdtemp(prefix=f"cp5-t08-root{i}-")) for i in range(2)]
     procs = [
-        subprocess.Popen([sys.executable, str(child), str(ENGINE), str(cfg_path), str(roots[i]),
+        subprocess.Popen([sys.executable, str(child), str(LAUNCHER), str(cfg_path), str(roots[i]),
                           str(gate / f"ready-{i}"), str(gate / "go")], env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True)
         for i in range(2)

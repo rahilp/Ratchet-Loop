@@ -75,7 +75,9 @@ import _tmp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 README = README_DOCS
 SCHEMAS = ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md"
 THIS_FILE = Path(__file__).resolve()
@@ -172,7 +174,7 @@ class World:
         return env
 
     def sh(self, *args, stdin=None, env_extra=None, timeout=180):
-        return subprocess.run([sys.executable, str(ENGINE), *args], cwd=str(self.proj), input=stdin,
+        return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=str(self.proj), input=stdin,
                               capture_output=True, text=True, env=self.env(**(env_extra or {})), timeout=timeout)
 
 
@@ -1150,7 +1152,7 @@ def retargeted_plugin(w, stem, engine_path, src=None):
 
     def sub(m):
         try:
-            if json.loads(m.group(0)) == str(ENGINE):
+            if json.loads(m.group(0)) == str(LAUNCHER):
                 hits[0] += 1
                 return json.dumps(str(engine_path))
         except ValueError:
@@ -1370,7 +1372,7 @@ def host_enforcement():
     env = scrubbed_env()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     with _tmp.mkdtemp(prefix="ratchet-ocprompt-probe-") as cwd:
-        r = subprocess.run([sys.executable, "-c", code, str(ENGINE)], cwd=cwd, capture_output=True, text=True, env=env,
+        r = subprocess.run([sys.executable, "-c", code, str(LAUNCHER)], cwd=cwd, capture_output=True, text=True, env=env,
                            timeout=180)
     if r.returncode != 0:
         return None
@@ -1475,7 +1477,7 @@ def case_t30():
 MUTANT_JS = r"""
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-const E = __ENGINE__;
+const E = __LAUNCHER__;
 const PREFIX = '[RATCHET PLUGIN TURN - NOT USER INPUT]';
 const TOKEN = __TOKEN__;
 const OPTS = __OPTS__;
@@ -1529,7 +1531,7 @@ MUTANTS = {
 def mutant_plugin(w, name):
     opts = {**GOOD, **MUTANTS[name]}
     token = json.dumps("static-token-aaaaaaaaaaaaaaaaaaaa") if opts["static"] else "randomUUID()"
-    src = (MUTANT_JS.replace("__ENGINE__", json.dumps(str(ENGINE))).replace("__TOKEN__", token)
+    src = (MUTANT_JS.replace("__LAUNCHER__", json.dumps(str(LAUNCHER))).replace("__TOKEN__", token)
            .replace("__OPTS__", json.dumps(opts)))
     d = w.s.work / "mutants"
     d.mkdir(exist_ok=True)
@@ -1698,7 +1700,7 @@ def failing_once_engine(w, stem, mode):
     body = (f"n = len(open(LOG).read().splitlines()) if os.path.exists(LOG) else 0\nnote(argv=sys.argv)\n"
             f"data = sys.stdin.read()\nif n < 1:\n    if {mode!r} == 'crash':\n        sys.stderr.write('boom')\n"
             "        sys.exit(1)\n    sys.stdout.write('this is not json')\n    sys.exit(0)\nimport subprocess\n"
-            f"p = subprocess.run([{sys.executable!r}, {str(ENGINE)!r}] + sys.argv[1:], input=data, capture_output=True, "
+            f"p = subprocess.run([{sys.executable!r}, {str(LAUNCHER)!r}] + sys.argv[1:], input=data, capture_output=True, "
             "text=True)\nsys.stdout.write(p.stdout)\nsys.exit(p.returncode)")
     return stub_engine(w, stem, body)
 

@@ -299,7 +299,7 @@ def t02_help_byte_identical():
         except OSError as ex:
             check(f"[CP6-T02] baseline file for `{' '.join(cmd)}` is readable", False, str(ex))
             continue
-        r = subprocess.run([sys.executable, str(ENGINE), *cmd], cwd=str(ROOT), capture_output=True, text=True,
+        r = subprocess.run([sys.executable, str(LAUNCHER), *cmd], cwd=str(ROOT), capture_output=True, text=True,
                            timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1",
                                                  PYTHON_COLORS="0"))
         check(f"[CP6-T02] `ratchet.py {' '.join(cmd)}` exits {e.get('exit_code')}, same as CP1's baseline",
@@ -324,7 +324,7 @@ def t03_status_json_byte_identical():
     except (OSError, json.JSONDecodeError) as ex:
         check("[CP6-T03] the saved status --json baseline parses as JSON", False, str(ex))
         return
-    r = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(ROOT), capture_output=True,
+    r = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(ROOT), capture_output=True,
                        text=True, timeout=30)
     try:
         live_status = json.loads(r.stdout) if r.returncode == 0 else None
@@ -344,7 +344,7 @@ def t03_status_json_byte_identical():
     pinned_script = _write_pinned_script()
     try:
         d = Path(_tmp.mkdtemp(prefix="cp6-t03-status-"))
-        r_init = subprocess.run([sys.executable, str(ENGINE), "init", "status parity cap", "--slug", "st"],
+        r_init = subprocess.run([sys.executable, str(LAUNCHER), "init", "status parity cap", "--slug", "st"],
                                 cwd=str(d), capture_output=True, text=True, timeout=30)
         check("[CP6-T03] setup: a fresh throwaway project's `init` succeeds", r_init.returncode == 0,
               (r_init.returncode, r_init.stderr))
@@ -352,7 +352,7 @@ def t03_status_json_byte_identical():
             return
         r_before = subprocess.run([sys.executable, str(pinned_script), "status", "--json"], cwd=str(d),
                                   capture_output=True, text=True, timeout=30)
-        r_after = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(d),
+        r_after = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(d),
                                  capture_output=True, text=True, timeout=30)
         check("[CP6-T03] setup: the pinned pre-move engine's `status --json` exits 0 on the fresh fixture",
               r_before.returncode == 0, (r_before.returncode, r_before.stdout[-300:], r_before.stderr[-300:]))
@@ -371,7 +371,7 @@ def t03_status_json_byte_identical():
 def t04_hook_reply_byte_identical():
     print("CP6-T04: a sample prompt/stop hook reply is byte-identical to CP1's baseline")
     d = Path(_tmp.mkdtemp(prefix="cp6-t04-hook-"))
-    r = subprocess.run([sys.executable, str(ENGINE), "init", "hook cap", "--slug", "hk"], cwd=str(d),
+    r = subprocess.run([sys.executable, str(LAUNCHER), "init", "hook cap", "--slug", "hk"], cwd=str(d),
                        capture_output=True, text=True, timeout=30)
     check("[CP6-T04] setup: a fresh throwaway project's `init` succeeds", r.returncode == 0, (r.returncode, r.stderr))
     if r.returncode != 0:
@@ -379,7 +379,7 @@ def t04_hook_reply_byte_identical():
     state = str(d / ".ratchet" / "runs" / "hk" / "state.json")
     payload = {"sessionId": "s", "timestamp": 1, "cwd": str(d), "toolName": "edit",
                "toolArgs": json.dumps({"path": state, "old_str": "a", "new_str": "b"})}
-    rg = subprocess.run([sys.executable, str(ENGINE), "hook", "guard", "--host", "copilot"], cwd=str(d),
+    rg = subprocess.run([sys.executable, str(LAUNCHER), "hook", "guard", "--host", "copilot"], cwd=str(d),
                         capture_output=True, text=True, timeout=30, input=json.dumps(payload))
     try:
         reply = json.loads(rg.stdout)
@@ -427,13 +427,13 @@ def t05_failure_exit_codes_unchanged():
             check(f"[CP6-T05] baseline file for failure `{' '.join(cmd)}` is readable", False, str(ex))
             continue
         if cmd and cmd[0] == "no-such-command":
-            rf = subprocess.run([sys.executable, str(ENGINE), *cmd], cwd=str(ROOT), capture_output=True,
+            rf = subprocess.run([sys.executable, str(LAUNCHER), *cmd], cwd=str(ROOT), capture_output=True,
                                 text=True, timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1",
                                                                  PYTHON_COLORS="0"))
             got = rf.stderr
         else:  # "status --json (run from a directory with no .ratchet/ at all)"
             empty_dir = Path(_tmp.mkdtemp(prefix="cp6-t05-empty-"))
-            rf = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(empty_dir),
+            rf = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(empty_dir),
                                 capture_output=True, text=True, timeout=30)
             got = rf.stderr
         check(f"[CP6-T05] failure case `{' '.join(cmd)}` exits {e.get('exit_code')}, same as CP1's baseline",
@@ -500,7 +500,7 @@ def t07_doctor_hooks_fields_unchanged():
     pinned_script = _write_pinned_script()
     try:
         for label, d in (("fresh", d_fresh), ("stale", d_stale)):
-            r_cur = subprocess.run([sys.executable, str(ENGINE), "doctor", "--json"], cwd=str(d),
+            r_cur = subprocess.run([sys.executable, str(LAUNCHER), "doctor", "--json"], cwd=str(d),
                                    capture_output=True, text=True, env=env, timeout=30)
             r_pin = subprocess.run([sys.executable, str(pinned_script), "doctor", "--json"], cwd=str(d),
                                    capture_output=True, text=True, env=env, timeout=30)
@@ -540,7 +540,7 @@ def t08_hook_missing_record_refusal_unchanged():
         _plant_crash_marker(d)  # unresolved crash: hooks_in_use() is True; hook-env.json is never written
         check("[CP6-T08] setup: the fixture really has no hook-env.json yet (the record-missing scenario)",
               not (d / ".ratchet" / "hook-env.json").exists())
-        r_cur = subprocess.run([sys.executable, str(ENGINE), "plan-summary"], cwd=str(d), capture_output=True,
+        r_cur = subprocess.run([sys.executable, str(LAUNCHER), "plan-summary"], cwd=str(d), capture_output=True,
                                text=True, env=env, timeout=30)
         r_pin = subprocess.run([sys.executable, str(pinned_script), "plan-summary"], cwd=str(d),
                                capture_output=True, text=True, env=env, timeout=30)
@@ -574,7 +574,7 @@ def t09_hook_stale_record_refusal_unchanged():
         if not ok_write:
             return
         _plant_crash_marker(d)  # an unresolved crash now doubts even the EXISTING, matching record
-        r_cur = subprocess.run([sys.executable, str(ENGINE), "plan-summary"], cwd=str(d), capture_output=True,
+        r_cur = subprocess.run([sys.executable, str(LAUNCHER), "plan-summary"], cwd=str(d), capture_output=True,
                                text=True, env=env, timeout=30)
         r_pin = subprocess.run([sys.executable, str(pinned_script), "plan-summary"], cwd=str(d),
                                capture_output=True, text=True, env=env, timeout=30)
@@ -701,7 +701,7 @@ def t12_integrity_check_and_approve_changes_unchanged():
         # `tests-written CP1` runs _cur (phase/current checks) then verify_integrity before anything else, so
         # the post-approval edit above is what makes it die here -- plan-summary never calls verify_integrity
         # at all, so it would wrongly exit 0 on this same tampered fixture.
-        r_cur = subprocess.run([sys.executable, str(ENGINE), "tests-written", "CP1"], cwd=str(d_cur),
+        r_cur = subprocess.run([sys.executable, str(LAUNCHER), "tests-written", "CP1"], cwd=str(d_cur),
                                capture_output=True, text=True, env=g.ENV, timeout=30)
         r_pin = subprocess.run([sys.executable, str(pinned_script), "tests-written", "CP1"], cwd=str(d_pin),
                                capture_output=True, text=True, env=g.ENV, timeout=30)
@@ -726,7 +726,7 @@ def t12_integrity_check_and_approve_changes_unchanged():
         shutil.copytree(d_cur, d_pin2, dirs_exist_ok=True)
         for d in (d_cur2, d_pin2):
             (d / ".ratchet" / "director.json").write_text("not json")
-        r_cur2 = subprocess.run([sys.executable, str(ENGINE), "tests-written", "CP1"], cwd=str(d_cur2),
+        r_cur2 = subprocess.run([sys.executable, str(LAUNCHER), "tests-written", "CP1"], cwd=str(d_cur2),
                                 capture_output=True, text=True, env=g.ENV, timeout=30)
         r_pin2 = subprocess.run([sys.executable, str(pinned_script), "tests-written", "CP1"], cwd=str(d_pin2),
                                 capture_output=True, text=True, env=g.ENV, timeout=30)

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import trust_helpers
 from trust_helpers import (
-    ENGINE, check, cp3_fp, cp3_signed_combined, cp3_state, cp5_awaiting_checkpoint_review, cp5_plan, cp5_say,
+    ENGINE, LAUNCHER, check, cp3_fp, cp3_signed_combined, cp3_state, cp5_awaiting_checkpoint_review, cp5_plan, cp5_say,
     cp5w_lock, cp5x_frozen_ui_project, cp5x_hint, cp5x_history, cp5y_first_run_plan, cp5y_guard_bash,
     cp5y_load_engine, cp5y_repo, cp5z_notes, cp5z_project_notes, iso_ago, make_env, now_dt, project, rx,
 )
@@ -46,7 +46,7 @@ def cp5y_set_state(d, env, code):
             "spec = importlib.util.spec_from_file_location('r', sys.argv[1]); m = importlib.util.module_from_spec(spec)\n"
             "spec.loader.exec_module(m)\nctx = m.Ctx(Path(sys.argv[2])); st = ctx.state()\n" + code +
             "\nctx.save_state(st)\n")
-    r = subprocess.run([sys.executable, "-c", prog, str(ENGINE), str(d)], cwd=d, env=env, capture_output=True,
+    r = subprocess.run([sys.executable, "-c", prog, str(LAUNCHER), str(d)], cwd=d, env=env, capture_output=True,
                        text=True)
     assert r.returncode == 0, r.stderr + r.stdout
 
@@ -63,7 +63,7 @@ def cp5_adv_round2_owner_before_questions():
     check("[CP5-X13] `ask claim` with no owner chat is refused (nothing to take over) and stores nothing",
           r.returncode != 0 and "nothing to take over" in r.stderr and not cp3_state(d).get("pending"),
           (r.returncode, r.stderr))
-    g = cp5y_guard_bash(d, env, f'python3 "{ENGINE}" ask approve-plan', "s-A")
+    g = cp5y_guard_bash(d, env, f'python3 "{LAUNCHER}" ask approve-plan', "s-A")
     r = rx(d, env, "ask", "approve-plan")
     st = cp3_state(d)
     rec = cp5x_history(d, "owner_recorded")
@@ -152,7 +152,7 @@ def cp5_adv_round2_owner_before_questions():
             "spec.loader.exec_module(m)\nctx = m.Ctx(Path(sys.argv[2])); none = {'owner_session': None}\n"
             "print(json.dumps({'replies': m._replies(ctx, none, '0', {'action': 'approve-plan'}),\n"
             "  'ask': m._asking_session(ctx, none, 'approve-plan'), 'claim': m._asking_session(ctx, none, 'claim')}))\n")
-    u = subprocess.run([sys.executable, "-c", prog, str(ENGINE), str(d)], cwd=d, env=env, capture_output=True,
+    u = subprocess.run([sys.executable, "-c", prog, str(LAUNCHER), str(d)], cwd=d, env=env, capture_output=True,
                        text=True)
     out = json.loads(u.stdout) if u.returncode == 0 and u.stdout.strip() else {}
     check("[CP5-X15] with no chat known for the question, _replies counts no message at all (no unfiltered fallback)",
@@ -166,7 +166,7 @@ def cp5_adv_round2_owner_before_questions():
     # --- X16: the chat that runs `init` owns the run, even on a first run and even if another chat typed last -----
     env = make_env("claude")
     d = cp5y_repo()
-    g = cp5y_guard_bash(d, env, f'python3 "{ENGINE}" init "feature" --slug f', "s-A")
+    g = cp5y_guard_bash(d, env, f'python3 "{LAUNCHER}" init "feature" --slug f', "s-A")
     r = rx(d, env, "init", "feature", "--slug", "f")
     check("[CP5-X16] the guard notes the chat that runs `init`, and init makes it the owner (first run, empty log)",
           g.returncode == 0 and r.returncode == 0 and cp3_state(d).get("owner_session") == "s-A",
@@ -362,7 +362,7 @@ def cp5_adv_round3_engine_note_real_call():
     bad = [c for c in decoys if m._engine_invocations(c)]
     check("[CP5-X22] text that only mentions ratchet.py init/ask (echo, commit message, grep, heredoc, comment, "
           "quoted separators) is never read as a call", not bad, bad)
-    real = {f'python3 "{ENGINE}" ask approve-plan': [["ask", "approve-plan"]],
+    real = {f'python3 "{LAUNCHER}" ask approve-plan': [["ask", "approve-plan"]],
             '$RATCHET ask approve-plan 2>&1 | tail -5': [["ask", "approve-plan"]],
             "cd /p && $RATCHET init 'my feature' --slug f; echo done": [["init", "my feature", "--slug", "f"]],
             "X=1 python3 -u ./ratchet.py --root /p ask claim": [["--root", "/p", "ask", "claim"]]}
@@ -390,7 +390,7 @@ def cp5_adv_round3_engine_note_real_call():
     (d / ".ratchet").mkdir()
     cp5_say(d, d / "t.jsonl", env, "please build the feature", session="s-A")
     cp5y_guard_bash(d, env, 'git commit -m "then run $RATCHET init feature --slug f"', "s-B")
-    cp5y_guard_bash(d, env, f'echo python3 "{ENGINE}" init feature --slug f', "s-B")
+    cp5y_guard_bash(d, env, f'echo python3 "{LAUNCHER}" init feature --slug f', "s-B")
     rx(d, env, "init", "feature", "--slug", "f")
     check("[CP5-X23] an `init` mentioned in another chat's echo/commit message does not make that chat the owner",
           cp3_state(d).get("owner_session") == "s-A", cp3_state(d).get("owner_session"))
@@ -398,7 +398,7 @@ def cp5_adv_round3_engine_note_real_call():
     # --- X24: the real call does name the chat; the note is used once ---------------------------------------
     env = make_env("claude")
     d, tp = cp5y_first_run_plan(env)
-    cp5y_guard_bash(d, env, f'cd "{d}" && python3 "{ENGINE}" ask approve-plan 2>&1 | tail -5', "s-B")
+    cp5y_guard_bash(d, env, f'cd "{d}" && python3 "{LAUNCHER}" ask approve-plan 2>&1 | tail -5', "s-B")
     r = rx(d, env, "ask", "approve-plan")
     st = cp3_state(d)
     check("[CP5-X24] the chat whose guard saw the real `ask approve-plan` call owns the run",
@@ -539,7 +539,7 @@ def cp5_adv_round4_claim_chat_and_lock():
     cp5_say(d, tp, env, "yes")
     lock = cp5w_lock(d)
     lock.write_text("12345 held-by-test")
-    proc = subprocess.Popen([sys.executable, str(ENGINE), "approve-plan"], cwd=d, env=env, stdout=subprocess.PIPE,
+    proc = subprocess.Popen([sys.executable, str(LAUNCHER), "approve-plan"], cwd=d, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
     time.sleep(1.5)
     waited = proc.poll() is None and cp3_state(d)["phase"] == "awaiting_plan_approval"
@@ -563,7 +563,7 @@ def cp5_adv_round4_claim_chat_and_lock():
         r = rx(d, env, "ask", cmd)
         cp5_say(d, tp, env, "yes")
         events_before = len(cp5x_history(d))
-        procs = [subprocess.Popen([sys.executable, str(ENGINE), cmd], cwd=d, env=env, stdout=subprocess.PIPE,
+        procs = [subprocess.Popen([sys.executable, str(LAUNCHER), cmd], cwd=d, env=env, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True) for _ in range(2)]
         res = [(p.communicate(timeout=120), p.returncode) for p in procs]
         codes = sorted(rc for _, rc in res)

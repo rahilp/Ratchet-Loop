@@ -71,7 +71,7 @@ def cp5v_wrap(d):
 
 def cp5v_start(d, env, marker, wait, *args, gate=None):
     e = dict(env, CP5V_GATE=str(gate)) if gate else env
-    return subprocess.Popen([sys.executable, str(cp5v_wrap(d)), str(ENGINE), str(marker), str(wait), *args], cwd=d,
+    return subprocess.Popen([sys.executable, str(cp5v_wrap(d)), str(LAUNCHER), str(marker), str(wait), *args], cwd=d,
                             env=e, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
@@ -354,7 +354,7 @@ def cp5_adv_round6_long_command_keeps_approval():
     assert rx(d, env, "implemented", "CP1").returncode == 0
     r_ask = rx(d, env, "ask", "set-review", "each")
     hold.write_text("1")
-    proc = subprocess.Popen([sys.executable, str(ENGINE), "behavior", "CP1"], cwd=d, env=env,
+    proc = subprocess.Popen([sys.executable, str(LAUNCHER), "behavior", "CP1"], cwd=d, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     said, r_set, set_s, mid = None, None, 99, {}
     try:
@@ -464,7 +464,7 @@ def cp5r7_at_complete(d, env):
 
 
 def cp5r7_start(d, env, *args):
-    return subprocess.Popen([sys.executable, str(ENGINE), *args], cwd=d, env=env, stdout=subprocess.PIPE,
+    return subprocess.Popen([sys.executable, str(LAUNCHER), *args], cwd=d, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
 
 
@@ -636,7 +636,7 @@ def cp5_adv_round7_one_command_at_a_time():
     base = cp5r7_commits(d)
     fail = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r7-f-")) / "fail_after_commit.py"
     fail.write_text(_CP5R7_FAIL_AFTER_COMMIT)
-    r1 = subprocess.run([sys.executable, str(fail), str(ENGINE), "complete", "CP1"], cwd=d, env=env,
+    r1 = subprocess.run([sys.executable, str(fail), str(LAUNCHER), "complete", "CP1"], cwd=d, env=env,
                         capture_output=True, text=True)
     head1 = git(d, "rev-parse", "HEAD").stdout.strip()[:7]
     check("[CP5-X43] (setup) complete made the checkpoint commit, then failed before saving, leaving no lock",
@@ -718,7 +718,7 @@ def cp5r8_jsonl_ok(p):
 def cp5r8_prompt_proc(d, env, tp, text):
     tp.open("a").write(json.dumps({"type": "user", "message": {"role": "user", "content": text},
                                    "timestamp": now_dt().isoformat()}) + "\n")
-    p = subprocess.Popen([sys.executable, str(ENGINE), "hook", "prompt", "--host", "claude"], cwd=d, env=env,
+    p = subprocess.Popen([sys.executable, str(LAUNCHER), "hook", "prompt", "--host", "claude"], cwd=d, env=env,
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     p.stdin.write(json.dumps({"cwd": str(d), "prompt": text, "session_id": "s-owner", "transcript_path": str(tp)}))
     p.stdin.close()
@@ -738,7 +738,7 @@ def cp5_adv_round8_init_lock_and_hash_record_lock():
     git(d, "add", "-A")
     git(d, "commit", "-qm", "init")
     had_folder = (d / ".ratchet").exists()
-    procs = [subprocess.Popen([sys.executable, str(ENGINE), "init", f"feature {i}", "--slug", f"s{i}"], cwd=d,
+    procs = [subprocess.Popen([sys.executable, str(LAUNCHER), "init", f"feature {i}", "--slug", f"s{i}"], cwd=d,
                               env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for i in range(4)]
     results = [(p,) + p.communicate(timeout=120) for p in procs]
     won = [i for i, (p, _, _) in enumerate(results) if p.returncode == 0]
@@ -773,7 +773,7 @@ def cp5_adv_round8_init_lock_and_hash_record_lock():
     hold.write_text("1")
     beh = cp5r7_start(d, env, "behavior", "CP1")
     started = cp5v_until(lambda: running.exists())
-    appenders = [subprocess.Popen([sys.executable, str(script), str(ENGINE), str(t), str(start), str(n_lines)],
+    appenders = [subprocess.Popen([sys.executable, str(script), str(LAUNCHER), str(t), str(start), str(n_lines)],
                                   cwd=d, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                  for t in targets]
     texts = [f"cp5r8 message {i}" for i in range(n_prompts)]
@@ -781,7 +781,7 @@ def cp5_adv_round8_init_lock_and_hash_record_lock():
     stop = json.dumps({"session_id": "s-owner", "cwd": str(d), "hook_event_name": "Stop", "stop_hook_active": False})
     stops = []
     for _ in range(n_stops):
-        sp_ = subprocess.Popen([sys.executable, str(ENGINE), "hook", "stop", "--host", "claude"], cwd=d, env=env,
+        sp_ = subprocess.Popen([sys.executable, str(LAUNCHER), "hook", "stop", "--host", "claude"], cwd=d, env=env,
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         sp_.stdin.write(stop)
         sp_.stdin.close()
@@ -886,7 +886,7 @@ print(json.dumps(got))
 
 def cp5r9_race(script, root, env, workers, n, mode):
     start = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r9-s-")) / "start"
-    procs = [subprocess.Popen([sys.executable, str(script), str(ENGINE), str(root), str(start), str(w), str(n), mode],
+    procs = [subprocess.Popen([sys.executable, str(script), str(LAUNCHER), str(root), str(start), str(w), str(n), mode],
                               cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
              for w in range(workers)]
     ready = cp5v_until(lambda: all((start.parent / f"ready-{w}").exists() for w in range(workers)), timeout=120)
@@ -902,7 +902,7 @@ def cp5r9_race(script, root, env, workers, n, mode):
 def cp5r9_guard_proc(d, env, command, session):
     payload = {"session_id": session, "cwd": str(d), "hook_event_name": "PreToolUse", "tool_name": "Bash",
                "tool_input": {"command": command}}
-    p = subprocess.Popen([sys.executable, str(ENGINE), "hook", "guard", "--host", "claude"], cwd=d, env=env,
+    p = subprocess.Popen([sys.executable, str(LAUNCHER), "hook", "guard", "--host", "claude"], cwd=d, env=env,
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     p.stdin.write(json.dumps(payload))
     p.stdin.close()

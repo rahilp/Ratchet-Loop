@@ -97,7 +97,7 @@ def mutate(d, fn, slug="f"):
     st = json.loads(p.read_text())
     fn(st)
     p.write_text(json.dumps(st))
-    r = subprocess.run([sys.executable, "-c", REBASELINE, str(g.ENGINE), str(p)], cwd=d, env=g.ENV,
+    r = subprocess.run([sys.executable, "-c", REBASELINE, str(g.LAUNCHER), str(p)], cwd=d, env=g.ENV,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     return st

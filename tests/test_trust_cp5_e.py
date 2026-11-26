@@ -169,7 +169,7 @@ def cp2_guard_tool(m, d, env, tool, tool_input, session="s"):
 
 def cp2_director(m, home_dir, denv, lane, *args):
     """In-process mirror of trust_helpers.cp5r12_director."""
-    cp2_guard_tool(m, home_dir, denv, "Bash", {"command": f"python3 {ENGINE} --root {lane} {' '.join(args)}"},
+    cp2_guard_tool(m, home_dir, denv, "Bash", {"command": f"python3 {LAUNCHER} --root {lane} {' '.join(args)}"},
                   session="s-director")
     # replaces rx(home_dir, denv, "--root", str(lane), *args)  (trust_helpers.cp5r12_director)
     with _Cp2Call(m, home_dir, denv) as r:
@@ -355,7 +355,7 @@ def cp5r13_race(script, record, jobs):
     # CP2: kept as a REAL subprocess.Popen race -- it proves genuine cross-process contention for a shared
     # record's lock; one Python process calling in-process functions cannot reproduce two separate OS processes
     # racing to read-modify-write the same file.
-    procs = [subprocess.Popen([sys.executable, str(script), str(ENGINE), record, str(gate / "go"),
+    procs = [subprocess.Popen([sys.executable, str(script), str(LAUNCHER), record, str(gate / "go"),
                                str(gate / f"ready-{i}"), *argv], cwd=str(cwd), env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True)
              for i, (cwd, env, argv) in enumerate(jobs)]
@@ -439,7 +439,7 @@ def cp5_adv_round13_shared_record_lock():
     k = cp2_director(m, home_dir, denv, lanes[0], "director-key")
     for d in projects:
         # replaces cp4x_guard_tool(home_dir, denv, "Bash", {"command": ...}, session="s-director")
-        cp2_guard_tool(m, home_dir, denv, "Bash", {"command": f"python3 {ENGINE} --root {d} director-enroll"},
+        cp2_guard_tool(m, home_dir, denv, "Bash", {"command": f"python3 {LAUNCHER} --root {d} director-enroll"},
                       session="s-director")
     ready, res = cp5r13_race(script, "enrolled.json",
                              [(home_dir, denv, ["--root", str(d), "director-enroll"]) for d in lanes])
