@@ -1,7 +1,7 @@
 # Director redesign (Lane D) — design
 
 Date: 2026-11-26  
-Status: draft — awaiting approval  
+Status: approved  
 Approach: checkout identity + director-applies + parallel-by-ownership
 
 ## Who this is for
