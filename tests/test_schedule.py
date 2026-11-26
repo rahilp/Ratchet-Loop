@@ -964,7 +964,7 @@ def test_CP1_T30_no_new_module_and_no_module_level_collection():
     check("status_text.py defines schedule_numbers at the top level", "schedule_numbers" in defs, sorted(defs)[:5])
     check("status_text.py defines step_stall at the top level", "step_stall" in defs, sorted(defs)[:5])
     known = ("engine_utils.py", "fingerprint.py", "plan_support.py", "provider_discovery.py", "provider_health.py",
-             "ratchet.py", "records.py", "run_records.py", "spec_sources.py", "status_text.py")
+             "ratchet.py", "ratchet_engine.py", "records.py", "run_records.py", "spec_sources.py", "status_text.py")
     now_modules = sorted(p.name for p in SCRIPTS.glob("*.py"))
     check("no new .py module in the scripts folder", now_modules == sorted(known), now_modules)
     offenders = []

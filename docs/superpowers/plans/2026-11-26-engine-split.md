@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Move the body of `skills/ratchet-orchestrator/scripts/ratchet.py` into `ratchet_engine.py` and leave `ratchet.py` as a ~5-line launcher, preserving CLI, hook, and fixture behavior.
+**Goal:** Move the body of `skills/ratchet-orchestrator/scripts/ratchet.py` into `ratchet_engine.py` and leave `ratchet.py` as a tiny launcher, preserving CLI, hook, and fixture behavior — including every path the engine *emits* for hooks/plugins/retries.
 
-**Architecture:** Mechanical body move (design approach A). Process entry stays on `ratchet.py`. Internals load `ratchet_engine.py` by path. Subprocess CLI invocations use the launcher; in-process/`spec_from_file_location`/source scans use the engine file. No logic changes in the engine body; no lazy-import work.
+**Architecture:** Mechanical body move (design approach A), plus an engine-side `LAUNCHER = SCRIPT_DIR / "ratchet.py"` for all emitted runnable paths. Process entry stays on `ratchet.py`. Internals load `ratchet_engine.py` by path. Keep `sys.modules["ratchet"]` registration. Adversarial review before merge.
 
 **Tech Stack:** Python 3.8+ stdlib only; existing `tests/run_all.py` suite runner; `importlib.util.spec_from_file_location` loaders.
 
@@ -12,14 +12,15 @@
 
 ## Global Constraints
 
-- Move-only for the engine body: no intentional behavior or logic edits in the same change set as the split.
 - Public CLI/hook entry path remains `…/scripts/ratchet.py` (filename unchanged).
-- Launcher does not re-export engine internals (no `import *` facade).
+- Engine-emitted runnable paths (`ENGINE_PATH`, `_hook_cmd`, OpenCode slot, `_retry_command`, `_spawn_background`) must resolve to the **launcher**, never `Path(__file__)` after the move.
+- Launcher does not re-export engine internals (no `import *` facade); may insert `SCRIPT_DIR` on `sys.path` before importing `ratchet_engine`.
+- Keep cold-load `spec_from_file_location(..., "ratchet")` / `sys.modules["ratchet"]` reuse; do not invent `_ratchet_module` in `fingerprint.py`.
 - Stdlib only; no new third-party deps.
-- Full suite green is the merge bar; hook-latency measurement is optional and not a gate.
+- Full suite green **and** adversarial review (no open Critical/Important) are the merge bar; hook-latency measurement is optional and not a gate.
 - Naming convention after the split:
   - `ENGINE` → `…/scripts/ratchet_engine.py` (load / AST / source scan)
-  - `LAUNCHER` → `…/scripts/ratchet.py` (subprocess CLI: `python3 LAUNCHER …`)
+  - `LAUNCHER` → `…/scripts/ratchet.py` (subprocess CLI **and** engine-emitted paths)
 
 ---
 
@@ -456,10 +457,87 @@ git commit -m "fix: finish engine-split path sweep; full suite green"
 - [ ] **Step 5: Done-when checklist**
 
 - [ ] `ratchet.py` is the tiny launcher; body lives in `ratchet_engine.py`
-- [ ] `tests/test_engine_split.py` passes
+- [ ] `tests/test_engine_split.py` passes (including path-emission guards)
 - [ ] Full suite green
 - [ ] No sibling `_ratchet_module()` points at the launcher
-- [ ] No intentional engine logic changes in this branch
+- [ ] Engine-emitted paths name the launcher
+- [ ] Adversarial review closed (Task 7)
+
+---
+
+### Task 7: Engine-side `LAUNCHER` path emission + adversarial review
+
+**Files:**
+- Modify: `skills/ratchet-orchestrator/scripts/ratchet_engine.py` (`SCRIPT_DIR` / `LAUNCHER`, `ENGINE_PATH`, `_hook_cmd`, `_retry_command`, `_spawn_background`, OpenCode slot fill)
+- Modify: `tests/test_engine_split.py` (add S-T07+ guards that `ENGINE_PATH` / `_hook_cmd` name the launcher)
+- Test: `tests/test_engine_split.py`, focused hook-install suites, then adversarial pass
+
+**Interfaces:**
+- Consumes: `SCRIPT_DIR` already in engine
+- Produces: `LAUNCHER = SCRIPT_DIR / "ratchet.py"`; all emitted runnable paths use it
+
+- [ ] **Step 1: Extend guard suite (failing first)**
+
+Add checks such as:
+
+```python
+def t07_emitted_paths_name_launcher():
+    spec = importlib.util.spec_from_file_location("ratchet_engine_split_paths", ENGINE)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    check("[S-T07] ENGINE_PATH is the launcher",
+          Path(m.ENGINE_PATH).resolve() == LAUNCHER.resolve(), m.ENGINE_PATH)
+    hook = m._hook_cmd("claude", "guard")
+    check("[S-T07] _hook_cmd embeds ratchet.py not ratchet_engine.py",
+          "ratchet.py" in hook and "ratchet_engine.py" not in hook, hook)
+```
+
+Run `python3 tests/test_engine_split.py` — expect S-T07 FAIL before the engine edit.
+
+- [ ] **Step 2: Add `LAUNCHER` and retarget emit sites**
+
+Near `SCRIPT_DIR`:
+
+```python
+LAUNCHER = SCRIPT_DIR / "ratchet.py"
+```
+
+Then:
+
+```python
+ENGINE_PATH = str(LAUNCHER)
+```
+
+Replace `Path(__file__).resolve()` in `_hook_cmd`, `_retry_command`, and `_spawn_background` with `LAUNCHER` (or `str(LAUNCHER)`). OpenCode template fill already uses `ENGINE_PATH` once that constant is fixed.
+
+- [ ] **Step 3: Re-run guards + hook-install slice**
+
+```bash
+python3 tests/test_engine_split.py
+python3 tests/test_hook_opencode_install.py
+python3 tests/test_hooks.py
+```
+
+Expected: exit 0 (or only pre-existing unrelated failures documented).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add skills/ratchet-orchestrator/scripts/ratchet_engine.py tests/test_engine_split.py
+git commit -m "fix: emit launcher paths from engine (ENGINE_PATH, hooks, spawns)"
+```
+
+- [ ] **Step 5: Adversarial review**
+
+Dispatch a separate adversarial agent with the amended design + branch diff. Brief it to attack:
+
+- emitted paths still naming `ratchet_engine.py`
+- doctor/guard/`_pid_is_ratchet`/`_strip_ratchet` mismatches
+- double-load via `sys.modules`
+- bare `import ratchet` getting an empty launcher
+- hook-install / OpenCode plugin regressions
+
+Fix Critical/Important findings; re-run covering tests; re-dispatch adversarial until clean. Summarize on the PR.
 
 ---
 
@@ -468,13 +546,16 @@ git commit -m "fix: finish engine-split path sweep; full suite green"
 | Spec requirement | Task |
 |------------------|------|
 | Body → `ratchet_engine.py`, tiny launcher | Task 2 |
-| CLI/hooks stay on `ratchet.py` | Tasks 2, 4 (LAUNCHER) |
+| Launcher `sys.path` insert | Task 2 / interim fix |
+| CLI/hooks stay on `ratchet.py` | Tasks 2, 4, **7** |
+| Engine-emitted paths use launcher | **Task 7** |
 | Internals load `ratchet_engine.py` | Tasks 3–4 |
-| Fixture / `spec_from_file_location` / source scans retargeted | Tasks 4–5 |
+| `sys.modules["ratchet"]` reuse | Task 3 |
+| Fixture / source scans retargeted | Tasks 4–5 |
 | Inventory + module map updated | Task 5 |
-| Move-only / no logic edits | Global constraint + Task 2 |
 | Full suite green | Task 6 |
+| Adversarial review | **Task 7** |
 | Latency not a merge gate | Task 6 optional timing |
 | No launcher star-import facade | Task 2 launcher code |
 
-No TBD/placeholder steps remain. `ENGINE`/`LAUNCHER` naming is consistent across tasks.
+`ENGINE`/`LAUNCHER` naming is consistent across tasks. Path-emission amendment is the only intentional engine behavior change beyond the move.
