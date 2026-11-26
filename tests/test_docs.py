@@ -1714,7 +1714,7 @@ def cp4_orchestrator_setup_and_plan_review():
     print("CP4: orchestrator setup and plan review")
     path = ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md"
     doc = path.read_text(encoding="utf-8") if path.exists() else ""
-    engine_src = (ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py").read_text(encoding="utf-8")
+    engine_src = (ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet_engine.py").read_text(encoding="utf-8")
     p = cp4_parts(doc)
     check("[CP4-T01] hooks check (doctor --json) sits after init and before plan-submit, done by the agent", l_hooks_after_init(p), p["pos"])
     check("[CP4-T02] missing hooks: agent offers install-hooks for the CLI in use, nothing installs before a yes", l_install_offer(p), p["hooks"][:200])

@@ -103,7 +103,7 @@ def fake_opencode_bin(models, fail=False):
     """A private PATH with a fake `opencode` (serving `models`) plus the real binaries the engine itself
     needs, and a models-list file the fake CLI reads via $RATCHET_OPENCODE_MODELS. Never a real agent CLI."""
     b = Path(_tmp.mkdtemp(prefix="ratchet-fakebin-oc-"))
-    for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+    for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename"):
         p = shutil.which(n)
         if p:
             (b / n).symlink_to(p)

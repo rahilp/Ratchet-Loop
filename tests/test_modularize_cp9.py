@@ -179,6 +179,9 @@ def t02_names_every_real_module_exactly():
     new_files, base_files = _real_new_modules()
     expected = {"engine_utils.py", "fingerprint.py", "records.py", "provider_discovery.py",
                 "run_records.py", "plan_support.py", "status_text.py"}
+    # Lane S relocated the engine body to ratchet_engine.py; the live census still sees it as a
+    # scripts/*.py that was not in PRE_EXISTING_SCRIPTS, so subtract it from the CP2–CP8 "new modules" set.
+    new_files = set(new_files) - {"ratchet_engine.py"}
     check("[CP9-T02] setup: live-derived new-module set matches the 7 modules this run's checkpoints "
           "(CP2-CP8) actually created (sanity check on our own derivation, not on the doc)",
           new_files == expected, (sorted(new_files), sorted(base_files)))
@@ -193,10 +196,10 @@ def t02_names_every_real_module_exactly():
           not missing, missing)
 
     py_tokens = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\.py\b", doc_text))
-    allowed = expected | {"ratchet.py"}
+    allowed = expected | {"ratchet.py", "ratchet_engine.py"}
     invented = sorted(py_tokens - allowed)
-    check("[CP9-T02] no eighth '.py' module name (beyond the 7 real ones and the ratchet.py entry "
-          "point) is invented in the doc", not invented, invented)
+    check("[CP9-T02] no eighth '.py' module name (beyond the 7 real ones, the ratchet.py launcher, "
+          "and ratchet_engine.py) is invented in the doc", not invented, invented)
 
     coupling_a = ("_ratchet_module" in doc_text) or (
         "forward-dependenc" in doc_text.lower() and "19" in doc_text)
@@ -273,10 +276,10 @@ def t05_never_claims_an_out_of_scope_move():
     # ratchet.py entry point is listed in the doc -- the most direct form an "it moved out" claim
     # about an out-of-scope area could take.
     expected = {"engine_utils.py", "fingerprint.py", "records.py", "provider_discovery.py",
-                "run_records.py", "plan_support.py", "status_text.py", "ratchet.py"}
+                "run_records.py", "plan_support.py", "status_text.py", "ratchet.py", "ratchet_engine.py"}
     py_tokens = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\.py\b", doc_text))
     invented = sorted(py_tokens - expected)
-    check("[CP9-T05] no module filename outside the 7 real ones (plus the ratchet.py entry point) is "
+    check("[CP9-T05] no module filename outside the 7 real ones (plus launcher/engine) is "
           "named anywhere in the doc", not invented, invented)
 
     lines = doc_text.splitlines()

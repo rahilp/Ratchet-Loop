@@ -56,7 +56,7 @@ printf '%s\n' "$reply"
 
 def fake_bin(*names, failing=()):
     b = Path(_tmp.mkdtemp(prefix="ratchet-fakebin-"))
-    for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+    for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename"):
         p = shutil.which(n)
         if p:
             (b / n).symlink_to(p)

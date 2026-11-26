@@ -30,7 +30,7 @@ def x01_phases_the_merge_guard_allows_do_not_block_integrate():
 
 def x02_engine_avoids_python_39_only_string_methods():
     cid = "CP1-X02"
-    src = (tic.ROOT / "skills/ratchet-orchestrator/scripts/ratchet.py").read_text()
+    src = (tic.ROOT / "skills/ratchet-orchestrator/scripts/ratchet_engine.py").read_text()
     tic.check(f"[{cid}] no str.removeprefix / removesuffix (Python 3.9+) in the engine",
               ".removeprefix(" not in src and ".removesuffix(" not in src)
 

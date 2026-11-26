@@ -267,7 +267,7 @@ def cp7_host_project(name, **kw):
     """A project whose host is forced to claude and whose PATH has no other agent CLI (codex/gemini/copilot/claude)."""
     import shutil
     b = Path(_tmp.mkdtemp(prefix="ratchet-bin-"))
-    for n in ("python3", "git", "node", "sh", "env"):
+    for n in ("python3", "git", "node", "sh", "bash", "env"):
         p = shutil.which(n)
         if p:
             (b / n).symlink_to(p)

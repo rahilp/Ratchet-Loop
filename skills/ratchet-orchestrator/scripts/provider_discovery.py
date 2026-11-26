@@ -96,7 +96,9 @@ def _ratchet_module():
     when there is one, so this never re-executes the file as a second, separate module instance in the normal
     case. Mirrors records.py's own helper of the same name and shape."""
     mod = sys.modules.get("ratchet")
-    if mod is not None:
+    # After the Lane S split, a bare `import ratchet` binds the tiny launcher. Ignore that shell and
+    # cold-load ratchet_engine.py so siblings never call into a module that only exposes main().
+    if mod is not None and Path(getattr(mod, "__file__", "") or "").name != "ratchet.py":
         return mod
     import importlib.util as _ilu
     path = Path(__file__).resolve().with_name("ratchet_engine.py")

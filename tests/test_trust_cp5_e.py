@@ -30,7 +30,7 @@ sys.path.insert(0, str(HERE))
 import _tmp
 import trust_helpers
 from trust_helpers import (
-    ENGINE, PROVIDER_DISCOVERY, RECORDS, RUN_RECORDS, check, cp5v_until, cp5y_load_engine, engine_env, git,
+    ENGINE, LAUNCHER, PROVIDER_DISCOVERY, RECORDS, RUN_RECORDS, check, cp5v_until, cp5y_load_engine, engine_env, git,
     make_env, now_dt,
 )
 
@@ -355,7 +355,8 @@ def cp5r13_race(script, record, jobs):
     # CP2: kept as a REAL subprocess.Popen race -- it proves genuine cross-process contention for a shared
     # record's lock; one Python process calling in-process functions cannot reproduce two separate OS processes
     # racing to read-modify-write the same file.
-    procs = [subprocess.Popen([sys.executable, str(script), str(LAUNCHER), record, str(gate / "go"),
+    # Child loads the engine body by path (needs _read_record); CLI argv still starts with ratchet.py below.
+    procs = [subprocess.Popen([sys.executable, str(script), str(ENGINE), record, str(gate / "go"),
                                str(gate / f"ready-{i}"), *argv], cwd=str(cwd), env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True)
              for i, (cwd, env, argv) in enumerate(jobs)]
@@ -1300,11 +1301,11 @@ def _cp2_test_only_functions(tree, lines):
 
 
 def t06_test_only_seam_is_structurally_sound():
-    src = (HERE.parent / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py").read_text()
+    src = (HERE.parent / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet_engine.py").read_text()
     tree = _cp2_ast.parse(src)
     lines = src.splitlines()
     found = _cp2_test_only_functions(tree, lines)
-    cp2_check("{CP2-T06} ratchet.py has at most one top-level function clearly labeled test-only (by name or an "
+    cp2_check("{CP2-T06} ratchet_engine.py has at most one top-level function clearly labeled test-only (by name or an "
               "adjacent comment/docstring saying so)", len(found) <= 1, [n.name for n in found])
     if not found:
         return
@@ -1314,7 +1315,7 @@ def t06_test_only_seam_is_structurally_sound():
     callers = [node.lineno for node in _cp2_ast.walk(tree)
                if isinstance(node, _cp2_ast.Name) and node.id == fn.name
                and not (fn.lineno <= node.lineno <= (fn.end_lineno or fn.lineno))]
-    cp2_check(f"{{CP2-T06}} no production code path in ratchet.py (no command dispatch, no CLI handler, no other "
+    cp2_check(f"{{CP2-T06}} no production code path in ratchet_engine.py (no command dispatch, no CLI handler, no other "
               f"function body) calls '{fn.name}()' -- it has no callers anywhere else in the file",
               callers == [], callers)
 

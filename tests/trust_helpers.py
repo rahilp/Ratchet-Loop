@@ -56,7 +56,7 @@ _DROP_EXACT = {"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "GEMINI_CLI", "GITHUB_COP
 
 # Tools a throwaway git project and the engine itself need; deliberately excludes every agent CLI binary name
 # (claude, codex, gemini, cursor-agent, opencode, copilot) so they stay unreachable regardless of the real PATH.
-_SAFE_TOOLS = ("git", "python3", "sh", "env", "cat", "mkdir", "rm", "ls", "dirname", "basename", "true", "false",
+_SAFE_TOOLS = ("git", "python3", "sh", "bash", "env", "cat", "mkdir", "rm", "ls", "dirname", "basename", "true", "false",
                "uname", "chmod", "mv", "cp", "sed", "grep", "find", "touch", "date", "sort", "head", "tail", "wc",
                "readlink", "printf", "echo")
 
@@ -105,7 +105,8 @@ def rx(d, env, *args, stdin=None):
 
 
 def git(d, *a):
-    r = subprocess.run(["git", *a], cwd=d, capture_output=True, text=True,
+    # Hermetic throwaways must not inherit host commit.gpgsign (cursor-git-ssh-keygen needs a fuller PATH).
+    r = subprocess.run(["git", "-c", "commit.gpgsign=false", *a], cwd=d, capture_output=True, text=True,
                        env=dict(os.environ, PATH=SAFE_PATH))
     assert r.returncode == 0, r.stdout + r.stderr
     return r

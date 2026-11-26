@@ -59,7 +59,14 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # under a throwaway name via spec_from_file_location without registering it in sys.modules at all (__name__
 # itself then has no entry); only alias when there is an actual module object to alias, so that case is
 # untouched and such a test's own engine_utils.py calls simply load this file fresh, by path, once.
-if "ratchet" not in sys.modules and __name__ in sys.modules:
+# After Lane S, bare `import ratchet` may already bind the tiny launcher under "ratchet" — overwrite that
+# shell so siblings resolve to this engine body, not a module that only exposes main().
+_existing_ratchet = sys.modules.get("ratchet")
+_existing_is_launcher = (
+    _existing_ratchet is not None
+    and Path(getattr(_existing_ratchet, "__file__", "") or "").name == "ratchet.py"
+)
+if __name__ in sys.modules and ("ratchet" not in sys.modules or _existing_is_launcher):
     sys.modules["ratchet"] = sys.modules[__name__]
 _dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True  # never litter the installed plugin with __pycache__
 import spec_sources as specsrc  # noqa: E402

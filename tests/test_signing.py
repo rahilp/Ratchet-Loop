@@ -93,7 +93,7 @@ printf '%s\n' "$reply"
 
 def fake_bin(name, reply_json):
     b = Path(_tmp.mkdtemp(prefix="ratchet-sign-fakebin-"))
-    for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+    for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename"):
         p = shutil.which(n)
         if p:
             (b / n).symlink_to(p)
@@ -692,7 +692,7 @@ def say_x(d, env, text):
 def raw_fake_bin(name, body):
     """A fake CLI whose whole script body is given (no reply escaping), on a PATH holding only a few real tools."""
     b = Path(_tmp.mkdtemp(prefix="ratchet-sign-rawbin-"))
-    for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+    for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename"):
         p = shutil.which(n)
         if p:
             (b / n).symlink_to(p)
@@ -1047,7 +1047,7 @@ printf '%s\n' "$reply"
           r.returncode in (0, 2) and "Traceback" not in r.stderr
           and (cp3_state(d)["checkpoints"]["CP1"].get("adv_round") or {}).get("recorded"), (r.returncode, r.stderr))
     import importlib.util
-    spec = importlib.util.spec_from_file_location("ratchet_engine_x12", ROOT / "skills/ratchet-orchestrator/scripts/ratchet.py")
+    spec = importlib.util.spec_from_file_location("ratchet_engine_x12", ROOT / "skills/ratchet-orchestrator/scripts/ratchet_engine.py")
     eng = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(eng)
     try:

@@ -379,7 +379,7 @@ def _fake_clis(specs):
     """One private folder holding a fake agent CLI per entry of `specs` ({name: (standards reply, correctness
     reply)}), plus the few real tools the engine shells out to, so PATH can be exactly this folder."""
     b = Path(_tmp.mkdtemp(prefix="ratchet-cp5-bin-"))
-    for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+    for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename"):
         p = shutil.which(n)
         if p:
             (b / n).symlink_to(p)

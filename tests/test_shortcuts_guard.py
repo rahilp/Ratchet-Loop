@@ -51,7 +51,7 @@ CASE_STATUS: dict[str, bool] = {}
 CASE_MESSAGES: dict[str, list] = {}
 ID_RE = re.compile(r"\[(CP7-[TX]\d+[a-z]?)\]")
 
-ENGINE_REL = "skills/ratchet-orchestrator/scripts/ratchet.py"
+ENGINE_REL = "skills/ratchet-orchestrator/scripts/ratchet_engine.py"
 TABLE_REL = "tests/shortcuts/guard.json"
 RUNNER_REL = "tests/shortcuts/guard_runner.py"
 RUNNER_CMD = "python3 tests/shortcuts/guard_runner.py"

@@ -148,7 +148,7 @@ def fake_opencode_bin_blocking(models):
     """A private PATH with the blocking fake `opencode` above, built the same way as
     test_discover.fake_opencode_bin: (bin dir, models-list file)."""
     b = Path(_tmp.mkdtemp(prefix="ratchet-fakebin-oc-block-"))
-    for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+    for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename"):
         p = shutil.which(n)
         if p:
             (b / n).symlink_to(p)
@@ -446,14 +446,14 @@ TESTS += [
 # --add must be mirrored into schemas.md section 8 in the same step).
 
 def x05_schemas_names_every_long_locked_cmd():
-    engine_src = (ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py").read_text()
+    engine_src = (ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet_engine.py").read_text()
     m = re.search(r'LONG_LOCKED_CMDS\s*=\s*\(([^)]*)\)', engine_src)
-    check("[CP2-X05] (setup) LONG_LOCKED_CMDS is found in ratchet.py", bool(m), engine_src[:0])
+    check("[CP2-X05] (setup) LONG_LOCKED_CMDS is found in ratchet_engine.py", bool(m), engine_src[:0])
     names = re.findall(r'"([^"]+)"', m.group(1)) if m else []
     check("[CP2-X05] (setup) LONG_LOCKED_CMDS has at least one entry", bool(names), names)
     schemas = (ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md").read_text()
     missing = [n for n in names if f"`{n}" not in schemas]
-    check("[CP2-X05] schemas.md section 8 names every LONG_LOCKED_CMDS entry from ratchet.py",
+    check("[CP2-X05] schemas.md section 8 names every LONG_LOCKED_CMDS entry from ratchet_engine.py",
           not missing, (names, missing))
 
 

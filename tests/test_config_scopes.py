@@ -34,7 +34,7 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import test_config_layers as cl                         # noqa: E402  (its in-process helpers: project(), run(), ...)
 
-ENGINE_PATH = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+ENGINE_PATH = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet_engine.py"
 CASE_STATUS: dict = {}
 CASE_MESSAGES: dict = {}
 PASS = FAIL = 0

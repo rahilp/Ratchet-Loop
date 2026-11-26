@@ -109,7 +109,8 @@ def jwrite(p, d):
 
 def gitx(d, *a):
     """git without the assert of th.git (a failing command is data here)."""
-    return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True, env=dict(os.environ, PATH=th.SAFE_PATH))
+    return subprocess.run(["git", "-c", "commit.gpgsign=false", *a], cwd=d, capture_output=True, text=True,
+                          env=dict(os.environ, PATH=th.SAFE_PATH))
 
 
 def gout(d, *a) -> str:

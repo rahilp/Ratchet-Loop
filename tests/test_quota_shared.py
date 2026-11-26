@@ -104,7 +104,7 @@ class Machine:
 
     def __init__(self, names):
         b = Path(_tmp.mkdtemp(prefix="ratchet-fk-bin-"))
-        for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+        for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename"):
             p = shutil.which(n)
             if p:
                 (b / n).symlink_to(p)
@@ -903,7 +903,7 @@ def x11_the_health_record_is_only_written_under_its_lock_and_a_lockless_writer_l
     # [CP6] register_active and the rest of run bookkeeping/hook-env trust/integrity verification moved into
     # run_records.py; include it too.
     scripts_dir = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
-    src = ((scripts_dir / "ratchet.py").read_text(encoding="utf-8") + "\n"
+    src = ((scripts_dir / "ratchet_engine.py").read_text(encoding="utf-8") + "\n"
           + (scripts_dir / "records.py").read_text(encoding="utf-8") + "\n"
           + (scripts_dir / "provider_discovery.py").read_text(encoding="utf-8") + "\n"
           + (scripts_dir / "run_records.py").read_text(encoding="utf-8"))
@@ -1027,7 +1027,7 @@ def x09_status_json_lists_a_provider_any_lane_benched():
 import ast                      # noqa: E402  (CP4-T03/T07: finds real fast=True call sites and add_parser() calls)
 import measure_suite_baseline as _msb  # noqa: E402  (CP4-T09: REAL_SUITES, the schema it writes)
 
-CP4_ENGINE_REL = "skills/ratchet-orchestrator/scripts/ratchet.py"
+CP4_ENGINE_REL = "skills/ratchet-orchestrator/scripts/ratchet_engine.py"
 CP4_MEASURE_REL = "tests/measure_suite_baseline.py"
 # [CP4 fix round 2 per director check-in 'simplify': host-alt-standards/B1+B2, host-alt-correctness/C1+C2 --
 # forever-freezing ratchet.py/measure_suite_baseline.py against a committed snapshot (round 1's answer to

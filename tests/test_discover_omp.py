@@ -130,7 +130,7 @@ def fake_bin(include_opencode=False, include_pi=False, include_crush=False):
     optionally a fake `opencode` / `pi` / `crush`. Returns a dict of paths this case's env needs. Never a
     real agent CLI."""
     b = Path(_tmp.mkdtemp(prefix="ratchet-fakebin-omp-"))
-    for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+    for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename"):
         p = shutil.which(n)
         if p:
             (b / n).symlink_to(p)
