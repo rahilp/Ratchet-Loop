@@ -118,7 +118,7 @@ def _ratchet_module():
     if mod is not None:
         return mod
     import importlib.util as _ilu
-    path = Path(__file__).resolve().with_name("ratchet.py")
+    path = Path(__file__).resolve().with_name("ratchet_engine.py")
     spec = _ilu.spec_from_file_location("ratchet", path)
     mod = _ilu.module_from_spec(spec)
     sys.modules["ratchet"] = mod
