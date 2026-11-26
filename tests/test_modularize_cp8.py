@@ -182,7 +182,7 @@ def compare_text(label, d, args, env=None, normalize=None):
     try:
         d1, d2 = clone(d), clone(d)
         r1 = run(pinned, d1, args, env=env)
-        r2 = run(ENGINE, d2, args, env=env)
+        r2 = run(LAUNCHER, d2, args, env=env)
     finally:
         pinned.unlink(missing_ok=True)
     # CP2 of the schedule-awareness lane: the schedule additions are dropped from BOTH raw outputs first, while a
@@ -218,7 +218,7 @@ def mutate(d, fn, slug="f"):
     st = json.loads(p.read_text())
     fn(st)
     p.write_text(json.dumps(st))
-    r = subprocess.run([sys.executable, "-c", REBASELINE, str(LAUNCHER), str(p)], cwd=str(d), env=g.ENV,
+    r = subprocess.run([sys.executable, "-c", REBASELINE, str(ENGINE), str(p)], cwd=str(d), env=g.ENV,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     return st
@@ -538,7 +538,7 @@ def t06_next_plain_fields_byte_identical():
         try:
             d1, d2 = clone(d), clone(d)
             r1 = run(pinned, d1, ["next"])
-            r2 = run(ENGINE, d2, ["next"])
+            r2 = run(LAUNCHER, d2, ["next"])
         finally:
             pinned.unlink(missing_ok=True)
         try:
@@ -600,7 +600,7 @@ def t09_finish_pause_block_byte_identical():
     # An accepted line: line 2's exact current reasons are read first, then recorded as "covered" so the
     # acceptance genuinely matches what holds it (never a guess at the wording).
     d_acc = fin._fin2("cp8t09acc", failed=True)[0]
-    tbl = json.loads(run(ENGINE, d_acc, ["status", "--json"]).stdout).get("done_means_table")
+    tbl = json.loads(run(LAUNCHER, d_acc, ["status", "--json"]).stdout).get("done_means_table")
     line2 = next((e for e in (tbl or []) if e.get("number") == 2), {}) if isinstance(tbl, list) else {}
     check("[CP8-T09] setup: the accepted-line fixture's line 2 is really unproven before accepting it",
           line2.get("verdict") == "unproven" and line2.get("reasons"), tbl)
@@ -645,7 +645,7 @@ def t10_waiting_question_byte_identical():
 
     d_al = fin._fin2("cp8t10al", failed=True)[0]
     g.rx(d_al, "ask", "accept-line", "2")
-    r_check = run(ENGINE, clone(d_al), ["status", "--json"])
+    r_check = run(LAUNCHER, clone(d_al), ["status", "--json"])
     try:
         pending = json.loads(r_check.stdout).get("question")
     except json.JSONDecodeError:
@@ -768,7 +768,7 @@ def t13_status_and_next_json_carry_same_fields():
         pinned = pinned_script(f"t13_{re.sub(r'[^A-Za-z0-9]+', '_', name)}")
         try:
             d1, d2 = clone(d), clone(d)
-            j1, j2 = _json_for_compare(pinned, d1), _json_for_compare(ENGINE, d2)
+            j1, j2 = _json_for_compare(pinned, d1), _json_for_compare(LAUNCHER, d2)
         finally:
             pinned.unlink(missing_ok=True)
         check(f"[CP8-T13] {name}: both sides' status --json parse", j1 is not None and j2 is not None,
@@ -781,7 +781,7 @@ def t13_status_and_next_json_carry_same_fields():
         try:
             d3, d4 = clone(d), clone(d)
             r1 = run(pinned2, d3, ["next"])
-            r2 = run(ENGINE, d4, ["next"])
+            r2 = run(LAUNCHER, d4, ["next"])
         finally:
             pinned2.unlink(missing_ok=True)
         try:
@@ -900,7 +900,7 @@ def t15_known_failure_exit_codes_unchanged():
 
     # The plan also names `complete` on an unknown checkpoint id as a known failure.
     d = clone(base3())
-    r = run(ENGINE, d, ["complete", "CP99-does-not-exist"])
+    r = run(LAUNCHER, d, ["complete", "CP99-does-not-exist"])
     check("[CP8-T15] `complete` on an unknown checkpoint id exits non-zero with a plain refusal (no traceback)",
           r.returncode != 0 and "Traceback" not in (r.stdout + r.stderr), (r.returncode, r.stdout, r.stderr))
     pinned = pinned_script("t15_unknown_cp")

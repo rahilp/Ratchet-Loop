@@ -623,7 +623,7 @@ def _director_env():
 
 
 def _spawn(df, d, *args):
-    return subprocess.Popen([sys.executable, str(g.ENGINE), "--root", str(d), *args], cwd=df, env=_director_env(),
+    return subprocess.Popen([sys.executable, str(g.LAUNCHER), "--root", str(d), *args], cwd=df, env=_director_env(),
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 

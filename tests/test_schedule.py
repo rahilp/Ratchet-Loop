@@ -1145,7 +1145,7 @@ def s2_fblocked():
 def s2_out(d, env=None, engine=None):
     """(plain status result, status --json result, parsed json or None)."""
     c = s2c()
-    eng = engine or c.ENGINE
+    eng = engine or c.LAUNCHER
     rp = c.run(eng, d, ["status"], env=env)
     rj = c.run(eng, d, ["status", "--json"], env=env)
     try:
@@ -1237,11 +1237,11 @@ def s2_pair(d, args, pin, env=None, stdin=None):
     c = s2c()
     d1, d2 = c.clone(d), c.clone(d)
     if stdin is None:
-        r1, r2 = c.run(pin, d1, args, env=env), c.run(c.ENGINE, d2, args, env=env)
+        r1, r2 = c.run(pin, d1, args, env=env), c.run(c.LAUNCHER, d2, args, env=env)
     else:
         r1 = subprocess.run([sys.executable, str(pin), *args], cwd=str(d1), capture_output=True, text=True,
                             env=env or c.g.ENV, timeout=60, input=stdin(d1))
-        r2 = subprocess.run([sys.executable, str(c.ENGINE), *args], cwd=str(d2), capture_output=True, text=True,
+        r2 = subprocess.run([sys.executable, str(c.LAUNCHER), *args], cwd=str(d2), capture_output=True, text=True,
                             env=env or c.g.ENV, timeout=60, input=stdin(d2))
     return r1, r2, s2_norm(r1.stdout, d1, d2), s2_norm(r2.stdout, d2, d1)
 
@@ -1544,7 +1544,7 @@ def test_CP2_T13_every_existing_status_json_field_keeps_its_value():
         for label, d in fixtures:
             c = s2c()
             d1, d2 = c.clone(d), c.clone(d)
-            r1, r2 = c.run(pin, d1, ["status", "--json"]), c.run(c.ENGINE, d2, ["status", "--json"])
+            r1, r2 = c.run(pin, d1, ["status", "--json"]), c.run(c.LAUNCHER, d2, ["status", "--json"])
             try:
                 j1, j2 = json.loads(r1.stdout), json.loads(r2.stdout)
             except ValueError:
@@ -1602,14 +1602,14 @@ def test_CP2_T14_taking_the_new_lines_out_leaves_the_old_bytes_exactly():
                 check(f"{label}: `{' '.join(args)}` stdout is byte-identical once the schedule lines are dropped",
                       o1 == o2, (o1[-300:], o2[-300:]))
         d1, d2 = c.clone(f3), c.clone(f3)
-        raw1, raw2 = c.run(pin, d1, ["status"]).stdout, c.run(c.ENGINE, d2, ["status"]).stdout
+        raw1, raw2 = c.run(pin, d1, ["status"]).stdout, c.run(c.LAUNCHER, d2, ["status"]).stdout
         n1, n2 = c._normalize_clone_text(raw1, d1, d2), c._normalize_clone_text(raw2, d2, d1)
         added = [ln for ln in n2.splitlines(keepends=True) if ln.startswith(S2_PREFIX)]
         rest, base = c.drop_schedule_output(n2), c.drop_schedule_output(n1)
         check("without the normalizer the raw `status` outputs on F3 differ (the normalizer is needed)", n1 != n2, None)
         check("the raw outputs differ by exactly the schedule lines and nothing else", bool(added) and rest == base,
               (added, rest[-200:], base[-200:]))
-        rn = c.run(c.ENGINE, c.clone(f3), ["next"])
+        rn = c.run(c.LAUNCHER, c.clone(f3), ["next"])
         try:
             nj = json.loads(rn.stdout)
         except ValueError:
@@ -1658,7 +1658,7 @@ def test_CP2_T15_the_earlier_byte_pins_and_key_set_checks_still_pass_with_only_a
     except (OSError, ValueError) as e:
         saved = None
         check("the CP1 baseline status_json.json parses", False, str(e))
-    rl = subprocess.run([sys.executable, str(c.ENGINE), "status", "--json"], cwd=str(ROOT), capture_output=True,
+    rl = subprocess.run([sys.executable, str(c.LAUNCHER), "status", "--json"], cwd=str(ROOT), capture_output=True,
                         text=True, timeout=60)
     try:
         live = json.loads(rl.stdout) if rl.returncode == 0 else None
@@ -1696,7 +1696,7 @@ def test_CP2_T16_showing_the_schedule_does_not_write_or_change_anything():
           isinstance(j0, dict) and isinstance(j0.get("schedule"), dict), None)
     before = s2_tree_hash(d)
     for args in (["status"], ["status", "--json"], ["next"]) * 2:
-        r = c.run(c.ENGINE, d, args)
+        r = c.run(c.LAUNCHER, d, args)
         check(f"`{' '.join(args)}` exits 0", r.returncode == 0, (r.returncode, r.stderr[-200:]))
     check("state.json, the evidence folder and .ratchet/config.json are unchanged after showing the schedule",
           s2_tree_hash(d) == before, None)
@@ -1749,7 +1749,7 @@ def test_CP2_T17_other_readers_of_status_keep_working_with_the_new_field():
     with s2_pinned("cp2t17") as pin:
         d1, d2 = c.clone(d), c.clone(d)
         r1, a = rows(pin, d1)
-        r2, b = rows(c.ENGINE, d2)
+        r2, b = rows(c.LAUNCHER, d2)
     check("both engines list the lane (`lanes --scan --json` exits 0 and prints one row)",
           r1.returncode == 0 and r2.returncode == 0 and isinstance(a, list) and isinstance(b, list) and len(a) == 1 == len(b),
           (r1.returncode, r2.returncode, r2.stderr[-200:], r2.stdout[-200:]))
@@ -1886,7 +1886,7 @@ def s3_json(text):
 def s3_cmds(d, engine=None):
     """status, status --json and next, each run once: .rp/.rj/.rn are the results, .j/.n the parsed JSON (or None)."""
     c = s2c()
-    eng = engine or c.ENGINE
+    eng = engine or c.LAUNCHER
     o = types.SimpleNamespace()
     o.rp, o.rj, o.rn = (c.run(eng, d, a) for a in (["status"], ["status", "--json"], ["next"]))
     o.j, o.n = s3_json(o.rj.stdout), s3_json(o.rn.stdout)
@@ -2202,7 +2202,7 @@ def test_CP3_T12_a_building_run_with_no_current_step_shows_no_stall_and_does_not
 def test_CP3_T13_setting_stall_budget_minutes_to_45_changes_the_budget():
     c = s2c()
     d = s3_fx(started=50)
-    r = c.run(c.ENGINE, d, ["config", "--set", "stall_budget_minutes=45"])
+    r = c.run(c.LAUNCHER, d, ["config", "--set", "stall_budget_minutes=45"])
     check("`config --set stall_budget_minutes=45` is accepted (exit 0, not refused as unknown)",
           r.returncode == 0 and "unknown" not in (r.stdout + r.stderr).lower(), (r.returncode, r.stdout[-200:], r.stderr[-200:]))
     check("the setting is stored as 45", s3_json(s3_cfg_path(d).read_text()) is not None
@@ -2210,7 +2210,7 @@ def test_CP3_T13_setting_stall_budget_minutes_to_45_changes_the_budget():
     o = s3_cmds(d)
     sv, nv, line = s3_fires(o, "budget 45, 50 minutes in", 50, budget=45)
     check("the STALL text says the 45 minute budget", line is not None and s3_has_mins(line, 45, 0), line)
-    r = c.run(c.ENGINE, d, ["config", "--set", "stall_budget_minutes=60"])
+    r = c.run(c.LAUNCHER, d, ["config", "--set", "stall_budget_minutes=60"])
     check("`config --set stall_budget_minutes=60` is accepted", r.returncode == 0, (r.returncode, r.stderr[-200:]))
     o = s3_cmds(d)
     s3_exit(o, "budget 60, 50 minutes in")
@@ -2223,7 +2223,7 @@ def test_CP3_T14_changing_the_stall_budget_needs_no_approve_changes_and_moves_no
     c = s2c()
     d = s3_fx(started=60)
     before = s3_json(s3_cfg_path(d).read_text())
-    r = c.run(c.ENGINE, d, ["config", "--set", "stall_budget_minutes=45"])
+    r = c.run(c.LAUNCHER, d, ["config", "--set", "stall_budget_minutes=45"])
     check("`config --set stall_budget_minutes=45` exits 0", r.returncode == 0, (r.returncode, r.stdout[-200:], r.stderr[-200:]))
     after = s3_json(s3_cfg_path(d).read_text())
     check("every other config value is unchanged (only stall_budget_minutes is new)",
@@ -2337,7 +2337,7 @@ def test_CP3_T17_broken_or_missing_timestamps_degrade_quietly():
         if o.j is not None:
             check(f"{label}: every existing status --json key still prints", saved <= set(o.j), sorted(saved - set(o.j)))
     d = s3_fx(started=100, edit=lambda st: st["checkpoints"].pop("CP2"))
-    r = c.run(c.ENGINE, d, ["status"])
+    r = c.run(c.LAUNCHER, d, ["status"])
     check("the current step's checkpoint entry missing: plain `status` exits 0 with no traceback and no STALL",
           r.returncode == 0 and "Traceback" not in r.stderr and "STALL" not in r.stdout, (r.returncode, r.stderr[-200:], r.stdout[:200]))
     check("(same variant) plain `status` still prints its Phase line", "Phase:" in r.stdout, r.stdout[:200])
@@ -2387,7 +2387,7 @@ def test_CP3_T18_a_stall_changes_no_existing_status_or_next_field():
 def s3_stop(d):
     c = s2c()
     payload = json.dumps({"cwd": str(d), "session_id": "s-owner", "hook_event_name": "Stop"})
-    return subprocess.run([sys.executable, str(c.ENGINE), "hook", "stop", "--host", "claude"], cwd=str(d),
+    return subprocess.run([sys.executable, str(c.LAUNCHER), "hook", "stop", "--host", "claude"], cwd=str(d),
                           capture_output=True, text=True, env=c.g.ENV, timeout=60, input=payload)
 
 
@@ -2422,7 +2422,7 @@ def test_CP3_T20_checking_status_and_next_is_read_only():
           len(s3_lines(first.rp.stdout)) == 1 and isinstance(s3_sj(first)[1], dict) and isinstance(s3_nj(first)[1], dict), None)
     raw, hist_len, stamp, tree = p.read_bytes(), len(s3_state(d)["history"]), s3_state(d).get("updated_at"), s2_tree_hash(d)
     for args in (["status"], ["status", "--json"], ["next"]) * 2:
-        r = c.run(c.ENGINE, d, args)
+        r = c.run(c.LAUNCHER, d, args)
         check(f"`{' '.join(args)}` exits 0", r.returncode == 0, (r.returncode, r.stderr[-200:]))
     check("state.json is byte-identical after checking", p.read_bytes() == raw, None)
     check("no history entry was added (a warning is not a logged event)", len(s3_state(d)["history"]) == hist_len,
@@ -3023,7 +3023,7 @@ def test_CP4_T20_status_only_reads_the_run_record_is_untouched():
     raw, tree = p.read_bytes(), s2_tree_hash(d)
     before = {k: (v["gates"], v["status"], v["step"]) for k, v in s3_state(d)["checkpoints"].items()}
     for args in (["status"], ["status", "--json"], ["next"]) * 2:
-        r = c.run(c.ENGINE, d, args)
+        r = c.run(c.LAUNCHER, d, args)
         check(f"`{' '.join(args)}` exits 0", r.returncode == 0, (r.returncode, r.stderr[-200:]))
     check("state.json is byte-identical", p.read_bytes() == raw, None)
     check("state.json, config.json and the evidence folder are unchanged", s2_tree_hash(d) == tree, None)
@@ -3135,7 +3135,7 @@ def s5_p4():
 
 def s5_ps(d, engine=None):
     c = s2c()
-    return c.run(engine or c.ENGINE, d, ["plan-summary"])
+    return c.run(engine or c.LAUNCHER, d, ["plan-summary"])
 
 
 def s5_with(text, prefix):
@@ -3335,7 +3335,7 @@ def test_CP5_T08_after_a_step_finishes_plan_summary_shows_statuss_projected_fini
                                          base=s5_a4()), 1, False)):
         for _ in range(3):  # the two calls can straddle a 5-minute mark of the rounded finish
             r = s5_ps(d)
-            st = c.run(c.ENGINE, d, ["status"])
+            st = c.run(c.LAUNCHER, d, ["status"])
             if s5_pf(r.stdout) == s5_pf(st.stdout):
                 break
         s5_ok(r, label)
@@ -3361,7 +3361,7 @@ def test_CP5_T08_after_a_step_finishes_plan_summary_shows_statuss_projected_fini
 def test_CP5_T09_plan_summary_shows_no_projected_finish_when_no_step_is_left():
     d = s2_fx(spans=(M(60),) * 4, attempts=(1,) * 4, phase="awaiting_final_review", base=s5_a4())
     c = s2c()
-    st = c.run(c.ENGINE, d, ["status"])
+    st = c.run(c.LAUNCHER, d, ["status"])
     check("(sanity) status shows no 'Projected finish:' line when every step is done", s5_pf(st.stdout) == [], s5_pf(st.stdout))
     r = s5_ps(d)
     s5_ok(r, "every step done")
@@ -3382,7 +3382,7 @@ def test_CP5_T10_plan_summary_does_not_claim_a_hard_deadline_anywhere():
     with s2_pinned("cp5t10") as pin:
         for label, d in fx:
             d1, d2 = c.clone(d), c.clone(d)
-            r1, r2 = c.run(pin, d1, ["plan-summary"]), c.run(c.ENGINE, d2, ["plan-summary"])
+            r1, r2 = c.run(pin, d1, ["plan-summary"]), c.run(c.LAUNCHER, d2, ["plan-summary"])
             old = set(c._normalize_clone_text(r1.stdout, d1, d2).splitlines())
             new = [ln for ln in c._normalize_clone_text(r2.stdout, d2, d1).splitlines() if ln not in old]
             check(f"{label}: plan-summary exits 0", r2.returncode == 0, r2.stderr[-200:])
@@ -3479,7 +3479,7 @@ def test_CP5_T13_asking_for_plan_summary_changes_nothing_in_the_run_and_no_other
     sp = Path(d) / ".ratchet" / "runs" / "f" / "state.json"
     bytes0, tree0 = sp.read_bytes(), s2_tree_hash(d)
     cfg0 = (Path(d) / ".ratchet" / "config.json").read_bytes()
-    rp0, rj0, rn0 = (c.run(c.ENGINE, d, a) for a in (["status"], ["status", "--json"], ["next"]))
+    rp0, rj0, rn0 = (c.run(c.LAUNCHER, d, a) for a in (["status"], ["status", "--json"], ["next"]))
     j0, n0 = s3_json(rj0.stdout), s3_json(rn0.stdout)
     check("(sanity) status --json and next parse before", j0 is not None and n0 is not None, None)
     for _ in range(3):  # the two plan-summary calls can straddle a 5-minute mark of the rounded finish
@@ -3494,7 +3494,7 @@ def test_CP5_T13_asking_for_plan_summary_changes_nothing_in_the_run_and_no_other
     check("state.json is byte-identical", sp.read_bytes() == bytes0, None)
     check("state.json, evidence and config are unchanged (tree hash)", s2_tree_hash(d) == tree0, None)
     check(".ratchet/config.json is byte-identical", (Path(d) / ".ratchet" / "config.json").read_bytes() == cfg0, None)
-    rp1, rj1, rn1 = (c.run(c.ENGINE, d, a) for a in (["status"], ["status", "--json"], ["next"]))
+    rp1, rj1, rn1 = (c.run(c.LAUNCHER, d, a) for a in (["status"], ["status", "--json"], ["next"]))
     j1, n1 = s3_json(rj1.stdout), s3_json(rn1.stdout)
     if j0 is not None and j1 is not None:
         a, b = dict(j0), dict(j1)
@@ -3533,7 +3533,7 @@ def test_CP5_T14_the_review_limits_themselves_still_act_as_before():
         para = s5_budget(s5_ps(d), f"{att} rounds used")
         check(f"[{att} used] plan-summary shows the budget (6 per step, 24 in all, run-wide 30) before the round is asked for",
               para is not None and not s5_num_in(para, 6, 24, 30), para)
-        r = c.run(c.ENGINE, d, ["reviewers", "CP1", "--json"])
+        r = c.run(c.LAUNCHER, d, ["reviewers", "CP1", "--json"])
         st = s3_state(d)
         check(f"[{att} used] the next round request exits {want_rc} with no traceback",
               r.returncode == want_rc and "Traceback" not in r.stderr, (r.returncode, r.stderr[-300:]))
@@ -3548,7 +3548,7 @@ def test_CP5_T14_the_review_limits_themselves_still_act_as_before():
         else:
             check("[5 used] a review round was opened for CP1", s3_json(r.stdout) is not None
                   and s3_json(r.stdout).get("checkpoint") == "CP1", r.stdout[:200])
-        rc = c.run(c.ENGINE, d, ["config"])
+        rc = c.run(c.LAUNCHER, d, ["config"])
         cf = s3_json(rc.stdout) or {}
         check(f"[{att} used] max_adversarial_rounds and max_adversarial_rounds_run still read 6 and 30",
               (cf.get("max_adversarial_rounds"), cf.get("max_adversarial_rounds_run")) == (6, 30),
@@ -3560,7 +3560,7 @@ def test_CP5_T15_plan_summary_without_a_plan_still_fails_the_same_way():
     c = s2c()
     d = s2_base("noplan")
     with s2_pinned("cp5t15") as pin:
-        r1, r2 = c.run(pin, c.clone(d), ["plan-summary"]), c.run(c.ENGINE, c.clone(d), ["plan-summary"])
+        r1, r2 = c.run(pin, c.clone(d), ["plan-summary"]), c.run(c.LAUNCHER, c.clone(d), ["plan-summary"])
     check("(sanity) the pinned engine refuses with 'There is no plan yet'",
           r1.returncode != 0 and "There is no plan yet" in r1.stdout + r1.stderr, (r1.returncode, r1.stderr[-200:]))
     check("the built plan-summary exits non-zero", r2.returncode != 0, r2.returncode)

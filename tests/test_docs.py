@@ -788,6 +788,7 @@ CP2_R4_PROBE = r'''
 import concurrent.futures, datetime as dt, importlib.util, json, os, shlex, shutil, subprocess, sys, tempfile
 from pathlib import Path
 ENGINE, PARTS = sys.argv[1], set(sys.argv[2].split(","))
+LAUNCHER = str(Path(ENGINE).parent / "ratchet.py")
 ID_PAYLOADS, ID_REVIEW_REL = json.loads(sys.argv[3]), sys.argv[4]
 spec = importlib.util.spec_from_file_location("ratchet_engine_cp2_r4", ENGINE)
 eng = importlib.util.module_from_spec(spec)
@@ -829,7 +830,7 @@ def hook(d, host, kind, payload):
 
 
 def rx(d, *a):
-    r = subprocess.run([sys.executable, ENGINE, *a], cwd=d, capture_output=True, text=True, timeout=300)
+    r = subprocess.run([sys.executable, LAUNCHER, *a], cwd=d, capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         raise SystemExit("ratchet.py %s failed: %s %s" % (" ".join(a), r.stdout[-400:], r.stderr[-400:]))
     return r
@@ -1249,6 +1250,7 @@ CP2_R5_PROBE = r'''
 import contextlib, importlib.util, io, json, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 ENGINE = sys.argv[1]
+LAUNCHER = str(Path(ENGINE).parent / "ratchet.py")
 spec = importlib.util.spec_from_file_location("ratchet_engine_cp2_r5", ENGINE)
 eng = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(eng)
@@ -1262,7 +1264,7 @@ def run_stop_hook(d, home):
     env = dict(os.environ)
     env["RATCHET_HOME"] = str(home)
     payload = json.dumps({"session_id": "s", "cwd": str(d), "hook_event_name": "Stop"})
-    r = subprocess.run([sys.executable, ENGINE, "hook", "stop", "--host", "claude"],
+    r = subprocess.run([sys.executable, LAUNCHER, "hook", "stop", "--host", "claude"],
                        input=payload, capture_output=True, text=True, cwd=d, env=env, timeout=60)
     return r.returncode
 

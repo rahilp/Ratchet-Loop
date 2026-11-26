@@ -342,7 +342,7 @@ def x01_concurrent_adds_consume_one_ok_only_once():
     a = ask_paid(d, env, "opencode", MODEL_OR)
     exact = extract_exact_reply(a.stdout, MODEL_OR)
     reply(d, exact)
-    argv = [sys.executable, str(g.ENGINE), "providers", "--add", "opencode-glm", "--preset", "opencode",
+    argv = [sys.executable, str(g.LAUNCHER), "providers", "--add", "opencode-glm", "--preset", "opencode",
             "--model", MODEL_OR]
     p1 = sp.Popen(argv, cwd=d, env=env, stdout=sp.PIPE, stderr=sp.PIPE, text=True)
 
