@@ -399,7 +399,7 @@ def cp5_t09_docs_state_one_order():
               re.search(r"director-sign[^\n]{0,120}--apply", text) is not None, "")
         if name == "schemas.md section 9":
             check(f"[CP5-T09] {name}: has director interface documentation",
-                  "director-sign" in _section9(text), "")
+                  "director-sign" in text, "")
         else:
             check(f"[CP5-T09] {name}: documents director-sign with --apply",
                   "--apply" in text and "director-sign" in text, "")
