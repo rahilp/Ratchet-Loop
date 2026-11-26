@@ -41,7 +41,7 @@ sys.path.insert(0, str(HERE))
 import _tmp
 import trust_helpers
 from trust_helpers import (
-    CP4_CODE_RE, ENGINE, HAVE_PTY, check, cp3_state, cp4_answer_correct, cp4_pty_run,
+    CP4_CODE_RE, ENGINE, LAUNCHER, HAVE_PTY, check, cp3_state, cp4_answer_correct, cp4_pty_run,
     cp4_unapproved_plan, cp5r8_sha, cp5v_until,
     cp5y_load_engine, cp5y_repo, cp5z_notes, cp5z_project_notes, engine_env, git, js, make_env,
     stop_payload,

@@ -65,7 +65,7 @@ sys.path.insert(0, str(HERE))
 import _tmp  # noqa: E402
 import test_gates as g  # noqa: E402  (project, approve_plan, rx, say, ENV)
 import trust_helpers  # noqa: E402
-from trust_helpers import ENGINE, cp5y_load_engine, engine_env, make_env  # noqa: E402
+from trust_helpers import ENGINE, LAUNCHER, cp5y_load_engine, engine_env, make_env  # noqa: E402
 
 SCRIPT_DIR = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
 RUN_RECORDS = SCRIPT_DIR / "run_records.py"
