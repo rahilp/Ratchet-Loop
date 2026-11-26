@@ -531,7 +531,7 @@ def _mutate_state(d, fn, slug="f"):
     st = json.loads(p.read_text())
     fn(st)
     p.write_text(json.dumps(st))
-    r = subprocess.run([sys.executable, "-c", _REBASELINE, str(LAUNCHER), str(p)], cwd=d, env=g.ENV,
+    r = subprocess.run([sys.executable, "-c", _REBASELINE, str(ENGINE), str(p)], cwd=d, env=g.ENV,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     return st

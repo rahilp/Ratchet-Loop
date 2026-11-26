@@ -109,7 +109,7 @@ def _corrupt_prev_round_tree(d, env, wrong_tree):
     state = json.loads(sp.read_text())
     state["checkpoints"]["CP1"]["adv_round"]["prev_round_tree"] = wrong_tree
     sp.write_text(json.dumps(state))
-    r = subprocess.run([sys.executable, "-c", _REBASELINE, str(LAUNCHER), str(sp)], cwd=d, env=env,
+    r = subprocess.run([sys.executable, "-c", _REBASELINE, str(ENGINE), str(sp)], cwd=d, env=env,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr + r.stdout
 

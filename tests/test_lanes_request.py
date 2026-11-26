@@ -90,7 +90,7 @@ ENVS = {}   # worktree -> the env its Ratchet commands run with
 def rebaseline(lane, *files):
     """A hand edit of a run file is re-baselined with the engine's own record_chain (what accept-state does), so
     the fixture does not look tampered with."""
-    r = subprocess.run([sys.executable, "-c", _REBASELINE, str(LAUNCHER), *map(str, files)], cwd=lane,
+    r = subprocess.run([sys.executable, "-c", _REBASELINE, str(ENGINE), *map(str, files)], cwd=lane,
                        env=ENVS[str(lane)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr + r.stdout
 

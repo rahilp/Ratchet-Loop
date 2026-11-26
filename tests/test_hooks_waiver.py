@@ -623,7 +623,7 @@ def main():
                    "s = importlib.util.spec_from_file_location('ratchet_fixture', sys.argv[1])\n"
                    "m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
                    "m.record_chain(Path(sys.argv[2]))\n")
-        r = subprocess.run([sys.executable, "-c", snippet, str(LAUNCHER), str(stp(d))], cwd=d, env=ENV,
+        r = subprocess.run([sys.executable, "-c", snippet, str(ENGINE), str(stp(d))], cwd=d, env=ENV,
                            capture_output=True, text=True)
         assert r.returncode == 0, r.stderr + r.stdout
 

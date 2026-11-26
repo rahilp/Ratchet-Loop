@@ -46,7 +46,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import _tmp  # noqa: E402
-from trust_helpers import ENGINE, cp5v_until, cp5y_load_engine, engine_env, make_env  # noqa: E402
+from trust_helpers import ENGINE, LAUNCHER, cp5v_until, cp5y_load_engine, engine_env, make_env  # noqa: E402
 
 SCRIPT_DIR = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
 RECORDS = SCRIPT_DIR / "records.py"
@@ -564,9 +564,9 @@ def t09_no_lost_entry_race():
     a = Path(_tmp.mkdtemp(prefix="ratchet-cp4r09-a-"))
     b = Path(_tmp.mkdtemp(prefix="ratchet-cp4r09-b-"))
     procs = [
-        subprocess.Popen([sys.executable, str(script), str(LAUNCHER), str(a), "fa", str(gate / "ready-0"),
+        subprocess.Popen([sys.executable, str(script), str(ENGINE), str(a), "fa", str(gate / "ready-0"),
                           str(gate / "go")], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True),
-        subprocess.Popen([sys.executable, str(script), str(LAUNCHER), str(b), "fb", str(gate / "ready-1"),
+        subprocess.Popen([sys.executable, str(script), str(ENGINE), str(b), "fb", str(gate / "ready-1"),
                           str(gate / "go")], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True),
     ]
     ready = cp5v_until(lambda: (gate / "ready-0").exists() and (gate / "ready-1").exists(), timeout=60)
@@ -645,7 +645,7 @@ def t10_stale_lock_cleared_by_exactly_one():
     marks = Path(_tmp.mkdtemp(prefix="ratchet-cp4r10-m-"))
 
     def spawn(role):
-        return subprocess.Popen([sys.executable, str(script), str(LAUNCHER), role, str(marks)], env=env,
+        return subprocess.Popen([sys.executable, str(script), str(ENGINE), role, str(marks)], env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     slow = spawn("slow")
     judged = cp5v_until(lambda: (marks / "slow-judged").exists(), timeout=60)

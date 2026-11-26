@@ -46,7 +46,7 @@ def cp5y_set_state(d, env, code):
             "spec = importlib.util.spec_from_file_location('r', sys.argv[1]); m = importlib.util.module_from_spec(spec)\n"
             "spec.loader.exec_module(m)\nctx = m.Ctx(Path(sys.argv[2])); st = ctx.state()\n" + code +
             "\nctx.save_state(st)\n")
-    r = subprocess.run([sys.executable, "-c", prog, str(LAUNCHER), str(d)], cwd=d, env=env, capture_output=True,
+    r = subprocess.run([sys.executable, "-c", prog, str(ENGINE), str(d)], cwd=d, env=env, capture_output=True,
                        text=True)
     assert r.returncode == 0, r.stderr + r.stdout
 
@@ -152,7 +152,7 @@ def cp5_adv_round2_owner_before_questions():
             "spec.loader.exec_module(m)\nctx = m.Ctx(Path(sys.argv[2])); none = {'owner_session': None}\n"
             "print(json.dumps({'replies': m._replies(ctx, none, '0', {'action': 'approve-plan'}),\n"
             "  'ask': m._asking_session(ctx, none, 'approve-plan'), 'claim': m._asking_session(ctx, none, 'claim')}))\n")
-    u = subprocess.run([sys.executable, "-c", prog, str(LAUNCHER), str(d)], cwd=d, env=env, capture_output=True,
+    u = subprocess.run([sys.executable, "-c", prog, str(ENGINE), str(d)], cwd=d, env=env, capture_output=True,
                        text=True)
     out = json.loads(u.stdout) if u.returncode == 0 and u.stdout.strip() else {}
     check("[CP5-X15] with no chat known for the question, _replies counts no message at all (no unfiltered fallback)",

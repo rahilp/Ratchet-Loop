@@ -278,7 +278,7 @@ _CHILD_RECORD = (
 
 def record_in_child(d, env, host, event, crashed, ready=None, go=None):
     """Record a hook run from a separate process, as a concurrent hook process would (optionally after a barrier)."""
-    args = [sys.executable, "-c", _CHILD_RECORD, str(LAUNCHER), str(d), host, event, "1" if crashed else "0"]
+    args = [sys.executable, "-c", _CHILD_RECORD, str(ENGINE), str(d), host, event, "1" if crashed else "0"]
     args += [str(ready), str(go)] if ready else []
     return subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 

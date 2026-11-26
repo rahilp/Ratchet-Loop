@@ -4,7 +4,7 @@
 
 ## Reference (commands the agent runs)
 
-Everything above is done by talking to your agent. This section is for people typing at a terminal, and it lists what the agent runs on your behalf. `ratchet.py` lives in `skills/ratchet-orchestrator/scripts/`, alongside seven smaller modules it imports from; see the Module map in `skills/ratchet-orchestrator/references/modules.md` for what each one owns.
+Everything above is done by talking to your agent. This section is for people typing at a terminal, and it lists what the agent runs on your behalf. `ratchet.py` is the tiny CLI/hook launcher in `skills/ratchet-orchestrator/scripts/`; the implementation is `ratchet_engine.py` in the same folder, alongside seven smaller modules it imports from. See the Module map in `skills/ratchet-orchestrator/references/modules.md` for what each one owns.
 
 ### What's inside
 
@@ -17,7 +17,8 @@ ratchet-loop/
 ├── skills/
 │   ├── ratchet-orchestrator/          the one skill you prompt
 │   │   ├── SKILL.md
-│   │   ├── scripts/ratchet.py         state engine: checkpoints, gates, fingerprints, evidence, viewer, hooks
+│   │   ├── scripts/ratchet.py         tiny CLI/hook launcher (calls ratchet_engine.main)
+│   │   ├── scripts/ratchet_engine.py  state engine: checkpoints, gates, fingerprints, evidence, viewer, hooks
 │   │   ├── scripts/spec_sources.py    reads OpenSpec, Spec Kit and BMAD files; ticks tasks back
 │   │   ├── scripts/provider_health.py the shared provider test results and benches (provider-health.json)
 │   │   ├── assets/viewer.html         checkpoint viewer (plan review + live progress)

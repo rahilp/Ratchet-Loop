@@ -16,7 +16,7 @@ from pathlib import Path
 import _tmp
 import trust_helpers
 from trust_helpers import (
-    ENGINE, HAVE_PTY, check, cp3_R0, cp3_open_round, cp3_project, cp3_reviewer_writes, cp3_state, cp3_write_tests,
+    ENGINE, HAVE_PTY, LAUNCHER, check, cp3_R0, cp3_open_round, cp3_project, cp3_reviewer_writes, cp3_state, cp3_write_tests,
     cp4_answer_correct, cp4_find_code, cp4_human_log_lines, cp4_pty_run, cp4_say_yes, cp5_plan, cp5_say, cp5r8_sha,
     cp5v_until, cp5w_lock, cp5x_history, cp5y_first_run_plan, cp5y_guard_bash, cp5y_load_engine, cp5y_repo,
     cp5z_notes, cp5z_project_notes, git, make_env, now_dt, rx,
@@ -71,7 +71,7 @@ def cp5v_wrap(d):
 
 def cp5v_start(d, env, marker, wait, *args, gate=None):
     e = dict(env, CP5V_GATE=str(gate)) if gate else env
-    return subprocess.Popen([sys.executable, str(cp5v_wrap(d)), str(LAUNCHER), str(marker), str(wait), *args], cwd=d,
+    return subprocess.Popen([sys.executable, str(cp5v_wrap(d)), str(ENGINE), str(marker), str(wait), *args], cwd=d,
                             env=e, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
@@ -636,7 +636,7 @@ def cp5_adv_round7_one_command_at_a_time():
     base = cp5r7_commits(d)
     fail = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r7-f-")) / "fail_after_commit.py"
     fail.write_text(_CP5R7_FAIL_AFTER_COMMIT)
-    r1 = subprocess.run([sys.executable, str(fail), str(LAUNCHER), "complete", "CP1"], cwd=d, env=env,
+    r1 = subprocess.run([sys.executable, str(fail), str(ENGINE), "complete", "CP1"], cwd=d, env=env,
                         capture_output=True, text=True)
     head1 = git(d, "rev-parse", "HEAD").stdout.strip()[:7]
     check("[CP5-X43] (setup) complete made the checkpoint commit, then failed before saving, leaving no lock",
@@ -773,7 +773,7 @@ def cp5_adv_round8_init_lock_and_hash_record_lock():
     hold.write_text("1")
     beh = cp5r7_start(d, env, "behavior", "CP1")
     started = cp5v_until(lambda: running.exists())
-    appenders = [subprocess.Popen([sys.executable, str(script), str(LAUNCHER), str(t), str(start), str(n_lines)],
+    appenders = [subprocess.Popen([sys.executable, str(script), str(ENGINE), str(t), str(start), str(n_lines)],
                                   cwd=d, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                  for t in targets]
     texts = [f"cp5r8 message {i}" for i in range(n_prompts)]
@@ -886,7 +886,7 @@ print(json.dumps(got))
 
 def cp5r9_race(script, root, env, workers, n, mode):
     start = Path(_tmp.mkdtemp(prefix="ratchet-trust-cp5r9-s-")) / "start"
-    procs = [subprocess.Popen([sys.executable, str(script), str(LAUNCHER), str(root), str(start), str(w), str(n), mode],
+    procs = [subprocess.Popen([sys.executable, str(script), str(ENGINE), str(root), str(start), str(w), str(n), mode],
                               cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
              for w in range(workers)]
     ready = cp5v_until(lambda: all((start.parent / f"ready-{w}").exists() for w in range(workers)), timeout=120)

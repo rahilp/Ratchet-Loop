@@ -1084,7 +1084,7 @@ def host_enforcement():
     env = scrubbed_env()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     with _tmp.mkdtemp(prefix="ratchet-ocguard-probe-") as cwd:
-        r = subprocess.run([sys.executable, "-c", code, str(LAUNCHER)], cwd=cwd, capture_output=True, text=True, env=env,
+        r = subprocess.run([sys.executable, "-c", code, str(ENGINE)], cwd=cwd, capture_output=True, text=True, env=env,
                            timeout=180)
     if r.returncode != 0:
         return None

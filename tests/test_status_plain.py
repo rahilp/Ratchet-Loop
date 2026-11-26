@@ -213,7 +213,7 @@ def mutate(d, fn):
     p.write_text(json.dumps(st))
     # Re-baseline with the engine's own record_chain (what accept-state does), in this suite's RATCHET_HOME.
     # accept-state itself now needs a person typing a code at a real terminal, which a fixture cannot be.
-    r = subprocess.run([sys.executable, "-c", REBASELINE, str(LAUNCHER), str(p)], cwd=d, env=ENV,
+    r = subprocess.run([sys.executable, "-c", REBASELINE, str(ENGINE), str(p)], cwd=d, env=ENV,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr + r.stdout
     return d

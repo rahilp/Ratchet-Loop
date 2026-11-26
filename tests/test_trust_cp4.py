@@ -844,7 +844,7 @@ def cp4z_slow_hook(d, env, event, payload, pause=2.0):
     the exact interleaving of a hook that started first but finishes last. Returns the process once it is paused
     (or after 15 s if it never reaches the write)."""
     ready = Path(_tmp.mkdtemp(prefix="ratchet-trust-x12-")) / "ready"
-    p = subprocess.Popen([sys.executable, "-c", _CP4Z_SLOW_HOOK, str(LAUNCHER), str(ready), event, str(pause)],
+    p = subprocess.Popen([sys.executable, "-c", _CP4Z_SLOW_HOOK, str(ENGINE), str(ready), event, str(pause)],
                          cwd=str(d), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True)
     p.stdin.write(json.dumps(payload))

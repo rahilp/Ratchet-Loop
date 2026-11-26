@@ -50,7 +50,7 @@ import _tmp  # noqa: E402
 import test_gates as g  # noqa: E402  (project, approve_plan, rx, ENV, say)
 import test_discover as td  # noqa: E402  (fake_opencode_bin, log_text, config_providers)
 import test_providers as tp  # noqa: E402  (FAKE fake-agent-CLI shell script, fake_bin)
-from trust_helpers import ENGINE, cp5v_until, cp5y_load_engine, engine_env, make_env  # noqa: E402
+from trust_helpers import ENGINE, LAUNCHER, cp5v_until, cp5y_load_engine, engine_env, make_env  # noqa: E402
 
 SCRIPT_DIR = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
 PROVIDER_DISCOVERY = SCRIPT_DIR / "provider_discovery.py"
@@ -697,7 +697,7 @@ def t07_provider_share_window_limit():
     child = Path(_tmp.mkdtemp(prefix="cp5-t07-child-")) / "race.py"
     child.write_text(_CP5T07_CHILD)
     procs = [
-        subprocess.Popen([sys.executable, str(child), str(LAUNCHER), str(cfg_path), f"lane{i}",
+        subprocess.Popen([sys.executable, str(child), str(ENGINE), str(cfg_path), f"lane{i}",
                           str(gate / f"ready-{i}"), str(gate / "go")], env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True)
         for i in range(2)
@@ -772,7 +772,7 @@ def t08_probe_shared_claim_and_wait():
     child.write_text(_CP5T08_CHILD)
     roots = [Path(_tmp.mkdtemp(prefix=f"cp5-t08-root{i}-")) for i in range(2)]
     procs = [
-        subprocess.Popen([sys.executable, str(child), str(LAUNCHER), str(cfg_path), str(roots[i]),
+        subprocess.Popen([sys.executable, str(child), str(ENGINE), str(cfg_path), str(roots[i]),
                           str(gate / f"ready-{i}"), str(gate / "go")], env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True)
         for i in range(2)

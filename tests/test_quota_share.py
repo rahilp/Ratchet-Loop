@@ -784,7 +784,7 @@ def cp6_x08_a_reservation_released_for_a_test_request_leaves_no_start_behind():
                                                     "starts": [{"at": _xnow_iso(), "id": "other-lane:opencode-glm-both"}]}})
         a = scn.lane("lane-a", [CODEX, GLM], share=(1, 15))
         (scn.bin / "codex").write_text(FAKE.replace('reply="RATCHET-PROBE-OK"', 'reply="no thanks"'))
-        r = subprocess.run([sys.executable, "-c", XSTALE_DRIVER, str(LAUNCHER)], cwd=a.dir, env=a.env,
+        r = subprocess.run([sys.executable, "-c", XSTALE_DRIVER, str(ENGINE)], cwd=a.dir, env=a.env,
                            capture_output=True, text=True, timeout=RUN_TIMEOUT)
         rnd = parse(r)
     need("the round opens", r.returncode == 0 and len(ids(rnd)) == 1, (said(r)[-400:], ids(rnd)))
