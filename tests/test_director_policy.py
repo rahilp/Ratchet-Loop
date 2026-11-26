@@ -191,13 +191,9 @@ def cp6_t01_no_policy_file_means_today_behavior():
           v.returncode == 0 and re.search(r"no policy", out(v), re.I) is not None, out(v))
     check("[CP6-T01] looking at the policy creates no file", not pfile(env).exists(), "file exists")
     q = th.rx(d, env, "ask", "accept-finding", "CP1", "F1")
-    sg = m.director(df, d, "director-sign", "accept-finding", env=env)
-    tok = last_line(sg)
     check("[CP6-T01] setup: ask accept-finding works in the enrolled lane", q.returncode == 0, out(q))
-    check("[CP6-T01] director-sign prints a token as before", sg.returncode == 0 and TOKEN_LINE.match(tok) is not None,
-          out(sg))
-    r = th.rx(d, env, "accept-finding", "CP1", "--director-token", tok or m.MADE_UP_TOKEN, "--reason", ACCEPT_REASON)
-    check("[CP6-T01] applying the token accepts the finding", r.returncode == 0 and accepted(d, "F1"), out(r))
+    r = ds(df, d, "accept-finding", "CP1", "--ids", "F1", "--reason", ACCEPT_REASON, env=env)
+    check("[CP6-T01] director-sign accept-finding --apply accepts the finding", r.returncode == 0 and accepted(d, "F1"), out(r))
     check("[CP6-T01] no policy_rule is recorded anywhere in the log",
           all("policy_rule" not in e for e in state(d).get("history") or []), events(d, "finding_accepted"))
     check("[CP6-T01] the policy file still does not exist", not pfile(env).exists(), "file exists")
@@ -502,12 +498,8 @@ def cp6_t12_other_approvals_unaffected_by_a_policy():
     d, df = da.plan_lane("t12a")
     reset()
     check("[CP6-T12] setup: all four rules are set", setrules(df, d, *allfour), "")
-    sp = m.director(df, d, "director-sign", "approve-plan")
-    tok = last_line(sp)
-    check("[CP6-T12] director-sign approve-plan prints a token as without a policy",
-          sp.returncode == 0 and TOKEN_LINE.match(tok) is not None, out(sp))
-    rp = g.rx(d, "approve-plan", "--director-token", tok or m.MADE_UP_TOKEN)
-    check("[CP6-T12] the plan is approved with no policy_rule on the log",
+    rp = ds(df, d, "approve-plan")
+    check("[CP6-T12] director-sign approve-plan --apply approves the plan with no policy_rule on the log",
           rp.returncode == 0 and state(d).get("phase") == "building"
           and all("policy_rule" not in e for e in state(d).get("history") or []), out(rp))
     env = th.make_env("claude")
@@ -515,21 +507,17 @@ def cp6_t12_other_approvals_unaffected_by_a_policy():
     dfd = m.enroll(dd, None, env=env)
     check("[CP6-T12] setup: all four rules are set for the final-review lane",
           setrules(dfd, dd, *allfour, env=env), "")
-    sg = m.director(dfd, dd, "director-sign", "human-approve", env=env)
-    tk = last_line(sg)
-    check("[CP6-T12] director-sign human-approve prints a token as without a policy",
-          sg.returncode == 0 and TOKEN_LINE.match(tk) is not None, out(sg))
-    rh = th.rx(dd, env, "human-approve", "--director-token", tk or m.MADE_UP_TOKEN)
-    check("[CP6-T12] the run is done and no entry carries a policy_rule",
+    rh = m.director(dfd, dd, "director-sign", "human-approve", "--apply", env=env)
+    check("[CP6-T12] director-sign human-approve --apply finishes the run with no policy_rule on the log",
           rh.returncode == 0 and state(dd).get("phase") == "done"
           and all("policy_rule" not in e for e in state(dd).get("history") or []), out(rh))
     # an empty policy file with no rules does not block them either
     d2, df2 = da.plan_lane("t12c")
     reset()
     check("[CP6-T12] setup: a policy with one unrelated rule", setrules(df2, d2, "raise-limit=max:1"), "")
-    s2 = m.director(df2, d2, "director-sign", "approve-plan")
-    check("[CP6-T12] the policy neither grants nor blocks plan approval",
-          s2.returncode == 0 and TOKEN_LINE.match(last_line(s2)) is not None, out(s2))
+    s2 = ds(df2, d2, "approve-plan")
+    check("[CP6-T12] the policy neither grants nor blocks plan approval via --apply",
+          s2.returncode == 0 and state(d2).get("phase") == "building", out(s2))
 
 
 # ------------------------------------------------------------------------------------------------ T13

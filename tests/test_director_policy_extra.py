@@ -37,26 +37,21 @@ def e01_plain_path_signs_and_records():
     d, df = p.choice_lane("e01")
     p.reset()
     p.setrules(df, d, "choice=no-unlock")
-    r = m.director(df, d, "director-sign", "choice", "A")
-    tok = p.last_line(r)
-    check("[E01] plain director-sign under a covering policy prints a token",
-          r.returncode == 0 and p.TOKEN_LINE.match(tok) is not None, p.out(r))
-    r2 = g.rx(d, "choice", "A", "--director-token", tok)
+    r = p.ds(df, d, "choice", "A")
     ev = p.events(d, "choice_made")
-    check("[E01] the lane's apply logs the rule on the same event",
-          r2.returncode == 0 and len(ev) == 1 and ev[0].get("policy_rule") == "choice: no-unlock", p.out(r2))
+    check("[E01] director-sign choice --apply under a covering policy logs the rule on the event",
+          r.returncode == 0 and len(ev) == 1 and ev[0].get("policy_rule") == "choice: no-unlock", p.out(r))
     rc = g.rx(d, "receipt")
     check("[E01] and the receipt shows it", "choice: no-unlock" in rc.stdout, rc.stdout[-300:])
     # a token signed under a rule is refused at the apply once the policy no longer covers it
     d2, df2 = p.choice_lane("e01b")
     p.reset()
     p.setrules(df2, d2, "choice=no-unlock")
-    tok2 = p.last_line(m.director(df2, d2, "director-sign", "choice", "A"))
     p.pol(df2, d2, "--clear", "choice")
     p.setrules(df2, d2, "raise-limit=max:1")
     before = p.raw(d2)
-    r3 = g.rx(d2, "choice", "A", "--director-token", tok2)
-    check("[E01] a token the policy no longer covers is refused at the apply, nothing changed",
+    r3 = p.ds(df2, d2, "choice", "A")
+    check("[E01] --apply under a policy that no longer covers choice is refused, nothing changed",
           r3.returncode != 0 and p.raw(d2) == before and not p.events(d2, "choice_made"), p.out(r3))
     p.reset()
 
@@ -168,9 +163,9 @@ def e04_clear_last_rule_fails_closed_and_remove_goes_back():
     check("[E04] clearing the last rule: the view says a policy with no rules asks the developer",
           c.returncode == 0 and re.search(r"policy with no rules", p.out(v), re.I) is not None
           and re.search(r"asks the developer", p.out(v)) is not None, p.out(v))
-    r = m.director(df, d, "director-sign", "choice", "A")
-    check("[E04] routine signing is refused (nothing is covered), ask the developer",
-          r.returncode != 0 and p.TOKEN_LINE.search(r.stdout) is None and p.ASK_DEV.search(p.out(r)) is not None, p.out(r))
+    r = p.ds(df, d, "choice", "A")
+    check("[E04] routine --apply is refused (nothing is covered), ask the developer",
+          r.returncode != 0 and p.ASK_DEV.search(p.out(r)) is not None, p.out(r))
     p.setrules(df, d, "accept-finding=max:minor")
     hist = (p.policy_json(df, d) or {}).get("changes") or []
     check("[E04] the dated history survives: set, clear, set", len(hist) == 3 and all(x.get("at") for x in hist), hist)
@@ -181,9 +176,9 @@ def e04_clear_last_rule_fails_closed_and_remove_goes_back():
     check("[E04] --remove deletes the file, logs the removal, and the view says no policy is set",
           rm.returncode == 0 and not p.pfile().exists() and log.exists() and "\"at\"" in log.read_text()
           and re.search(r"no policy is set", p.out(v2), re.I) is not None, p.out(rm))
-    r2 = m.director(df, d, "director-sign", "choice", "A")
-    check("[E04] after --remove, routine signing works as with no policy",
-          r2.returncode == 0 and p.TOKEN_LINE.search(r2.stdout) is not None, p.out(r2))
+    r2 = p.ds(df, d, "choice", "A")
+    check("[E04] after --remove, routine --apply works as with no policy",
+          r2.returncode == 0 and len(p.events(d, "choice_made")) == 1, p.out(r2))
     again = p.pol(df, d, "--remove")
     check("[E04] --remove with no file is refused", again.returncode != 0, p.out(again))
     p.reset()
