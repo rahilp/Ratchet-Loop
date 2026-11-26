@@ -339,19 +339,19 @@ def x08_background_warning_is_right_for_integrate():
     check(f"[{cid}] with no note from the host, the warning is printed", "WARNING" in r.stderr and "run_in_background" in r.stderr,
           r.stderr[:300])
     w = mk()
-    cmd = f"RATCHET_ROLE=director python3 {th.ENGINE} integrate lane-x"
+    cmd = f"RATCHET_ROLE=director python3 {th.LAUNCHER} integrate lane-x"
     payload = {"cwd": str(w.main), "session_id": "s-director", "tool_name": "Bash",
                "tool_input": {"command": cmd, "run_in_background": True, "timeout": 120000}}
     gr = th.rx(w.main, w.denv, "hook", "guard", "--host", "claude", stdin=json.dumps(payload))
     need(f"[{cid}] the guard lets the director's integrate call through", gr.returncode == 0, (gr.stdout, gr.stderr))
-    r = subprocess.run([sys.executable, str(th.ENGINE), "integrate", "lane-x"], cwd=w.main, capture_output=True, text=True,
+    r = subprocess.run([sys.executable, str(th.LAUNCHER), "integrate", "lane-x"], cwd=w.main, capture_output=True, text=True,
                        env=w.denv, timeout=150)
     need(f"[{cid}] the merge succeeds", r.returncode == 0, tim.said(r)[:300])
     check(f"[{cid}] no warning when the host noted the call runs in the background", "WARNING" not in r.stderr, r.stderr[:300])
     w = mk()
     payload["tool_input"]["run_in_background"] = False
     th.rx(w.main, w.denv, "hook", "guard", "--host", "claude", stdin=json.dumps(payload))
-    r = subprocess.run([sys.executable, str(th.ENGINE), "integrate", "lane-x"], cwd=w.main, capture_output=True, text=True,
+    r = subprocess.run([sys.executable, str(th.LAUNCHER), "integrate", "lane-x"], cwd=w.main, capture_output=True, text=True,
                        env=w.denv, timeout=150)
     check(f"[{cid}] the warning is printed when the host noted a foreground call", "WARNING" in r.stderr, r.stderr[:300])
 
@@ -513,7 +513,7 @@ def x13_project_below_the_repository_top_is_refused():
     (app / "a.txt").write_text("a\n")
     th.git(outer, "add", "-A")
     th.git(outer, "commit", "-qm", "project in a subfolder")
-    argv = [sys.executable, str(th.ENGINE), "--root", str(app), "integrate", "lane-x"]
+    argv = [sys.executable, str(th.LAUNCHER), "--root", str(app), "integrate", "lane-x"]
     r = subprocess.run(argv, cwd=app, capture_output=True, text=True, env=w.denv, timeout=150)
     t = tim.failed_run(r, cid, "the project sits at app/ in its repository", "top of its git repository", "app/",
                        "by hand")
@@ -657,18 +657,18 @@ def x18_background_note_from_the_directors_own_folder():
     w = mk()
     ddir = w.base / "director"
     ddir.mkdir()
-    cmd = f"RATCHET_ROLE=director python3 {th.ENGINE} --root {w.main} integrate lane-x"
+    cmd = f"RATCHET_ROLE=director python3 {th.LAUNCHER} --root {w.main} integrate lane-x"
     payload = {"cwd": str(ddir), "session_id": "s-director", "tool_name": "Bash",
                "tool_input": {"command": cmd, "run_in_background": True, "timeout": 120000}}
     gr = th.rx(ddir, w.denv, "hook", "guard", "--host", "claude", stdin=json.dumps(payload))
     need(f"[{cid}] the guard lets the director's call through from its own folder", gr.returncode == 0, (gr.stdout, gr.stderr))
-    r = subprocess.run([sys.executable, str(th.ENGINE), "--root", str(w.main), "integrate", "lane-x"], cwd=ddir,
+    r = subprocess.run([sys.executable, str(th.LAUNCHER), "--root", str(w.main), "integrate", "lane-x"], cwd=ddir,
                        capture_output=True, text=True, env=w.denv, timeout=150)
     need(f"[{cid}] the merge succeeds", r.returncode == 0, tim.said(r)[:300])
     check(f"[{cid}] no warning: the background note under the director's folder counts", "WARNING" not in r.stderr,
           r.stderr[:300])
     w = mk()
-    r = subprocess.run([sys.executable, str(th.ENGINE), "--root", str(w.main), "integrate", "lane-x"], cwd=ddir,
+    r = subprocess.run([sys.executable, str(th.LAUNCHER), "--root", str(w.main), "integrate", "lane-x"], cwd=ddir,
                        capture_output=True, text=True, env=w.denv, timeout=150)
     check(f"[{cid}] without a note the warning is printed", r.returncode == 0 and "WARNING" in r.stderr, r.stderr[:300])
 

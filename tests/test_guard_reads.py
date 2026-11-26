@@ -27,6 +27,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import trust_helpers as tt  # noqa: E402
 
+LAUNCHER = tt.LAUNCHER
 ENGINE = tt.ENGINE
 rx = tt.rx
 git = tt.git

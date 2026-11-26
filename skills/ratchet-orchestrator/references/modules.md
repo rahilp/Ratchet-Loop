@@ -1,16 +1,19 @@
 # Module map
 
-`skills/ratchet-orchestrator/scripts/ratchet.py` is a 21,000+ line engine. The behavior-preserving
-modularization run (CP1-CP9) moved seven self-contained responsibilities out of it, verbatim, into their own
-files, so a maintainer can read and change one of those responsibilities without reading or risking the rest
-of ratchet.py. `ratchet.py` imports every name it still needs from these seven modules by explicit, non-star
-import; it keeps no `def`/`class` of its own for any of them, and main()'s argparse setup and dispatch stay in
-ratchet.py as the stable, thin entry point.
+`skills/ratchet-orchestrator/scripts/ratchet.py` is the tiny CLI/hook launcher. It inserts its directory on
+`sys.path` and calls `ratchet_engine.main`. The implementation lives in
+`skills/ratchet-orchestrator/scripts/ratchet_engine.py` (the former monolithic `ratchet.py` body). The
+behavior-preserving modularization run (CP1-CP9) moved seven self-contained responsibilities out of that
+engine, verbatim, into their own files, so a maintainer can read and change one of those responsibilities
+without reading or risking the rest of `ratchet_engine.py`. The engine imports every name it still needs from
+these seven modules by explicit, non-star import; it keeps no `def`/`class` of its own for any of them, and
+`main()`'s argparse setup and dispatch stay in `ratchet_engine.py`. Sibling modules' `_ratchet_module()`
+helpers load `ratchet_engine.py` by path and register it under `sys.modules["ratchet"]` (never the launcher).
 
 ## Modules this run created
 
 - **`engine_utils.py`** -- small, stateless leaf utilities (`now`, `die`, `ok`, `find_root`, `read_json`,
-  `write_json`, `slugify`, `config_from_user`) that nearly every ratchet.py command calls into for config
+  `write_json`, `slugify`, `config_from_user`) that nearly every engine command calls into for config
   loading, JSON read/write and basic helpers.
 - **`fingerprint.py`** -- working-tree fingerprinting and git-tree bookkeeping (`fingerprint`, `changed_files`,
   `touches_ui`, `_head_commit_named`, `_commit_reviewed`) used by `behavior`, `complete`, `approve-plan`,
@@ -43,16 +46,17 @@ intentional limits of a behavior-preserving verbatim-extraction scope -- not sil
 
 - **CP5 forward-dependency pattern (`_ratchet_module()`).** `provider_discovery.py`, and the other modules
   extracted this run in the same pattern (`engine_utils.py`, `records.py`, `run_records.py`, `plan_support.py`,
-  `status_text.py`), resolve roughly 19 lazy `_ratchet_module()`-wrapped names back into `ratchet.py` (names
+  `status_text.py`), resolve roughly 19 lazy `_ratchet_module()`-wrapped names back into `ratchet_engine.py` (names
   such as `ratchet_home`, `require_hook_env`, `_StateLock`, `provider_health`, `roster`, `detect_host`), plus
   `PRESETS`, so each module's own moved functions can still reach a handful of names that have not moved yet.
-  `_ratchet_module()` loads `ratchet.py` lazily, by file path, only inside each wrapper's own body at call
+  `_ratchet_module()` loads `ratchet_engine.py` lazily, by file path, only inside each wrapper's own body at call
   time -- never at the extracted module's own load time -- so this is a deliberate, behavior-preserving
   verbatim-extraction pattern, not a load-time circular import (importing any one of these modules alone, with
-  `ratchet.py` never previously imported, never loads `ratchet.py` as a side effect). It is, however, a real,
-  intentional forward-dependency coupling back to `ratchet.py`: these modules are not yet fully independent of
+  the engine never previously imported, never loads the engine as a side effect). It is, however, a real,
+  intentional forward-dependency coupling back to `ratchet_engine.py`: these modules are not yet fully independent of
   the engine they were extracted from, and that is accepted as a known limit of this run's scope, not a design
-  flaw to be fixed here.
+  flaw to be fixed here. After Lane S, a cached `sys.modules["ratchet"]` that is only the tiny launcher is
+  ignored so helpers never resolve to a module that exposes only `main`.
 - **CP6 `_HOST`/`bind_host()` coupling.** `run_records.py`'s `_HOST`/`bind_host()` first-binder-wins mechanism
   decides which loaded copy of the engine owns the live `_IN_HOOK`/`_HOOK_ENV_ADVISORY` cross-instance identity
   that `require_hook_env` reads. This is a known, accepted limit, forced by CP6-T01's own locked planned test,
@@ -64,20 +68,20 @@ intentional limits of a behavior-preserving verbatim-extraction scope -- not sil
   strictly weaker on trust (leaving `_IN_HOOK` stuck `True` after a mid-hook crash). The director accepted
   `_HOST`/`bind_host()` as-is during CP6's review.
 
-## Still inside ratchet.py, deferred to later features
+## Still inside ratchet_engine.py, deferred to later features
 
-This run moved seven specific responsibilities only. The following areas are still inside ratchet.py,
+This run moved seven specific responsibilities only. The following areas are still inside `ratchet_engine.py`,
 deferred to a later feature -- none of them was moved out or given its own module by this run:
 
 - The hooks section (prompt hook, stop hook, guard/command-safety checks, hook installation) stays inside
-  ratchet.py, deferred to a later feature.
-- `cmd_init` stays inside ratchet.py, deferred to a later feature.
-- `cmd_lanes_start` and `cmd_integrate` stay inside ratchet.py, deferred to a later feature.
-- `cmd_ask` stays inside ratchet.py, deferred to a later feature.
-- Director approvals and signing (director_policy, director_sign, director_key/enroll) stay inside ratchet.py,
-  deferred to a later feature.
-- Receipts stay inside ratchet.py, deferred to a later feature.
-- Spec tools (OpenSpec, Spec Kit, BMAD import) stay inside ratchet.py, deferred to a later feature.
-- Shortcut tables stay inside ratchet.py, deferred to a later feature.
-- The viewer/dashboard stays inside ratchet.py, deferred to a later feature.
-- CI export stays inside ratchet.py, deferred to a later feature.
+  `ratchet_engine.py`, deferred to a later feature.
+- `cmd_init` stays inside `ratchet_engine.py`, deferred to a later feature.
+- `cmd_lanes_start` and `cmd_integrate` stay inside `ratchet_engine.py`, deferred to a later feature.
+- `cmd_ask` stays inside `ratchet_engine.py`, deferred to a later feature.
+- Director approvals and signing (director_policy, director_sign, director_key/enroll) stay inside
+  `ratchet_engine.py`, deferred to a later feature.
+- Receipts stay inside `ratchet_engine.py`, deferred to a later feature.
+- Spec tools (OpenSpec, Spec Kit, BMAD import) stay inside `ratchet_engine.py`, deferred to a later feature.
+- Shortcut tables stay inside `ratchet_engine.py`, deferred to a later feature.
+- The viewer/dashboard stays inside `ratchet_engine.py`, deferred to a later feature.
+- CI export stays inside `ratchet_engine.py`, deferred to a later feature.

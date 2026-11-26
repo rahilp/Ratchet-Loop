@@ -51,7 +51,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PLUGIN_ROOT = HERE.parents[2]  # .../ratchet-loop
-ENGINE = PLUGIN_ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+ENGINE = PLUGIN_ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet_engine.py"
 PROVIDER_VENDOR = {"claude": "anthropic", "codex": "openai", "gemini": "google"}
 AGENT_DIRS = [PLUGIN_ROOT / "agents", Path.home() / ".claude" / "agents", Path.cwd() / ".claude" / "agents"]
 IE_PREFIX = "INSUFFICIENT-EVIDENCE:"  # starts the invalid_reason of a review whose only problem is unjudged cases

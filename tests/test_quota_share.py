@@ -48,6 +48,7 @@ _CUR_CASE: str | None = None
 TESTS: list = []
 ORIG_HOME = g.ENV["RATCHET_HOME"]
 PAID_OK = "2026-10-01T00:00:00Z"            # what the developer's exact OK leaves in a provider entry: a fixed date
+LAUNCHER = g.LAUNCHER
 ENGINE = g.ENGINE
 RUN_TIMEOUT = 240                          # a parallel lane's command may wait for another lane's lock or test request
 
@@ -147,7 +148,7 @@ class Scenario:
     def __init__(self):
         self.home = Path(_tmp.mkdtemp(prefix="ratchet-fk-user-"))
         b = Path(_tmp.mkdtemp(prefix="ratchet-fk-bin-"))
-        for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+        for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename"):
             p = shutil.which(n)
             if p:
                 (b / n).symlink_to(p)
@@ -223,7 +224,7 @@ class Lane:
         return g.rx(self.dir, *args, env=self.env)
 
     def popen(self, *args):
-        return subprocess.Popen([sys.executable, str(ENGINE), *args], cwd=self.dir, env=self.env,
+        return subprocess.Popen([sys.executable, str(LAUNCHER), *args], cwd=self.dir, env=self.env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def nudge(self):

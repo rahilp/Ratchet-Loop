@@ -522,7 +522,7 @@ def _guard_note(d, command, session):
     which chat runs that exact engine call."""
     payload = {"session_id": session, "cwd": str(d), "hook_event_name": "PreToolUse", "tool_name": "Bash",
                "tool_input": {"command": command}}
-    return subprocess.run([sys.executable, str(g.ENGINE), "hook", "guard", "--host", "claude"], cwd=d, text=True,
+    return subprocess.run([sys.executable, str(g.LAUNCHER), "hook", "guard", "--host", "claude"], cwd=d, text=True,
                           capture_output=True, env=g.ENV, input=json.dumps(payload))
 
 
@@ -555,7 +555,7 @@ def x02_guard_note_decides_the_chat():
     g.approve_plan(d)
     g.say(d, "unrelated question here", session="s-other")  # the chat typed in last is not the owner
     args = ["wait", "--for", "the codex review", "--minutes", "5", "--session", "s-owner"]
-    cmd = f'python3 "{g.ENGINE}" ' + " ".join(f'"{a}"' if " " in a else a for a in args)
+    cmd = f'python3 "{g.LAUNCHER}" ' + " ".join(f'"{a}"' if " " in a else a for a in args)
     r = _guard_note(d, cmd, "s-other")
     assert r.returncode == 0, (r.returncode, r.stderr)  # setup precondition: the guard lets the call through
     r = g.rx(d, *args)

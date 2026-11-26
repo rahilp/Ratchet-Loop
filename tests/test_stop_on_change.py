@@ -323,7 +323,7 @@ class Run:
 
 
 def start(d, env, *args):
-    proc = subprocess.Popen([sys.executable, str(tt.ENGINE), *args], cwd=str(d), env=env, text=True,
+    proc = subprocess.Popen([sys.executable, str(tt.LAUNCHER), *args], cwd=str(d), env=env, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                             start_new_session=True, preexec_fn=_dfl)
     _tmp.track(proc)

@@ -35,6 +35,7 @@ sys.path.insert(0, str(HERE))
 import _tmp  # noqa: E402
 import trust_helpers as th  # noqa: E402
 
+LAUNCHER = th.LAUNCHER
 ENGINE = th.ENGINE
 PASS = FAIL = 0
 CASE_STATUS: dict[str, bool] = {}
@@ -236,7 +237,7 @@ class W:
         return [json.loads(x) for x in p.read_text().splitlines() if x.strip()] if p.exists() else []
 
     def argv(self, target, *extra):
-        return [sys.executable, str(ENGINE), "--root", str(self.main), "integrate", str(target), *extra]
+        return [sys.executable, str(LAUNCHER), "--root", str(self.main), "integrate", str(target), *extra]
 
     def integrate(self, target="lane-x", *extra, role="director", timeout=150):
         return subprocess.run(self.argv(target, *extra), cwd=self.main, capture_output=True, text=True,

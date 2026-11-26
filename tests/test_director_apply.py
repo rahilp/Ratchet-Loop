@@ -446,7 +446,7 @@ def cp5_t11_builder_cannot_sign_and_apply():
     check("[CP5-T11] the refusal says director-only (a real refusal, not a usage error)",
           "usage:" not in out(sa) and re.search(r"director", out(sa), re.I) is not None, out(sa))
     benv = {k: v for k, v in g.ENV.items() if k != "RATCHET_ROLE"}
-    cmd = f"python3 {g.ENGINE} --root {d} director-sign approve-changes --apply"
+    cmd = f"python3 {g.LAUNCHER} --root {d} director-sign approve-changes --apply"
     gr = th.cp4x_guard_tool(df, benv, "Bash", {"command": cmd}, session="s-builder")
     check("[CP5-T11] the guard hook blocks the same command", gr.returncode == 2, out(gr))
     check("[CP5-T11] the file stays unapproved, nothing is asked or pending, no history event was added",
@@ -623,13 +623,13 @@ def _director_env():
 
 
 def _spawn(df, d, *args):
-    return subprocess.Popen([sys.executable, str(g.ENGINE), "--root", str(d), *args], cwd=df, env=_director_env(),
+    return subprocess.Popen([sys.executable, str(g.LAUNCHER), "--root", str(d), *args], cwd=df, env=_director_env(),
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
 def _prime_guard(df, d, *args):
     import shlex
-    cmd = f"python3 {g.ENGINE} --root {d} {shlex.join(args)}"
+    cmd = f"python3 {g.LAUNCHER} --root {d} {shlex.join(args)}"
     th.cp4x_guard_tool(df, _director_env(), "Bash", {"command": cmd}, session="s-director")
 
 

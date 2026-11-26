@@ -152,7 +152,7 @@ class Proj:
 
     def __init__(self, tag, fakes, providers, slots):
         b = Path(_tmp.mkdtemp(prefix="ratchet-fk-bin-"))
-        for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+        for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename"):
             p = shutil.which(n)
             if p:
                 (b / n).symlink_to(p)

@@ -292,7 +292,7 @@ def cutoff_bin(name, mode):
     """A fake agent CLI on its own private PATH whose reply depends on an invocation counter: a cut-off (truncated
     mid-JSON) reply once or always, a plain non-JSON error, or a hang past --timeout. Returns (bin_dir, counter)."""
     b = Path(_tmp.mkdtemp(prefix="ratchet-cutoff-bin-"))
-    for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename", "sleep"):
+    for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename", "sleep"):
         p = shutil.which(n)
         if p:
             (b / n).symlink_to(p)
@@ -695,7 +695,7 @@ def cutoff_then_quota_bin(name):
     """A fake agent CLI: cut off mid-JSON on its first call, then a genuine (non-JSON) quota error on its retry.
     Used to check that the retry is classified by its OWN reply, not assumed to be another cut-off."""
     b = Path(_tmp.mkdtemp(prefix="ratchet-cutoff2-bin-"))
-    for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+    for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename"):
         p = shutil.which(n)
         if p:
             (b / n).symlink_to(p)
@@ -835,7 +835,7 @@ def json_error_bin(name):
     object), on every call. Used to check that a complete JSON reply with no findings-reply key is never treated
     as a cut-off, however many times it would be called."""
     b = Path(_tmp.mkdtemp(prefix="ratchet-jsonerr-bin-"))
-    for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+    for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename"):
         p = shutil.which(n)
         if p:
             (b / n).symlink_to(p)

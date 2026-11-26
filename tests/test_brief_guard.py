@@ -70,7 +70,7 @@ def guard_host(d, host, tool_name, tool_input, extra_payload=None):
     payload = {"cwd": str(d), "tool_name": tool_name, "tool_input": tool_input}
     if extra_payload:
         payload.update(extra_payload)
-    return subprocess.run([sys.executable, str(g.ENGINE), "hook", "guard", "--host", host], cwd=d, text=True,
+    return subprocess.run([sys.executable, str(g.LAUNCHER), "hook", "guard", "--host", host], cwd=d, text=True,
                           capture_output=True, env=g.ENV, input=json.dumps(payload))
 
 

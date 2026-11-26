@@ -676,7 +676,7 @@ TESTS += [("CP3-X06", x06_host_bare_models), ("CP3-X07", x07_inapplicable_agents
 
 def _load_engine():
     sys.path.insert(0, str(ROOT / "skills" / "ratchet-orchestrator" / "scripts"))
-    import ratchet as eng
+    import ratchet_engine as eng
     return eng
 
 

@@ -63,7 +63,9 @@ import _tmp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 README = README_DOCS
 THIS_FILE = Path(__file__).resolve()
 NEW_TEST_LINE = "python3 tests/test_hook_opencode_guard.py"
@@ -132,7 +134,7 @@ class World:
         return env
 
     def sh(self, *args, stdin=None, timeout=180):
-        return subprocess.run([sys.executable, str(ENGINE), *args], cwd=str(self.proj), input=stdin,
+        return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=str(self.proj), input=stdin,
                               capture_output=True, text=True, env=self.env(), timeout=timeout)
 
     def next(self, stem):
@@ -387,7 +389,7 @@ def retargeted_plugin(w, stem, engine_path):
 
     def sub(m):
         try:
-            if json.loads(m.group(0)) == str(ENGINE):
+            if json.loads(m.group(0)) == str(LAUNCHER):
                 hits[0] += 1
                 return json.dumps(str(engine_path))
         except ValueError:
@@ -1204,17 +1206,17 @@ MUTANT_NEVER = "export const RatchetPlugin = async () => ({'tool.execute.before'
 MUTANT_LATCH = ("let latched = false;\nexport const RatchetPlugin = async () => ({'tool.execute.before': "
                 "async (input, output) => {\n  if (JSON.stringify(output.args).includes('.ratchet/')) latched = true;\n"
                 "  if (latched) throw new Error('RATCHET: latched');\n}});\n")
-MUTANT_CANNED = ("import { spawnSync } from 'node:child_process';\nconst E = __ENGINE__;\n"
+MUTANT_CANNED = ("import { spawnSync } from 'node:child_process';\nconst E = __LAUNCHER__;\n"
                  "export const RatchetPlugin = async (ctx) => ({'tool.execute.before': async (input, output) => {\n"
                  "  const r = spawnSync('python3', [E, 'hook', 'guard', '--host', 'opencode'], {input: '{}', encoding: 'utf8'});\n"
                  "  let j; try { j = JSON.parse(r.stdout); } catch (e) { return; }\n"
                  "  if (j && j.block === true) throw new Error('blocked');\n}});\n")
-MUTANT_CLOSED = ("import { spawnSync } from 'node:child_process';\nconst E = __ENGINE__;\n"
+MUTANT_CLOSED = ("import { spawnSync } from 'node:child_process';\nconst E = __LAUNCHER__;\n"
                  "export const RatchetPlugin = async (ctx) => ({'tool.execute.before': async (input, output) => {\n"
                  "  const r = spawnSync('python3', [E, 'hook', 'guard', '--host', 'opencode'], {input: '{}', encoding: 'utf8'});\n"
                  "  if (r.error || r.status !== 0) throw new Error('RATCHET: guard unavailable');\n"
                  "  const j = JSON.parse(r.stdout); if (j.block === true) throw new Error(j.message);\n}});\n")
-MUTANT_TRUTHY = ("import { spawnSync } from 'node:child_process';\nconst E = __ENGINE__;\n"
+MUTANT_TRUTHY = ("import { spawnSync } from 'node:child_process';\nconst E = __LAUNCHER__;\n"
                  "export const RatchetPlugin = async (ctx) => ({'tool.execute.before': async (input, output) => {\n"
                  "  const r = spawnSync('python3', [E, 'hook', 'guard', '--host', 'opencode'], {input: '{}', encoding: 'utf8'});\n"
                  "  let j; try { j = JSON.parse(r.stdout); } catch (e) { return; }\n"
@@ -1234,7 +1236,7 @@ def case_teeth():
                               ("canned", MUTANT_CANNED, str(stub_block)), ("closed", MUTANT_CLOSED, missing),
                               ("truthy", MUTANT_TRUTHY, str(stub_yes))):
         files[name] = d / f"{name}.js"
-        files[name].write_text(src.replace("__ENGINE__", json.dumps(engine)), encoding="utf-8")
+        files[name].write_text(src.replace("__LAUNCHER__", json.dumps(engine)), encoding="utf-8")
     app = oc_call("write", {"filePath": P(w, "src/app.js"), "content": "x"})
     o = drive(w, [run_of(files["always"], [protected_write(w), app], label="always"),
                   run_of(files["never"], [protected_write(w)], label="never"),

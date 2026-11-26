@@ -173,7 +173,7 @@ _LEGACY_HELPER.write_text(
     "import sys, json\n"
     "from pathlib import Path\n"
     "sys.path.insert(0, sys.argv[2])\n"
-    "import ratchet as rt\n"
+    "import ratchet_engine as rt\n"
     "root = Path(sys.argv[1])\n"
     "ctx = rt.Ctx(root)\n"
     "st = ctx.state()\n"

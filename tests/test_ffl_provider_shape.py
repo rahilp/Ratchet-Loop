@@ -61,7 +61,9 @@ ID_RE = re.compile(r"\[(CP3-[TX]\d+)\]")
 README = README_DOCS
 SKILL = ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md"
 SCHEMAS = ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md"
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 INVENTORY = ROOT / "tests" / "fixtures" / "modularize_cp1" / "test-inventory.md"
 
 FOR_RISK_SHAPE = "list of risk names (low, normal, high)"

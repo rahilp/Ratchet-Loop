@@ -44,7 +44,9 @@ import _tmp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 SKILL = ROOT / "skills" / "ratchet-orchestrator"
 INSTALL_SH = ROOT / "install.sh"
 README = README_DOCS
@@ -195,7 +197,7 @@ class World:
         return env
 
     def sh(self, *args, stdin=None, engine=None, xdg=None, occonf=None):
-        return subprocess.run([sys.executable, str(engine or ENGINE), *args], cwd=str(self.proj), input=stdin,
+        return subprocess.run([sys.executable, str(engine or LAUNCHER), *args], cwd=str(self.proj), input=stdin,
                               capture_output=True, text=True, env=self.env(xdg, occonf), timeout=180)
 
     def install_sh(self, *args):
@@ -340,8 +342,8 @@ def case_t01():
     check("[CP3-T01] .opencode/plugins/ratchet.js exists", text is not None)
     check("[CP3-T01] its first line is exactly the Ratchet header", text is not None and text.split("\n", 1)[0] == HEADER,
           None if text is None else text.split("\n", 1)[0])
-    check("[CP3-T01] it holds the installing engine's absolute path as a JSON string literal",
-          has_engine_literal(text, str(ENGINE.resolve())))
+    check("[CP3-T01] it holds the installing launcher's absolute path as a JSON string literal",
+          has_engine_literal(text, str(LAUNCHER.resolve())))
     check("[CP3-T01] the project gained exactly the .opencode folder, plugins and ratchet.js (no other hook files)",
           new_entries(before_p, tree(w.proj)) == [".opencode", ".opencode/plugins", ".opencode/plugins/ratchet.js"],
           new_entries(before_p, tree(w.proj)))
@@ -440,7 +442,7 @@ def case_t05():
     check("[CP3-T05] the header is still the first line, once, and the old engine path is gone",
           text is not None and text.split("\n", 1)[0] == HEADER and text.count(HEADER) == 1
           and "/old/path" not in text)
-    check("[CP3-T05] it holds the current engine path", has_engine_literal(text, str(ENGINE.resolve())))
+    check("[CP3-T05] it holds the current launcher path", has_engine_literal(text, str(LAUNCHER.resolve())))
     check("[CP3-T05] the plugins folder holds only ratchet.js (nothing duplicated)",
           sorted(os.listdir(str(w.plugin.parent))) == ["ratchet.js"], sorted(os.listdir(str(w.plugin.parent))))
 
@@ -527,8 +529,8 @@ def case_t10():
     r = w.install("--dry-run")
     check("[CP3-T10] exit 0", r.returncode == 0, out(r)[:200])
     check("[CP3-T10] stdout holds the Ratchet header line", HEADER in r.stdout.splitlines(), r.stdout[:200])
-    check("[CP3-T10] stdout holds the engine path as a JSON string literal",
-          has_engine_literal(r.stdout, str(ENGINE.resolve())))
+    check("[CP3-T10] stdout holds the launcher path as a JSON string literal",
+          has_engine_literal(r.stdout, str(LAUNCHER.resolve())))
     check("[CP3-T10] no file or folder was created in the project or HOME",
           tree(w.proj) == before_p and tree(w.home) == before_h, new_entries(before_p, tree(w.proj)))
     r1 = w.install()

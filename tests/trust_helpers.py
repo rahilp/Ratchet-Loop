@@ -32,7 +32,9 @@ try:  # pty / os.forkpty give a test a REAL controlling terminal; absent on Wind
 except ImportError:
     HAVE_PTY = False
 
-ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 # [CP4] update_record and the rest of the tamper-evidence chain moved out of ratchet.py into this sibling
 # module; a structural scan of "ratchet.py's source" for that machinery now needs both files' text.
 RECORDS = ENGINE.with_name("records.py")
@@ -54,7 +56,7 @@ _DROP_EXACT = {"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "GEMINI_CLI", "GITHUB_COP
 
 # Tools a throwaway git project and the engine itself need; deliberately excludes every agent CLI binary name
 # (claude, codex, gemini, cursor-agent, opencode, copilot) so they stay unreachable regardless of the real PATH.
-_SAFE_TOOLS = ("git", "python3", "sh", "env", "cat", "mkdir", "rm", "ls", "dirname", "basename", "true", "false",
+_SAFE_TOOLS = ("git", "python3", "sh", "bash", "env", "cat", "mkdir", "rm", "ls", "dirname", "basename", "true", "false",
                "uname", "chmod", "mv", "cp", "sed", "grep", "find", "touch", "date", "sort", "head", "tail", "wc",
                "readlink", "printf", "echo")
 
@@ -98,12 +100,13 @@ def make_env(host="claude"):
 
 
 def rx(d, env, *args, stdin=None):
-    return subprocess.run([sys.executable, str(ENGINE), *args], cwd=d, capture_output=True, text=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=d, capture_output=True, text=True,
                           env=env, input=stdin)
 
 
 def git(d, *a):
-    r = subprocess.run(["git", *a], cwd=d, capture_output=True, text=True,
+    # Hermetic throwaways must not inherit host commit.gpgsign (cursor-git-ssh-keygen needs a fuller PATH).
+    r = subprocess.run(["git", "-c", "commit.gpgsign=false", *a], cwd=d, capture_output=True, text=True,
                        env=dict(os.environ, PATH=SAFE_PATH))
     assert r.returncode == 0, r.stdout + r.stderr
     return r
@@ -457,7 +460,7 @@ def cp4_pty_run(args, cwd, env, on_output, timeout=15):
             os.chdir(str(cwd))
             os.environ.clear()
             os.environ.update(env)
-            os.execvp(sys.executable, [sys.executable, str(ENGINE), *args])
+            os.execvp(sys.executable, [sys.executable, str(LAUNCHER), *args])
         except Exception:
             pass
         os._exit(127)
@@ -886,6 +889,6 @@ def cp5r8_sha(p):
 
 
 def cp5r12_director(home_dir, denv, lane, *args):
-    cp4x_guard_tool(home_dir, denv, "Bash", {"command": f"python3 {ENGINE} --root {lane} {' '.join(args)}"},
+    cp4x_guard_tool(home_dir, denv, "Bash", {"command": f"python3 {LAUNCHER} --root {lane} {' '.join(args)}"},
                     session="s-director")
     return rx(home_dir, denv, "--root", str(lane), *args)

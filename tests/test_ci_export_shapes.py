@@ -31,7 +31,9 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import _tmp  # noqa: E402
 
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 ENV = {k: v for k, v in os.environ.items() if k not in ("RATCHET_ROLE", "RATCHET_HUMAN_OVERRIDE", "RATCHET_ROOT")}
 ENV["RATCHET_HOME"] = str(_tmp.mkdtemp(prefix="ratchet-ci-shapes-home-"))
 ENV["RATCHET_HOST_PROVIDER"] = "anthropic"
@@ -64,7 +66,7 @@ def git(d, *a):
 
 
 def rx(d, *args):
-    return subprocess.run([sys.executable, str(ENGINE), *args], cwd=d, capture_output=True, text=True, env=ENV)
+    return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=d, capture_output=True, text=True, env=ENV)
 
 
 def project(name, config=None, files=None) -> Path:

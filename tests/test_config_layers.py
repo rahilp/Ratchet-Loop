@@ -563,7 +563,7 @@ def x13_no_direct_project_config_read_of_layered_keys():
     """Structural: a value read straight from the project's config file (not through Ctx.config / user_config) is
     never used for a key the machine-wide file may set, or the global layer would be bypassed."""
     files = sorted((ROOT / "skills").glob("*/scripts/*.py"))
-    check("[CP1-X13] the scan sees the engine sources", any(f.name == "ratchet.py" for f in files))
+    check("[CP1-X13] the scan sees the engine sources", any(f.name == "ratchet_engine.py" for f in files))
     read_re = re.compile(r"(\w+)\s*=\s*\(?\s*(?:[\w.]+\(\s*)?(?:read_json|json\.loads)\([^\n]*(?:config_path|config\.json)")
     for f in files:
         src = f.read_text()
@@ -594,7 +594,7 @@ def x14_merge_and_integrity_read_the_layered_config():
     regexes cannot see, e.g. config_from_user(main_cfg) (project file alone) in cmd_merged."""
     import ast
     sc = ROOT / "skills/ratchet-orchestrator/scripts"
-    want = {sc / "ratchet.py": ("cmd_merged",), sc / "run_records.py": ("integrity_problems", "approval_snapshot")}
+    want = {sc / "ratchet_engine.py": ("cmd_merged",), sc / "run_records.py": ("integrity_problems", "approval_snapshot")}
 
     def fname(c):
         return c.func.attr if isinstance(c.func, ast.Attribute) else getattr(c.func, "id", "")

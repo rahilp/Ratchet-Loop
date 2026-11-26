@@ -41,7 +41,7 @@ sys.path.insert(0, str(HERE))
 import _tmp
 import trust_helpers
 from trust_helpers import (
-    CP4_CODE_RE, ENGINE, HAVE_PTY, check, cp3_state, cp4_answer_correct, cp4_pty_run,
+    CP4_CODE_RE, ENGINE, LAUNCHER, HAVE_PTY, check, cp3_state, cp4_answer_correct, cp4_pty_run,
     cp4_unapproved_plan, cp5r8_sha, cp5v_until,
     cp5y_load_engine, cp5y_repo, cp5z_notes, cp5z_project_notes, engine_env, git, js, make_env,
     stop_payload,
@@ -229,7 +229,7 @@ def cp3_first_run_plan(env):
 def cp3_director(home_dir, denv, lane, *args):
     """In-process mirror of trust_helpers.cp5r12_director."""
     m = cp5y_load_engine()
-    cp3_guard_tool(home_dir, denv, "Bash", {"command": f"python3 {ENGINE} --root {lane} {' '.join(args)}"},
+    cp3_guard_tool(home_dir, denv, "Bash", {"command": f"python3 {LAUNCHER} --root {lane} {' '.join(args)}"},
                   session="s-director")
     # replaces rx(home_dir, denv, "--root", str(lane), *args)  (trust_helpers.cp5r12_director)
     with _Cp3Call(m, home_dir, denv) as r:
@@ -2039,7 +2039,7 @@ def t10_source_inspection_reads_live_file():
     cp3_check("{CP3-T10} ENGINE itself still names the real, live production file on disk, and reading it now "
               "matches reading the real path directly -- never a cached/snapshotted copy",
               ENGINE.exists() and ENGINE.read_text(encoding="utf-8") == (HERE.parent / "skills" /
-              "ratchet-orchestrator" / "scripts" / "ratchet.py").read_text(encoding="utf-8"), str(ENGINE))
+              "ratchet-orchestrator" / "scripts" / "ratchet_engine.py").read_text(encoding="utf-8"), str(ENGINE))
 
 
 def t11_two_cold_runs_agree():

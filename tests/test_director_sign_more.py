@@ -138,7 +138,7 @@ def director(dfolder, lane, *args, env=None, session="s-director"):
     (and records the director's folder, which has no .ratchet/), then the command runs from that folder with
     --root <lane>. `env` is the lane's env plus RATCHET_ROLE=director (default: test_gates's shared env)."""
     denv = dict(env or g.ENV, RATCHET_ROLE="director")
-    cmd = f"python3 {g.ENGINE} --root {lane} {shlex.join(str(a) for a in args)}"
+    cmd = f"python3 {g.LAUNCHER} --root {lane} {shlex.join(str(a) for a in args)}"
     th.cp4x_guard_tool(dfolder, denv, "Bash", {"command": cmd}, session=session)
     return th.rx(dfolder, denv, "--root", str(lane), *[str(a) for a in args])
 

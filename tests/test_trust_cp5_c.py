@@ -16,7 +16,7 @@ from pathlib import Path
 import _tmp
 import trust_helpers
 from trust_helpers import (
-    ENGINE, HAVE_PTY, check, cp3_R0, cp3_open_round, cp3_project, cp3_reviewer_writes, cp3_state, cp3_write_tests,
+    ENGINE, HAVE_PTY, LAUNCHER, check, cp3_R0, cp3_open_round, cp3_project, cp3_reviewer_writes, cp3_state, cp3_write_tests,
     cp4_answer_correct, cp4_find_code, cp4_human_log_lines, cp4_pty_run, cp4_say_yes, cp5_plan, cp5_say, cp5r8_sha,
     cp5v_until, cp5w_lock, cp5x_history, cp5y_first_run_plan, cp5y_guard_bash, cp5y_load_engine, cp5y_repo,
     cp5z_notes, cp5z_project_notes, git, make_env, now_dt, rx,
@@ -354,7 +354,7 @@ def cp5_adv_round6_long_command_keeps_approval():
     assert rx(d, env, "implemented", "CP1").returncode == 0
     r_ask = rx(d, env, "ask", "set-review", "each")
     hold.write_text("1")
-    proc = subprocess.Popen([sys.executable, str(ENGINE), "behavior", "CP1"], cwd=d, env=env,
+    proc = subprocess.Popen([sys.executable, str(LAUNCHER), "behavior", "CP1"], cwd=d, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     said, r_set, set_s, mid = None, None, 99, {}
     try:
@@ -464,7 +464,7 @@ def cp5r7_at_complete(d, env):
 
 
 def cp5r7_start(d, env, *args):
-    return subprocess.Popen([sys.executable, str(ENGINE), *args], cwd=d, env=env, stdout=subprocess.PIPE,
+    return subprocess.Popen([sys.executable, str(LAUNCHER), *args], cwd=d, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
 
 
@@ -718,7 +718,7 @@ def cp5r8_jsonl_ok(p):
 def cp5r8_prompt_proc(d, env, tp, text):
     tp.open("a").write(json.dumps({"type": "user", "message": {"role": "user", "content": text},
                                    "timestamp": now_dt().isoformat()}) + "\n")
-    p = subprocess.Popen([sys.executable, str(ENGINE), "hook", "prompt", "--host", "claude"], cwd=d, env=env,
+    p = subprocess.Popen([sys.executable, str(LAUNCHER), "hook", "prompt", "--host", "claude"], cwd=d, env=env,
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     p.stdin.write(json.dumps({"cwd": str(d), "prompt": text, "session_id": "s-owner", "transcript_path": str(tp)}))
     p.stdin.close()
@@ -738,7 +738,7 @@ def cp5_adv_round8_init_lock_and_hash_record_lock():
     git(d, "add", "-A")
     git(d, "commit", "-qm", "init")
     had_folder = (d / ".ratchet").exists()
-    procs = [subprocess.Popen([sys.executable, str(ENGINE), "init", f"feature {i}", "--slug", f"s{i}"], cwd=d,
+    procs = [subprocess.Popen([sys.executable, str(LAUNCHER), "init", f"feature {i}", "--slug", f"s{i}"], cwd=d,
                               env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for i in range(4)]
     results = [(p,) + p.communicate(timeout=120) for p in procs]
     won = [i for i, (p, _, _) in enumerate(results) if p.returncode == 0]
@@ -781,7 +781,7 @@ def cp5_adv_round8_init_lock_and_hash_record_lock():
     stop = json.dumps({"session_id": "s-owner", "cwd": str(d), "hook_event_name": "Stop", "stop_hook_active": False})
     stops = []
     for _ in range(n_stops):
-        sp_ = subprocess.Popen([sys.executable, str(ENGINE), "hook", "stop", "--host", "claude"], cwd=d, env=env,
+        sp_ = subprocess.Popen([sys.executable, str(LAUNCHER), "hook", "stop", "--host", "claude"], cwd=d, env=env,
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         sp_.stdin.write(stop)
         sp_.stdin.close()
@@ -902,7 +902,7 @@ def cp5r9_race(script, root, env, workers, n, mode):
 def cp5r9_guard_proc(d, env, command, session):
     payload = {"session_id": session, "cwd": str(d), "hook_event_name": "PreToolUse", "tool_name": "Bash",
                "tool_input": {"command": command}}
-    p = subprocess.Popen([sys.executable, str(ENGINE), "hook", "guard", "--host", "claude"], cwd=d, env=env,
+    p = subprocess.Popen([sys.executable, str(LAUNCHER), "hook", "guard", "--host", "claude"], cwd=d, env=env,
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     p.stdin.write(json.dumps(payload))
     p.stdin.close()

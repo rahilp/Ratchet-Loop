@@ -1,4 +1,9 @@
-# CP1 evidence: test files that inspect ratchet.py's on-disk source or load it as a module
+# CP1 evidence: test files that inspect the engine's on-disk source or load it as a module
+
+> Lane S: implementation lives in `ratchet_engine.py`. The tiny `ratchet.py` launcher is not the
+> Kind 1/2/3 engine under scan; loaders and AST/source readers should target `ratchet_engine.py`.
+> Prose below may still say "ratchet.py" historically; treat those as the engine body unless they
+> explicitly mean the CLI entry path.
 
 Re-derived live, not a hand-picked list. This file lists what the live grep below found, by name,
 but deliberately carries no frozen "raw output" snapshot of grep's own stdout: a frozen snapshot
@@ -198,8 +203,11 @@ tree, never loads it as a module itself): 10 files
   Its structural cases read ratchet.py's text with `ENGINE.read_text` and `ast.parse` / `ast.walk` to find every
   provider field the engine reads and every sub-command; it never loads ratchet.py with `spec_from_file_location` itself.
 
-## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 14 files
+## Kind 3 — both (loads ratchet.py dynamically AND reads/parses its literal on-disk text): 15 files
 
+- `test_engine_split.py` — Lane S guard suite: loads `ratchet_engine.py` via `spec_from_file_location`
+  (path-emission checks) AND reads/parses launcher + engine text for size/`main` invariants; CLI `--help`
+  runs the `ratchet.py` launcher as a subprocess.
 - `test_trust_cp4.py` — trust-holes CP4: agent-set overrides no longer bypass checks. Loads
   ratchet.py dynamically (`ratchet_engine_slow_hook`) AND reads `ENGINE.read_text()` +
   `ast.parse`/`ast.walk` to collect specific `FunctionDef`s, plus `inspect.getsource(m._open_terminal)`

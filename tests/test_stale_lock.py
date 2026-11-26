@@ -49,7 +49,9 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import _tmp  # noqa: E402
 
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 README = README_DOCS
 SKILL = ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md"
 SCHEMAS = ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md"
@@ -213,7 +215,7 @@ class Lane:
         g = _g()
         if self.marker.exists():
             self.marker.unlink()
-        p = spawn([sys.executable, str(ENGINE), "red", "CP1"], self.d, g.ENV)
+        p = spawn([sys.executable, str(LAUNCHER), "red", "CP1"], self.d, g.ENV)
         up = wait_for(lambda: self.marker.exists() or p.poll() is not None, 60)
         assert up and p.poll() is None and self.marker.exists(), \
             f"red did not reach its slow test: rc={p.poll()} {p.stdout.read() if p.poll() is not None else ''}"
@@ -475,7 +477,7 @@ def t07():
     ok_all = True
     for rnd in range(1, 6):
         lock_path(d).write_text(dead["text"])
-        procs = [spawn([sys.executable, str(ENGINE), "ask", "approve-plan"], d, g.ENV) for _ in range(2)]
+        procs = [spawn([sys.executable, str(LAUNCHER), "ask", "approve-plan"], d, g.ENV) for _ in range(2)]
         outs = []
         for p in procs:
             try:

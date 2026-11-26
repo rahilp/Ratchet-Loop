@@ -102,7 +102,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _tmp  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 README = README_DOCS
 SKILL = ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md"
 SCHEMAS = ROOT / "skills" / "ratchet-orchestrator" / "references" / "schemas.md"
@@ -1103,7 +1105,7 @@ def _install(scope):
     proj, home, env = _install_world()
     root = proj if scope == "project" else home
     before = _files(root)
-    cmd = [sys.executable, str(ENGINE), "install-hooks", "--host", "opencode", "--scope", scope]
+    cmd = [sys.executable, str(LAUNCHER), "install-hooks", "--host", "opencode", "--scope", scope]
     r1 = subprocess.run(cmd, cwd=str(proj), env=env, capture_output=True, text=True, timeout=120)
     first = _files(root) - before
     r2 = subprocess.run(cmd, cwd=str(proj), env=env, capture_output=True, text=True, timeout=120)

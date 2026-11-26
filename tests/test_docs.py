@@ -333,7 +333,7 @@ import json as cp2_json
 import os as cp2_os
 import subprocess as cp2_subprocess
 
-CP2_ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+CP2_ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet_engine.py"
 CP2_CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "gemini": "Gemini", "copilot": "Copilot",
                  "opencode": "OpenCode"}
 CP2_HEADER = ["CLI", "Protects Ratchet's records", "Confirms reviewer identity", "Stop hook", "Records your replies"]
@@ -788,6 +788,7 @@ CP2_R4_PROBE = r'''
 import concurrent.futures, datetime as dt, importlib.util, json, os, shlex, shutil, subprocess, sys, tempfile
 from pathlib import Path
 ENGINE, PARTS = sys.argv[1], set(sys.argv[2].split(","))
+LAUNCHER = str(Path(ENGINE).parent / "ratchet.py")
 ID_PAYLOADS, ID_REVIEW_REL = json.loads(sys.argv[3]), sys.argv[4]
 spec = importlib.util.spec_from_file_location("ratchet_engine_cp2_r4", ENGINE)
 eng = importlib.util.module_from_spec(spec)
@@ -829,7 +830,7 @@ def hook(d, host, kind, payload):
 
 
 def rx(d, *a):
-    r = subprocess.run([sys.executable, ENGINE, *a], cwd=d, capture_output=True, text=True, timeout=300)
+    r = subprocess.run([sys.executable, LAUNCHER, *a], cwd=d, capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         raise SystemExit("ratchet.py %s failed: %s %s" % (" ".join(a), r.stdout[-400:], r.stderr[-400:]))
     return r
@@ -1249,6 +1250,7 @@ CP2_R5_PROBE = r'''
 import contextlib, importlib.util, io, json, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 ENGINE = sys.argv[1]
+LAUNCHER = str(Path(ENGINE).parent / "ratchet.py")
 spec = importlib.util.spec_from_file_location("ratchet_engine_cp2_r5", ENGINE)
 eng = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(eng)
@@ -1262,7 +1264,7 @@ def run_stop_hook(d, home):
     env = dict(os.environ)
     env["RATCHET_HOME"] = str(home)
     payload = json.dumps({"session_id": "s", "cwd": str(d), "hook_event_name": "Stop"})
-    r = subprocess.run([sys.executable, ENGINE, "hook", "stop", "--host", "claude"],
+    r = subprocess.run([sys.executable, LAUNCHER, "hook", "stop", "--host", "claude"],
                        input=payload, capture_output=True, text=True, cwd=d, env=env, timeout=60)
     return r.returncode
 
@@ -1712,7 +1714,7 @@ def cp4_orchestrator_setup_and_plan_review():
     print("CP4: orchestrator setup and plan review")
     path = ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md"
     doc = path.read_text(encoding="utf-8") if path.exists() else ""
-    engine_src = (ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py").read_text(encoding="utf-8")
+    engine_src = (ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet_engine.py").read_text(encoding="utf-8")
     p = cp4_parts(doc)
     check("[CP4-T01] hooks check (doctor --json) sits after init and before plan-submit, done by the agent", l_hooks_after_init(p), p["pos"])
     check("[CP4-T02] missing hooks: agent offers install-hooks for the CLI in use, nothing installs before a yes", l_install_offer(p), p["hooks"][:200])
@@ -1787,7 +1789,9 @@ import subprocess
 import shutil
 import tempfile
 
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 BUILDERS = ("ratchet-implementer", "ratchet-fixer", "ratchet-test-writer")
 ENTRY_SPLIT = re.compile(r"(?m)^(?=\s*(?:[-*]\s|\d+[.)]\s|\||\*\*|#{3,6}\s))")
 # user-directed command phrasing; every hit is reported as file:line
@@ -1852,7 +1856,7 @@ def control_entries(controls):
 
 
 def engine_commands():
-    r = subprocess.run([sys.executable, str(ENGINE), "--help"], capture_output=True, text=True, timeout=60, cwd=tempfile.gettempdir())
+    r = subprocess.run([sys.executable, str(LAUNCHER), "--help"], capture_output=True, text=True, timeout=60, cwd=tempfile.gettempdir())
     m = re.search(r"\{([a-z][^}]*)\}", r.stdout)
     return set(m.group(1).split(",")) if m else set()
 
@@ -2030,7 +2034,15 @@ def stdlib_only(path):
 def tree_snapshot(d):
     """(path, mtime, size) of every file under d. Only ever pointed at a private temp copy, never the live .ratchet/."""
     d = Path(d)
-    return sorted((str(f.relative_to(d)), f.stat().st_mtime_ns, f.stat().st_size) for f in d.rglob("*") if f.is_file())
+    out = []
+    for f in d.rglob("*"):
+        if not f.is_file():
+            continue
+        # Nested suite runs can leave interpreter litter even when the copy ignored __pycache__ at clone time.
+        if "__pycache__" in f.parts or f.suffix in {".pyc", ".pyo"}:
+            continue
+        out.append((str(f.relative_to(d)), f.stat().st_mtime_ns, f.stat().st_size))
+    return sorted(out)
 
 
 def private_repo_copy(dest):
@@ -2123,7 +2135,7 @@ def cp5_docs_lint():
     orch = by.get("skills/ratchet-orchestrator/SKILL.md", "")
     controls = hsection(orch, r"control")
     cmds = engine_commands()
-    sub = subprocess.run([sys.executable, str(ENGINE), "set-review", "--help"], capture_output=True, text=True, timeout=60, cwd=tempfile.gettempdir())
+    sub = subprocess.run([sys.executable, str(LAUNCHER), "set-review", "--help"], capture_output=True, text=True, timeout=60, cwd=tempfile.gettempdir())
     setrev_help = sub.stdout
 
     def teeth(tid, label, pred_ok, pred_mut_red):
@@ -2293,7 +2305,7 @@ def cp5_docs_lint():
         check("[CP5-T20] standalone run (nested run: skipped to avoid recursion)", True)
         return
     me = Path(__file__).resolve()
-    env = dict(os.environ, RATCHET_DOCS_NESTED="1")
+    env = dict(os.environ, RATCHET_DOCS_NESTED="1", PYTHONDONTWRITEBYTECODE="1")
     with _tmp.mkdtemp() as tmp:
         copy = private_repo_copy(Path(tmp) / "repo")
         before = tree_snapshot(copy)

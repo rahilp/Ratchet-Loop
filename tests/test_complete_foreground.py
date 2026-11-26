@@ -41,6 +41,7 @@ import test_signing as ts  # noqa: E402  (project2, pass_behavior2, open_round, 
 import test_flaky as tf  # noqa: E402  (set_regression_command_confirmed, flaky_cmd_from_outcomes)
 import trust_helpers as tt  # noqa: E402  (ENGINE)
 
+LAUNCHER = tt.LAUNCHER
 ENGINE = tt.ENGINE
 README = README_DOCS
 SKILL = ROOT / "skills" / "ratchet-orchestrator" / "SKILL.md"
@@ -104,7 +105,7 @@ def norm(text, d):
 # ---- the host: the guard hook sees the Bash call, then the call runs ------------------------------------------
 
 def complete_cmd():
-    return f"python3 {shlex.quote(str(ENGINE))} complete CP1"
+    return f"python3 {shlex.quote(str(LAUNCHER))} complete CP1"
 
 
 def guard_bash(d, env, command, session="s-builder", **extra):
@@ -247,7 +248,7 @@ def t02_warning_before_regression():
     cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(_HOLD))} {shlex.quote(str(started))} {shlex.quote(str(release))}"
     d, env, _ = finished_project(regression=cmd)
     note_complete(d, env, run_in_background=False, timeout=120000)
-    proc = subprocess.Popen([sys.executable, str(ENGINE), "complete", "CP1"], cwd=d, env=env, stdin=subprocess.DEVNULL,
+    proc = subprocess.Popen([sys.executable, str(LAUNCHER), "complete", "CP1"], cwd=d, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     first = b""
     still_running = False

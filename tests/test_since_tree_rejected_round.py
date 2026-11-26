@@ -92,7 +92,9 @@ t.check = check
 xf.check = check
 
 
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 _REBASELINE = ("import importlib.util, sys\nfrom pathlib import Path\n"
                "s = importlib.util.spec_from_file_location('ratchet_fixture', sys.argv[1])\n"
                "m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"

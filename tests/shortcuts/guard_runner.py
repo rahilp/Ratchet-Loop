@@ -2,7 +2,7 @@
 """Runner for tests/shortcuts/guard.json: asks one version of Ratchet's guard about one command.
 
 Reads RATCHET_SHORTCUT_ROOT (the version's folder) and RATCHET_SHORTCUT_COMMAND (the row's command, never run).
-Loads that version's skills/ratchet-orchestrator/scripts/ratchet.py, builds a throwaway project with an active run
+Loads that version's skills/ratchet-orchestrator/scripts/ratchet_engine.py, builds a throwaway project with an active run
 `hk` and a second run `other`, calls _guard_shell(cmd, cwd) there, prints ALLOWED or REFUSED and exits 0. Any
 problem is a plain message on stderr and a non-zero exit with nothing printed on stdout. It never changes the guard
 and never writes into the project.
@@ -16,7 +16,7 @@ import shutil
 import sys
 import tempfile
 
-ENGINE_REL = "skills/ratchet-orchestrator/scripts/ratchet.py"
+ENGINE_REL = "skills/ratchet-orchestrator/scripts/ratchet_engine.py"
 
 
 def fail(msg):

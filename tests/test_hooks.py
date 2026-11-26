@@ -19,12 +19,14 @@ import sys
 import _tmp
 from pathlib import Path
 
-ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 PASS, FAIL = 0, 0
 
 
 def sh(*args, cwd, stdin=None, env=None):
-    return subprocess.run([sys.executable, str(ENGINE), *args], cwd=cwd, input=stdin, capture_output=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=cwd, input=stdin, capture_output=True,
                           text=True, env=env or os.environ)
 
 

@@ -37,7 +37,9 @@ import _tmp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 README = README_DOCS
 INVENTORY = ROOT / "tests" / "fixtures" / "modularize_cp1" / "test-inventory.md"
 THIS_FILE = Path(__file__).resolve()
@@ -74,7 +76,7 @@ class Proj:
         self.state = str(path / ".ratchet/runs/hk/state.json")
 
     def sh(self, *args, stdin=None):
-        return subprocess.run([sys.executable, str(ENGINE), *args], cwd=self.path, input=stdin, capture_output=True,
+        return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=self.path, input=stdin, capture_output=True,
                               text=True, env=child_env(self.home))
 
     def hook(self, event, host, payload):

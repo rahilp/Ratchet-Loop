@@ -37,6 +37,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import trust_helpers as th  # noqa: E402
 
+LAUNCHER = th.LAUNCHER
 ENGINE = th.ENGINE
 PASS = FAIL = 0
 CASE_STATUS: dict[str, bool] = {}
@@ -149,7 +150,7 @@ def setup_lane(w, name, kind):
 
 
 def integrate(w, lane):
-    return subprocess.run([sys.executable, str(ENGINE), "--root", str(w.main), "integrate", lane], cwd=w.main,
+    return subprocess.run([sys.executable, str(LAUNCHER), "--root", str(w.main), "integrate", lane], cwd=w.main,
                           capture_output=True, text=True, env=w.denv, timeout=150)
 
 

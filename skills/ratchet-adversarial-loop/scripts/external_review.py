@@ -78,7 +78,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PLUGIN_ROOT = HERE.parents[2]
-ENGINE = PLUGIN_ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+ENGINE = PLUGIN_ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet_engine.py"
 AGENT_DIRS = [PLUGIN_ROOT / "agents", Path.home() / ".claude" / "agents"]
 
 # Presets (how to run each known agent CLI) live in ratchet.py (PRESETS), next to the provider registry.

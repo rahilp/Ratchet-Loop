@@ -33,7 +33,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 SCRUB = ("RATCHET_ROLE", "RATCHET_HUMAN_OVERRIDE", "RATCHET_ROOT", "RATCHET_HOST_PROVIDER", "CLAUDECODE",
          "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED",
          "GEMINI_CLI", "COPILOT_CLI", "GITHUB_COPILOT_CLI", "CODEX_HOME", "COPILOT_HOME", "RATCHET_HOOKS_WAIVE")
@@ -118,7 +120,7 @@ def rx(d, *args, env=None, popen=subprocess.Popen, monotonic=time.monotonic):
     # seams (defaulting to the real subprocess.Popen/time.monotonic, untouched at every real call site) a
     # test may inject to make the call fully deterministic, reusing tests/test_install.py's CP1-T06/T07
     # pattern.
-    return run_all.run_with_stretched_timeout([sys.executable, str(ENGINE), *args], 120.0, cwd=d,
+    return run_all.run_with_stretched_timeout([sys.executable, str(LAUNCHER), *args], 120.0, cwd=d,
                                                env=env or ENV, popen=popen, monotonic=monotonic)
 
 
@@ -131,7 +133,7 @@ def say(d, text, session="s-owner"):
     with tp.open("a") as f:
         f.write(json.dumps({"type": "user", "message": {"role": "user", "content": text},
                             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
-    return subprocess.run([sys.executable, str(ENGINE), "hook", "prompt", "--host", "claude"], cwd=d, text=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), "hook", "prompt", "--host", "claude"], cwd=d, text=True,
                           capture_output=True, env=ENV,
                           input=json.dumps({"cwd": str(d), "prompt": text, "session_id": session,
                                             "transcript_path": str(tp)}))

@@ -115,10 +115,12 @@ def _ratchet_module():
     two flags instead read bind_host()'s bound reference to the actual executing module's own globals -- see
     below."""
     mod = sys.modules.get("ratchet")
-    if mod is not None:
+    # After the Lane S split, a bare `import ratchet` binds the tiny launcher. Ignore that shell and
+    # cold-load ratchet_engine.py so siblings never call into a module that only exposes main().
+    if mod is not None and Path(getattr(mod, "__file__", "") or "").name != "ratchet.py":
         return mod
     import importlib.util as _ilu
-    path = Path(__file__).resolve().with_name("ratchet.py")
+    path = Path(__file__).resolve().with_name("ratchet_engine.py")
     spec = _ilu.spec_from_file_location("ratchet", path)
     mod = _ilu.module_from_spec(spec)
     sys.modules["ratchet"] = mod

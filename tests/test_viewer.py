@@ -14,7 +14,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-ENGINE = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 TEMPLATE = ENGINE.parent.parent / "assets" / "viewer.html"
 PHASES = ["planning", "awaiting_plan_approval", "building", "awaiting_checkpoint_review", "awaiting_final_review",
           "planning_feedback", "blocked", "paused", "done", "cancelled"]
@@ -32,7 +34,7 @@ os.environ.update(HOME=str(_HOME), CODEX_HOME=str(_HOME / "codexhome"), COPILOT_
 
 
 def sh(*args, cwd):
-    return subprocess.run([sys.executable, str(ENGINE), *args], cwd=cwd, capture_output=True, text=True)
+    return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=cwd, capture_output=True, text=True)
 
 
 def get(url):
@@ -77,7 +79,7 @@ def say(d, text, transcripts):
     with tp.open("a") as f:
         f.write(json.dumps({"type": "user", "message": {"role": "user", "content": text},
                             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
-    return subprocess.run([sys.executable, str(ENGINE), "hook", "prompt", "--host", "claude"], cwd=d, text=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), "hook", "prompt", "--host", "claude"], cwd=d, text=True,
                           capture_output=True, input=json.dumps({"cwd": str(d), "prompt": text, "session_id": "s-owner",
                                                                  "transcript_path": str(tp)}))
 
@@ -195,18 +197,18 @@ def slow_start_checks():
                               "def _slow(*a, **k):\n    time.sleep(8)\n    return _real(*a, **k)\n"
                               "socket.getfqdn = _slow\n")
     try:
-        r = subprocess.run([sys.executable, str(ENGINE), "view", "--serve"], cwd=c, capture_output=True, text=True,
+        r = subprocess.run([sys.executable, str(LAUNCHER), "view", "--serve"], cwd=c, capture_output=True, text=True,
                            env=slow_dns)
         check("the viewer starts even when reverse DNS is slow", r.returncode == 0 and
               (c / ".ratchet/viewer.json").exists(), r.stdout + r.stderr)
-        r = subprocess.run([sys.executable, str(ENGINE), "lanes", "--serve", "--scan", str(base)], cwd=base,
+        r = subprocess.run([sys.executable, str(LAUNCHER), "lanes", "--serve", "--scan", str(base)], cwd=base,
                            capture_output=True, text=True, env=slow_dns)
         check("the lanes dashboard starts even when reverse DNS is slow", r.returncode == 0 and
               (base / ".ratchet-lanes.json").exists(), r.stdout + r.stderr)
         # A server that never comes up must not be left running in the background after the start gives up.
         hang = patched_python("import socketserver, time\n"
                               "socketserver.TCPServer.server_bind = lambda self: time.sleep(60)\n")
-        r = subprocess.run([sys.executable, str(ENGINE), "view", "--serve"], cwd=d, capture_output=True, text=True,
+        r = subprocess.run([sys.executable, str(LAUNCHER), "view", "--serve"], cwd=d, capture_output=True, text=True,
                            env=hang)
         check("a server that never starts is reported", r.returncode != 0 and "did not start" in r.stdout + r.stderr,
               r.stdout + r.stderr)

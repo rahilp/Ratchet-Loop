@@ -30,7 +30,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-ENGINE = ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet.py"
+SCRIPTS = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
+LAUNCHER = SCRIPTS / "ratchet.py"
+ENGINE = SCRIPTS / "ratchet_engine.py"
 sys.path.insert(0, str(HERE))
 import _tmp                     # noqa: E402
 import test_gates as g          # noqa: E402  (project, rx, ENV, approve_plan, say)
@@ -128,7 +130,7 @@ def fake_bin(include_opencode=False, include_pi=False, include_crush=False):
     optionally a fake `opencode` / `pi` / `crush`. Returns a dict of paths this case's env needs. Never a
     real agent CLI."""
     b = Path(_tmp.mkdtemp(prefix="ratchet-fakebin-omp-"))
-    for n in ("python3", "git", "node", "sh", "env", "cat", "dirname", "basename"):
+    for n in ("python3", "git", "node", "sh", "bash", "env", "cat", "dirname", "basename"):
         p = shutil.which(n)
         if p:
             (b / n).symlink_to(p)

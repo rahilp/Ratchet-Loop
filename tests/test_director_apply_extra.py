@@ -103,7 +103,7 @@ def cp5_x01_apply_waits_for_a_held_lock_deterministically():
     env["RATCHET_TEST_LOCKWAIT_MARK"] = str(mark)
     held = "12345 held-by-test"
     lock.write_text(held)
-    proc = subprocess.Popen([sys.executable, str(g.ENGINE), "--root", str(d), *args], cwd=df, env=env,
+    proc = subprocess.Popen([sys.executable, str(g.LAUNCHER), "--root", str(d), *args], cwd=df, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         deadline = time.monotonic() + 60

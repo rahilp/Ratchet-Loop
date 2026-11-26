@@ -43,6 +43,7 @@ sys.path.insert(0, str(HERE))
 import _tmp                     # noqa: E402
 import test_gates as g          # noqa: E402
 
+LAUNCHER = g.LAUNCHER
 ENGINE = g.ENGINE
 RUN_ALL = HERE / "run_all.py"
 ENV = dict(g.ENV, RATCHET_FAKE_LOADAVG="0")
@@ -214,7 +215,7 @@ def _out(r):
 
 
 def rx(d, *args, env=None):
-    return subprocess.run([sys.executable, str(ENGINE), *args], cwd=d, capture_output=True, text=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=d, capture_output=True, text=True,
                           env=env or ENV)
 
 

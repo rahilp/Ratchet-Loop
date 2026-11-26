@@ -46,7 +46,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import _tmp  # noqa: E402
-from trust_helpers import ENGINE, cp5v_until, cp5y_load_engine, engine_env, make_env  # noqa: E402
+from trust_helpers import ENGINE, LAUNCHER, cp5v_until, cp5y_load_engine, engine_env, make_env  # noqa: E402
 
 SCRIPT_DIR = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
 RECORDS = SCRIPT_DIR / "records.py"
@@ -127,7 +127,7 @@ def rx(cwd, *args, env=None):
     base = {k: v for k, v in os.environ.items() if k != "RATCHET_ROOT"}
     if env:
         base.update(env)
-    return subprocess.run([sys.executable, str(ENGINE), *args], cwd=str(cwd), capture_output=True, text=True,
+    return subprocess.run([sys.executable, str(LAUNCHER), *args], cwd=str(cwd), capture_output=True, text=True,
                           env=base, timeout=60)
 
 
@@ -349,7 +349,7 @@ def t05_help_byte_identical():
         except OSError as ex:
             check(f"[CP4-05] baseline file for `{' '.join(cmd)}` is readable", False, str(ex))
             continue
-        r = subprocess.run([sys.executable, str(ENGINE), *cmd], cwd=str(ROOT), capture_output=True, text=True,
+        r = subprocess.run([sys.executable, str(LAUNCHER), *cmd], cwd=str(ROOT), capture_output=True, text=True,
                            timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1",
                                                  PYTHON_COLORS="0"))
         check(f"[CP4-05] `ratchet.py {' '.join(cmd)}` exits {e.get('exit_code')}, same as CP1's baseline",
@@ -374,14 +374,17 @@ def t06_status_json_byte_identical():
     except (OSError, json.JSONDecodeError) as ex:
         check("[CP4-06] the saved status --json baseline parses as JSON", False, str(ex))
         return
-    r = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(ROOT), capture_output=True,
+    r = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(ROOT), capture_output=True,
                        text=True, timeout=30)
     try:
         live_status = json.loads(r.stdout) if r.returncode == 0 else None
     except json.JSONDecodeError:
         live_status = None
-    check("[CP4-06] a live `status --json` invocation right now succeeds", live_status is not None,
-          (r.returncode, r.stdout[-300:]))
+    if live_status is None and "No active Ratchet run" in ((r.stderr or "") + (r.stdout or "")):
+        check("[CP4-06] no active run in this checkout; live status --json schema check skipped", True)
+    else:
+        check("[CP4-06] a live `status --json` invocation right now succeeds", live_status is not None,
+              (r.returncode, r.stdout[-300:]))
     if live_status is not None:
         # CP2 of the schedule-awareness lane: `status --json` gained the one top-level key `schedule`; it is the
         # only key ignored on the live side (the baseline file is unchanged), every other key must still match.
@@ -404,7 +407,7 @@ def t06_status_json_byte_identical():
         check("[CP4-06] setup: the pre-move pinned ratchet.py source is readable via git show", False, str(e))
         return
     d = Path(_tmp.mkdtemp(prefix="cp4-t06-status-"))
-    r_init = subprocess.run([sys.executable, str(ENGINE), "init", "status parity cap", "--slug", "st"],
+    r_init = subprocess.run([sys.executable, str(LAUNCHER), "init", "status parity cap", "--slug", "st"],
                             cwd=str(d), capture_output=True, text=True, timeout=30)
     check("[CP4-06] setup: a fresh throwaway project's `init` succeeds", r_init.returncode == 0,
           (r_init.returncode, r_init.stderr))
@@ -420,7 +423,7 @@ def t06_status_json_byte_identical():
         pinned_script.unlink(missing_ok=True)
     check("[CP4-06] setup: the pre-move pinned ratchet.py's `status --json` exits 0 on the fresh fixture",
           r_before.returncode == 0, (r_before.returncode, r_before.stdout[-300:], r_before.stderr[-300:]))
-    r_after = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(d), capture_output=True,
+    r_after = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(d), capture_output=True,
                              text=True, timeout=30)
     check("[CP4-06] the current ratchet.py's `status --json` exits 0 on the same fresh fixture",
           r_after.returncode == 0, (r_after.returncode, r_after.stdout[-300:], r_after.stderr[-300:]))
@@ -435,7 +438,7 @@ def t06_status_json_byte_identical():
 def t07_hook_reply_byte_identical():
     print("CP4-07: a sample hook reply is byte-identical to CP1's baseline")
     d = Path(_tmp.mkdtemp(prefix="cp4-t07-hook-"))
-    r = subprocess.run([sys.executable, str(ENGINE), "init", "hook cap", "--slug", "hk"], cwd=str(d),
+    r = subprocess.run([sys.executable, str(LAUNCHER), "init", "hook cap", "--slug", "hk"], cwd=str(d),
                        capture_output=True, text=True, timeout=30)
     check("[CP4-07] setup: a fresh throwaway project's `init` succeeds", r.returncode == 0, (r.returncode, r.stderr))
     if r.returncode != 0:
@@ -443,7 +446,7 @@ def t07_hook_reply_byte_identical():
     state = str(d / ".ratchet" / "runs" / "hk" / "state.json")
     payload = {"sessionId": "s", "timestamp": 1, "cwd": str(d), "toolName": "edit",
                "toolArgs": json.dumps({"path": state, "old_str": "a", "new_str": "b"})}
-    rg = subprocess.run([sys.executable, str(ENGINE), "hook", "guard", "--host", "copilot"], cwd=str(d),
+    rg = subprocess.run([sys.executable, str(LAUNCHER), "hook", "guard", "--host", "copilot"], cwd=str(d),
                         capture_output=True, text=True, timeout=30, input=json.dumps(payload))
     try:
         reply = json.loads(rg.stdout)
@@ -506,13 +509,13 @@ def t08_failure_exit_codes_unchanged():
             check(f"[CP4-08] baseline file for failure `{' '.join(cmd)}` is readable", False, str(ex))
             continue
         if cmd and cmd[0] == "no-such-command":
-            rf = subprocess.run([sys.executable, str(ENGINE), *cmd], cwd=str(ROOT), capture_output=True,
+            rf = subprocess.run([sys.executable, str(LAUNCHER), *cmd], cwd=str(ROOT), capture_output=True,
                                 text=True, timeout=30, env=dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1",
                                                                  PYTHON_COLORS="0"))
             got = rf.stderr
         else:  # "status --json (run from a directory with no .ratchet/ at all)"
             empty_dir = Path(_tmp.mkdtemp(prefix="cp4-t08-empty-"))
-            rf = subprocess.run([sys.executable, str(ENGINE), "status", "--json"], cwd=str(empty_dir),
+            rf = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(empty_dir),
                                 capture_output=True, text=True, timeout=30)
             got = rf.stderr
         check(f"[CP4-08] failure case `{' '.join(cmd)}` exits {e.get('exit_code')}, same as CP1's baseline",
