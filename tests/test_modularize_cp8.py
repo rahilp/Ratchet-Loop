@@ -665,7 +665,7 @@ def t10_waiting_question_byte_identical():
     # chat reply never counts there), so there is never a pending question of THOSE two kinds to compare; but
     # `ask accept-line` is not refused (only its ANSWER needs a director token, never a chat reply), so it is
     # the one real way to get a waiting "director's answer" question_line to compare here.
-    d_dir, env, denv = fin._director_fin2("cp8t10dir", failed=True)
+    d_dir, env, denv, *_rest = fin._director_fin2("cp8t10dir", failed=True)
     rx_dir = subprocess.run([sys.executable, str(LAUNCHER), "ask", "accept-line", "2"], cwd=str(d_dir),
                            capture_output=True, text=True, env=env, timeout=30)
     check("[CP8-T10] setup: `ask accept-line 2` succeeds on the director-enrolled lane", rx_dir.returncode == 0,

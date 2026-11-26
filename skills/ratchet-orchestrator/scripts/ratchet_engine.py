@@ -5507,10 +5507,13 @@ def _request_records(main: Path):
 
 
 def _layout_director_home(here: Path) -> bool:
-    """True when `here` is recorded as director_root for a request in this (or its) git project."""
+    """True when `here` (or its Ratchet project root) is recorded as director_root for a request."""
     here = here.resolve()
-    roots = []
     own = _ratchet_root_of(here)
+    check_paths = {here}
+    if own is not None:
+        check_paths.add(own.resolve())
+    roots = []
     if own is not None:
         roots.append(own.resolve())
     try:
@@ -5526,9 +5529,10 @@ def _layout_director_home(here: Path) -> bool:
         seen.add(root)
         for _p, data in _request_records(root):
             dr = data.get("director_root")
-            if isinstance(dr, str) and dr and Path(dr).resolve() == here:
-                return True
-            if isinstance(dr, str) and dr and Path(dr).resolve() == root and here == root:
+            if not isinstance(dr, str) or not dr:
+                continue
+            drp = Path(dr).resolve()
+            if drp in check_paths or (drp == root and own is not None and own.resolve() == root):
                 return True
     return False
 
@@ -5600,6 +5604,26 @@ def _director_session_check(what: str):
                 "--root <lane>. Nothing was changed."), None
     if _layout_director_home(here):
         return None, None
+    # If this project has request layout at all and cwd's ratchet root is neither director nor recognized builder,
+    # still refuse ROLE override when the ratchet root is an enrolled lane path listed in any request.
+    own = _ratchet_root_of(here)
+    if own is not None:
+        for _p, data in _request_records(own.resolve()):
+            # standing in a tree that has requests but is not director_root: only allow if ROLE+hooks legacy
+            break
+        else:
+            # also scan parent sibling mains for requests listing own as worktree
+            parent = own.parent
+            if parent.is_dir():
+                for sib in parent.iterdir():
+                    if (sib / RATCHET_DIR / "requests").is_dir():
+                        for _p, data in _request_records(sib.resolve()):
+                            dr = data.get("director_root")
+                            for lane in data.get("lanes") or []:
+                                if isinstance(lane, dict) and Path(str(lane.get("worktree") or "")).resolve() == own.resolve():
+                                    if not (isinstance(dr, str) and Path(dr).resolve() in {here.resolve(), own.resolve()}):
+                                        return (f"{what} refused: this checkout is a director-enrolled lane (builder). "
+                                                "Run director commands from the director home checkout. Nothing was changed."), None
     if not _is_director_session():
 
         return f"{what} must be run from the director's session (RATCHET_ROLE=director).", None
@@ -6028,6 +6052,12 @@ def _require_human(ctx, st, action="human-approve", token=None):
     return {"prompt": a["detail"], "by": a["by"], "session": a.get("session")}
 
 
+def _director_token_first(ctx, st, action, token, mode=None):
+    """Lane D: if a paste token was passed on an enrolled lane, refuse it before pending/ask checks."""
+    if token and approval_mode(ctx) == "director" and not _DIRECTOR_APPLYING:
+        _require_approval(ctx, st, action, token)  # dies: tokens no longer accepted
+
+
 def cmd_director_key(args):
     require_director_session("director-key")
     p = director_key_path()
@@ -6168,9 +6198,19 @@ def _lanes_start_run(args, main: Path):
         x["own"] = list(own_map.get(x["name"], []))
         x["depends_on"] = list(dep_map.get(x["name"], []))
     # Parallel readiness: start_ok when deps empty/satisfied among started set and ownership disjoint from others starting
+    def _norm_own(p):
+        p = str(p).strip().replace("\\", "/")
+        if not p or p.startswith("/") or ".." in Path(p).parts:
+            return None
+        n = str(Path(p))
+        return "." if n in (".", "") else n
     def _paths_overlap(a, b):
-        for p in a:
-            for q in b:
+        aa = [x for x in (_norm_own(p) for p in a) if x]
+        bb = [x for x in (_norm_own(p) for p in b) if x]
+        if any(x == "." for x in aa + bb):
+            return True
+        for p in aa:
+            for q in bb:
                 if p == q or p.startswith(q.rstrip("/") + "/") or q.startswith(p.rstrip("/") + "/"):
                     return True
         return False
@@ -6324,7 +6364,8 @@ def _lanes_start_run(args, main: Path):
              "(set one with `ratchet.py config --set agents.orchestrator=<model>`)."
              if template and not model and any("{model}" in w for w in template) else "")
     if args.json:
-        print(json.dumps(dict({"request": name, "lanes": out}, **({"note": empty} if empty else {})), indent=2))
+        print(json.dumps(dict({"request": name, "director_root": str(main.resolve()), "lanes": out},
+                                  **({"note": empty} if empty else {})), indent=2))
         return
     ok(f"Request '{name}' recorded: {len(out)} lane(s) ready. Lanes are enrolled with no run; each lane's agent runs "
        "init itself.")
@@ -8081,6 +8122,7 @@ def cmd_director_sign(args):
             director_token=None, director_apply=True, cp=target, reason=reason,
             letter=(target.upper() if target else None), policy_rule=rule, policy_checked=True,
             kind=kind, mode=target or None, ids=",".join(ids) if ids else None,
+            text=reason or None, learning=None, source=None,
         )
         if args.action == "guardrail":
             die("director-sign guardrail --apply is not used: from the director home, run "
@@ -10189,8 +10231,10 @@ def cmd_ui_respec(args):
     if not g.get("frozen"):
         ok(f"{args.cp}'s UI check isn't frozen; the spec can change freely until it finds a difference.")
         return
+    tok = getattr(args, "director_token", None)
+    _director_token_first(ctx, st, "ui-respec", tok)
     _require_pending(st, "ui-respec", args.cp)
-    msg = _require_human(ctx, st, "ui-respec", getattr(args, "director_token", None))
+    msg = _require_human(ctx, st, "ui-respec", tok)
     g.pop("frozen", None)
     _clear_pending(st)
     ctx.log(st, "ui_respec_approved", cp=args.cp, by=msg["by"], note=msg.get("prompt", "")[:200])
@@ -10576,6 +10620,8 @@ def cmd_adv_record(args):
         origin = check_review_origin(ctx, cfg, st, args.cp, rnd["round"], rp, rpath, r, rid, rnd["nonce"])
         r = clean_review_text(r)  # its signature is checked: from here on it only feeds records and messages
         age = fst.st_mtime - _iso(rnd["opened_at"])
+        if age < 0:
+            age = 0.0  # filesystem/clock skew: treat simultaneous writes as age 0
         if age < min_seconds:
             die(f"{rp} ({rid}) was written {age:.0f}s after the round opened — too fast to be a real review. "
                 "Launch the reviewer and let it do the work.")
@@ -14840,7 +14886,7 @@ def _ask_paid_provider(ctx, st, args):
 def cmd_choice(args):
     """Record which lettered option the user picked, from their first reply after `ask choice`. In a
     director-enrolled lane a chat reply picks nothing (the same rule as every other approval there): the letter
-    comes from `choice <L> --director-token <t>`, where the token was signed for exactly that letter
+    comes from `director-sign choice <L> --apply` for exactly that letter
     (`director-sign choice <L>`, after the lane's own `ask choice`); it is recorded exactly as a user's pick,
     including what the option unlocks."""
     ctx = Ctx(find_root())
@@ -14906,7 +14952,7 @@ def cmd_choice(args):
                 "--test-command \"...\" --test-file <path>`.")
     if unblock:
         msg += (" The run is blocked: run `ratchet.py human-approve`"
-                + (" with a director token (`director-sign human-approve`)" if by == "director" else "")
+                + (" with `director-sign human-approve --apply`" if by == "director" else "")
                 + " to resume it, then act on the choice.")
     ok(msg)
 
@@ -14927,13 +14973,11 @@ def _require_pending(st, action, mode=None, ctx=None):
         if ctx is not None and action in DIRECTOR_APPLY_ACTIONS and approval_mode(ctx) == "director":
             if action == "choice":
                 die("No lettered question is waiting, and in this director-enrolled lane a chat reply picks nothing. "
-                    "Run `ratchet.py ask choice --options ...` to register the options, then the director picks one "
-                    f"with `{_director_apply_cmd(ctx, 'choice')}` (or signs it with `director-sign choice <letter>` "
-                    "and you apply the token with `ratchet.py choice <letter> --director-token <t>`). Nothing was changed.")
+                    "Run `ratchet.py ask choice --options ...` to register the options, then the director harness "
+                    f"picks one with `{_director_apply_cmd(ctx, 'choice')}`. Nothing was changed.")
             die("This lane is director-enrolled, so there is no question to put in chat for this: the director "
-                f"approves it in one step with `{_director_apply_cmd(ctx, action, mode)}` (or signs it after this "
-                f"lane's `ask` with `director-sign {action}`, and you apply the token with `ratchet.py {action}"
-                f"{' ' + mode if mode else ''} --director-token <t>`). Nothing was changed; end your turn saying "
+                f"harness approves it with `{_director_apply_cmd(ctx, action, mode)}`. "
+                "Pasteable director tokens are no longer accepted. Nothing was changed; end your turn saying "
                 "what you are waiting for.")
         die(f"First run {_ask_now(ctx, st, action) if ctx and not mode else _ask_cmd(action, mode)}, show the user the question it prints, "
             "and wait for their reply. Replies from before the question don't count.")
@@ -14954,8 +14998,10 @@ def cmd_cancel(args):
     if st["phase"] in ("done", "cancelled"):
         ok(f"Run '{st['slug']}' is already {st['phase']}.")
         return
+    tok = getattr(args, "director_token", None)
+    _director_token_first(ctx, st, "cancel", tok)
     _require_pending(st, "cancel")
-    msg = _require_human(ctx, st, "cancel", getattr(args, "director_token", None))
+    msg = _require_human(ctx, st, "cancel", tok)
     st.pop("pending", None)
     st["cancelled_from"] = st["phase"]
     st["phase"] = "cancelled"
@@ -14975,8 +15021,10 @@ def cmd_set_review(args):
     """Change how often the user reviews (end | each | none) — the user's call, so it needs their confirmation."""
     ctx = Ctx(find_root())
     st = ctx.state()
+    tok = getattr(args, "director_token", None)
+    _director_token_first(ctx, st, "set-review", tok)
     _require_pending(st, "set-review", args.mode)
-    msg = _require_human(ctx, st, "set-review", getattr(args, "director_token", None))
+    msg = _require_human(ctx, st, "set-review", tok)
     old = st.get("human_review")
     st["human_review"] = args.mode
     if st.get("approved"):
@@ -15017,8 +15065,10 @@ def cmd_approve_changes(args):
             die(f"The user's pick of option {allow['letter']} approved changing {', '.join(allow['files'])}, but these "
                 f"changed too: {'; '.join(extra)}. Undo them, or show the user exactly what changed and ask "
                 "(`ratchet.py ask approve-changes`).")
+        tok = getattr(args, "director_token", None)
+        _director_token_first(ctx, st, "approve-changes", tok)
         _require_pending(st, "approve-changes", ctx=ctx)
-        msg = _require_human(ctx, st, "approve-changes", getattr(args, "director_token", None))
+        msg = _require_human(ctx, st, "approve-changes", tok)
         if msg["by"] == "director":
             _policy_apply(args, ctx, st, "approve-changes", "")
     plan = ctx.plan()
@@ -17497,7 +17547,7 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                        "waiting on the director: this lane is director-enrolled, so a letter typed "
                                        "in chat picks nothing. Do not run `choice` on it. The director signs a "
                                        f"letter with `director-sign choice <letter>`; apply it with `{eng} choice "
-                                       "<letter> --director-token <t>`.")
+                                       "<letter> director-sign … --apply`.")
                     return False, (f"[ratchet] This reply answers your lettered question ({', '.join(p.get('options') or [])}). "
                                    + (f"It reads as option {letter}. " if letter else "It is NOT a clear pick of one option. ")
                                    + f"Run `{eng} choice` to record it, then continue. It does NOT approve the plan or a "
@@ -19377,7 +19427,15 @@ def _merge_rule(cmd: str, cwd: str, root: Path) -> tuple[str, str | None]:
 
 def decide_guard(n: dict) -> tuple[bool, str]:
     cmd, cwd = n["command"], n["cwd"]
-    if not _is_director_session():
+    here = Path(cwd).resolve() if cwd else Path.cwd()
+    # Lane D: layout beats RATCHET_ROLE. Builder worktrees never look like the director to the guard.
+    if _layout_is_builder(here):
+        director_here = False
+    elif _layout_director_home(here):
+        director_here = True
+    else:
+        director_here = _is_director_session()
+    if not director_here:
         if n["kind"] == "shell" and cmd:
             why = _reserved_env_problem(cmd)
             if why:

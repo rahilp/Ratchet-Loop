@@ -619,6 +619,7 @@ def _blocked_round_unconfirmed(name):
     hook has already touched."""
     env = th.make_env("codex")
     d = th.cp3_project(env)
+    th.rx(d, env, "config", "--set", "min_review_seconds=0")
     th.cp3_pass_behavior(d, env)
     rnd = th.cp3_open_round(d, env)
     rid = th.cp3_R0(rnd)
