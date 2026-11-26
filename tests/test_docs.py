@@ -2034,7 +2034,15 @@ def stdlib_only(path):
 def tree_snapshot(d):
     """(path, mtime, size) of every file under d. Only ever pointed at a private temp copy, never the live .ratchet/."""
     d = Path(d)
-    return sorted((str(f.relative_to(d)), f.stat().st_mtime_ns, f.stat().st_size) for f in d.rglob("*") if f.is_file())
+    out = []
+    for f in d.rglob("*"):
+        if not f.is_file():
+            continue
+        # Nested suite runs can leave interpreter litter even when the copy ignored __pycache__ at clone time.
+        if "__pycache__" in f.parts or f.suffix in {".pyc", ".pyo"}:
+            continue
+        out.append((str(f.relative_to(d)), f.stat().st_mtime_ns, f.stat().st_size))
+    return sorted(out)
 
 
 def private_repo_copy(dest):
@@ -2297,7 +2305,7 @@ def cp5_docs_lint():
         check("[CP5-T20] standalone run (nested run: skipped to avoid recursion)", True)
         return
     me = Path(__file__).resolve()
-    env = dict(os.environ, RATCHET_DOCS_NESTED="1")
+    env = dict(os.environ, RATCHET_DOCS_NESTED="1", PYTHONDONTWRITEBYTECODE="1")
     with _tmp.mkdtemp() as tmp:
         copy = private_repo_copy(Path(tmp) / "repo")
         before = tree_snapshot(copy)
