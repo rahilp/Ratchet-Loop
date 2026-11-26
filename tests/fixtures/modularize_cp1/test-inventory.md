@@ -1,4 +1,9 @@
-# CP1 evidence: test files that inspect ratchet.py's on-disk source or load it as a module
+# CP1 evidence: test files that inspect the engine's on-disk source or load it as a module
+
+> Lane S: implementation lives in `ratchet_engine.py`. The tiny `ratchet.py` launcher is not the
+> Kind 1/2/3 engine under scan; loaders and AST/source readers should target `ratchet_engine.py`.
+> Prose below may still say "ratchet.py" historically; treat those as the engine body unless they
+> explicitly mean the CLI entry path.
 
 Re-derived live, not a hand-picked list. This file lists what the live grep below found, by name,
 but deliberately carries no frozen "raw output" snapshot of grep's own stdout: a frozen snapshot
