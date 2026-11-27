@@ -212,7 +212,7 @@ python3 tests/run_all.py
 
 - [ ] **Step 3: Fix Critical/Important findings; re-run suite; re-review until clean.**
 
-- [ ] **Step 4: Mark design status `approved; implemented`** if not already; push; update PR.
+- [x] **Step 4: Mark design status `approved; implemented`** if not already; push; update PR.
 
 - [ ] **Step 5: Final commit if needed**
 
