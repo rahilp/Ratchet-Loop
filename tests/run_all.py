@@ -180,10 +180,12 @@ def run_with_stretched_timeout(argv, base: float, max_stretch: float = DEFAULT_M
     t0 = monotonic()
     limit = base
     out = err = None
+    can_stretch = float(max_stretch) > 1.0
     while True:
         try:
-            factor, _, _ = stretch_factor(max_stretch)
-            limit = max(limit, base * factor)
+            if can_stretch:
+                factor, _, _ = stretch_factor(max_stretch)
+                limit = max(limit, base * factor)
             remaining = limit - (monotonic() - t0)
         except BaseException:
             kill_tree(proc)
@@ -195,8 +197,10 @@ def run_with_stretched_timeout(argv, base: float, max_stretch: float = DEFAULT_M
             except subprocess.TimeoutExpired:
                 pass
             raise subprocess.TimeoutExpired(argv, limit)
+        # When stretch cannot grow, sleep until the deadline (or process exit) instead of waking every POLL_SECONDS.
+        slice_ = min(POLL_SECONDS, remaining) if can_stretch else remaining
         try:
-            out, err = proc.communicate(timeout=min(POLL_SECONDS, remaining))
+            out, err = proc.communicate(timeout=max(0.0, slice_))
             break
         except subprocess.TimeoutExpired:
             continue
@@ -454,31 +458,37 @@ class Runner:
         return res
 
     def wait(self, proc, res: Result, t0: float) -> None:
-        """Wait for a suite, polling. The deadline is --timeout times the highest stretch factor read while the
-        suite runs, so a load spike while it runs still extends it and a load drop never takes back time already
-        granted; it is never earlier than --timeout. Stops the suite when the deadline passes. The summary line
-        reports the limit in force when the suite ended (the highest reached, or a fresh reading when the suite
-        ended within one poll of passing --timeout); a suite that ran within the plain --timeout gets no line."""
+        """Wait for a suite. The deadline is --timeout times the highest stretch factor read while the suite
+        runs (when stretch can grow: re-read every POLL_SECONDS so a load spike still extends it; a load drop
+        never takes back time already granted). When --max-stretch is 1, load is not re-read on a timer — the
+        wait sleeps until the process exits or the deadline. Stops the suite when the deadline passes. The
+        summary line reports the limit in force when the suite ended (the highest reached, or a fresh reading
+        when the suite ended within one poll of passing --timeout); a suite that ran within the plain --timeout
+        gets no line."""
         peak = None  # the reading that set the highest limit so far: the limit in force never shrinks
         limit = self.timeout
+        can_stretch = float(self.max_stretch) > 1.0
         while True:
-            factor, load, cpus = stretch_factor(self.max_stretch)
-            if self.timeout * factor > limit:
-                limit = self.timeout * factor
-                peak = (factor, load, cpus)
+            if can_stretch:
+                factor, load, cpus = stretch_factor(self.max_stretch)
+                if self.timeout * factor > limit:
+                    limit = self.timeout * factor
+                    peak = (factor, load, cpus)
             elapsed = time.monotonic() - t0
             if elapsed >= limit:
                 res.timed_out = True
                 stop(proc)
                 res.exit_code = proc.returncode
                 break
+            remaining = limit - elapsed
+            slice_ = min(POLL_SECONDS, remaining) if can_stretch else remaining
             try:
-                res.exit_code = proc.wait(timeout=min(POLL_SECONDS, limit - elapsed))
+                res.exit_code = proc.wait(timeout=max(0.0, slice_))
                 break
             except subprocess.TimeoutExpired:
                 continue
         ran_past = res.timed_out or time.monotonic() - t0 >= self.timeout
-        if ran_past and not res.timed_out:
+        if ran_past and not res.timed_out and can_stretch:
             fresh = stretch_factor(self.max_stretch)  # ended within one poll of passing --timeout
             if self.timeout * fresh[0] > limit:
                 limit = self.timeout * fresh[0]
