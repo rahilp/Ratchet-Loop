@@ -214,38 +214,7 @@ git -c user.name="Rahil Pirani" -c user.email="rahil@piranifam.com" commit -m "t
 
 ### Task 5: Phase T2 — `run_all` workers under low load
 
-**Files:**
-- Modify: `tests/run_all.py` (`default_workers`, load cap block ~609–628)
-- Test: `tests/test_runner_load.py` / fixes (worker floor/cap pins)
-
-**Interfaces:**
-- Default remains safe: never raise workers above a documented formula; load still caps downward
-
-- [ ] **Step 1: Choose a conservative default**
-
-Options (pick one in code + test + docs docstring of `run_all`):
-
-- Keep `max(2, cpus // 2)` but allow `--workers` docs to show measured sweet spot; **or**
-- Raise idle default to `max(2, (cpus * 3) // 4)` only when load/cpus ≤ 1.0 at start, else keep half.
-
-Prefer the second only if `test_runner_load*` can pin the idle vs busy behavior with `RATCHET_FAKE_LOADAVG` / `RATCHET_FAKE_CPUS`.
-
-- [ ] **Step 2: Tests + run**
-
-```bash
-python3 tests/test_runner_load.py
-python3 tests/test_runner_load_fixes.py
-python3 tests/test_runner_load_concurrency.py
-```
-
-Expected: PASS.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add tests/run_all.py tests/test_runner_load*.py
-git -c user.name="Rahil Pirani" -c user.email="rahil@piranifam.com" commit -m "perf(run_all): safer higher worker default when machine is idle"
-```
+**Cancelled:** `run_all.py`'s own measured sweet spot is already half the CPUs (6 on 12 cores beat 8 and 12). Raising the idle default would lengthen wall-clock. Left unchanged; docstring already records the measurement.
 
 ---
 
