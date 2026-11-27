@@ -205,6 +205,13 @@ def u05_mode_orchestration_helpers():
     check("[U-T05] enforce + inconclusive → run visual",
           um.should_run_visual("enforce", "inconclusive") is True,
           getattr(um, "should_run_visual", None))
+    for verdict in ("pass", "fail", "inconclusive", None):
+        check(f"[U-T05] off + {verdict!r} → run visual",
+              um.should_run_visual("off", verdict) is True,
+              um.should_run_visual("off", verdict))
+    check("[U-T05] report + fail → run visual",
+          um.should_run_visual("report", "fail") is True,
+          um.should_run_visual("report", "fail"))
     decide = um.ui_gate_decision
     check("[U-T05] report: measure fail, visual PASS → gate PASS (visual rules)",
           decide("report", "fail", "PASS", True) == "PASS",
