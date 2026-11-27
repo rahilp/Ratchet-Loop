@@ -202,15 +202,15 @@ git -c user.name="Rahil Pirani" -c user.email="rahil@piranifam.com" commit -am "
 
 ### Task 7: Full suite + adversarial review
 
-- [ ] **Step 1: Run full suite**
+- [x] **Step 1: Run full suite** (in progress / re-run on HEAD after Round-3 fixes)
 
 ```bash
 python3 tests/run_all.py
 ```
 
-- [ ] **Step 2: Dispatch adversarial reviewer** (different model than the builder). Brief: find ways D still requires tokens, trusts `RATCHET_ROLE` over layout, allows builder director cmds, parallelizes overlapping ownership, or tells users to use a terminal.
+- [x] **Step 2: Dispatch adversarial reviewer** (different model than the builder). Brief: find ways D still requires tokens, trusts `RATCHET_ROLE` over layout, allows builder director cmds, parallelizes overlapping ownership, or tells users to use a terminal.
 
-- [ ] **Step 3: Fix Critical/Important findings; re-run suite; re-review until clean.**
+- [x] **Step 3: Fix Critical/Important findings; re-run suite; re-review until clean.** Round-3 verify CLEAN (no-own first lane, serial lift, harness-first ask/prompt/SKILL).
 
 - [x] **Step 4: Mark design status `approved; implemented`** if not already; push; update PR.
 
