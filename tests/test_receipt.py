@@ -58,6 +58,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import traceback
@@ -239,12 +240,30 @@ def _run_not_finished(name):
     return d
 
 
+def _ensure_codex_stub_on_path():
+    """reviewer_availability reports 'CLI not installed' before any --mark reason when `codex` is missing.
+    Host-fallback cases need a stub on PATH so the recorded mark reason ('out of credits') is what resolve
+    keeps — never shell out (probe_providers=false) and never need a real Codex install.
+    Updates both os.environ and test_gates.ENV (the env every g.rx subprocess inherits; ENV is a snapshot
+    taken at import time, so mutating os.environ alone is not enough)."""
+    if shutil.which("codex", path=g.ENV.get("PATH")):
+        return
+    bindir = Path(_tmp.mkdtemp(prefix="ratchet-codex-stub-"))
+    stub = bindir / "codex"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    new_path = str(bindir) + os.pathsep + os.environ.get("PATH", "")
+    os.environ["PATH"] = new_path
+    g.ENV["PATH"] = new_path
+
+
 def _host_fallback_fresh(name):
     """Normal-risk CP1 whose only round opens fresh with the sole configured outside provider (codex) marked
     unavailable on BOTH lenses before the round ever opens, so `resolve_reviewers`'s own fallback genuinely
     picks host-alt-standards/host-alt-correctness, each with a real recorded reason. `probe_providers=false`
     stops Ratchet from ever shelling out to the real `codex` CLI to test it (codex-standards/codex-correctness
     are marked unavailable before the round opens, so resolve_reviewers never even picks them)."""
+    _ensure_codex_stub_on_path()
     cfg = ["min_review_seconds=0", "probe_providers=false", 'providers=[{"id":"codex","preset":"codex"}]']
     d = g.project(name, extra_cp={"risk": "normal"}, config=cfg)
     g.approve_plan(d)
@@ -265,6 +284,7 @@ def _host_fallback_midround(name):
     host-alt-standards/host-alt-correctness within that same round. `probe_providers=false` stops Ratchet from
     ever shelling out to the real `codex` CLI to test it (round 1 genuinely resolves codex-standards/
     codex-correctness without a probe call; only `reviewer-status --mark` ever touches availability)."""
+    _ensure_codex_stub_on_path()
     cfg = ["min_review_seconds=0", "probe_providers=false", 'providers=[{"id":"codex","preset":"codex"}]']
     d = g.project(name, extra_cp={"risk": "normal"}, config=cfg)
     g.approve_plan(d)
@@ -432,6 +452,7 @@ def _rich_run(name):
     assert mf.returncode == 0, mf.stdout + mf.stderr
     comp = g.rx(d, "complete", "CP1")
     assert comp.returncode == 0, comp.stdout + comp.stderr
+    _ensure_codex_stub_on_path()
     cfg2 = g.rx(d, "config", "--set", "probe_providers=false", 'providers=[{"id":"codex","preset":"codex"}]')
     assert cfg2.returncode == 0, cfg2.stdout + cfg2.stderr
     for rid in ("codex-standards", "codex-correctness"):
@@ -892,6 +913,7 @@ def _pending_round_midswap(name):
     round stays open (pending) the whole time, first fresh then after both reviewers are marked unavailable and
     the SAME round is re-resolved (cmd_reviewers' own same-round branch), so `cps["adv_round"]["reviewers"]`
     stays a plain list of string ids throughout, exactly the shape a receipt asked for mid-round must handle."""
+    _ensure_codex_stub_on_path()
     cfg = ["min_review_seconds=0", "probe_providers=false", 'providers=[{"id":"codex","preset":"codex"}]']
     d = g.project(name, extra_cp={"risk": "normal"}, config=cfg)
     g.approve_plan(d)

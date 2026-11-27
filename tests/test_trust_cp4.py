@@ -853,6 +853,7 @@ def cp4z_slow_hook(d, env, event, payload, pause=2.0):
                          text=True)
     p.stdin.write(json.dumps(payload))
     p.stdin.close()
+    p.stdin = None  # communicate() on 3.12 still flushes a closed stdin file object otherwise
     t0 = time.time()
     while not ready.exists() and p.poll() is None and time.time() - t0 < 15:
         time.sleep(0.02)
