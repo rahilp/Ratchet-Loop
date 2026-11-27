@@ -298,12 +298,20 @@ class _BreakerLock:
 
     def _holds_breaker(self) -> bool:
         """Whether the breaker file in place is still the one this process created (a waiter clearing a stale
-        breaker may have moved it away for a moment). Checked right before removing anything under it."""
+        breaker may have moved it away for a moment). Checked right before removing anything under it.
+        Device+inode alone is not enough: after unlink+create the kernel can reuse the same inode (and the same
+        mtime_ns on a fast clock), so the holder's own token must still be what the file contains."""
         try:
             st = os.lstat(self.breaker)
         except OSError:
             return False
-        return self._breaker_id is not None and (st.st_dev, st.st_ino) == self._breaker_id
+        if self._breaker_id is None or (st.st_dev, st.st_ino) != self._breaker_id:
+            return False
+        try:
+            with open(self.breaker, "r", encoding="utf-8") as f:
+                return f.read() == self.token
+        except OSError:
+            return False
 
     def _drop_breaker(self):
         try:
