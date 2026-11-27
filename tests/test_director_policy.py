@@ -459,12 +459,11 @@ def cp6_t10_plain_token_path_follows_the_policy():
     plain = m.director(df, d, "director-sign", "choice", "A")
     app = ds(df, d, "choice", "A")
     check("[CP6-T10] director-sign choice A (no --apply) is refused, no token printed",
-          plain.returncode != 0 and TOKEN_LINE.search(plain.stdout) is None, out(plain))
-    check("[CP6-T10] the refusal says to ask the developer and names the choice rule",
-          ASK_DEV.search(out(plain)) is not None and re.search(r"choice", out(plain)) is not None
-          and "usage:" not in out(plain), out(plain))
-    check("[CP6-T10] --apply is refused the same way", app.returncode != 0 and ASK_DEV.search(out(app)) is not None,
-          out(app))
+          plain.returncode != 0 and TOKEN_LINE.search(plain.stdout) is None
+          and "needs --apply" in out(plain), out(plain))
+    check("[CP6-T10] --apply without a choice policy rule asks the developer and names choice",
+          app.returncode != 0 and ASK_DEV.search(out(app)) is not None
+          and re.search(r"choice", out(app)) is not None and "usage:" not in out(app), out(app))
     check("[CP6-T10] the lane is unchanged", raw(d) == before and not events(d, "choice_made"), "changed")
 
 
