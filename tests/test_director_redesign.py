@@ -169,6 +169,9 @@ def d06_parallel_own():
     check("[D-T06] absolute / .. ownership paths are refused (not dropped)",
           "absolute ownership" in pr and ("escapes with .." in pr or ".." in pr),
           "_norm_own still drops abs/.. silently")
+    check("[D-T06] no --own keeps the first bare lane start_ok (serialized)",
+          "serialized after" in pr and "first_bare" in pr,
+          "no --own still marks every lane start_ok false")
 
 
 def d07_overlap():

@@ -6233,7 +6233,7 @@ def _lanes_start_run(args, main: Path):
         if x.get("_own_bad"):
             reasons.append(x["_own_bad"])
         if multi and not x["own"]:
-            reasons.append("no --own paths; serialized (not parallel)")
+            reasons.append("no --own paths (serialized, not parallel)")
         if any(d not in names for d in x["depends_on"]):
             reasons.append("depends on unknown lane")
         if x["depends_on"]:
@@ -6266,6 +6266,26 @@ def _lanes_start_run(args, main: Path):
                     f"ownership overlaps lane '{x['name']}' (serialized after it)")
             else:
                 y["start_ok"] = False
+    # No --own serialization: keep the earliest bare lane start_ok; later bare lanes wait on it.
+    # Reasons must not contain "; " (that is the join delimiter for start_wait).
+    first_bare = None
+    bare_reason = "no --own paths (serialized, not parallel)"
+    for x in lanes:
+        if x.get("_own_bad") or x["own"]:
+            continue
+        wait = x.get("start_wait") or ""
+        if bare_reason not in wait.split("; "):
+            continue
+        if first_bare is None:
+            first_bare = x["name"]
+            parts = [p for p in wait.split("; ") if p and p != bare_reason]
+            x["start_wait"] = "; ".join(parts) if parts else None
+            x["start_ok"] = x["start_wait"] is None
+        else:
+            parts = [p for p in wait.split("; ") if p and p != bare_reason]
+            parts.append(f"no --own paths (serialized after '{first_bare}')")
+            x["start_wait"] = "; ".join(dict.fromkeys(parts))
+            x["start_ok"] = False
     for x in lanes:
         x.pop("_own_norm", None)
         x.pop("_own_bad", None)
@@ -8188,8 +8208,8 @@ def cmd_approve_plan(args):
     st = ctx.state()
     if st["phase"] != "awaiting_plan_approval":
         die(f"Nothing to approve (phase {st['phase']})"
-            + (". This lane is enrolled with the director, so its plan is approved only with a director token, "
-               "never by a chat reply." if approval_mode(ctx) == "director" else ""))
+            + (". This lane is enrolled with the director, so its plan is approved only with "
+               "`director-sign approve-plan --apply`, never by a chat reply." if approval_mode(ctx) == "director" else ""))
     plan = ctx.plan()
     if _plan_hash(plan, ctx) != st["plan_hash"]:
         die("checkpoints.json changed since it was shown to the human. Run plan-submit again and re-review.")
@@ -14550,7 +14570,7 @@ def _approval_question(ctx, st, action) -> str:
 def _ask_choice(ctx, st, args):
     """A lettered-options question. An option may approve a change to locked files: then picking it is the approval.
     In a director-enrolled lane the question is recorded the same way, but it waits for the director (who signs a
-    letter with `director-sign choice <L>`), not for a chat reply: it is not shown to the user as a question."""
+    letter with `director-sign choice <L> --apply`), not for a chat reply: it is not shown to the user as a question."""
     director = approval_mode(ctx) == "director"
     opts = [o.strip().upper() for o in (args.options or "").split(",") if o.strip()]
     if len(opts) < 2 or len(set(opts)) != len(opts) or not all(re.fullmatch(r"[A-Z]", o) for o in opts):
@@ -14595,8 +14615,7 @@ def _ask_choice(ctx, st, args):
         lines = [f"FOR THE DIRECTOR (this lane is director-enrolled, so a chat reply picks nothing): options "
                  f"{', '.join(opts)} are recorded as waiting. Do not put them to the user as a chat question; say in "
                  "one line what each option is, with your recommendation, and that the director picks one with "
-                 "`director-sign choice <letter> --apply` (or signs it with `director-sign choice <letter>` for a "
-                 "token you apply)."]
+                 "`director-sign choice <letter> --apply`."]
         for letter, paths in locked.items():
             lines.append(f"  Option {letter} approves changing {', '.join(paths)} (locked since the plan was approved).")
         for letter, kind in guards.items():
@@ -16471,28 +16490,46 @@ def _lanes_request(args):
             row["_rec_start_ok"] = x.get("start_ok")
             row["_rec_start_wait"] = x.get("start_wait")
         out.append(row)
-    # Recompute start_ok from live phases: depends_on unmet until that lane is done; keep ownership refusals.
+    # Recompute start_ok from live phases: depends_on / serial-after unmet until that lane is done.
+    # Permanent refusals (abs/.. / empty / unknown) stay false; ownership/no-own serial lifts when the
+    # named earlier sibling reaches phase done.
     by_name = {r["lane"]: r for r in out}
     n_lanes = len([z for z in lanes_in if isinstance(z, dict)])
+    order = [z.get("name") for z in lanes_in if isinstance(z, dict)]
     for r in out:
         if "_rec_start_ok" not in r and "_rec_start_wait" not in r:
             continue
         wait_msg = r.pop("_rec_start_wait", None)
         r.pop("_rec_start_ok", None)
-        stuck = wait_msg and any(k in str(wait_msg) for k in (
-            "ownership", "absolute", "escapes", "empty ownership", "invalid ownership", "unknown lane"))
+        permanent = wait_msg and any(k in str(wait_msg) for k in (
+            "absolute", "escapes", "empty ownership", "invalid ownership", "unknown lane"))
         deps = r.get("depends_on") or []
         unmet = [d for d in deps if (by_name.get(d) or {}).get("phase") != "done"]
+        serial = []
+        if wait_msg and not permanent:
+            for m in re.finditer(r"ownership overlaps lane '([^']+)'", wait_msg):
+                if (by_name.get(m.group(1)) or {}).get("phase") != "done":
+                    serial.append(m.group(1))
+            for m in re.finditer(r"serialized after '([^']+)'", wait_msg or ""):
+                if (by_name.get(m.group(1)) or {}).get("phase") != "done":
+                    serial.append(m.group(1))
+            if "no --own paths (serialized, not parallel)" in (wait_msg or ""):
+                # unnamed serial: wait on every earlier request sibling that is not done
+                try:
+                    idx = order.index(r["lane"])
+                except ValueError:
+                    idx = len(order)
+                for prev in order[:idx]:
+                    if (by_name.get(prev) or {}).get("phase") != "done":
+                        serial.append(prev)
         own = r.get("own") or []
-        if stuck:
+        who = list(dict.fromkeys(unmet + serial))
+        if permanent:
             r["start_ok"] = False
             r["start_wait"] = wait_msg
-        elif unmet:
+        elif who:
             r["start_ok"] = False
-            r["start_wait"] = "waiting on " + ", ".join(unmet)
-        elif n_lanes > 1 and not own:
-            r["start_ok"] = False
-            r["start_wait"] = wait_msg or "no --own paths; serialized (not parallel)"
+            r["start_wait"] = "waiting on " + ", ".join(who)
         else:
             r["start_ok"] = True
             r["start_wait"] = None
@@ -17586,6 +17623,11 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
             p = st.get("pending") or {}
             claim_here = p.get("action") == "claim" and here and p.get("session") == here
             if st.get("owner_session") and here and here != st["owner_session"] and not claim_here:
+                if approval_mode(ctx) == "director":
+                    return False, (f"[ratchet] This repo has an unfinished Ratchet run '{st['slug']}' (phase "
+                                   f"{st['phase']}) started in another chat. This lane is director-enrolled, so "
+                                   "`ask claim` / `resume --claim` are refused here; leave the run alone and do "
+                                   "what the user asked, or wait for the director harness.")
                 return False, (f"[ratchet] This repo has an unfinished Ratchet run '{st['slug']}' (phase {st['phase']}) "
                                "started in another chat. If the user wants to continue it here, run "
                                f"{_ask_cmd('claim', eng=eng)}, end your message with the question it prints, word for "
@@ -17607,6 +17649,12 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                    "still waiting, so this reply approves nothing, whatever it says. Answer what they "
                                    f"said; if you still need their answer, run {again} again and show them only that "
                                    "question.")
+                if _question_waiter(ctx) == "director" and p["action"] != "paid-provider":
+                    # Enrolled lane: chat replies approve nothing. Point at director-sign --apply; never lane cmds.
+                    return False, (f"[ratchet] Your waiting question (shall I {what}?) is waiting on the director: "
+                                   "this lane is director-enrolled, so a chat reply approves nothing. Do not run "
+                                   f"`{cmd}` on it. The director harness applies with "
+                                   f"`{eng} director-sign {p['action']} ... --apply`.")
                 if p["action"] == "choice":
                     letter = choice_letter(n["prompt"], p.get("options") or [])
                     if _question_waiter(ctx) == "director":  # read-only: never exits or writes from a hook
