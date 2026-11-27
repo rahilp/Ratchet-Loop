@@ -169,11 +169,33 @@ def t04_stop_on_edit_still_fires():
           any("README" in str(x) for x in changed), changed)
 
 
+def t05_informational_product_loop_timing():
+    """Informational: wall-clock for a short _wait_stretched with watch.every large and max_stretch=1."""
+    print("T-T05: informational product-loop wait timing (not a CI gate)")
+    m = load_engine()
+    proc = sleep_proc(2.0)
+    watch = SimpleNamespace(every=30.0, found_at_end=False, changed=lambda final=False: [])
+    t0 = time.monotonic()
+    timed_out, _limit, _note, changed = m._wait_stretched(proc, timeout=60.0, max_stretch=1.0, watch=watch)
+    elapsed = time.monotonic() - t0
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        m._kill_group(proc)
+    check("[T-T05] short sleep wait completes without timeout", timed_out is False and changed == [],
+          (timed_out, changed))
+    # Soft bound: should be near 2s, not padded by poll spin. Allow generous slack for CI load.
+    check("[T-T05] wall-clock near the 2s sleep (informational slack ≤4s)",
+          1.5 <= elapsed <= 4.0, f"elapsed={elapsed:.3f}s")
+    print(f"  (timing) _wait_stretched ~2s sleep with max_stretch=1 watch.every=30: {elapsed:.3f}s")
+
+
 TESTS = [
     ("T-T01", t01_no_stretch_spin_while_hanging),
     ("T-T02", t02_watch_every_does_not_force_stretch_spin),
     ("T-T03", t03_timeout_still_kills),
     ("T-T04", t04_stop_on_edit_still_fires),
+    ("T-T05", t05_informational_product_loop_timing),
 ]
 
 
