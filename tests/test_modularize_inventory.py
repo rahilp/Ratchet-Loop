@@ -40,6 +40,9 @@ import traceback
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import _tmp  # noqa: E402
+
 ROOT = HERE.parent
 RUN_DIR = ROOT / ".ratchet" / "runs" / "behavior-preserving-modularization-of-skills-rat"
 FIXTURES_DIR = ROOT / "tests" / "fixtures" / "modularize_cp1"
@@ -353,9 +356,9 @@ def t06_status_json_captured():
           captured if not isinstance(captured, dict) else sorted(captured))
     if not isinstance(captured, dict):
         return
-    # Live re-derivation: this repo's own active run (the one this checkpoint runs inside) gives the same
-    # top-level key set right now that a real `status --json` invocation gave when the baseline was captured --
-    # proving the sample is verbatim from a real run, not hand-typed, without hardcoding key names here.
+    # Live re-derivation: prefer this repo's own active run when one exists; otherwise spin a throwaway
+    # project so the schema check still runs outside a Ratchet-managed workspace (Cloud Agent checkouts).
+    # Proves the sample is verbatim from a real run, not hand-typed, without hardcoding key names here.
     try:
         live = subprocess.run([sys.executable, str(LAUNCHER), "status", "--json"], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)
@@ -363,9 +366,23 @@ def t06_status_json_captured():
     except (subprocess.SubprocessError, json.JSONDecodeError):
         live, live_json = None, None
     if live_json is None:
-        check("[CP1-T06] setup: a live `status --json` invocation in this repo succeeds right now (to compare "
-              "schemas against)", False, None if live is None else (live.returncode, live.stdout[-300:]))
-        return
+        td = Path(_tmp.mkdtemp(prefix="ratchet-inv-status-"))
+        init = None
+        try:
+            init = subprocess.run([sys.executable, str(LAUNCHER), "--root", str(td), "init", "inventory-status-schema"],
+                                  capture_output=True, text=True, timeout=60)
+            live = subprocess.run([sys.executable, str(LAUNCHER), "--root", str(td), "status", "--json"],
+                                  capture_output=True, text=True, timeout=30)
+            live_json = json.loads(live.stdout) if live.returncode == 0 else None
+        except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+            live, live_json = None, None
+        if live_json is None:
+            check("[CP1-T06] setup: a live `status --json` invocation in this repo succeeds right now (to compare "
+                  "schemas against)", False,
+                  None if live is None else (live.returncode, (live.stdout or live.stderr or "")[-300:],
+                                             getattr(init, "returncode", None),
+                                             (getattr(init, "stderr", None) or "")[-200:]))
+            return
     # CP2 of the schedule-awareness lane: `status --json` gained the one top-level key `schedule` (the captured baseline
     # file is unchanged), so that one key alone is ignored on the live side; any other new or missing key still fails.
     missing_keys = sorted(set(live_json) - set(captured) - {"schedule"})

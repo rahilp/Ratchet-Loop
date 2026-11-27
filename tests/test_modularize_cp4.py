@@ -172,8 +172,42 @@ def t01_records_module_byte_identical():
         if name not in rec_defs:
             continue
         pinned_seg = ast.get_source_segment(pinned_src, pinned_defs[name])
+        note = ""
+        if name == "_BreakerLock":
+            # Intentional post-move fix (Lane D suite): inode reuse after unlink+create made _holds_breaker
+            # claim another process's breaker; also require the file still contain this process's token.
+            _old = (
+                '        """Whether the breaker file in place is still the one this process created (a waiter clearing a stale\n'
+                '        breaker may have moved it away for a moment). Checked right before removing anything under it."""\n'
+                '        try:\n'
+                '            st = os.lstat(self.breaker)\n'
+                '        except OSError:\n'
+                '            return False\n'
+                '        return self._breaker_id is not None and (st.st_dev, st.st_ino) == self._breaker_id\n'
+            )
+            _new = (
+                '        """Whether the breaker file in place is still the one this process created (a waiter clearing a stale\n'
+                '        breaker may have moved it away for a moment). Checked right before removing anything under it.\n'
+                '        Device+inode alone is not enough: after unlink+create the kernel can reuse the same inode (and the same\n'
+                '        mtime_ns on a fast clock), so the holder\'s own token must still be what the file contains."""\n'
+                '        try:\n'
+                '            st = os.lstat(self.breaker)\n'
+                '        except OSError:\n'
+                '            return False\n'
+                '        if self._breaker_id is None or (st.st_dev, st.st_ino) != self._breaker_id:\n'
+                '            return False\n'
+                '        try:\n'
+                '            with open(self.breaker, "r", encoding="utf-8") as f:\n'
+                '                return f.read() == self.token\n'
+                '        except OSError:\n'
+                '            return False\n'
+            )
+            check("[CP4-01] _BreakerLock: the pinned body holds the pre-fix _holds_breaker, exactly once",
+                  pinned_seg.count(_old) == 1, pinned_seg.count(_old))
+            pinned_seg = pinned_seg.replace(_old, _new)
+            note = " apart from the inode-reuse _holds_breaker fix"
         rec_seg = ast.get_source_segment(rec_src, rec_defs[name])
-        check(f"[CP4-01] {name}'s body in records.py is byte-for-byte identical to its pre-move body",
+        check(f"[CP4-01] {name}'s body in records.py is byte-for-byte identical to its pre-move body" + note,
               rec_seg == pinned_seg, "" if rec_seg == pinned_seg else (pinned_seg, rec_seg))
 
     live_src = live_ratchet_source()

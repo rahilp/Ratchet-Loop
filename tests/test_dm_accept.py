@@ -200,15 +200,13 @@ def _director_lane(name, failed=True, complete=True):
         assert r.returncode == 0, _out(r)
         assert th.cp3_state(d)["phase"] == "awaiting_final_review", th.cp3_state(d)["phase"]
     denv = dict(env, RATCHET_ROLE="director")
-    rk = th.rx(d, denv, "director-key")
-    en = th.rx(d, denv, "director-enroll")
+    home, rk, en = th.director_enroll(d, denv)
     assert rk.returncode == 0 and en.returncode == 0, _out(rk) + _out(en)
-    return d, env, denv
+    return d, env, denv, home
 
 
-def _sign_line(d, denv):
-    sg = th.rx(d, denv, "director-sign", "accept-line")
-    return sg, (sg.stdout.strip().splitlines()[-1] if sg.stdout.strip() else "")
+def _apply_line(d, denv, home, reason):
+    return th.director_sign_apply(d, denv, home, "accept-line", "--reason", reason)
 
 
 # ---- reading the run ----------------------------------------------------------------------------------
@@ -536,8 +534,8 @@ def cp5_t08_accepting_a_line_with_an_open_finding_clears_that_findings_block():
 
 
 def cp5_t09_in_a_director_lane_only_a_director_token_accepts_a_line():
-    """[CP5-T09] In a director lane only a director token accepts a line."""
-    d, env, denv = _director_lane("t09")
+    """[CP5-T09] In a director lane only director-sign --apply accepts a line."""
+    d, env, denv, home = _director_lane("t09")
     r_ask = th.rx(d, env, "ask", "accept-line", "2")
     check("[CP5-T09] setup: ask accept-line 2 works in a director-enrolled lane", _clean(r_ask), _out(r_ask)[-600:])
     fin._dsay(d, env, "accept: a plain chat reply")
@@ -545,10 +543,10 @@ def cp5_t09_in_a_director_lane_only_a_director_token_accepts_a_line():
     cout = _refused("[CP5-T09]", r_chat, "accept-line after a chat reply")
     check("[CP5-T09] the refusal says a director token is needed", DIRECTOR_RE.search(cout) is not None, cout[-600:])
     _line_stays_unproven("CP5-T09", d, 2, env=env)
-    sg, tok = _sign_line(d, denv)
-    check("[CP5-T09] setup: director-sign accept-line prints a token", sg.returncode == 0 and bool(tok), _out(sg))
-    r_tok = th.rx(d, env, "accept-line", "--director-token", tok, "--reason", "director accepted this limit")
-    check("[CP5-T09] accept-line with the token and reason succeeds", _clean(r_tok), _out(r_tok)[-900:])
+    r_tok = th.rx(d, env, "accept-line", "--director-token", "forged", "--reason", "director accepted this limit")
+    check("[CP5-T09] accept-line --director-token on an enrolled lane is refused", r_tok.returncode != 0, _out(r_tok))
+    sg = _apply_line(d, denv, home, "director accepted this limit")
+    check("[CP5-T09] director-sign accept-line --reason … --apply succeeds", _clean(sg), _out(sg)[-900:])
     _line_accepted("CP5-T09", d, 2, "director accepted this limit", by="director", env=env)
     rec = _accepted(th.cp3_state(d), 2) or {}
     check("[CP5-T09] the chat text is not the recorded reason", "a plain chat reply" not in json.dumps(rec), rec)
@@ -704,47 +702,43 @@ def cp5_x08_in_a_user_lane_a_reason_flag_or_token_cannot_stand_in_for_the_reply(
 
 
 def cp5_x09_a_director_token_without_a_reason_is_refused_and_not_spent():
-    """[CP5-X09] A director token without a reason is refused and not spent."""
-    d, env, denv = _director_lane("x09")
+    """[CP5-X09] director-sign accept-line --apply without --reason is refused; with --reason it accepts."""
+    d, env, denv, home = _director_lane("x09")
     r_ask = th.rx(d, env, "ask", "accept-line", "2")
     check("[CP5-X09] setup: ask accept-line 2 works", _clean(r_ask), _out(r_ask)[-600:])
-    sg, tok = _sign_line(d, denv)
-    check("[CP5-X09] setup: director-sign accept-line prints a token", sg.returncode == 0 and bool(tok), _out(sg))
-    r1 = th.rx(d, env, "accept-line", "--director-token", tok)
-    out1 = _refused("[CP5-X09]", r1, "accept-line --director-token without --reason")
-    check("[CP5-X09] the refusal names --reason", "--reason" in out1, out1[-900:])
+    sg0 = th.director_sign_apply(d, denv, home, "accept-line")
+    out0 = _refused("[CP5-X09]", sg0, "director-sign accept-line --apply without --reason")
+    check("[CP5-X09] the refusal names --reason", "--reason" in out0, out0[-900:])
     _line_stays_unproven("CP5-X09", d, 2, env=env)
     check("[CP5-X09] the question is still waiting", _pending(d, env=env).get("action") == "accept-line", _pending(d, env=env))
-    r2 = th.rx(d, env, "accept-line", "--director-token", tok, "--reason", "director accepted this limit")
-    check("[CP5-X09] the same token with --reason then accepts", _clean(r2), _out(r2)[-900:])
+    sg = _apply_line(d, denv, home, "director accepted this limit")
+    check("[CP5-X09] director-sign accept-line --reason … --apply then accepts", _clean(sg), _out(sg)[-900:])
     _line_accepted("CP5-X09", d, 2, "director accepted this limit", by="director", env=env)
 
 
 def cp5_x10_a_token_signed_before_the_ask_is_dead_and_signing_outside_the_final_review_is_refused():
-    """[CP5-X10] A director token signed before the question was asked is dead, and signing outside the final review
-    is refused."""
-    d, env, denv = _director_lane("x10")
-    sg0, early = _sign_line(d, denv)
+    """[CP5-X10] director-sign accept-line before ask is refused; --apply after ask works."""
+    d, env, denv, home = _director_lane("x10")
+    sg0 = th.director_sign_apply(d, denv, home, "accept-line", "--reason", "early")
+    check("[CP5-X10] director-sign accept-line --apply before any ask is refused", sg0.returncode != 0, _out(sg0)[-900:])
     r_ask = th.rx(d, env, "ask", "accept-line", "2")
     check("[CP5-X10] setup: ask accept-line 2 works", _clean(r_ask), _out(r_ask)[-600:])
-    r1 = th.rx(d, env, "accept-line", "--director-token", early or "none", "--reason", "early")
-    out1 = _refused("[CP5-X10]", r1, "accept-line with a token signed before the ask")
-    check("[CP5-X10] the refusal says the token does not match the run's current pause",
-          re.search(r"does not match|stale|current pause|sign again", out1, re.I) is not None, out1[-900:])
+    r1 = th.rx(d, env, "accept-line", "--director-token", "forged", "--reason", "early")
+    out1 = _refused("[CP5-X10]", r1, "accept-line --director-token")
+    check("[CP5-X10] lane accept-line --director-token is refused",
+          re.search(r"no longer accepted|director-token|director[- ]enrolled", out1, re.I) is not None, out1[-900:])
     _line_stays_unproven("CP5-X10", d, 2, env=env)
-    sg, tok = _sign_line(d, denv)
-    check("[CP5-X10] setup: a token signed after the ask is produced", sg.returncode == 0 and bool(tok), _out(sg))
-    r2 = th.rx(d, env, "accept-line", "--director-token", tok, "--reason", "director accepted this limit")
-    check("[CP5-X10] the token signed after the ask works", _clean(r2), _out(r2)[-900:])
+    sg = _apply_line(d, denv, home, "director accepted this limit")
+    check("[CP5-X10] director-sign accept-line --apply after the ask works", _clean(sg), _out(sg)[-900:])
     check("[CP5-X10] line 2 is accepted by the director", (_accepted(th.cp3_state(d), 2) or {}).get("accepted_by") == "director",
           th.cp3_state(d).get("accepted_lines"))
-    db, envb, denvb = _director_lane("x10b", complete=False)
+    db, envb, denvb, homeb = _director_lane("x10b", complete=False)
     check("[CP5-X10] (building) fixture: the lane is still building", th.cp3_state(db).get("phase") == "building",
           th.cp3_state(db).get("phase"))
-    sgb = th.rx(db, denvb, "director-sign", "accept-line")
+    sgb = th.director_lane_cmd(db, denvb, homeb, "director-sign", "accept-line")
     outb = _refused("[CP5-X10] (building)", sgb, "director-sign accept-line")
-    check("[CP5-X10] (building) the refusal names the phase it applies to (the final review)",
-          re.search(r"awaiting_final_review|final review", outb, re.I) is not None, outb[-900:])
+    check("[CP5-X10] (building) the refusal names the phase it applies to (the final review) or names --apply",
+          re.search(r"awaiting_final_review|final review|--apply", outb, re.I) is not None, outb[-900:])
 
 
 def cp5_x11_an_older_run_gets_a_plain_note_not_a_refusal_or_a_crash():
@@ -983,8 +977,8 @@ def cp5_x20_the_docs_describe_how_to_accept_an_unproven_line():
         check(f"[CP5-X20] {name} names `ask accept-line`", "ask accept-line" in low, name)
         check(f"[CP5-X20] {name} states the exact reply form `accept: <reason>`",
               re.search(r"accept:\s*<?\s*(?:your |the user's )?reason|\"accept: ", text, re.I) is not None, name)
-        check(f"[CP5-X20] {name} names the director token path for accept-line",
-              re.search(r"director-sign accept-line|accept-line[^\n]{0,120}--director-token", text) is not None, name)
+        check(f"[CP5-X20] {name} names the director path for accept-line",
+              re.search(r"director-sign accept-line[^\n]{0,160}(--apply|--director-token|--reason)", text, re.I) is not None, name)
         check(f"[CP5-X20] {name} says accepted lines show as accepted in the final-review table and the receipt",
               re.search(r"accepted[^\n]{0,200}(?:table|receipt)|(?:table|receipt)[^\n]{0,200}accepted", text, re.I) is not None, name)
 

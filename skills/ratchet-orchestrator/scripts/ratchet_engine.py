@@ -2289,9 +2289,9 @@ def next_action(ctx: Ctx, st=None, compute_accept_note: bool = True) -> dict:
 
 def _director_next(ctx: Ctx, st) -> str | None:
     """In a director-enrolled lane, what the lane waits for at a pause (plan approval, a review, a block), naming
-    the director's command: the one-step `director-sign <action> ... --apply` for a routine approval, or the token
-    the lane applies with `--director-token`. None in a lane the developer approves, or in any other phase. Used by
-    `next`, `status` and `status --json` so an enrolled lane's agent is never told to ask the user."""
+    the director harness/agent command: `director-sign <action> ... --apply` against this lane. No pasteable
+    tokens. None in a lane the developer approves, or in any other phase. Used by `next`, `status` and
+    `status --json` so an enrolled lane's agent is never told to ask a human in chat."""
     if approval_mode(ctx) != "director":
         return None
     phase = st.get("phase")
@@ -2299,12 +2299,12 @@ def _director_next(ctx: Ctx, st) -> str | None:
     tail = (" A chat reply approves nothing here, so put no question in chat; end your turn saying what you are "
             "waiting for.")
     if phase == "awaiting_plan_approval":
-        return (f"Waiting for the director to approve the plan: the director runs `{eng} director-sign approve-plan` "
-                "and the token is applied with `ratchet.py approve-plan --director-token <t>`." + tail)
+        return (f"Waiting for the director to approve the plan: the director harness runs "
+                f"`{eng} director-sign approve-plan --apply`." + tail)
     if phase in ("awaiting_checkpoint_review", "awaiting_final_review"):
-        return (f"Waiting for the director to review: the director runs `{eng} director-sign human-approve` (applied "
-                "with `ratchet.py human-approve --director-token <t>`), or `director-sign feedback` for changes "
-                "(applied with `ratchet.py feedback --director-token <t>`)." + tail)
+        return (f"Waiting for the director to review: the director harness runs "
+                f"`{eng} director-sign human-approve --apply`, or "
+                f"`{eng} director-sign feedback --apply` for changes." + tail)
     if phase == "blocked":
         cur = st.get("current")
         cps = ((st.get("checkpoints") or {}).get(cur) or {}) if cur else {}
@@ -2314,9 +2314,9 @@ def _director_next(ctx: Ctx, st) -> str | None:
             ways.append(f"accept the open findings with `{_director_apply_cmd(ctx, 'accept-finding', cur)}`")
             if not g.get("cap_raised_to"):
                 ways.append(f"raise this step's review limit once with `{_director_apply_cmd(ctx, 'raise-limit', cur)}`")
-        ways.append(f"resume the run with `{eng} director-sign human-approve` (applied with `ratchet.py human-approve "
-                    "--director-token <t>`), after a lettered option if one is wanted (`ratchet.py ask choice "
-                    f"--options ...` here, then `{_director_apply_cmd(ctx, 'choice')}`)")
+        ways.append(f"resume the run with `{eng} director-sign human-approve --apply`, after a lettered option if "
+                    f"one is wanted (`ratchet.py ask choice --options ...` here, then "
+                    f"`{_director_apply_cmd(ctx, 'choice')}`)")
         return "Waiting for the director, who can " + "; or ".join(ways) + "." + tail
     return None
 
@@ -3422,7 +3422,7 @@ def _consume_paid_ok(ctx, st, pv) -> str:
     if approval_mode(ctx) == "director":
         die(f"{model} (via {tool}) costs money per use (or its cost is unknown, treated the same way), and "
             "this lane is director-enrolled: a chat reply here never counts as the developer's own OK to "
-            "spend money (unlike every other approval, paid-provider takes no director token). Nothing was "
+            "spend money (unlike every other approval, paid-provider takes no director-sign --apply). Nothing was "
             "added and nothing was sent to it. The developer must give this OK themselves, in a lane that "
             "isn't director-enrolled.")
     p = st.get("pending") or {}
@@ -5493,6 +5493,94 @@ DIRECTOR_NO_HOOKS_NOTE = (
     "hook-recorded director session.")
 
 
+
+def _request_records(main: Path):
+    """Yield (path, data) for each readable request JSON under main/.ratchet/requests/."""
+    rdir = main / RATCHET_DIR / "requests"
+    if not rdir.is_dir():
+        return
+    for p in sorted(rdir.glob("*.json")):
+        data, why = _read_record(p)
+        if why or not isinstance(data, dict):
+            continue
+        yield p, data
+
+
+def _layout_director_home(here: Path) -> bool:
+    """True when `here` (or its Ratchet project root) is recorded as director_root for a request."""
+    here = here.resolve()
+    own = _ratchet_root_of(here)
+    check_paths = {here}
+    if own is not None:
+        check_paths.add(own.resolve())
+    roots = []
+    if own is not None:
+        roots.append(own.resolve())
+    try:
+        top = find_root(here)
+        if top is not None:
+            roots.append(top.resolve())
+    except Exception:
+        pass
+    seen = set()
+    for root in roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        for _p, data in _request_records(root):
+            dr = data.get("director_root")
+            if not isinstance(dr, str) or not dr:
+                continue
+            drp = Path(dr).resolve()
+            if drp in check_paths or (drp == root and own is not None and own.resolve() == root):
+                return True
+    return False
+
+
+def _layout_is_builder(here: Path) -> bool:
+    """True when `here` is an enrolled lane worktree under a request (not the director_root)."""
+    here = here.resolve()
+    own = _ratchet_root_of(here)
+    if own is None:
+        return False
+    own = own.resolve()
+    # Walk sibling/main for request records that list this worktree
+    candidates = {own, own.parent}
+    try:
+        top = find_root(own)
+        if top is not None:
+            candidates.add(top.resolve())
+            # main may be sibling parent folder's app; also scan parent of worktree naming
+            candidates.add(Path(str(own)).parent.resolve())
+    except Exception:
+        pass
+    for root in list(candidates):
+        # also check common main: worktree is often <main>-<lane> beside main
+        for sib in root.parent.iterdir() if root.parent.is_dir() else []:
+            if (sib / RATCHET_DIR / "requests").is_dir():
+                candidates.add(sib.resolve())
+    for root in candidates:
+        for _p, data in _request_records(root):
+            dr = data.get("director_root")
+            lanes = data.get("lanes") or []
+            if not isinstance(lanes, list):
+                continue
+            for lane in lanes:
+                if not isinstance(lane, dict):
+                    continue
+                wt = lane.get("worktree")
+                if isinstance(wt, str) and wt and Path(wt).resolve() == own:
+                    if isinstance(dr, str) and dr and Path(dr).resolve() == here:
+                        return False  # standing in director home
+                    return True
+    # Enrolled lane with director.json but no request layout: treat as builder when not director home
+    # (cwd may be a subdirectory of the lane root).
+    if (own / RATCHET_DIR / "director.json").is_file() and not _layout_director_home(here):
+        if approval_mode(Ctx(own)) == "director":
+            return True
+    return False
+
+
 def director_session_problem(what: str) -> str | None:
     """None when this process may act as the director; otherwise a plain reason. Fail closed: RATCHET_ROLE=director
     counts only with a positive record from a director session's own guard hook. The one exception is when Ratchet's
@@ -5502,9 +5590,43 @@ def director_session_problem(what: str) -> str | None:
     return _director_session_check(what)[0]
 
 
+
 def _director_session_check(what: str):
-    """(problem or None, note or None) for director_session_problem / require_director_session."""
+    """(problem or None, note or None) for director_session_problem / require_director_session.
+
+    Happy path (Lane D): checkout layout — director_root from lanes-start/request records, without needing
+    RATCHET_ROLE. Builder worktrees (enrolled lanes) are refused even if RATCHET_ROLE=director. Legacy fallback:
+    RATCHET_ROLE + hook-recorded director session when no layout speaks.
+    """
+    here = Path.cwd().resolve()
+    if _layout_is_builder(here):
+        return (f"{what} refused: this checkout is a director-enrolled lane (builder). Run director commands from "
+                "the director home checkout (the main worktree recorded as director_root), reaching a lane with "
+                "--root <lane>. Nothing was changed."), None
+    if _layout_director_home(here):
+        return None, None
+    # If this project has request layout at all and cwd's ratchet root is neither director nor recognized builder,
+    # still refuse ROLE override when the ratchet root is an enrolled lane path listed in any request.
+    own = _ratchet_root_of(here)
+    if own is not None:
+        for _p, data in _request_records(own.resolve()):
+            # standing in a tree that has requests but is not director_root: only allow if ROLE+hooks legacy
+            break
+        else:
+            # also scan parent sibling mains for requests listing own as worktree
+            parent = own.parent
+            if parent.is_dir():
+                for sib in parent.iterdir():
+                    if (sib / RATCHET_DIR / "requests").is_dir():
+                        for _p, data in _request_records(sib.resolve()):
+                            dr = data.get("director_root")
+                            for lane in data.get("lanes") or []:
+                                if isinstance(lane, dict) and Path(str(lane.get("worktree") or "")).resolve() == own.resolve():
+                                    if not (isinstance(dr, str) and Path(dr).resolve() in {here.resolve(), own.resolve()}):
+                                        return (f"{what} refused: this checkout is a director-enrolled lane (builder). "
+                                                "Run director commands from the director home checkout. Nothing was changed."), None
     if not _is_director_session():
+
         return f"{what} must be run from the director's session (RATCHET_ROLE=director).", None
     if _IN_HOOK:
         return None, None
@@ -5602,7 +5724,7 @@ def _enrolled_outside(ctx) -> str | None:
         key_here = True
     if key_here:
         _note_unreadable(p, why, "it holds which lanes a director enrolled, so Ratchet treats this project as "
-                         "enrolled (chat replies approve nothing; a director token still does) until it is "
+                         "enrolled (chat replies approve nothing; director-sign --apply still does) until it is "
                          "repaired. To repair it: " + _enrolled_repair(p))
         return "unreadable"
     _note_unreadable(p, why, "no director key exists on this machine, so Ratchet treats it as naming no enrolled "
@@ -5726,31 +5848,30 @@ def _iso(ts) -> float:
         return 0.0
 
 
-def _require_approval(ctx, st, action, token=None, bind=()):
-    """Returns {"by": "human"|"director", "detail": ...} or dies. `bind` is what the director token must also
-    match (see _approval_payload): a token signed for another step, reason or letter is refused as not matching."""
+_DIRECTOR_APPLYING = False  # lane D: true only inside director-sign --apply
+
+
+def _require_approval(ctx, st, action, token=None, bind=(), *, director_apply=False):
+    """Returns {"by": "human"|"director", "detail": ...} or dies.
+
+    Lane D: enrolled-lane approvals come from director-sign --apply (director_apply=True). Pasteable
+    `--director-token` values are no longer accepted from the lane CLI.
+    """
     mode = approval_mode(ctx)
+    if director_apply or _DIRECTOR_APPLYING:
+        if mode != "director":
+            die(f"{ctx.root} is not director-enrolled: there is nothing for the director harness to apply.")
+        return {"by": "director", "detail": f"director-applied {action}"}
     if token:
-        if mode == "human":
-            die("This lane only accepts human approvals (approver=human). A director must enroll it first.")
-        key = _director_key()
-        if not hmac.compare_digest(token, _sign(key, _approval_payload(ctx, st, action, bind))):
-            die("Director token does not match this run's current pause (wrong lane, wrong action, stale token, "
-                "or the run moved on" + (", or it was signed for a different step, reason or letter" if bind else "")
-                + "). Ask the director to sign again.")
-        return {"by": "director", "detail": f"director-signed {action}"}
+        if mode == "director":
+            die("Director tokens are no longer accepted. The director harness applies the pause with "
+                f"`{_director_apply_cmd(ctx, action, bind[0] if bind and action != 'choice' else None)}` "
+                "(chat replies still do not count here).")
+        die("This lane only accepts human approvals (approver=human). A director must enroll it first.")
     if mode == "director":
-        sign = f"director-sign {action}"  # the command that actually signs this action, whole
-        if action == "raise-limit":
-            sign += f" {bind[0] if bind else '<CPn>'} --reason \"<why>\""
-        elif action == "choice":
-            opts = (st.get("pending") or {}).get("options") or []
-            sign += " <one of " + ", ".join(opts) + ">" if opts else " <letter>"
-        die("This lane is director-enrolled: approvals need a director token "
-            f"(director runs: ratchet.py --root {ctx.root} {sign}"
-            + (f", or signs and applies it in one step with `{_director_apply_cmd(ctx, action, bind[0] if action != 'choice' and bind else None)}`"
-               if action in DIRECTOR_APPLY_ACTIONS else "")
-            + "). Chat messages do not count as approvals here.")
+        die("This lane is director-enrolled: the director harness must apply the approval with "
+            f"`{_director_apply_cmd(ctx, action, bind[0] if bind and action != 'choice' else None)}`. "
+            "Chat messages do not count as approvals here.")
     if human_override(f"approve this pause ({action})", ctx, action):
         return {"by": "human", "detail": "(RATCHET_HUMAN_OVERRIDE, code typed back at the terminal)"}
     p = st.get("pending") or {}
@@ -5932,6 +6053,12 @@ def _require_human(ctx, st, action="human-approve", token=None):
     return {"prompt": a["detail"], "by": a["by"], "session": a.get("session")}
 
 
+def _director_token_first(ctx, st, action, token, mode=None):
+    """Lane D: if a paste token was passed on an enrolled lane, refuse it before pending/ask checks."""
+    if token and approval_mode(ctx) == "director" and not _DIRECTOR_APPLYING:
+        _require_approval(ctx, st, action, token)  # dies: tokens no longer accepted
+
+
 def cmd_director_key(args):
     require_director_session("director-key")
     p = director_key_path()
@@ -5976,7 +6103,7 @@ def cmd_director_enroll(args):
     require_director_session("director-enroll")
     ctx = Ctx(find_root())
     _enroll_lane(ctx.root)
-    ok(f"Lane {ctx.root} enrolled: approvals now require a director token.")
+    ok(f"Lane {ctx.root} enrolled: approvals now need the director harness (director-sign --apply).")
 
 
 _LANE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -6055,6 +6182,113 @@ def _lanes_start_run(args, main: Path):
     names = [x["name"] for x in lanes]
     if len(set(names)) != len(names):
         die("Each lane name must be distinct: a name is used twice. Pick another name for one. Nothing was changed.")
+    own_map, dep_map = {}, {}
+    for spec in (getattr(args, "own", None) or []):
+        n, eq, path = spec.partition("=")
+        n, path = n.strip(), path.strip()
+        if n not in names or not path:
+            die(f"--own needs NAME=PATH for a lane in this request (got {spec!r}). Nothing was changed.")
+        own_map.setdefault(n, []).append(path)
+    for spec in (getattr(args, "depend", None) or []):
+        n, eq, other = spec.partition("=")
+        n, other = n.strip(), other.strip()
+        if n not in names or other not in names or n == other:
+            die(f"--depend needs NAME=OTHER for two distinct lanes in this request (got {spec!r}). Nothing was changed.")
+        dep_map.setdefault(n, []).append(other)
+    for x in lanes:
+        x["own"] = list(own_map.get(x["name"], []))
+        x["depends_on"] = list(dep_map.get(x["name"], []))
+    # Parallel readiness (Lane D): at lanes-start time, every depends_on is unmet (nothing finished yet).
+    # Ownership must be valid relative prefixes; absolute / .. paths refuse parallel for that lane.
+    def _norm_own(p):
+        raw = str(p).strip().replace("\\", "/")
+        if not raw:
+            return None, "empty ownership path"
+        if raw.startswith("/") or raw.startswith("~"):
+            return None, f"absolute ownership path {raw!r}"
+        parts = Path(raw).parts
+        if ".." in parts:
+            return None, f"ownership path escapes with .. ({raw!r})"
+        n = str(Path(*parts)) if parts else "."
+        return ("." if n in (".", "") else n), None
+    def _paths_overlap(a, b):
+        for p in a:
+            for q in b:
+                if p == "." or q == "." or p == q or p.startswith(q.rstrip("/") + "/") or q.startswith(p.rstrip("/") + "/"):
+                    return True
+        return False
+    multi = len(lanes) > 1
+    for x in lanes:
+        norms, bad = [], None
+        for raw in x["own"]:
+            n, err = _norm_own(raw)
+            if err:
+                bad = err
+                break
+            norms.append(n)
+        x["_own_norm"] = norms
+        x["_own_bad"] = bad
+    for x in lanes:
+        reasons = []
+        if x.get("_own_bad"):
+            reasons.append(x["_own_bad"])
+        if multi and not x["own"]:
+            reasons.append("no --own paths (serialized, not parallel)")
+        if any(d not in names for d in x["depends_on"]):
+            reasons.append("depends on unknown lane")
+        if x["depends_on"]:
+            reasons.append("waiting on " + ", ".join(x["depends_on"]))
+        if x["own"] and not x.get("_own_bad"):
+            for y in lanes:
+                if y is x or not y.get("_own_norm") or y.get("_own_bad"):
+                    continue
+                if _paths_overlap(x["_own_norm"], y["_own_norm"]):
+                    reasons.append(f"ownership overlaps lane '{y['name']}'")
+                    break
+        x["start_ok"] = not reasons
+        x["start_wait"] = "; ".join(dict.fromkeys(reasons)) if reasons else None
+    # Mutual ownership overlap only: keep the earlier lane start_ok when overlap was its only ownership issue.
+    for i, x in enumerate(lanes):
+        for y in lanes[i + 1:]:
+            xn, yn = x.get("_own_norm"), y.get("_own_norm")
+            if not xn or not yn or x.get("_own_bad") or y.get("_own_bad"):
+                continue
+            if not _paths_overlap(xn, yn):
+                continue
+            def _drop_overlap(lane, other):
+                parts = [p for p in (lane.get("start_wait") or "").split("; ") if p and f"'{other}'" not in p]
+                lane["start_wait"] = "; ".join(parts) if parts else None
+                lane["start_ok"] = lane["start_wait"] is None
+            _drop_overlap(x, y["name"])
+            if "ownership overlaps" not in (y.get("start_wait") or ""):
+                y["start_ok"] = False
+                y["start_wait"] = ((y.get("start_wait") + "; ") if y.get("start_wait") else "") + (
+                    f"ownership overlaps lane '{x['name']}' (serialized after it)")
+            else:
+                y["start_ok"] = False
+    # No --own serialization: keep the earliest bare lane start_ok; later bare lanes wait on it.
+    # Reasons must not contain "; " (that is the join delimiter for start_wait).
+    first_bare = None
+    bare_reason = "no --own paths (serialized, not parallel)"
+    for x in lanes:
+        if x.get("_own_bad") or x["own"]:
+            continue
+        wait = x.get("start_wait") or ""
+        if bare_reason not in wait.split("; "):
+            continue
+        if first_bare is None:
+            first_bare = x["name"]
+            parts = [p for p in wait.split("; ") if p and p != bare_reason]
+            x["start_wait"] = "; ".join(parts) if parts else None
+            x["start_ok"] = x["start_wait"] is None
+        else:
+            parts = [p for p in wait.split("; ") if p and p != bare_reason]
+            parts.append(f"no --own paths (serialized after '{first_bare}')")
+            x["start_wait"] = "; ".join(dict.fromkeys(parts))
+            x["start_ok"] = False
+    for x in lanes:
+        x.pop("_own_norm", None)
+        x.pop("_own_bad", None)
     name = args.name if args.name is not None else slugify(request)
     if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name):
         die(f"The request name '{name}' must be lowercase letters, digits and hyphens. Pick another --name. "
@@ -6129,11 +6363,13 @@ def _lanes_start_run(args, main: Path):
             _write_record(brief, (
                 f"# Lane {x['name']}\n\nThe developer's request: {request}\n\nYour part of it, lane '{x['name']}': "
                 f"{x['feature']}\n\nYou work only in {x['worktree']} (branch {x['branch']}). Run Ratchet's init "
-                "yourself there to plan this feature, and ask for the developer's approvals through your own "
-                "director as usual. When the lane is finished, the director merges it with integrate.\n"), raw=True)
+                "yourself there to plan this feature, and wait for the director harness to apply approvals with director-sign --apply. When the lane is finished, the director merges it with integrate.\n"), raw=True)
             x["brief"] = str(brief)
         _write_record(rdir / f"{name}.json", {"request": request, "name": name, "created_at": now(),
-                                              "lanes": [{k: x[k] for k in ("name", "feature", "branch", "worktree", "brief")}
+                                              "director_root": str(main.resolve()),
+                                              "lanes": [{k: x[k] for k in ("name", "feature", "branch", "worktree", "brief",
+                                                                           "own", "depends_on", "start_ok", "start_wait")
+                                                         if k in x}
                                                         for x in lanes]}, pretty=True)
     except BaseException:
         def attempt(fn, *a, **kw):   # one failed cleanup action never skips the rest
@@ -6168,12 +6404,14 @@ def _lanes_start_run(args, main: Path):
             start = shlex.join(parts)
         else:
             start = f"Open your agent CLI in {x['worktree']} and give it the brief {x['brief']}"
-        out.append(dict({k: x[k] for k in ("name", "branch", "worktree", "brief")}, start=start))
+        out.append(dict({k: x[k] for k in ("name", "branch", "worktree", "brief", "own", "depends_on", "start_ok", "start_wait")
+                                  if k in x}, start=start))
     empty = ("Note: the model argument in the start command is empty because no orchestrator model is chosen "
              "(set one with `ratchet.py config --set agents.orchestrator=<model>`)."
              if template and not model and any("{model}" in w for w in template) else "")
     if args.json:
-        print(json.dumps(dict({"request": name, "lanes": out}, **({"note": empty} if empty else {})), indent=2))
+        print(json.dumps(dict({"request": name, "director_root": str(main.resolve()), "lanes": out},
+                                  **({"note": empty} if empty else {})), indent=2))
         return
     ok(f"Request '{name}' recorded: {len(out)} lane(s) ready. Lanes are enrolled with no run; each lane's agent runs "
        "init itself.")
@@ -7506,17 +7744,25 @@ def _integrate_merge(main: Path, f: dict, info: dict, finish):
         _integrate_drop_scratch(tmp)
 
 
-# The routine approvals a director may sign AND apply in one call (`director-sign <action> ... --apply`). Everything
-# else a director signs (plan approval, step and final review, cancel, set-review, hooks-waive, ui-respec, guardrail,
-# feedback) stays a token the lane applies: --apply is refused there and approves nothing.
-DIRECTOR_APPLY_ACTIONS = ("approve-changes", "accept-finding", "raise-limit", "choice")
+# Lane D: every director-sign action is applied in one call (`director-sign <action> ... --apply`).
+# POLICY_ACTIONS is the subset the developer's director-policy file may cover (unchanged from pre-D routine set).
+DIRECTOR_APPLY_ACTIONS = ("approve-plan", "human-approve", "feedback", "approve-changes", "cancel", "set-review",
+                          "hooks-waive", "ui-respec", "accept-finding", "accept-line", "raise-limit",
+                          "choice")
+# guardrail is not director-sign --apply: unlock via choice, then run `guardrail` from the director home.
+POLICY_ACTIONS = ("approve-changes", "accept-finding", "raise-limit", "choice")
 
 
 def _director_apply_cmd(ctx, action, cp=None, eng="ratchet.py") -> str:
-    """The one-step director command for a routine approval in this lane, with its arguments spelled out."""
+    """The one-step director harness command for an approval in this lane."""
     tail = {"accept-finding": f" {cp or '<CPn>'} --ids <ids> --reason \"<why>\"",
             "raise-limit": f" {cp or '<CPn>'} --reason \"<why>\"",
-            "choice": " <letter>"}.get(action, "")
+            "choice": " <letter>",
+            "accept-line": " --reason \"<why>\"",
+            "guardrail": " --kind <kind>",
+            "set-review": " <mode>",
+            "ui-respec": f" {cp or '<CPn>'}",
+            "feedback": " --reason \"<why>\""}.get(action, "")
     return f"{eng} --root {ctx.root} director-sign {action}{tail} --apply"
 
 
@@ -7563,8 +7809,8 @@ def _policy_rule_problem(action, rule) -> str | None:
     if action in POLICY_NEVER:
         return (f"{action} can never be covered by a policy: it is the developer's own approval (plans, scope, final "
                 "approval, cancel, review settings, hooks waivers, paid providers). Nothing was changed.")
-    if action not in DIRECTOR_APPLY_ACTIONS:
-        return f"{action} is not a routine approval. A rule is for one of: {', '.join(DIRECTOR_APPLY_ACTIONS)}. Nothing was changed."
+    if action not in POLICY_ACTIONS:
+        return f"{action} is not a routine approval. A rule is for one of: {', '.join(POLICY_ACTIONS)}. Nothing was changed."
     rule = rule if isinstance(rule, str) else ""
     if action == "approve-changes" and rule != "test-files":
         return "approve-changes takes the rule test-files (changes to test files only). Nothing was changed."
@@ -7761,27 +8007,19 @@ def _policy_rule_for(ctx, st, action, target, ids) -> str | None:
 
 
 def cmd_director_sign(args):
-    """Sign the lane's current pause for `action` and print the token (stdout's last line) that the lane applies
-    with `--director-token`. With `--apply`, for a routine approval (DIRECTOR_APPLY_ACTIONS) only: the question step
-    the action needs is run here (`ask approve-changes`, `ask accept-finding CPn <ids>`, `ask raise-limit CPn`; a
-    lettered choice is signed from the question the lane itself registered with `ask choice`), the token is signed
-    and applied at once, all under one hold of the lane's state lock (see _changes_state), so the token cannot go
-    stale between the ask and the apply; a refusal (a missing --reason, an unknown id, a letter not offered, the
-    wrong phase, a lane that is not enrolled) comes before anything is asked or written. The old separate steps
-    (the lane's ask, this command without --apply, the lane's command with the token) still work unchanged. When the
-    developer has a policy file (`director-policy`), the four routine actions are policy-checked first, on both paths:
-    one no rule covers (or a damaged policy file) is refused before anything is signed. A covered plain signature
-    prints a token; the lane's command that applies it checks the policy again under its own lock and records the
-    rule as `policy_rule`, the same as `--apply` does."""
+    """Apply a director approval against the lane (`--apply`). Lane D: pasteable tokens are gone; without
+    `--apply` this command refuses. Policy still gates the POLICY_ACTIONS subset when a policy file exists."""
+    global _DIRECTOR_APPLYING
     require_director_session("director-sign")
     action = args.action
     apply = bool(getattr(args, "apply", False))
-    if apply and action not in DIRECTOR_APPLY_ACTIONS:
-        die(f"director-sign {action} takes no --apply: only the routine approvals ({', '.join(DIRECTOR_APPLY_ACTIONS)}) "
-            f"are signed and applied in one step. Nothing was signed or approved. Without --apply, director-sign "
-            f"{action} prints a token the lane applies with `{action} --director-token <t>`.")
+    if not apply:
+        die(f"director-sign {action} needs --apply: the director harness signs and applies in one step. "
+            "Pasteable director tokens are no longer used. Nothing was changed.")
+    if action not in DIRECTOR_APPLY_ACTIONS:
+        die(f"director-sign {action} is not an applicable director action. Nothing was changed.")
     ctx = Ctx(find_root())
-    if apply and approval_mode(ctx) != "director":
+    if approval_mode(ctx) != "director":
         die(f"{ctx.root} is not director-enrolled: this lane takes the developer's own approval (its agent asks in "
             "chat and only the developer's reply counts), so there is nothing for --apply to do. Nothing was asked or "
             f"approved. To drive it, enroll it first: ratchet.py --root {ctx.root} director-enroll")
@@ -7793,7 +8031,7 @@ def cmd_director_sign(args):
             "ui-respec": ["building", "blocked"],
             "guardrail": ["building", "blocked"],
             "accept-finding": ["building", "blocked"],
-            "accept-line": ["awaiting_final_review", "awaiting_checkpoint_review"],  # the finish pause (CP5)
+            "accept-line": ["awaiting_final_review", "awaiting_checkpoint_review"],
             "cancel": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
                        "awaiting_checkpoint_review", "awaiting_final_review", "planning_feedback"],
             "set-review": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
@@ -7803,58 +8041,48 @@ def cmd_director_sign(args):
             "raise-limit": ["blocked"],
             "choice": ["planning", "awaiting_plan_approval", "building", "blocked", "paused",
                        "awaiting_checkpoint_review", "awaiting_final_review", "planning_feedback"]}[args.action]
-    pause = None  # a lane that paused itself for the director: the apply works through the pause (in memory
-    # until every check passed), in the phase it paused from, and the lane is parked again afterwards
-    if apply and st["phase"] == "paused":
+    pause = None
+    if st["phase"] == "paused":
         pause = _lift_pause(st)
     shown = f"paused (from {st['phase']})" if pause else st["phase"]
     target = (getattr(args, "target", None) or "").strip()
     if action == "raise-limit" and target:
         g = ((st.get("checkpoints") or {}).get(target) or {}).get("gates", {}).get("adversarial") or {}
-        if g.get("cap_raised_to"):  # its one raise is spent: said first, since a raised step is rarely still blocked
+        if g.get("cap_raised_to"):
             die(f"{target}'s review-round limit was already raised once (to {g['cap_raised_to']} rounds); it is never "
-                "raised a second time. Nothing was " + ("changed." if apply else "signed."))
+                "raised a second time. Nothing was changed.")
     if st["phase"] not in want:
         if action == "raise-limit":
             die(f"Run {st['slug']} is in phase {shown}, not blocked; director-sign raise-limit only applies "
-                "when the step is blocked at its review-round limit" + (" (after the lane ran `ask raise-limit CPn`)."
-                                                                       if not apply else "."))
+                "when the step is blocked at its review-round limit.")
         if action == "approve-changes" and st["phase"] == "awaiting_plan_approval":
             die(f"Run {st['slug']} is awaiting plan approval: nothing is approved yet, so there is no baseline for "
-                "approve-changes to move. Approve the plan first (director-sign approve-plan). Nothing was changed.")
-        die(f"Run {st['slug']} is in phase {shown}; {action} applies to {want}." + (" Nothing was changed."
-                                                                                        if apply else ""))
+                "approve-changes to move. Approve the plan first (director-sign approve-plan --apply). Nothing was changed.")
+        die(f"Run {st['slug']} is in phase {shown}; {action} applies to {want}. Nothing was changed.")
     reason = (getattr(args, "reason", None) or "").strip()
     ids = [i.strip() for i in (getattr(args, "ids", None) or "").split(",") if i.strip()]
     bind = ()
+    kind = None
     if action == "guardrail":
         if not args.kind:
             die("director-sign guardrail needs --kind <kind> (from ratchet.py repeats)")
-        action = f"guardrail:{norm_kind(args.kind)}"
-    elif action == "raise-limit":
-        # Signed only for the step the lane asked about, while it is blocked at its review-round limit and its one
-        # raise is unspent: the same checks `ask raise-limit` and `raise-limit` make, so a token is never signed for
-        # a step it could not raise. The step and the reason are bound into the token (_approval_payload), so the
-        # lane applies exactly this raise, with exactly this reason, and nothing else.
+        kind = norm_kind(args.kind)
+        action_key = f"guardrail:{kind}"
+    else:
+        action_key = action
+    if action == "raise-limit":
         if not target or not reason:
-            die("director-sign raise-limit needs the step and the reason: director-sign raise-limit CPn --reason \"...\""
-                + (" --apply. Nothing was asked or changed." if apply else ""))
-        p = st.get("pending") or {}
-        if not apply and (p.get("action") != "raise-limit" or p.get("mode") != target):
-            die(f"No raise-limit question is waiting for {target}: the lane runs `ask raise-limit {target}` first "
-                "(it is refused there unless the step is blocked at its review-round limit), then the director signs; "
-                f"or sign and apply in one step with --apply.")
+            die("director-sign raise-limit needs the step and the reason: director-sign raise-limit CPn --reason \"...\" "
+                "--apply. Nothing was asked or changed.")
         g = ((st.get("checkpoints") or {}).get(target) or {}).get("gates", {}).get("adversarial") or {}
         if g.get("cap_raised_to"):
             die(f"{target}'s review-round limit was already raised once (to {g['cap_raised_to']} rounds); it is never "
-                "raised a second time. Nothing was " + ("changed." if apply else "signed."))
+                "raised a second time. Nothing was changed.")
         if _adv_block_kind(st, target) not in ("own", "run_wide"):
             die(f"{target} is not blocked at its review-round limit right now; director-sign raise-limit only applies "
-                "when it is. Nothing was " + ("changed." if apply else "signed."))
+                "when it is. Nothing was changed.")
         bind = (target, reason)
-    elif action == "accept-finding" and apply:
-        # The same refusals `ask accept-finding` and `accept-finding` give, made before anything is asked or written:
-        # a missing --reason, an unknown step, an id already accepted (so a repeated --apply records nothing twice).
+    elif action == "accept-finding":
         if not target or target not in (st.get("checkpoints") or {}):
             die(f"director-sign accept-finding needs the step: director-sign accept-finding CPn --ids F1,F2 --reason "
                 "\"...\" --apply" + (f" ({target} is no checkpoint of this run)" if target else "")
@@ -7863,7 +8091,7 @@ def cmd_director_sign(args):
             die(f"director-sign accept-finding needs the finding ids: director-sign accept-finding {target} --ids F1,F2 "
                 "--reason \"...\" --apply. Nothing was asked or changed.")
         if not reason:
-            die(f"director-sign accept-finding needs --reason \"...\" (there is no chat reply to read a reason from): "
+            die(f"director-sign accept-finding needs --reason \"...\": "
                 f"director-sign accept-finding {target} --ids {','.join(ids)} --reason \"...\" --apply. Nothing was "
                 "asked or changed.")
         cps = st["checkpoints"][target]
@@ -7875,57 +8103,100 @@ def cmd_director_sign(args):
                 die(f"{', '.join(already)} already accepted earlier for {target}; nothing new to do. Nothing was "
                     "changed.")
     elif action == "choice":
-        # Signed only for a letter the waiting question offers; the letter is bound into the token.
-        p = st.get("pending") or {}
-        if p.get("action") != "choice":
+        pnd = st.get("pending") or {}
+        if pnd.get("action") != "choice":
             die("No lettered question is waiting: the lane runs `ask choice --options ...` first, then the director "
-                "signs one of its letters with `director-sign choice <letter>" + (" --apply`" if apply else "`")
-                + ". Nothing was " + ("changed." if apply else "signed."))
+                "applies one of its letters with `director-sign choice <letter> --apply`. Nothing was changed.")
         letter = target.upper()
-        opts = p.get("options") or []
+        opts = pnd.get("options") or []
         if letter not in opts:
             die(f"director-sign choice needs one of the offered letters ({', '.join(opts)}), got "
-                f"{target or '(none)'}. Nothing was " + ("changed." if apply else "signed."))
+                f"{target or '(none)'}. Nothing was changed.")
         bind = (letter,)
-        # What the letter does, from the recorded question itself (not the lane's prose), on stderr so stdout
-        # stays the bare token: the director never signs blind.
-        files = (p.get("locked") or {}).get(letter) or []
-        kind = (p.get("guardrail") or {}).get(letter)
+        files = (pnd.get("locked") or {}).get(letter) or []
+        gkind = (pnd.get("guardrail") or {}).get(letter)
         does = []
         if files:
             does.append(f"approves changing the locked file(s) {', '.join(files)} (approve-changes then needs no "
                         "further signature)")
-        if kind:
-            does.append(f"adds a guardrail step for '{kind}' right after the current step (it may add a tool)")
+        if gkind:
+            does.append(f"adds a guardrail step for '{gkind}' right after the current step (it may add a tool)")
         if st["phase"] == "blocked":
-            does.append("is the pick at a blocked run; resuming it still needs director-sign human-approve")
-        print(f"Signing option {letter} of {', '.join(opts)}: it " + ("; ".join(does) if does else
+            does.append("is the pick at a blocked run; resuming it still needs director-sign human-approve --apply")
+        print(f"Applying option {letter} of {', '.join(opts)}: it " + ("; ".join(does) if does else
               "unlocks nothing (it only records the letter)") + ".", file=sys.stderr)
-    rule = _policy_rule_for(ctx, st, action, target, ids) if action in DIRECTOR_APPLY_ACTIONS else None
-    if not apply:
-        print(_sign(_director_key(), _approval_payload(ctx, st, action, bind)))
-        return
-    key = _director_key()  # before anything is asked: a missing key refuses with nothing changed
+    elif action == "accept-line" and not reason:
+        die("director-sign accept-line needs --reason \"...\". Nothing was changed.")
+    elif action == "feedback" and not reason:
+        # feedback can take empty in some flows; keep optional
+        pass
+    elif action == "set-review":
+        if target not in ("end", "each", "none"):
+            die("director-sign set-review needs the mode: end | each | none. Nothing was changed.")
+    elif action == "ui-respec" and not target:
+        die("director-sign ui-respec needs the step (CPn). Nothing was changed.")
+
+    rule = _policy_rule_for(ctx, st, action_key if action != "guardrail" else action, target, ids) if action in POLICY_ACTIONS else None
+    _director_key()  # refuse early if key missing
     if action == "approve-changes":
-        errs = validate_plan(ctx.plan())  # as approve-changes itself checks first: a malformed plan is named, not asked
+        errs = validate_plan(ctx.plan())
         if errs:
             die("Plan invalid:\n  - " + "\n  - ".join(errs))
         if not integrity_problems(ctx, st):
             ok("Nothing has changed since approval; there is nothing to approve.")
             return
-    if pause and action == "choice":  # no ask step to save it: the lane is unparked here for the apply (parked
-        ctx.save_state(st)  # again below); for the other three the ask saves the unparked run once its own checks pass
+    if pause and action == "choice":
+        ctx.save_state(st)
     try:
-        if action != "choice":  # a lettered question is the lane's own `ask choice`; the other three are asked here
+        # Ask step only for actions that previously needed a pending question minted here
+        if action in ("approve-changes", "accept-finding", "raise-limit"):
             _director_apply_ask(ctx, st, action, target, ",".join(ids))
-            st = ctx.state()  # the ask moved awaiting_since: the token is signed for the pause as it now stands
-        token = _sign(key, _approval_payload(ctx, st, action, bind))
-        ns = argparse.Namespace(director_token=token, cp=target, reason=reason, letter=target.upper() or None,
-                                 policy_rule=rule, policy_checked=True)
-        {"approve-changes": cmd_approve_changes, "accept-finding": cmd_accept_finding, "raise-limit": cmd_raise_limit,
-         "choice": cmd_choice}[action](ns)
+            st = ctx.state()
+        elif action in ("approve-plan", "human-approve", "cancel", "set-review", "hooks-waive", "ui-respec",
+                        "accept-line", "feedback") and (st.get("pending") or {}).get("action") != action:
+            # Mint a pending question so lane cmds that expect ask still see one, without chat text
+            overtook = _overtake(ctx, st, action, target or None)
+            asked = now()
+            st["pending"] = {"action": action, "mode": target or None, "asked_at": asked,
+                             "prev_awaiting": st.get("awaiting_since"),
+                             "session": _asking_session(ctx, st, action), **overtook}
+            if action in ("approve-plan", "human-approve"):
+                st["pending"]["phase"] = st["phase"]
+            st["awaiting_since"] = asked
+            ctx.log(st, "question_asked", action=action, mode=target or None)
+            ctx.save_state(st)
+            st = ctx.state()
+        ns = argparse.Namespace(
+            director_token=None, director_apply=True, cp=target, reason=reason,
+            letter=(target.upper() if target else None), policy_rule=rule, policy_checked=True,
+            kind=kind, mode=target or None, ids=",".join(ids) if ids else None,
+            text=reason or None, learning=None, source=None,
+        )
+        if args.action == "guardrail":
+            die("director-sign guardrail --apply is not used: from the director home, run "
+                f"`ratchet.py --root {ctx.root} guardrail --kind {kind} ...` after the lane offered the option "
+                "(or after a director-applied choice that unlocks it). Nothing was changed.")
+        apply_map = {
+            "approve-plan": cmd_approve_plan,
+            "human-approve": cmd_human_approve,
+            "feedback": cmd_feedback,
+            "approve-changes": cmd_approve_changes,
+            "cancel": cmd_cancel,
+            "set-review": cmd_set_review,
+            "hooks-waive": cmd_hooks_waive,
+            "ui-respec": cmd_ui_respec,
+            "accept-finding": cmd_accept_finding,
+            "accept-line": cmd_accept_line,
+            "raise-limit": cmd_raise_limit,
+            "choice": cmd_choice,
+        }
+        _DIRECTOR_APPLYING = True
+        try:
+            apply_map[args.action](ns)
+        finally:
+            _DIRECTOR_APPLYING = False
     finally:
-        if pause:  # parked again, whatever the apply did (its unblock, if any, is what `resume` now returns to)
+        if pause:
             st = ctx.state()
             if st["phase"] != "paused":
                 _enter_pause(st, pause["reason"])
@@ -7937,8 +8208,8 @@ def cmd_approve_plan(args):
     st = ctx.state()
     if st["phase"] != "awaiting_plan_approval":
         die(f"Nothing to approve (phase {st['phase']})"
-            + (". This lane is enrolled with the director, so its plan is approved only with a director token, "
-               "never by a chat reply." if approval_mode(ctx) == "director" else ""))
+            + (". This lane is enrolled with the director, so its plan is approved only with "
+               "`director-sign approve-plan --apply`, never by a chat reply." if approval_mode(ctx) == "director" else ""))
     plan = ctx.plan()
     if _plan_hash(plan, ctx) != st["plan_hash"]:
         die("checkpoints.json changed since it was shown to the human. Run plan-submit again and re-review.")
@@ -10008,8 +10279,10 @@ def cmd_ui_respec(args):
     if not g.get("frozen"):
         ok(f"{args.cp}'s UI check isn't frozen; the spec can change freely until it finds a difference.")
         return
+    tok = getattr(args, "director_token", None)
+    _director_token_first(ctx, st, "ui-respec", tok)
     _require_pending(st, "ui-respec", args.cp)
-    msg = _require_human(ctx, st, "ui-respec", getattr(args, "director_token", None))
+    msg = _require_human(ctx, st, "ui-respec", tok)
     g.pop("frozen", None)
     _clear_pending(st)
     ctx.log(st, "ui_respec_approved", cp=args.cp, by=msg["by"], note=msg.get("prompt", "")[:200])
@@ -10395,6 +10668,8 @@ def cmd_adv_record(args):
         origin = check_review_origin(ctx, cfg, st, args.cp, rnd["round"], rp, rpath, r, rid, rnd["nonce"])
         r = clean_review_text(r)  # its signature is checked: from here on it only feeds records and messages
         age = fst.st_mtime - _iso(rnd["opened_at"])
+        if age < 0:
+            age = 0.0  # filesystem/clock skew: treat simultaneous writes as age 0
         if age < min_seconds:
             die(f"{rp} ({rid}) was written {age:.0f}s after the round opened — too fast to be a real review. "
                 "Launch the reviewer and let it do the work.")
@@ -11142,9 +11417,12 @@ def _announce_repeats(ctx, st):
     director = approval_mode(ctx) == "director"
     for r in repeat_candidates(ctx, st):
         if director:
-            print(f"REPEAT: reviewers have now found '{r['kind']}' in {r['times']} places. This lane is "
-                  f"director-enrolled: tell the director, who can approve a guardrail with "
-                  f"`director-sign guardrail --kind {r['kind']}`; then run ratchet.py repeats --offered {r['kind']}.")
+            kind, times = r["kind"], r["times"]
+            print(
+                f"REPEAT: reviewers have now found '{kind}' in {times} places. This lane is "
+                "director-enrolled: tell the director, who can approve a guardrail with "
+                f"`ask choice --options … --guardrail \"A={kind}\"` then "
+                f"`director-sign choice <letter> --apply`; then run ratchet.py repeats --offered {kind}.")
             continue
         print(f"REPEAT: reviewers have now found '{r['kind']}' {r['times']} times (e.g. {r['example']}). Offer the user "
               f"a guardrail now: ratchet.py ask choice --options A,B,C --guardrail \"A={r['kind']}\" "
@@ -11178,7 +11456,7 @@ def cmd_guardrail(args):
         bad.relative_to(ctx.root.resolve())
     except ValueError:
         die("--bad-example must be inside the project (a test fixture).")
-    if token:
+    if token or _DIRECTOR_APPLYING:
         _require_approval(ctx, st, f"guardrail:{kind}", token)
     elif allow.get("guardrail") != kind or allow.get("cp") != st.get("current"):
         die(f"The user hasn't picked a guardrail option for '{kind}' at this step. Offer it first: ratchet.py ask "
@@ -14028,6 +14306,9 @@ def cmd_resume(args):
     if st["phase"] in ("done", "cancelled"):
         die(f"Run '{st['slug']}' is {st['phase']}; start a new one with init.")
     if args.claim:
+        if approval_mode(ctx) == "director":
+            die("This lane is director-enrolled: claim / resume --claim is not used here. The director harness owns "
+                "routing across sessions; builders do not take over the run. Nothing was changed.")
         _require_pending(st, "claim")
         msg = _require_human(ctx, st, "claim")
         st["owner_session"] = msg.get("session") or st.get("owner_session")
@@ -14095,6 +14376,9 @@ def cmd_ask(args):
         ctx.save_state(st)
         ok(f"Withdrew the waiting question ({p.get('action')}). Nothing was changed.")
         return
+    if args.action == "claim" and approval_mode(ctx) == "director":
+        die("This lane is director-enrolled: claim / resume --claim is not used here. The director harness owns "
+            "routing across sessions; builders do not take over the run. Nothing was asked.")
     if args.action == "set-review" and args.mode not in ("end", "each", "none"):
         die("ask set-review needs the mode: end | each | none")
     if args.action == "ui-respec" and not (args.mode and args.mode in (st.get("checkpoints") or {})):
@@ -14286,7 +14570,7 @@ def _approval_question(ctx, st, action) -> str:
 def _ask_choice(ctx, st, args):
     """A lettered-options question. An option may approve a change to locked files: then picking it is the approval.
     In a director-enrolled lane the question is recorded the same way, but it waits for the director (who signs a
-    letter with `director-sign choice <L>`), not for a chat reply: it is not shown to the user as a question."""
+    letter with `director-sign choice <L> --apply`), not for a chat reply: it is not shown to the user as a question."""
     director = approval_mode(ctx) == "director"
     opts = [o.strip().upper() for o in (args.options or "").split(",") if o.strip()]
     if len(opts) < 2 or len(set(opts)) != len(opts) or not all(re.fullmatch(r"[A-Z]", o) for o in opts):
@@ -14331,14 +14615,13 @@ def _ask_choice(ctx, st, args):
         lines = [f"FOR THE DIRECTOR (this lane is director-enrolled, so a chat reply picks nothing): options "
                  f"{', '.join(opts)} are recorded as waiting. Do not put them to the user as a chat question; say in "
                  "one line what each option is, with your recommendation, and that the director picks one with "
-                 "`director-sign choice <letter> --apply` (or signs it with `director-sign choice <letter>` for a "
-                 "token you apply)."]
+                 "`director-sign choice <letter> --apply`."]
         for letter, paths in locked.items():
             lines.append(f"  Option {letter} approves changing {', '.join(paths)} (locked since the plan was approved).")
         for letter, kind in guards.items():
             lines.append(f"  Option {letter} adds an automatic check for '{kind}' as its own step right after the "
                          "current one.")
-        lines.append("Apply the director's pick with `ratchet.py choice <letter> --director-token <t>`.")
+        lines.append("The director harness applies the pick with `director-sign choice <letter> --apply`.")
         print("\n".join(lines))
         return
     lines = [f"ASK THE USER: give them options {', '.join(opts)} in your own words, with your recommendation, and ask "
@@ -14653,7 +14936,7 @@ def _ask_paid_provider(ctx, st, args):
 def cmd_choice(args):
     """Record which lettered option the user picked, from their first reply after `ask choice`. In a
     director-enrolled lane a chat reply picks nothing (the same rule as every other approval there): the letter
-    comes from `choice <L> --director-token <t>`, where the token was signed for exactly that letter
+    comes from `director-sign choice <L> --apply` for exactly that letter
     (`director-sign choice <L>`, after the lane's own `ask choice`); it is recorded exactly as a user's pick,
     including what the option unlocks."""
     ctx = Ctx(find_root())
@@ -14672,8 +14955,7 @@ def cmd_choice(args):
     given = (getattr(args, "letter", None) or "").strip().upper()
     if token or approval_mode(ctx) == "director":
         if token and given not in opts:
-            die(f"choice needs the signed letter with a director token (one of {', '.join(opts)}): "
-                "`ratchet.py choice <letter> --director-token <t>`. Nothing was recorded.")
+            die(f"choice needs the letter (one of {', '.join(opts)}) via `director-sign choice <letter> --apply`. Nothing was recorded.")
         # _require_approval's own director check and token verification (the letter is bound into the token, so a
         # token for another letter, lane, question or pause is refused): dies here when this lane is
         # director-enrolled and no (or a bad) director token was given; a chat letter is never enough in that lane.
@@ -14720,7 +15002,7 @@ def cmd_choice(args):
                 "--test-command \"...\" --test-file <path>`.")
     if unblock:
         msg += (" The run is blocked: run `ratchet.py human-approve`"
-                + (" with a director token (`director-sign human-approve`)" if by == "director" else "")
+                + (" with `director-sign human-approve --apply`" if by == "director" else "")
                 + " to resume it, then act on the choice.")
     ok(msg)
 
@@ -14741,13 +15023,11 @@ def _require_pending(st, action, mode=None, ctx=None):
         if ctx is not None and action in DIRECTOR_APPLY_ACTIONS and approval_mode(ctx) == "director":
             if action == "choice":
                 die("No lettered question is waiting, and in this director-enrolled lane a chat reply picks nothing. "
-                    "Run `ratchet.py ask choice --options ...` to register the options, then the director picks one "
-                    f"with `{_director_apply_cmd(ctx, 'choice')}` (or signs it with `director-sign choice <letter>` "
-                    "and you apply the token with `ratchet.py choice <letter> --director-token <t>`). Nothing was changed.")
+                    "Run `ratchet.py ask choice --options ...` to register the options, then the director harness "
+                    f"picks one with `{_director_apply_cmd(ctx, 'choice')}`. Nothing was changed.")
             die("This lane is director-enrolled, so there is no question to put in chat for this: the director "
-                f"approves it in one step with `{_director_apply_cmd(ctx, action, mode)}` (or signs it after this "
-                f"lane's `ask` with `director-sign {action}`, and you apply the token with `ratchet.py {action}"
-                f"{' ' + mode if mode else ''} --director-token <t>`). Nothing was changed; end your turn saying "
+                f"harness approves it with `{_director_apply_cmd(ctx, action, mode)}`. "
+                "Pasteable director tokens are no longer accepted. Nothing was changed; end your turn saying "
                 "what you are waiting for.")
         die(f"First run {_ask_now(ctx, st, action) if ctx and not mode else _ask_cmd(action, mode)}, show the user the question it prints, "
             "and wait for their reply. Replies from before the question don't count.")
@@ -14768,8 +15048,10 @@ def cmd_cancel(args):
     if st["phase"] in ("done", "cancelled"):
         ok(f"Run '{st['slug']}' is already {st['phase']}.")
         return
+    tok = getattr(args, "director_token", None)
+    _director_token_first(ctx, st, "cancel", tok)
     _require_pending(st, "cancel")
-    msg = _require_human(ctx, st, "cancel", getattr(args, "director_token", None))
+    msg = _require_human(ctx, st, "cancel", tok)
     st.pop("pending", None)
     st["cancelled_from"] = st["phase"]
     st["phase"] = "cancelled"
@@ -14789,8 +15071,10 @@ def cmd_set_review(args):
     """Change how often the user reviews (end | each | none) — the user's call, so it needs their confirmation."""
     ctx = Ctx(find_root())
     st = ctx.state()
+    tok = getattr(args, "director_token", None)
+    _director_token_first(ctx, st, "set-review", tok)
     _require_pending(st, "set-review", args.mode)
-    msg = _require_human(ctx, st, "set-review", getattr(args, "director_token", None))
+    msg = _require_human(ctx, st, "set-review", tok)
     old = st.get("human_review")
     st["human_review"] = args.mode
     if st.get("approved"):
@@ -14831,8 +15115,10 @@ def cmd_approve_changes(args):
             die(f"The user's pick of option {allow['letter']} approved changing {', '.join(allow['files'])}, but these "
                 f"changed too: {'; '.join(extra)}. Undo them, or show the user exactly what changed and ask "
                 "(`ratchet.py ask approve-changes`).")
+        tok = getattr(args, "director_token", None)
+        _director_token_first(ctx, st, "approve-changes", tok)
         _require_pending(st, "approve-changes", ctx=ctx)
-        msg = _require_human(ctx, st, "approve-changes", getattr(args, "director_token", None))
+        msg = _require_human(ctx, st, "approve-changes", tok)
         if msg["by"] == "director":
             _policy_apply(args, ctx, st, "approve-changes", "")
     plan = ctx.plan()
@@ -15044,9 +15330,9 @@ def cmd_accept_finding(args):
         # saved, means the SAME command with --reason added simply works.
         reason = (getattr(args, "reason", None) or "").strip()
         if not reason:
-            die(f"accept-finding needs --reason \"...\" when a director token approves it (there is no chat reply "
-                f"to read a reason from). Nothing was accepted, and the question is still waiting: run the same "
-                f"command again with --reason \"...\" added.")
+            die(f"accept-finding needs --reason \"...\" when the director harness applies it (there is no chat reply "
+                f"to read a reason from). Nothing was accepted, and the question is still waiting: run "
+                f"`director-sign accept-finding {cp} --ids {','.join(ids)} --reason \"...\" --apply`.")
         # Reuses _require_approval's own director check and token verification (standards #2/#19: don't re-implement
         # the same gate): dies here, exactly as every other approval does, when this lane is director-enrolled and
         # no (or a bad) director token was given; a chat "accept: ..." reply is never enough in that lane.
@@ -15286,8 +15572,7 @@ def cmd_raise_limit(args):
         # With a token, --reason is checked BEFORE the token is verified or anything is cleared (as accept-finding
         # does): the question stays pending and nothing is saved, so the SAME token with --reason added works.
         if not reason:
-            die(f"raise-limit needs --reason \"...\" when a director token approves it (the reason the director "
-                f"signed; there is no chat reply to read one from). Nothing was raised, and the question is still "
+            die(f"raise-limit needs --reason \"...\" when the director harness applies it (there is no chat reply to read one from). Nothing was raised, and the question is still "
                 f"waiting: run the same command again with --reason \"...\" added.")
         # _require_approval's own director check and token verification (the step and the reason are bound into
         # the token, so a token for another step, reason, lane or pause is refused): dies here when this lane is
@@ -15387,7 +15672,7 @@ def cmd_accept_line(args):
         if token and not reason_flag:
             # checked BEFORE the token is verified or anything is cleared, as cmd_accept_finding does: the same
             # command with --reason added then simply works
-            die("accept-line needs --reason \"...\" when a director token accepts the line (there is no chat reply to "
+            die("accept-line needs --reason \"...\" when the director harness accepts the line (there is no chat reply to "
                 "read a reason from). Nothing was accepted, and the question is still waiting: run the same command "
                 "again with --reason \"...\" added.")
         # _require_approval's own checks: a token in a human lane, no (or a bad) token in a director lane
@@ -15395,7 +15680,7 @@ def cmd_accept_line(args):
         by, reason = appr["by"], reason_flag
     else:
         if reason_flag:
-            die("--reason is only for a director token in a director-enrolled lane. Here the reason must come from the "
+            die("--reason is only for director-sign --apply in a director-enrolled lane. Here the reason must come from the "
                 "user's own reply in the owning chat, exactly `accept: <reason>`, as their first reply after the "
                 "question; nothing else stands in for that reply. Nothing was accepted; the question is still waiting.")
         msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the question was asked in can answer it
@@ -16194,11 +16479,65 @@ def _lanes_request(args):
         if tip and ok_main and git(main, "merge-base", "--is-ancestor", tip, "HEAD").returncode == 0:
             made = git(main, "reflog", "show", "--format=%H", f"refs/heads/{branch}").stdout.split()
             merged = not made or made[-1] != tip
-        out.append({"lane": lane, "branch": branch, "worktree": wt, "worktree_missing": missing, "phase": phase,
-                    "done": done, "total": total, "waiting_on": waiting, "awaiting_since": since, "merged": merged,
-                    "next_director_action": "integrate" if phase == "done" and not merged and not missing else None})
+        row = {"lane": lane, "branch": branch, "worktree": wt, "worktree_missing": missing, "phase": phase,
+               "done": done, "total": total, "waiting_on": waiting, "awaiting_since": since, "merged": merged,
+               "next_director_action": "integrate" if phase == "done" and not merged and not missing else None}
+        if "own" in x:
+            row["own"] = x.get("own")
+        if "depends_on" in x:
+            row["depends_on"] = x.get("depends_on")
+        if "start_ok" in x or "start_wait" in x:
+            row["_rec_start_ok"] = x.get("start_ok")
+            row["_rec_start_wait"] = x.get("start_wait")
+        out.append(row)
+    # Recompute start_ok from live phases: depends_on / serial-after unmet until that lane is done.
+    # Permanent refusals (abs/.. / empty / unknown) stay false; ownership/no-own serial lifts when the
+    # named earlier sibling reaches phase done.
+    by_name = {r["lane"]: r for r in out}
+    n_lanes = len([z for z in lanes_in if isinstance(z, dict)])
+    order = [z.get("name") for z in lanes_in if isinstance(z, dict)]
+    for r in out:
+        if "_rec_start_ok" not in r and "_rec_start_wait" not in r:
+            continue
+        wait_msg = r.pop("_rec_start_wait", None)
+        r.pop("_rec_start_ok", None)
+        permanent = wait_msg and any(k in str(wait_msg) for k in (
+            "absolute", "escapes", "empty ownership", "invalid ownership", "unknown lane"))
+        deps = r.get("depends_on") or []
+        unmet = [d for d in deps if (by_name.get(d) or {}).get("phase") != "done"]
+        serial = []
+        if wait_msg and not permanent:
+            for m in re.finditer(r"ownership overlaps lane '([^']+)'", wait_msg):
+                if (by_name.get(m.group(1)) or {}).get("phase") != "done":
+                    serial.append(m.group(1))
+            for m in re.finditer(r"serialized after '([^']+)'", wait_msg or ""):
+                if (by_name.get(m.group(1)) or {}).get("phase") != "done":
+                    serial.append(m.group(1))
+            if "no --own paths (serialized, not parallel)" in (wait_msg or ""):
+                # unnamed serial: wait on every earlier request sibling that is not done
+                try:
+                    idx = order.index(r["lane"])
+                except ValueError:
+                    idx = len(order)
+                for prev in order[:idx]:
+                    if (by_name.get(prev) or {}).get("phase") != "done":
+                        serial.append(prev)
+        own = r.get("own") or []
+        who = list(dict.fromkeys(unmet + serial))
+        if permanent:
+            r["start_ok"] = False
+            r["start_wait"] = wait_msg
+        elif who:
+            r["start_ok"] = False
+            r["start_wait"] = "waiting on " + ", ".join(who)
+        else:
+            r["start_ok"] = True
+            r["start_wait"] = None
     if args.json:
-        print(json.dumps({"request": name, "lanes": out}, indent=2))
+        payload = {"request": name, "lanes": out}
+        if isinstance(rec.get("director_root"), str):
+            payload["director_root"] = rec["director_root"]
+        print(json.dumps(payload, indent=2))
         return
     print(f"Request '{name}': {len(out)} lane(s)")
     for l in out:
@@ -17284,6 +17623,11 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
             p = st.get("pending") or {}
             claim_here = p.get("action") == "claim" and here and p.get("session") == here
             if st.get("owner_session") and here and here != st["owner_session"] and not claim_here:
+                if approval_mode(ctx) == "director":
+                    return False, (f"[ratchet] This repo has an unfinished Ratchet run '{st['slug']}' (phase "
+                                   f"{st['phase']}) started in another chat. This lane is director-enrolled, so "
+                                   "`ask claim` / `resume --claim` are refused here; leave the run alone and do "
+                                   "what the user asked, or wait for the director harness.")
                 return False, (f"[ratchet] This repo has an unfinished Ratchet run '{st['slug']}' (phase {st['phase']}) "
                                "started in another chat. If the user wants to continue it here, run "
                                f"{_ask_cmd('claim', eng=eng)}, end your message with the question it prints, word for "
@@ -17310,13 +17654,18 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                     if _question_waiter(ctx) == "director":  # read-only: never exits or writes from a hook
                         return False, (f"[ratchet] Your lettered question ({', '.join(p.get('options') or [])}) is "
                                        "waiting on the director: this lane is director-enrolled, so a letter typed "
-                                       "in chat picks nothing. Do not run `choice` on it. The director signs a "
-                                       f"letter with `director-sign choice <letter>`; apply it with `{eng} choice "
-                                       "<letter> --director-token <t>`.")
+                                       "in chat picks nothing. Do not run `choice` on it. The director harness applies "
+                                       f"a letter with `{eng} director-sign choice <letter> --apply`.")
                     return False, (f"[ratchet] This reply answers your lettered question ({', '.join(p.get('options') or [])}). "
                                    + (f"It reads as option {letter}. " if letter else "It is NOT a clear pick of one option. ")
                                    + f"Run `{eng} choice` to record it, then continue. It does NOT approve the plan or a "
                                    "checkpoint.")
+                if _question_waiter(ctx) == "director" and p["action"] != "paid-provider":
+                    # Enrolled lane: chat replies approve nothing. Point at director-sign --apply; never lane cmds.
+                    return False, (f"[ratchet] Your waiting question (shall I {what}?) is waiting on the director: "
+                                   "this lane is director-enrolled, so a chat reply approves nothing. Do not run "
+                                   f"`{cmd}` on it. The director harness applies with "
+                                   f"`{eng} director-sign {p['action']} ... --apply`.")
                 try:
                     first = len(_replies(ctx, st, p.get("asked_at"), p)) <= 1
                 except (Exception, SystemExit):
@@ -19192,7 +19541,15 @@ def _merge_rule(cmd: str, cwd: str, root: Path) -> tuple[str, str | None]:
 
 def decide_guard(n: dict) -> tuple[bool, str]:
     cmd, cwd = n["command"], n["cwd"]
-    if not _is_director_session():
+    here = Path(cwd).resolve() if cwd else Path.cwd()
+    # Lane D: layout beats RATCHET_ROLE. Builder worktrees never look like the director to the guard.
+    if _layout_is_builder(here):
+        director_here = False
+    elif _layout_director_home(here):
+        director_here = True
+    else:
+        director_here = _is_director_session()
+    if not director_here:
         if n["kind"] == "shell" and cmd:
             why = _reserved_env_problem(cmd)
             if why:
@@ -20848,6 +21205,8 @@ def main(argv=None):
     a = sp.add_parser("lanes-start", help="director only: start several lanes (branch, worktree, enrollment, brief) from one request")
     a.add_argument("--request", required=True, help="the developer's request, in words")
     a.add_argument("--lane", action="append", metavar="NAME=FEATURE", help="a lane: its name and its part of the request (repeat)")
+    a.add_argument("--own", action="append", metavar="NAME=PATH", help="file ownership prefix for a lane (repeat; enables parallel when disjoint)")
+    a.add_argument("--depend", action="append", metavar="NAME=OTHER", help="lane NAME waits on OTHER (repeat)")
     a.add_argument("--name", help="the request's name (default: a slug of the request text)")
     a.add_argument("--json", action="store_true")
     a.set_defaults(fn=cmd_lanes_start)
@@ -20871,8 +21230,7 @@ def main(argv=None):
                                     "repeats it to raise-limit --reason)")
     a.add_argument("--ids", help="accept-finding with --apply: the finding ids to accept, comma-separated (e.g. F1,F2)")
     a.add_argument("--apply", action="store_true",
-                   help="approve-changes, accept-finding, raise-limit, choice: run the question step, sign and apply "
-                        "in one call (under one hold of the lane's state lock)")
+                   help="required: apply this director approval against the lane in one call (no pasteable tokens)")
     a.set_defaults(fn=cmd_director_sign)
     sp.add_parser("fingerprint").set_defaults(fn=cmd_fingerprint)
     a = sp.add_parser("config")

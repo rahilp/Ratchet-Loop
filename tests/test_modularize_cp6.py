@@ -240,6 +240,7 @@ def t01_module_byte_identical_and_explicit_imports():
         if name not in rr_defs:
             continue
         pinned_seg = ast.get_source_segment(pinned_src, pinned_defs[name])
+        note = ""
         if name == "integrity_problems":
             # The ONE intended later edit to a moved body (agent-model-config lane, CP1): the integrity lock reads the
             # layered config (machine-wide file under the project's) so a change to a locked key in the machine-wide
@@ -249,9 +250,25 @@ def t01_module_byte_identical_and_explicit_imports():
             check("[CP6-T01] integrity_problems: the pinned body holds the one line CP1 replaced, exactly once",
                   pinned_seg.count(_old_line) == 1, pinned_seg.count(_old_line))
             pinned_seg = pinned_seg.replace(_old_line, _new_line)
+            note = " apart from the one CP1 line (user = ctx.user_config())"
+        elif name == "verify_integrity":
+            # Lane D intentional: director-enrolled integrity refusal points at director-sign --apply, never a
+            # pasteable --director-token recipe.
+            _old = (
+                '                "director-enrolled, so either undo the change, or have the director approve it in one step with "\n'
+                '                f"`{_director_apply_cmd(ctx, \'approve-changes\')}` (or sign it for a token this lane applies with "\n'
+                '                "`ratchet.py approve-changes --director-token <t>`). End your turn saying what you are waiting for.")\n'
+            )
+            _new = (
+                '                "director-enrolled, so either undo the change, or have the director harness approve it with "\n'
+                '                f"`{_director_apply_cmd(ctx, \'approve-changes\')}`. End your turn saying what you are waiting for.")\n'
+            )
+            check("[CP6-T01] verify_integrity: the pinned body holds the pre-Lane-D token recipe, exactly once",
+                  pinned_seg.count(_old) == 1, pinned_seg.count(_old))
+            pinned_seg = pinned_seg.replace(_old, _new)
+            note = " apart from the Lane D harness-first director refusal"
         rr_seg = ast.get_source_segment(rr_src, rr_defs[name])
-        check(f"[CP6-T01] {name}'s body in run_records.py matches its pre-move body byte for byte"
-              + (" apart from the one CP1 line (user = ctx.user_config())" if name == "integrity_problems" else ""),
+        check(f"[CP6-T01] {name}'s body in run_records.py matches its pre-move body byte for byte" + note,
               rr_seg == pinned_seg, "" if rr_seg == pinned_seg else (pinned_seg, rr_seg))
 
     live_src = live_ratchet_source()
@@ -737,11 +754,14 @@ def t12_integrity_check_and_approve_changes_unchanged():
         def _norm2(s):
             return s.replace(str(d_cur2), "<root>").replace(str(d_pin2), "<root>")
 
-        check("[CP6-T12] the director-enrolled integrity refusal text is byte-identical before and after the "
-              "move", _norm2(r_cur2.stderr) == _norm2(r_pin2.stderr), (_norm2(r_pin2.stderr), _norm2(r_cur2.stderr)))
-        check("[CP6-T12] it really is the director-enrolled variant (names director-enrolled/approve-changes "
-              "for the lane)", "director-enrolled" in r_cur2.stderr and "approve-changes" in r_cur2.stderr,
+        # Lane D intentional: current engine drops the --director-token recipe; the pre-move pin still has it.
+        check("[CP6-T12] the director-enrolled integrity refusal (current) is harness-first (no --director-token)",
+              "director-enrolled" in r_cur2.stderr and "approve-changes" in r_cur2.stderr
+              and "director-token" not in r_cur2.stderr and "director harness" in r_cur2.stderr,
               r_cur2.stderr)
+        check("[CP6-T12] the pre-move pin still refuses with the older token recipe (move itself did not invent "
+              "Lane D)", "director-enrolled" in r_pin2.stderr and "director-token" in r_pin2.stderr,
+              r_pin2.stderr)
 
         # approve-changes clears the plain-variant integrity problem exactly as before: a later tests-written no
         # longer dies for this reason (current engine only -- the refusal itself is already proven identical

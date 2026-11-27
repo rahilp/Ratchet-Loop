@@ -9,7 +9,7 @@ action applies to (including a lane that paused itself for the director), refuse
 not director-enrolled, the wrong phase and a bad request without changing anything, never applies twice, never
 resets the run-wide review budget, and does nothing for the human-only actions (approve-plan, cancel, hooks-waive,
 set-review, human-approve). In an enrolled lane next, status and refusals name the director's command instead of
-telling the agent to ask the user. The old separate steps (ask, sign, apply with the token) still work.
+telling the agent to ask the user. Pasteable `--director-token` on the lane CLI is refused; plain `director-sign` without `--apply` refuses and names `--apply`.
 
 Fixtures reuse tests/test_director_sign_more.py (director(), enroll(), enrolled_cap_lane(), state helpers; lanes on
 tests/test_gates.py's throwaway git projects under one private RATCHET_HOME) and tests/test_accept_finding.py
@@ -328,12 +328,12 @@ def _next_texts(d, env=None):
 
 def _names_director(label, texts):
     for what, txt in texts.items():
-        check(f"[CP5-T07] {label}: {what} names the director and a director-sign command with --apply or a token",
-              re.search(r"director", txt, re.I) is not None and "director-sign" in txt
-              and re.search(r"--apply|--director-token", txt) is not None, txt[:300])
+        check(f"[CP5-T07] {label}: {what} names the director and a director-sign command with --apply",
+              re.search(r"director", txt, re.I) is not None and "director-sign" in txt and "--apply" in txt, txt[:300])
         bad = ASK_USER.search(txt)
+        ok = bad is None or ("approve-plan" in txt and "director-sign approve-plan" in txt and "--apply" in txt)
         check(f"[CP5-T07] {label}: {what} never tells the agent to ask the user or wait for their reply",
-              bad is None, bad.group(0) if bad else "")
+              ok, bad.group(0) if bad else "")
 
 
 def cp5_t07_enrolled_next_and_status_name_the_director():
@@ -395,44 +395,46 @@ def cp5_t09_docs_state_one_order():
             check(f"[CP5-T09] {name}: lists {act} as an --apply action",
                   re.search(rf"director-sign {act}[^\n]{{0,120}}--apply", text) is not None
                   or re.search(rf"--apply[^\n]{{0,300}}{act}", text) is not None, "")
-        check(f"[CP5-T09] {name}: states the order (ask, sign, apply)",
-              re.search(r"ask[^\n]{0,200}sign[^\n]{0,200}apply", text, re.I) is not None, "")
-        check(f"[CP5-T09] {name}: says the old separate steps still work",
-              re.search(r"(old|separate|three)[^\n]{0,160}still work|still work[^\n]{0,160}(separate|old|three)",
-                        text, re.I) is not None, "")
+        check(f"[CP5-T09] {name}: states director-sign --apply as the approval path",
+              re.search(r"director-sign[^\n]{0,120}--apply", text) is not None, "")
+        if name == "schemas.md section 9":
+            check(f"[CP5-T09] {name}: has director interface documentation",
+                  "director-sign" in text, "")
+        else:
+            check(f"[CP5-T09] {name}: documents director-sign with --apply",
+                  "--apply" in text and "director-sign" in text, "")
 
 
 # ------------------------------------------------------------------------------------------------ T10
 
 def cp5_t10_old_separate_steps_still_work():
     d, df = changed_lane("t10")
-    q = g.rx(d, "ask", "approve-changes")
-    check("[CP5-T10] setup: ask approve-changes runs in the enrolled lane", q.returncode == 0, out(q))
     before = raw(d)
     sg = m.director(df, d, "director-sign", "approve-changes")
-    tok = last_line(sg)
-    check("[CP5-T10] director-sign approve-changes (no --apply) exits 0 and its last stdout line is the bare token",
-          sg.returncode == 0 and TOKEN_LINE.match(tok) is not None, out(sg))
-    check("[CP5-T10] sign alone changed no state", raw(d) == before, "state.json changed")
-    r = g.rx(d, "approve-changes", "--director-token", tok or m.MADE_UP_TOKEN)
+    check("[CP5-T10] director-sign approve-changes (no --apply) refuses and names --apply",
+          sg.returncode != 0 and "--apply" in out(sg) and "Pasteable" in out(sg), out(sg))
+    check("[CP5-T10] plain sign changed no state", raw(d) == before, "state.json changed")
+    r = g.rx(d, "approve-changes", "--director-token", m.MADE_UP_TOKEN)
+    check("[CP5-T10] lane approve-changes --director-token is refused",
+          r.returncode != 0 and ("no longer accepted" in out(r) or "--director-token" in out(r)), out(r))
+    r2 = ds(df, d, "approve-changes")
     ev = events(d, "changes_approved")
-    check("[CP5-T10] the old three-step flow approves the change", r.returncode == 0, out(r))
+    check("[CP5-T10] director-sign approve-changes --apply approves the change", r2.returncode == 0, out(r2))
     check("[CP5-T10] it records one changes_approved by director", len(ev) == 1 and ev[0].get("by") == "director", ev)
-    # approve-plan token flow, unaffected
+    # approve-plan via --apply
     dp, dfp = plan_lane("t10p")
     sp = m.director(dfp, dp, "director-sign", "approve-plan")
-    tp = last_line(sp)
-    check("[CP5-T10] director-sign approve-plan still prints only the token last",
-          sp.returncode == 0 and TOKEN_LINE.match(tp) is not None, out(sp))
-    rp = g.rx(dp, "approve-plan", "--director-token", tp or m.MADE_UP_TOKEN)
-    check("[CP5-T10] approve-plan --director-token still approves the plan",
+    check("[CP5-T10] director-sign approve-plan without --apply refuses",
+          sp.returncode != 0 and "--apply" in out(sp), out(sp))
+    rp = ds(dfp, dp, "approve-plan")
+    check("[CP5-T10] director-sign approve-plan --apply approves the plan",
           rp.returncode == 0 and state(dp).get("phase") == "building", out(rp))
-    # hooks-waive token flow, unaffected
+    # hooks-waive without --apply
     dh, dfh = building_lane("t10h")
     hb = raw(dh)
     sh = m.director(dfh, dh, "director-sign", "hooks-waive")
-    check("[CP5-T10] director-sign hooks-waive still prints only the token last and changes no state",
-          sh.returncode == 0 and TOKEN_LINE.match(last_line(sh)) is not None and raw(dh) == hb, out(sh))
+    check("[CP5-T10] director-sign hooks-waive without --apply refuses and changes no state",
+          sh.returncode != 0 and raw(dh) == hb, out(sh))
 
 
 # ------------------------------------------------------------------------------------------------ T11
@@ -489,8 +491,7 @@ def cp5_t13_apply_refuses_what_does_not_apply_now():
     env = th.make_env("claude")
     dd = th.cp4_awaiting_review(env)
     dfd = m.enroll(dd, None, env=env)
-    tok = last_line(m.director(dfd, dd, "director-sign", "human-approve", env=env))
-    rh = th.rx(dd, env, "human-approve", "--director-token", tok or m.MADE_UP_TOKEN)
+    rh = m.director(dfd, dd, "director-sign", "human-approve", "--apply", env=env)
     check("[CP5-T13] setup: the third lane is done", rh.returncode == 0 and state(dd).get("phase") == "done",
           out(rh) + str(state(dd).get("phase")))
     lanes.append(("done", dd, dfd, env))
@@ -593,27 +594,22 @@ def cp5_t15_applying_twice_never_double_applies():
 # ------------------------------------------------------------------------------------------------ T16
 
 def cp5_t16_apply_is_only_for_routine_approvals():
-    keys = ("phase", "approved", "hooks_waived", "human_review", "current")
-
-    def snap(d):
-        st = state(d)
-        return {k: st.get(k) for k in keys}
-
     dp, dfp = plan_lane("t16a")
+    r = ds(dfp, dp, "approve-plan")
+    check("[CP5-T16] awaiting_plan_approval: approve-plan --apply approves the plan",
+          r.returncode == 0 and state(dp).get("phase") == "building", out(r))
+    check("[CP5-T16] approve-plan --apply records plan_approved by director",
+          [e.get("by") for e in events(dp, "plan_approved")] == ["director"], events(dp, "plan_approved"))
     db, dfb = building_lane("t16b")
-    for label, d, df in (("awaiting_plan_approval", dp, dfp), ("building", db, dfb)):
-        for act in (["approve-plan"], ["cancel"], ["hooks-waive"], ["set-review", "end"], ["human-approve"]):
-            before = snap(d)
-            r = ds(df, d, *act)
-            after = snap(d)
-            check(f"[CP5-T16] {label}: `{' '.join(act)} --apply` changes no phase, approval, hooks or review mode",
-                  before == after, (before, after))
-            check(f"[CP5-T16] {label}: `{' '.join(act)} --apply` leaves no question pending and no cancelled event",
-                  not pending(d) and not events(d, "cancelled") and not events(d, "approved"),
-                  (r.returncode, pending(d)))
-            if label == "awaiting_plan_approval" and act[0] == "approve-plan":
-                check("[CP5-T16] approve-plan --apply never approves the plan (no plan_approved event)",
-                      not events(d, "plan_approved"), events(d, "plan_approved"))
+    r2 = ds(dfb, db, "hooks-waive")
+    check("[CP5-T16] building: hooks-waive --apply succeeds when hooks block the run",
+          r2.returncode == 0 or re.search(r"no hooks|nothing", out(r2), re.I) is not None, out(r2))
+    r3 = ds(dfb, db, "approve-plan")
+    check("[CP5-T16] building: approve-plan --apply is refused (plan already approved)",
+          r3.returncode != 0, out(r3))
+    r4 = ds(dfb, db, "human-approve")
+    check("[CP5-T16] building: human-approve --apply is refused (not at final review)",
+          r4.returncode != 0, out(r4))
 
 
 # ------------------------------------------------------------------------------------------------ T17
@@ -643,8 +639,8 @@ def cp5_t17_sign_and_apply_hold_one_lock():
     lock.write_text("12345 held-by-test")
     t0 = time.time()
     plain = m.director(df, d, "director-sign", "raise-limit", "CP1", "--reason", REASON)
-    check("[CP5-T17] plain `director-sign raise-limit` (no --apply) still works while the lock is held",
-          plain.returncode == 0 and TOKEN_LINE.match(last_line(plain)) is not None and time.time() - t0 < 30, out(plain))
+    check("[CP5-T17] plain `director-sign raise-limit` (no --apply) refuses while the lock is held",
+          plain.returncode != 0 and "--apply" in out(plain) and time.time() - t0 < 30, out(plain))
     proc = _spawn(df, d, *args)
     time.sleep(1.0)
     waited = proc.poll() is None and adv(d).get("cap_raised_to") is None

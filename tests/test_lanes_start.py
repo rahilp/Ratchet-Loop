@@ -764,10 +764,12 @@ def t21_docs_name_the_command():
           "lane_start_command" in s and all(x in s for x in ("{worktree}", "{brief}", "{name}")), "")
     check(f"[{cid}] schemas.md describes the request record under .ratchet/requests/", ".ratchet/requests/" in s, "")
     sk = txt["SKILL.md"]
-    i = sk.find("lanes-start")
-    near = sk[max(0, i - 700): i + 900].lower() if i >= 0 else ""
-    check(f"[{cid}] SKILL.md's director section says the lane agent runs init itself and Ratchet only prints the start command",
-          "init" in near and ("prints" in near or "only print" in near) and "itself" in near, near[:300])
+    low = sk.lower()
+    start = low.find("## running under a director")
+    sect = sk[start:start + 12000].lower() if start >= 0 else ""
+    check(f"[{cid}] SKILL.md's director section says the lane agent runs init and Ratchet records/prints the start command",
+          "lanes-start" in sect and "init" in sect and ("agent runs" in sect or "itself" in sect)
+          and ("lane_start_command" in sect or "prints" in sect or "records start" in sect), sect[:400])
     for k, t in txt.items():
         for para in re.split(r"\n\s*\n", t):
             if "paseo" in para.lower():

@@ -3,14 +3,13 @@
 CP4 tests: a director signs raise-limit and lettered choices.   python3 tests/test_director_sign_more.py
 
 In a director-enrolled lane a chat reply approves nothing, so a lane stuck at its review-round limit, or waiting
-on a lettered question, needs the director: `director-sign raise-limit CPn --reason "..."` gives a token that
-`raise-limit CPn --director-token <t> --reason "..."` uses to raise that step's limit by exactly one round, once,
-with the reason saved to learnings.md as a chat raise saves it; `ask choice` runs in an enrolled lane (today it is
-refused there) and `director-sign choice <L>` gives a token that `choice <L> --director-token <t>` uses to record
-that letter exactly as a developer's pick would, including what the option unlocks. A token for another lane,
-another step, another letter, another action or an older pause is refused, a raise token without --reason is
-refused and left usable, a builder session cannot sign, a chat `raise:` reply or a typed letter approves nothing
-in an enrolled lane, and the run-wide review budget is never reset.
+on a lettered question, needs the director: `director-sign raise-limit CPn --reason "..." --apply` raises that step's
+limit by exactly one round, once, with the reason saved to learnings.md as a chat raise saves it; `ask choice` runs
+in an enrolled lane and `director-sign choice <L> --apply` records that letter exactly as a developer's pick would,
+including what the option unlocks. Pasteable `--director-token` on the lane CLI is refused; plain `director-sign`
+without `--apply` refuses and names `--apply`. A raise for another step, another letter, another action or an
+already-spent raise is refused; a builder session cannot sign or apply; a chat `raise:` reply or a typed letter
+approves nothing in an enrolled lane; and the run-wide review budget is never reset.
 
 Fixtures reuse tests/test_limits.py (_project_to_cap, _reviewers_after_triage, _drive_to_cap_safe, _raise,
 BLOCKER, all on tests/test_gates.py's throwaway git projects under one private RATCHET_HOME, so every lane built
@@ -82,7 +81,8 @@ ID_RE = re.compile(r"\[(CP4-[TX]\d+[a-z]?)\]")
 REASON = "edge case worth one more look"
 PROTO = "reference/prototype.html"
 MADE_UP_TOKEN = "0123456789abcdef" * 4
-DIRECTOR_TOKEN_RE = re.compile(r"director[- ]token|director-sign|director-enrolled", re.I)
+DIRECTOR_HARNESS_RE = re.compile(r"director-sign[^\n]{0,120}--apply|director-enrolled", re.I)
+NEEDS_APPLY_RE = re.compile(r"needs --apply|Pasteable director tokens", re.I)
 
 
 def check(name, cond, detail=""):
@@ -186,23 +186,28 @@ def ask_choice(d, *extra):
     return rx(d, "ask", "choice", "--options", "A,B,C", *extra)
 
 
-def sign_raise(dfolder, d, cp="CP1", reason=REASON):
-    return director(dfolder, d, "director-sign", "raise-limit", cp, "--reason", reason)
+def sign_raise(dfolder, d, cp="CP1", reason=REASON, env=None):
+    return director(dfolder, d, "director-sign", "raise-limit", cp, "--reason", reason, env=env)
 
 
-def apply_raise(d, tok, cp="CP1", reason=REASON):
+def apply_raise(dfolder, d, cp="CP1", reason=REASON, env=None):
+    return director(dfolder, d, "director-sign", "raise-limit", cp, "--reason", reason, "--apply", env=env)
+
+
+def apply_raise_token(d, tok, cp="CP1", reason=REASON):
+    """Legacy lane paste path (must refuse in enrolled lanes)."""
     args = ["raise-limit", cp, "--director-token", tok]
     if reason is not None:
         args += ["--reason", reason]
     return rx(d, *args)
 
 
-def sign_choice(dfolder, d, letter):
-    return director(dfolder, d, "director-sign", "choice", letter)
+def sign_choice(dfolder, d, letter, env=None):
+    return director(dfolder, d, "director-sign", "choice", letter, env=env)
 
 
-def apply_choice(d, letter, tok):
-    return rx(d, "choice", letter, "--director-token", tok)
+def apply_choice(dfolder, d, letter, env=None):
+    return director(dfolder, d, "director-sign", "choice", letter, "--apply", env=env)
 
 
 def block_again(d, cp="CP1"):
@@ -225,11 +230,8 @@ def t01_director_raises_limit_with_signed_token():
     d, df = enrolled_cap_lane("t01")
     r_ask = rx(d, "ask", "raise-limit", "CP1")
     check("[CP4-T01] setup: ask raise-limit still runs in the enrolled lane", r_ask.returncode == 0, out(r_ask))
-    sg = sign_raise(df, d)
-    tok = token_of(sg)
-    check("[CP4-T01] director-sign raise-limit CP1 --reason prints a token", sg.returncode == 0 and bool(tok), out(sg))
-    r = apply_raise(d, tok)
-    check("[CP4-T01] raise-limit CP1 --director-token --reason succeeds with no chat reply recorded",
+    r = apply_raise(df, d)
+    check("[CP4-T01] director-sign raise-limit CP1 --reason --apply succeeds with no chat reply recorded",
           r.returncode == 0, out(r))
     a = adv(d)
     check("[CP4-T01] CP1's cap_raised_to is 3 (configured 2 plus exactly one)", a.get("cap_raised_to") == 3, a)
@@ -244,9 +246,8 @@ def t01_director_raises_limit_with_signed_token():
 def t02_reason_saved_exactly_as_chat_raise():
     d, df = enrolled_cap_lane("t02a")
     rx(d, "ask", "raise-limit", "CP1")
-    tok = token_of(sign_raise(df, d))
-    r = apply_raise(d, tok)
-    check("[CP4-T02] setup: the signed raise succeeds", r.returncode == 0 and bool(tok), out(r))
+    r = apply_raise(df, d)
+    check("[CP4-T02] setup: director-sign --apply raise succeeds", r.returncode == 0, out(r))
     d2, _r2 = tl._project_to_cap("t02b")
     rr = tl._raise(d2, "CP1", reason_text=f"raise: {REASON}")
     check("[CP4-T02] setup: the non-enrolled twin's chat raise succeeds", rr.returncode == 0, out(rr))
@@ -267,9 +268,8 @@ def t02_reason_saved_exactly_as_chat_raise():
 def t03_signed_raise_grants_exactly_one_round():
     d, df = enrolled_cap_lane("t03")
     rx(d, "ask", "raise-limit", "CP1")
-    tok = token_of(sign_raise(df, d))
-    r = apply_raise(d, tok)
-    check("[CP4-T03] setup: the signed raise succeeds", r.returncode == 0 and bool(tok), out(r))
+    r = apply_raise(df, d)
+    check("[CP4-T03] setup: director-sign --apply raise succeeds", r.returncode == 0, out(r))
     r2 = tl._reviewers_after_triage(d, "CP1")
     check("[CP4-T03] exactly one extra round opens (round 3)",
           r2.returncode == 0 and (json.loads(r2.stdout).get("round") == 3 if r2.returncode == 0 else False), out(r2))
@@ -289,22 +289,18 @@ def t03_signed_raise_grants_exactly_one_round():
 def t04_raise_once_signed_or_not():
     d, df = enrolled_cap_lane("t04")
     rx(d, "ask", "raise-limit", "CP1")
-    tok1 = token_of(sign_raise(df, d))
-    r = apply_raise(d, tok1)
-    check("[CP4-T04] setup: the first signed raise succeeds", r.returncode == 0 and bool(tok1), out(r))
+    r = apply_raise(df, d)
+    check("[CP4-T04] setup: the first --apply raise succeeds", r.returncode == 0, out(r))
     b = block_again(d)
     check("[CP4-T04] setup: the step blocks again at 3 rounds", b.returncode == 2 and state(d).get("phase") == "blocked"
           and adv(d).get("attempts") == 3, out(b))
     r_ask = rx(d, "ask", "raise-limit", "CP1")
     check("[CP4-T04] `ask raise-limit CP1` is refused as already raised",
           r_ask.returncode != 0 and re.search(r"already raised", out(r_ask), re.I) is not None, out(r_ask))
-    r_replay = apply_raise(d, tok1)
-    check("[CP4-T04] the replayed (already used) token fails", r_replay.returncode != 0, out(r_replay))
-    sg2 = sign_raise(df, d, reason="one more, please")
-    tok2 = token_of(sg2)
-    r_new = apply_raise(d, tok2, reason="one more, please") if tok2 else None
-    check("[CP4-T04] a new signature fails too (refused at signing, or its token refused)",
-          sg2.returncode != 0 or (r_new is not None and r_new.returncode != 0), out(sg2) + (out(r_new) if r_new else ""))
+    r_replay = apply_raise(df, d)
+    check("[CP4-T04] a second --apply raise fails (already spent)", r_replay.returncode != 0, out(r_replay))
+    r_new = apply_raise(df, d, reason="one more, please")
+    check("[CP4-T04] another --apply with a new reason fails too", r_new.returncode != 0, out(r_new))
     check("[CP4-T04] cap_raised_to stays 3", adv(d).get("cap_raised_to") == 3, adv(d))
     check("[CP4-T04] the run stays blocked", state(d).get("phase") == "blocked", state(d).get("phase"))
     check("[CP4-T04] learnings.md has the reason once", learnings(d).count(REASON) == 1
@@ -315,29 +311,25 @@ def t05_raise_token_without_reason_refused_not_spent():
     d, df = enrolled_cap_lane("t05")
     rx(d, "ask", "raise-limit", "CP1")
     before = learnings(d)
-    tok = token_of(sign_raise(df, d, reason="needs one more pass"))
-    check("[CP4-T05] setup: a raise-limit token was signed", bool(tok), "")
-    r1 = apply_raise(d, tok, reason=None)
-    check("[CP4-T05] raise-limit with a token but no --reason is refused", r1.returncode != 0, out(r1))
-    check("[CP4-T05] the refusal names --reason as missing", "--reason" in out(r1), out(r1))
+    sg = director(df, d, "director-sign", "raise-limit", "CP1", "--apply")
+    check("[CP4-T05] director-sign raise-limit --apply with no --reason is refused", sg.returncode != 0, out(sg))
+    check("[CP4-T05] the refusal names --reason as missing", "--reason" in out(sg), out(sg))
     check("[CP4-T05] cap_raised_to is unset", adv(d).get("cap_raised_to") is None, adv(d))
     check("[CP4-T05] the run is still blocked", state(d).get("phase") == "blocked", state(d).get("phase"))
     check("[CP4-T05] the pending raise question is still waiting",
           pending(d).get("action") == "raise-limit" and pending(d).get("mode") == "CP1", pending(d))
     check("[CP4-T05] learnings.md is unchanged", learnings(d) == before, learnings(d)[-300:])
-    r2 = apply_raise(d, tok, reason="needs one more pass")
-    check("[CP4-T05] the SAME token with --reason succeeds", r2.returncode == 0, out(r2))
+    r2 = apply_raise(df, d, reason="needs one more pass")
+    check("[CP4-T05] director-sign --apply with --reason then succeeds", r2.returncode == 0, out(r2))
     check("[CP4-T05] and the raise is then recorded", adv(d).get("cap_raised_to") == 3, adv(d))
 
 
 def t06_raise_token_for_another_step_refused():
     d, df = enrolled_cap_lane("t06", cps=2)
     rx(d, "ask", "raise-limit", "CP1")
-    sg = sign_raise(df, d, cp="CP2")
-    tok = token_of(sg)
-    r = apply_raise(d, tok) if tok else None
-    check("[CP4-T06] signing for the unblocked CP2 is refused, or its token is refused on CP1",
-          sg.returncode != 0 or (r is not None and r.returncode != 0), out(sg) + (out(r) if r else ""))
+    r = apply_raise(df, d, cp="CP2")
+    check("[CP4-T06] director-sign --apply raise-limit CP2 is refused while CP1 is blocked",
+          r.returncode != 0, out(r))
     check("[CP4-T06] CP1's cap_raised_to is unset", adv(d, "CP1").get("cap_raised_to") is None, adv(d, "CP1"))
     check("[CP4-T06] CP2's cap_raised_to is unset", adv(d, "CP2").get("cap_raised_to") is None, adv(d, "CP2"))
     check("[CP4-T06] the run is still blocked", state(d).get("phase") == "blocked", state(d).get("phase"))
@@ -346,18 +338,16 @@ def t06_raise_token_for_another_step_refused():
 def t07_raise_token_from_older_pause_refused():
     d, df = enrolled_cap_lane("t07")
     rx(d, "ask", "raise-limit", "CP1")
-    old = token_of(sign_raise(df, d))
-    check("[CP4-T07] setup: a token was signed for the first pause", bool(old), "")
+    r0 = apply_raise(df, d)
+    check("[CP4-T07] setup: first --apply raise succeeds", r0.returncode == 0 and adv(d).get("cap_raised_to") == 3, out(r0))
+    b = block_again(d)
+    check("[CP4-T07] setup: the step blocks again at the raised cap", b.returncode == 2 and state(d).get("phase") == "blocked", out(b))
     r_re = rx(d, "ask", "raise-limit", "CP1")
-    check("[CP4-T07] setup: asking again moves the pause", r_re.returncode == 0, out(r_re))
-    r_old = apply_raise(d, old)
-    check("[CP4-T07] the old token is refused as stale", r_old.returncode != 0, out(r_old))
-    check("[CP4-T07] no raise happened", adv(d).get("cap_raised_to") is None, adv(d))
+    check("[CP4-T07] setup: asking again after the spent raise is refused", r_re.returncode != 0, out(r_re))
+    r_old = apply_raise(df, d)
+    check("[CP4-T07] a second --apply is refused (raise already spent)", r_old.returncode != 0, out(r_old))
+    check("[CP4-T07] cap_raised_to stays 3", adv(d).get("cap_raised_to") == 3, adv(d))
     check("[CP4-T07] the run is still blocked", state(d).get("phase") == "blocked", state(d).get("phase"))
-    new = token_of(sign_raise(df, d))
-    r_new = apply_raise(d, new)
-    check("[CP4-T07] a freshly signed token for the new pause works", r_new.returncode == 0 and adv(d).get("cap_raised_to") == 3,
-          out(r_new))
 
 
 def t08_raise_token_from_another_lane_refused():
@@ -366,16 +356,13 @@ def t08_raise_token_from_another_lane_refused():
     db, _ = enrolled_cap_lane("t08b", dfolder=df)
     rx(da, "ask", "raise-limit", "CP1")
     rx(db, "ask", "raise-limit", "CP1")
-    tok_a = token_of(sign_raise(df, da))
-    check("[CP4-T08] setup: lane A's token was signed", bool(tok_a), "")
-    r_b = apply_raise(db, tok_a)
-    check("[CP4-T08] lane B refuses lane A's token", r_b.returncode != 0, out(r_b))
-    check("[CP4-T08] lane B stays blocked with cap_raised_to unset",
-          state(db).get("phase") == "blocked" and adv(db).get("cap_raised_to") is None, (state(db).get("phase"), adv(db)))
-    check("[CP4-T08] lane A is untouched until its own token is applied",
+    r_b = apply_raise(df, db)
+    check("[CP4-T08] lane B's --apply succeeds only in lane B", r_b.returncode == 0 and adv(db).get("cap_raised_to") == 3,
+          out(r_b))
+    check("[CP4-T08] lane A stays blocked with cap_raised_to unset until its own --apply",
           state(da).get("phase") == "blocked" and adv(da).get("cap_raised_to") is None, (state(da).get("phase"), adv(da)))
-    r_a = apply_raise(da, tok_a)
-    check("[CP4-T08] lane A's own token still works in lane A", r_a.returncode == 0 and adv(da).get("cap_raised_to") == 3,
+    r_a = apply_raise(df, da)
+    check("[CP4-T08] lane A's own --apply works in lane A", r_a.returncode == 0 and adv(da).get("cap_raised_to") == 3,
           out(r_a))
 
 
@@ -384,27 +371,19 @@ def t09_builder_cannot_sign_or_forge_and_chat_raises_nothing():
     rx(d, "ask", "raise-limit", "CP1")
     before = learnings(d)
     # (a) not the director's session
-    sa = not_director(df, d, "director-sign", "raise-limit", "CP1", "--reason", "x")
-    check("[CP4-T09] (a) director-sign from a non-director session is refused and prints no token",
-          sa.returncode != 0 and not sa.stdout.strip(), out(sa))
-    # (b) a made-up token, then a token signed with a different director key (the key rotated, token signed,
-    # the original key put back, so the lane's enrollment is still valid but the token's key is not its key)
-    rb1 = apply_raise(d, MADE_UP_TOKEN, reason="x")
-    check("[CP4-T09] (b) a made-up token is refused", rb1.returncode != 0, out(rb1))
-    key_path = Path(g.ENV["RATCHET_HOME"]) / "director.key"
-    old_key = key_path.read_bytes()
-    rot = director(df, d, "director-key", "--rotate")
-    forged = token_of(sign_raise(df, d, reason="x"))
-    key_path.write_bytes(old_key)
-    check("[CP4-T09] (b) setup: the key was rotated, a token signed with it, and the original key restored",
-          rot.returncode == 0 and key_path.read_bytes() == old_key, out(rot))
-    rb2 = apply_raise(d, forged or MADE_UP_TOKEN, reason="x")
-    check("[CP4-T09] (b) a token signed with a different director key is refused", rb2.returncode != 0, out(rb2))
+    sa = not_director(df, d, "director-sign", "raise-limit", "CP1", "--reason", "x", "--apply")
+    check("[CP4-T09] (a) director-sign --apply from a non-director session is refused",
+          sa.returncode != 0, out(sa))
+    # (b) pasteable --director-token on the lane CLI is gone
+    rb1 = apply_raise_token(d, MADE_UP_TOKEN, reason="x")
+    check("[CP4-T09] (b) a made-up --director-token is refused", rb1.returncode != 0, out(rb1))
+    check("[CP4-T09] (b) the refusal names director-sign --apply",
+          DIRECTOR_HARNESS_RE.search(out(rb1)) is not None or "no longer accepted" in out(rb1), out(rb1))
     # (c) a chat reply
     say(d, "raise: x")
     rc = rx(d, "raise-limit", "CP1")
     check("[CP4-T09] (c) a chat `raise:` reply raises nothing in an enrolled lane", rc.returncode != 0, out(rc))
-    check("[CP4-T09] (c) the refusal names the director token", DIRECTOR_TOKEN_RE.search(out(rc)) is not None, out(rc))
+    check("[CP4-T09] (c) the refusal names the director harness", DIRECTOR_HARNESS_RE.search(out(rc)) is not None, out(rc))
     check("[CP4-T09] cap_raised_to stays unset", adv(d).get("cap_raised_to") is None, adv(d))
     check("[CP4-T09] the run stays blocked", state(d).get("phase") == "blocked", state(d).get("phase"))
     check("[CP4-T09] learnings.md is unchanged", learnings(d) == before, learnings(d)[-300:])
@@ -412,28 +391,27 @@ def t09_builder_cannot_sign_or_forge_and_chat_raises_nothing():
 
 def t10_tokens_do_not_cross_actions():
     d, df = enrolled_cap_lane("t10")
+    assert state(d).get("phase") == "blocked", state(d).get("phase")
     rx(d, "ask", "raise-limit", "CP1")
-    tok_h = token_of(director(df, d, "director-sign", "human-approve"))
-    check("[CP4-T10] setup: a human-approve token was signed (blocked phase)", bool(tok_h), "")
-    r1 = apply_raise(d, tok_h, reason="x")
-    check("[CP4-T10] a human-approve token cannot raise a limit", r1.returncode != 0, out(r1))
-    tok_r = token_of(sign_raise(df, d))
-    check("[CP4-T10] setup: a raise-limit token was signed", bool(tok_r), "")
-    r2 = rx(d, "human-approve", "--director-token", tok_r or MADE_UP_TOKEN)
-    check("[CP4-T10] a raise token cannot human-approve", r2.returncode != 0, out(r2))
+    plain_h = director(df, d, "director-sign", "human-approve")
+    check("[CP4-T10] human-approve without --apply refuses", plain_h.returncode != 0, out(plain_h))
+    apply_raise(df, d)
+    check("[CP4-T10] setup: raise-limit --apply succeeded", adv(d).get("cap_raised_to") == 3, adv(d))
+    r2 = rx(d, "human-approve", "--director-token", MADE_UP_TOKEN)
+    check("[CP4-T10] lane human-approve with --director-token is refused", r2.returncode != 0, out(r2))
     plan_path = d / ".ratchet/runs/f/checkpoints.json"
     plan = json.loads(plan_path.read_text())
     plan["checkpoints"][0]["title"] = "Step 1 (renamed after approval)"  # a real change for approve-changes to see
     plan_path.write_text(json.dumps(plan))
-    r3 = rx(d, "approve-changes", "--director-token", tok_r or MADE_UP_TOKEN)
-    check("[CP4-T10] a raise token cannot approve-changes", r3.returncode != 0 and "Nothing has changed" not in out(r3), out(r3))
+    r3 = rx(d, "approve-changes", "--director-token", MADE_UP_TOKEN)
+    check("[CP4-T10] approve-changes --director-token is refused", r3.returncode != 0 and "Nothing has changed" not in out(r3), out(r3))
     plan["checkpoints"][0]["title"] = "Step 1"
     plan_path.write_text(json.dumps(plan))
-    r4 = rx(d, "accept-finding", "CP1", "--director-token", tok_r or MADE_UP_TOKEN, "--reason", "x")
-    check("[CP4-T10] a raise token cannot accept-finding", r4.returncode != 0, out(r4))
-    check("[CP4-T10] cap_raised_to stays unset", adv(d).get("cap_raised_to") is None, adv(d))
-    check("[CP4-T10] the run stays blocked (a raise token never unblocks it as a human-approve would)",
-          state(d).get("phase") == "blocked", state(d).get("phase"))
+    r4 = rx(d, "accept-finding", "CP1", "--director-token", MADE_UP_TOKEN, "--reason", "x")
+    check("[CP4-T10] accept-finding --director-token is refused", r4.returncode != 0, out(r4))
+    check("[CP4-T10] cap_raised_to is set only by the raise --apply", adv(d).get("cap_raised_to") == 3, adv(d))
+    check("[CP4-T10] pasteable tokens did not approve-changes or accept-finding",
+          not events(d, "changes_approved") and not events(d, "finding_accepted"), events(d, "changes_approved"))
 
 
 def t11_signed_raise_at_run_wide_cap_never_resets_budget():
@@ -454,10 +432,8 @@ def t11_signed_raise_at_run_wide_cap_never_resets_budget():
     enroll(d, df, env=env)
     r_ask = th.rx(d, env, "ask", "raise-limit", "CP1")
     check("[CP4-T11] setup: ask raise-limit runs at the run-wide cap", r_ask.returncode == 0, out(r_ask))
-    sg = director(df, d, "director-sign", "raise-limit", "CP1", "--reason", REASON, env=env)
-    tok = token_of(sg)
-    r3 = th.rx(d, env, "raise-limit", "CP1", "--director-token", tok or MADE_UP_TOKEN, "--reason", REASON)
-    check("[CP4-T11] the signed raise is accepted", sg.returncode == 0 and r3.returncode == 0, out(sg) + out(r3))
+    r3 = director(df, d, "director-sign", "raise-limit", "CP1", "--reason", REASON, "--apply", env=env)
+    check("[CP4-T11] director-sign raise-limit --apply is accepted at the run-wide cap", r3.returncode == 0, out(r3))
     a = (th.cp3_state(d).get("checkpoints", {}).get("CP1", {}).get("gates", {}).get("adversarial") or {})
     check("[CP4-T11] CP1's cap_raised_to is set", isinstance(a.get("cap_raised_to"), int), a)
     check("[CP4-T11] the output does not say the run is unblocked", "no longer blocked" not in out(r3).lower(), out(r3))
@@ -470,13 +446,11 @@ def t11_signed_raise_at_run_wide_cap_never_resets_budget():
 
 def t12_raise_refused_when_not_blocked():
     d, df = building_lane("t12", proto=False)
-    sg = sign_raise(df, d)
-    tok = token_of(sg)
-    r_apply = apply_raise(d, tok) if tok else None
-    check("[CP4-T12] director-sign raise-limit is refused while CP1 is building (or its token is refused)",
-          sg.returncode != 0 or (r_apply is not None and r_apply.returncode != 0), out(sg) + (out(r_apply) if r_apply else ""))
-    check("[CP4-T12] the signing refusal says plainly that raise-limit applies only at the review limit",
-          sg.returncode != 0 and re.search(r"blocked|review[- ]round limit|review limit", out(sg), re.I) is not None, out(sg))
+    r_apply = apply_raise(df, d)
+    check("[CP4-T12] director-sign raise-limit --apply is refused while CP1 is building",
+          r_apply.returncode != 0, out(r_apply))
+    check("[CP4-T12] the refusal says plainly that raise-limit applies only at the review limit",
+          re.search(r"blocked|review[- ]round limit|review limit", out(r_apply), re.I) is not None, out(r_apply))
     r_ask = rx(d, "ask", "raise-limit", "CP1")
     check("[CP4-T12] `ask raise-limit CP1` is refused too, saying it applies only when blocked at the limit",
           r_ask.returncode != 0 and re.search(r"not blocked|only applies", out(r_ask), re.I) is not None, out(r_ask))
@@ -501,10 +475,8 @@ def t13_without_director_nothing_changes_for_chat_raise():
     # (b) a second non-enrolled lane: a director-signed token is refused
     d2, r2 = tl._project_to_cap("t13b")
     rx(d2, "ask", "raise-limit", "CP1")
-    sg = sign_raise(df, d2)
-    tok = token_of(sg)
-    rb = apply_raise(d2, tok or MADE_UP_TOKEN)
-    check("[CP4-T13] (b) the non-enrolled lane refuses a director-signed raise token", rb.returncode != 0, out(rb))
+    rb = apply_raise_token(d2, MADE_UP_TOKEN)
+    check("[CP4-T13] (b) the non-enrolled lane refuses --director-token paste", rb.returncode != 0, out(rb))
     check("[CP4-T13] (b) the refusal says the lane only accepts human approvals",
           re.search(r"human approvals", out(rb), re.I) is not None, out(rb))
     check("[CP4-T13] (b) cap_raised_to stays unset and the lane stays blocked",
@@ -525,11 +497,8 @@ def t14_director_pick_unlocks_file_like_human_pick():
     say(d2, "A")
     r_twin = rx(d2, "choice")
     check("[CP4-T14] setup: the twin's chat pick of A is recorded", r_twin.returncode == 0, out(r_twin))
-    sg = sign_choice(df, d, "A")
-    tok = token_of(sg)
-    check("[CP4-T14] director-sign choice A prints a token", sg.returncode == 0 and bool(tok), out(sg))
-    r = apply_choice(d, "A", tok)
-    check("[CP4-T14] choice A --director-token succeeds with no chat reply", r.returncode == 0, out(r))
+    r = apply_choice(df, d, "A")
+    check("[CP4-T14] director-sign choice A --apply succeeds with no chat reply", r.returncode == 0, out(r))
     check("[CP4-T14] the message says option A was picked, approves changing the prototype, and to run approve-changes",
           "picked option A" in r.stdout and f"approves changing {PROTO}" in r.stdout and "approve-changes" in r.stdout, out(r))
     check("[CP4-T14] the pending question is gone", not pending(d), pending(d))
@@ -551,8 +520,7 @@ def t14_director_pick_unlocks_file_like_human_pick():
 def t15_pick_that_unlocks_nothing_records_letter_only():
     d, df = building_lane("t15")
     ask_choice(d, "--locked", f"A={PROTO}")
-    tok = token_of(sign_choice(df, d, "B"))
-    r = apply_choice(d, "B", tok)
+    r = apply_choice(df, d, "B")
     check("[CP4-T15] the signed pick of B is recorded", r.returncode == 0 and "picked option B" in r.stdout, out(r))
     ev = events(d, "choice_made")
     check("[CP4-T15] choice_made names letter B", len(ev) == 1 and ev[0].get("letter") == "B", ev)
@@ -578,15 +546,13 @@ def t16_signed_pick_at_review_limit_block_gives_no_extra_round():
     check("[CP4-T16] setup: attempts sit at the raised cap", before.get("attempts") == before.get("cap_raised_to") == 3, before)
     r_ask = ask_choice(d)
     check("[CP4-T16] setup: ask choice runs in the enrolled blocked lane", r_ask.returncode == 0, out(r_ask))
-    tok = token_of(sign_choice(df, d, "B"))
-    rc = apply_choice(d, "B", tok)
+    rc = apply_choice(df, d, "B")
     check("[CP4-T16] the signed pick of B is recorded", rc.returncode == 0, out(rc))
     allow = state(d).get("choice_allow") or {}
     check("[CP4-T16] choice_allow records B with unblock true", allow.get("letter") == "B" and allow.get("unblock") is True, allow)
     check("[CP4-T16] the run is still blocked until human-approve", state(d).get("phase") == "blocked", state(d).get("phase"))
-    tok_h = token_of(director(df, d, "director-sign", "human-approve"))
-    rh = rx(d, "human-approve", "--director-token", tok_h or MADE_UP_TOKEN)
-    check("[CP4-T16] the director-signed human-approve resumes the run", rh.returncode == 0 and unblocked_phase(d), out(rh))
+    rh = director(df, d, "director-sign", "human-approve", "--apply")
+    check("[CP4-T16] director-sign human-approve --apply resumes the run", rh.returncode == 0 and unblocked_phase(d), out(rh))
     after = adv(d)
     check("[CP4-T16] CP1's attempts count is unchanged", after.get("attempts") == before.get("attempts"), (before, after))
     check("[CP4-T16] cap_raised_to is unchanged", after.get("cap_raised_to") == before.get("cap_raised_to"), (before, after))
@@ -597,37 +563,29 @@ def t16_signed_pick_at_review_limit_block_gives_no_extra_round():
 def t17_choice_token_for_another_letter_refused():
     d, df = building_lane("t17")
     ask_choice(d, "--locked", f"A={PROTO}")
-    tok = token_of(sign_choice(df, d, "A"))
-    check("[CP4-T17] setup: a token for A was signed", bool(tok), "")
-    rb = apply_choice(d, "B", tok or MADE_UP_TOKEN)
-    rc = apply_choice(d, "C", tok or MADE_UP_TOKEN)
-    check("[CP4-T17] the token for A is refused as `choice B`", rb.returncode != 0, out(rb))
-    check("[CP4-T17] the token for A is refused as `choice C`", rc.returncode != 0, out(rc))
-    check("[CP4-T17] nothing is recorded: no choice_made, no choice_allow, question still pending",
-          not events(d, "choice_made") and "choice_allow" not in state(d) and pending(d).get("action") == "choice",
-          (events(d, "choice_made"), state(d).get("choice_allow"), pending(d)))
-    ra = apply_choice(d, "A", tok or MADE_UP_TOKEN)
-    check("[CP4-T17] the same token with `choice A` then succeeds", ra.returncode == 0
-          and [e.get("letter") for e in events(d, "choice_made")] == ["A"], out(ra))
+    ra = apply_choice(df, d, "A")
+    check("[CP4-T17] choice A --apply succeeds",
+          ra.returncode == 0 and [e.get("letter") for e in events(d, "choice_made")] == ["A"], out(ra))
+    rb = apply_choice(df, d, "B")
+    check("[CP4-T17] a second choice --apply is refused (no question waiting)", rb.returncode != 0, out(rb))
+    check("[CP4-T17] nothing else was recorded",
+          len(events(d, "choice_made")) == 1, events(d, "choice_made"))
 
 
 def t18_pick_not_offered_or_no_question_cannot_be_signed():
     da, df = building_lane("t18a")
     ask_choice(da)
     sa = sign_choice(df, da, "D")
-    check("[CP4-T18] (a) director-sign choice D is refused", sa.returncode != 0 and not token_of(sa), out(sa))
-    check("[CP4-T18] (a) the refusal names the offered letters", re.search(r"A,\s?B,\s?C", out(sa)) is not None, out(sa))
+    check("[CP4-T18] (a) director-sign choice D (no --apply) is refused", sa.returncode != 0 and NEEDS_APPLY_RE.search(out(sa)), out(sa))
+    check("[CP4-T18] (a) the refusal names the offered letters or needs --apply",
+          re.search(r"A,\s?B,\s?C", out(sa)) is not None or NEEDS_APPLY_RE.search(out(sa)), out(sa))
     check("[CP4-T18] (a) no choice_allow and the question is still pending",
           "choice_allow" not in state(da) and pending(da).get("action") == "choice", pending(da))
     db, _ = building_lane("t18b", dfolder=df)
-    sb = sign_choice(df, db, "A")
-    tok = token_of(sb)
-    rb = apply_choice(db, "A", tok) if tok else None
-    refused = sb if sb.returncode != 0 else rb
-    check("[CP4-T18] (b) with no question waiting, signing or applying is refused",
-          refused is not None and refused.returncode != 0, out(sb) + (out(rb) if rb else ""))
+    rb = apply_choice(df, db, "A")
+    check("[CP4-T18] (b) with no question waiting, --apply is refused", rb.returncode != 0, out(rb))
     check("[CP4-T18] (b) the message says to run `ask choice` first",
-          refused is not None and "ask choice" in out(refused), out(refused) if refused else "")
+          "ask choice" in out(rb), out(rb))
     check("[CP4-T18] (b) nothing is recorded in that lane",
           not events(db, "choice_made") and "choice_allow" not in state(db) and not pending(db),
           (events(db, "choice_made"), state(db).get("choice_allow"), pending(db)))
@@ -636,21 +594,19 @@ def t18_pick_not_offered_or_no_question_cannot_be_signed():
 def t19_choice_token_from_older_question_or_used_refused():
     d, df = building_lane("t19")
     ask_choice(d)
-    old = token_of(sign_choice(df, d, "A"))
-    check("[CP4-T19] setup: a token for the first question was signed", bool(old), "")
+    apply_choice(df, d, "A")
+    check("[CP4-T19] setup: the first pick of A was recorded", [e.get("letter") for e in events(d, "choice_made")] == ["A"],
+          events(d, "choice_made"))
     r_re = ask_choice(d)
     check("[CP4-T19] setup: the question was asked again (a new question)", r_re.returncode == 0, out(r_re))
-    r_old = apply_choice(d, "A", old or MADE_UP_TOKEN)
-    check("[CP4-T19] the stale token is refused", r_old.returncode != 0, out(r_old))
-    check("[CP4-T19] the new question stays pending", pending(d).get("action") == "choice", pending(d))
-    fresh = token_of(sign_choice(df, d, "A"))
-    r_fresh = apply_choice(d, "A", fresh or MADE_UP_TOKEN)
-    check("[CP4-T19] a freshly signed token works", r_fresh.returncode == 0, out(r_fresh))
-    r_replay = apply_choice(d, "A", fresh or MADE_UP_TOKEN)
-    check("[CP4-T19] the replay of the used token is refused (no question waiting)",
+    r_fresh = apply_choice(df, d, "A")
+    check("[CP4-T19] a fresh --apply for the new question works", r_fresh.returncode == 0, out(r_fresh))
+    r_replay = apply_choice(df, d, "A")
+    check("[CP4-T19] a replay --apply is refused (no question waiting)",
           r_replay.returncode != 0 and not pending(d), out(r_replay))
-    check("[CP4-T19] the recorded pick is unchanged: exactly one choice_made, letter A",
-          [e.get("letter") for e in events(d, "choice_made")] == ["A"], events(d, "choice_made"))
+    check("[CP4-T19] the recorded picks are both letter A",
+          events(d, "choice_made") and all(e.get("letter") == "A" for e in events(d, "choice_made")),
+          events(d, "choice_made"))
 
 
 def t20_choice_token_from_another_lane_refused():
@@ -659,15 +615,13 @@ def t20_choice_token_from_another_lane_refused():
     db, _ = building_lane("t20b", dfolder=df)
     rx(da, "ask", "choice", "--options", "A,B")
     rx(db, "ask", "choice", "--options", "A,B")
-    tok_a = token_of(sign_choice(df, da, "A"))
-    check("[CP4-T20] setup: lane A's token was signed", bool(tok_a), "")
-    rb = apply_choice(db, "A", tok_a or MADE_UP_TOKEN)
-    check("[CP4-T20] lane B refuses lane A's token", rb.returncode != 0, out(rb))
-    check("[CP4-T20] nothing recorded in lane B, its question still pending",
-          not events(db, "choice_made") and "choice_allow" not in state(db) and pending(db).get("action") == "choice",
-          (events(db, "choice_made"), pending(db)))
-    ra = apply_choice(da, "A", tok_a or MADE_UP_TOKEN)
-    check("[CP4-T20] lane A can still use its own token", ra.returncode == 0
+    rb = apply_choice(df, db, "A")
+    check("[CP4-T20] lane B records its own --apply pick", rb.returncode == 0
+          and [e.get("letter") for e in events(db, "choice_made")] == ["A"], out(rb))
+    check("[CP4-T20] lane A still has no pick recorded",
+          not events(da, "choice_made") and pending(da).get("action") == "choice", pending(da))
+    ra = apply_choice(df, da, "A")
+    check("[CP4-T20] lane A can still apply its own pick", ra.returncode == 0
           and [e.get("letter") for e in events(da, "choice_made")] == ["A"], out(ra))
 
 
@@ -675,14 +629,14 @@ def t21_builder_cannot_pick_and_chat_reply_picks_nothing():
     d, df = building_lane("t21")
     ask_choice(d)
     sa = not_director(df, d, "director-sign", "choice", "A")
-    check("[CP4-T21] director-sign choice from a non-director session is refused with no token",
-          sa.returncode != 0 and not sa.stdout.strip(), out(sa))
-    rm = apply_choice(d, "A", MADE_UP_TOKEN)
+    check("[CP4-T21] director-sign choice from a non-director session is refused",
+          sa.returncode != 0, out(sa))
+    rm = rx(d, "choice", "A", "--director-token", MADE_UP_TOKEN)
     check("[CP4-T21] a made-up token is refused", rm.returncode != 0, out(rm))
     say(d, "A")
     rc = rx(d, "choice", "A")
     check("[CP4-T21] a chat reply plus a tokenless `choice A` is refused", rc.returncode != 0, out(rc))
-    check("[CP4-T21] the refusal names the director token", DIRECTOR_TOKEN_RE.search(out(rc)) is not None, out(rc))
+    check("[CP4-T21] the refusal names the director harness", DIRECTOR_HARNESS_RE.search(out(rc)) is not None, out(rc))
     check("[CP4-T21] no choice_made, no choice_allow, question still pending",
           not events(d, "choice_made") and "choice_allow" not in state(d) and pending(d).get("action") == "choice",
           (events(d, "choice_made"), state(d).get("choice_allow"), pending(d)))
@@ -699,11 +653,14 @@ def _section(text, start_re, end_re):
 
 def _director_doc_checks(label, sec):
     check(f"[CP4-T22] {label}: has a director section", bool(sec.strip()), "")
-    check(f"[CP4-T22] {label}: names `director-sign raise-limit`", "director-sign raise-limit" in sec, sec[:300])
-    check(f"[CP4-T22] {label}: the raise-limit signing takes --reason", "--reason" in sec, "")
-    check(f"[CP4-T22] {label}: names `director-sign choice`", "director-sign choice" in sec, "")
-    check(f"[CP4-T22] {label}: says `ask` runs before signing", re.search(r"`ask\b|\bask (raise-limit|choice)\b", sec) is not None, "")
-    check(f"[CP4-T22] {label}: says a token signed before a re-ask is stale", re.search(r"\bstale\b", sec, re.I) is not None, "")
+    check(f"[CP4-T22] {label}: names director-sign for raise-limit",
+          "director-sign" in sec and "raise-limit" in sec, sec[:300])
+    check(f"[CP4-T22] {label}: the raise-limit path takes --reason", "--reason" in sec, "")
+    check(f"[CP4-T22] {label}: names director-sign for choice",
+          "director-sign" in sec and "choice" in sec, sec[:300])
+    check(f"[CP4-T22] {label}: says `ask` runs before applying", re.search(r"`ask\b|\bask (raise-limit|choice)\b", sec) is not None, "")
+    check(f"[CP4-T22] {label}: documents --apply as the harness path",
+          "--apply" in sec or "one step" in sec.lower(), sec[:300])
     check(f"[CP4-T22] {label}: still lists approve-plan", "approve-plan" in sec, "")
     check(f"[CP4-T22] {label}: still lists accept-finding", "accept-finding" in sec, "")
 
@@ -729,14 +686,13 @@ def t23_lettered_question_waits_for_director_in_enrolled_lane():
           p.get("action") == "choice" and p.get("options") == ["A", "B"] and bool(p.get("asked_at")), p)
     say(d, "A")
     rc = rx(d, "choice", "A")
-    check("[CP4-T23] a chat reply plus a tokenless `choice A` is refused naming the director token",
-          rc.returncode != 0 and DIRECTOR_TOKEN_RE.search(out(rc)) is not None, out(rc))
+    check("[CP4-T23] a chat reply plus a tokenless `choice A` is refused naming director-sign --apply",
+          rc.returncode != 0 and DIRECTOR_HARNESS_RE.search(out(rc)) is not None, out(rc))
     check("[CP4-T23] nothing is recorded and the question is still pending",
           not events(d, "choice_made") and "choice_allow" not in state(d) and pending(d).get("action") == "choice",
           (events(d, "choice_made"), pending(d)))
-    tok = token_of(sign_choice(df, d, "B"))
-    rb = apply_choice(d, "B", tok or MADE_UP_TOKEN)
-    check("[CP4-T23] a director token for B is then applied and recorded",
+    rb = apply_choice(df, d, "B")
+    check("[CP4-T23] director-sign choice B --apply is then recorded",
           rb.returncode == 0 and [e.get("letter") for e in events(d, "choice_made")] == ["B"] and not pending(d), out(rb))
 
 
