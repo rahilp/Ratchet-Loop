@@ -227,6 +227,59 @@ def u05_mode_orchestration_helpers():
           decide("enforce", "pass", None, False))
 
 
+def u08_ui_record_gate_decision_pins():
+    print("U-T08: ui_gate_decision + ui-record decision helper pins")
+    um = load_ui_measure()
+    decide = um.ui_gate_decision
+    eng = load_engine()
+    cfg = {"ui_block_on_nits": True}
+    cp = {}
+
+    def rec(combined):
+        return eng._ui_record_decision(combined, cfg, cp)
+
+    check("[U-T08] off: no measure, visual PASS → PASS",
+          decide("off", None, "PASS", True) == "PASS",
+          decide("off", None, "PASS", True))
+    check("[U-T08] off: embedded measure fail ignored when visual PASS",
+          decide("off", "fail", "PASS", True) == "PASS",
+          decide("off", "fail", "PASS", True))
+    check("[U-T08] enforce: inconclusive + visual PASS → PASS",
+          decide("enforce", "inconclusive", "PASS", True) == "PASS",
+          decide("enforce", "inconclusive", "PASS", True))
+    check("[U-T08] enforce: inconclusive + visual FAIL → FAIL",
+          decide("enforce", "inconclusive", "FAIL", True) == "FAIL",
+          decide("enforce", "inconclusive", "FAIL", True))
+    check("[U-T08] report: measure fail + visual FAIL → FAIL",
+          decide("report", "fail", "FAIL", True) == "FAIL",
+          decide("report", "fail", "FAIL", True))
+    check("[U-T08] measure counts as visual lens",
+          eng._ui_lens_ok(["behavior", "measure"]) and not eng._ui_lens_ok(["behavior"]),
+          (eng._ui_lens_ok(["behavior", "measure"]), eng._ui_lens_ok(["behavior"])))
+    synth_fail = {
+        "verdict": "PASS",
+        "reviewers": ["behavior", "measure"],
+        "measure": {"verdict": "fail"},
+        "differences": [
+            {"reviewer": "measure", "severity": "blocker", "fixable_in_code": True,
+             "location": "home", "description": "pixel drift"},
+        ],
+    }
+    check("[U-T08] record enforce: measure fail overrides combined PASS",
+          rec(synth_fail) == ("FAIL", synth_fail["differences"]),
+          rec(synth_fail))
+    combined_report = {
+        "verdict": "PASS",
+        "reviewers": ["behavior", "measure"],
+        "measure": {"verdict": "fail"},
+        "differences": [],
+    }
+    v, _ = eng._ui_record_decision(
+        combined_report, {"ui_block_on_nits": True, "ui_measure_mode": "report"}, None)
+    check("[U-T08] record report: measure fail cannot fail alone (no visual blockers)",
+          v == "PASS", v)
+
+
 def u07_default_mode_is_enforce():
     print("U-T07: DEFAULT_CONFIG default + ui_measure_mode_for + plan/config validation")
     cfg = load_default_config()
@@ -299,6 +352,7 @@ TESTS = [
     ("U-T05", u05_mode_orchestration_helpers),
     ("U-T06", u06_accept_baseline_scoped),
     ("U-T07", u07_default_mode_is_enforce),
+    ("U-T08", u08_ui_record_gate_decision_pins),
 ]
 
 

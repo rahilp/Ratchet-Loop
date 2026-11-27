@@ -9735,6 +9735,64 @@ def _ui_verdict(review: dict, cfg) -> tuple[str, list]:
     return ("PASS" if not blockers else "FAIL"), blockers
 
 
+_UI_MEASURE_MOD = None
+
+
+def _ui_measure_module():
+    """ui_measure.py — gate decision and measure helpers (loaded once, by path)."""
+    global _UI_MEASURE_MOD
+    if _UI_MEASURE_MOD is not None:
+        return _UI_MEASURE_MOD
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / "ratchet-ui-compare" / "scripts" / "ui_measure.py"
+    spec = importlib.util.spec_from_file_location("ratchet_ui_measure", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _UI_MEASURE_MOD = mod
+    return mod
+
+
+def _ui_lens_ok(reviewers: list) -> bool:
+    """Whether the combined review includes the visual lens (LLM visual or synthetic measure)."""
+    return "visual" in reviewers or "measure" in reviewers
+
+
+def _ui_reviewer_verdict(review: dict, role: str, cfg) -> str | None:
+    """PASS|FAIL from one reviewer's differences only; None if that reviewer did not run."""
+    if role not in (review.get("reviewers") or []):
+        return None
+    diffs = [d for d in (review.get("differences") or []) if d.get("reviewer") == role]
+    v, _ = _ui_verdict({"differences": diffs}, cfg)
+    return v
+
+
+def _ui_record_decision(review: dict, cfg, cp) -> tuple[str, list]:
+    """UI gate outcome honoring ui_measure_mode (measure vs visual lenses + behavior)."""
+    if str(review.get("verdict", "")).upper() == "INVALID":
+        return "INVALID", []
+    mode = ui_measure_mode_for(cfg, cp)
+    measure_raw = (review.get("measure") or {}).get("verdict")
+    measure_verdict = str(measure_raw).lower() if measure_raw is not None else None
+    behavior_v = _ui_reviewer_verdict(review, "behavior", cfg)
+    behavior_ok = behavior_v != "FAIL" if behavior_v is not None else True
+    visual_verdict = None
+    if "visual" in (review.get("reviewers") or []):
+        visual_verdict = _ui_reviewer_verdict(review, "visual", cfg)
+    elif "measure" in (review.get("reviewers") or []):
+        visual_verdict = _ui_reviewer_verdict(review, "measure", cfg)
+    verdict = _ui_measure_module().ui_gate_decision(mode, measure_verdict, visual_verdict, behavior_ok)
+    if verdict != "FAIL":
+        return verdict, []
+    _, blockers = _ui_verdict(review, cfg)
+    if blockers:
+        return verdict, blockers
+    if mode == "enforce" and measure_verdict == "fail":
+        mdiffs = [d for d in (review.get("differences") or []) if d.get("reviewer") == "measure"]
+        _, blockers = _ui_verdict({"differences": mdiffs}, cfg)
+    return verdict, blockers
+
+
 MAX_REVIEW_BYTES = 8 * 1024 * 1024  # a reviewer's output or combined UI review larger than this is refused outright
 
 
@@ -10191,8 +10249,9 @@ def ui_input_origin(ctx, cfg, st: dict, key: dict | None, cp_id: str, n: int, pa
     if not hit or hit[0] != "ui":
         return "refused", (f"it is not signed by `ui_review.py review`, and it is not a reviewer's visual.json or "
                            f"behavior.json in this round's folder ({folder})")
-    if role != real.stem.lower():
-        return "refused", f"its reviewer field says {role!r}, but {real.name} is the {real.stem.lower()} reviewer's file"
+    stem = real.stem.lower()
+    if role != stem and not (role == "measure" and stem == "visual"):
+        return "refused", f"its reviewer field says {role!r}, but {real.name} is the {stem} reviewer's file"
     w = ((key or {}).get("writers") or {}).get(real.name)
     if w and w.get("manifest_stamp") != current:
         return "refused", STALE_UI_INPUT
@@ -10216,8 +10275,11 @@ def cmd_ui_record(args):
     for key in ("reviewers", "differences"):
         if key not in review:
             die(f"combined review must contain '{key}' (see ratchet-ui-compare skill)")
-    if len(review.get("reviewers", [])) < 2 and not cfg.get("ui_single_reviewer_ok"):
-        die("UI gate needs both a visual and a behaviour reviewer in the combined review.")
+    reviewers = [r for r in (review.get("reviewers") or []) if isinstance(r, str)]
+    if not cfg.get("ui_single_reviewer_ok"):
+        if len(reviewers) < 2 or "behavior" not in reviewers or not _ui_lens_ok(reviewers):
+            die("UI gate needs both a visual and a behaviour reviewer in the combined review "
+                "(measure counts as the visual lens when the LLM visual reviewer did not run).")
     if review.get("checkpoint") not in (None, args.cp):
         die(f"combined review is for {review.get('checkpoint')}, not {args.cp}.")
     cur_fp = fingerprint(ctx.root)["id"]
@@ -10258,7 +10320,7 @@ def cmd_ui_record(args):
         g["unconfirmed"] = unconfirmed
     else:
         g.pop("unconfirmed", None)
-    verdict, blockers = _ui_verdict(review, cfg)
+    verdict, blockers = _ui_record_decision(review, cfg, cp)
     dest = ctx.evidence(args.cp) / "ui" / f"round-{g['attempts']:02d}"
     dest.mkdir(parents=True, exist_ok=True)
     if review_path.parent != dest:
