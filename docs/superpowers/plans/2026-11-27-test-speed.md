@@ -1,6 +1,6 @@
 # Test Speed (Lane T) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Make required Ratchet test paths (`red` / `behavior` / `complete` and this repo’s `run_all`) finish sooner without changing gate, checkpoint, or testing outcomes.
 
@@ -41,7 +41,7 @@
 - Consumes: `_wait_stretched` / `_Watch` behavior via engine (in-process or subprocess as other trust suites do)
 - Produces: failing checks that pin (a) fewer wakeups when `load_stretch_max=1`, (b) stop-on-edit still fires, (c) timeout still fires
 
-- [ ] **Step 1: Write the failing guard suite**
+- [x] **Step 1: Write the failing guard suite**
 
 Create `tests/test_test_speed.py` that:
 
@@ -53,12 +53,12 @@ Create `tests/test_test_speed.py` that:
 
 Use `check()` / PASS/FAIL tally like other suites. Do **not** assert a specific absolute wall-clock for CI flakiness; assert wakeup/call counts and correctness.
 
-- [ ] **Step 2: Run guard — expect fail on T-T01/T-T02 against current polling**
+- [x] **Step 2: Run guard — expect fail on T-T01/T-T02 against current polling**
 
 Run: `python3 tests/test_test_speed.py`  
 Expected: T-T01 and/or T-T02 FAIL (current `_wait_stretched` polls every `RUN_POLL_SECONDS=0.25`); T-T03/T-T04 may already PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/test_test_speed.py
@@ -77,7 +77,7 @@ git -c user.name="Rahil Pirani" -c user.email="rahil@piranifam.com" commit -m "t
 - Consumes: `proc`, `timeout`, `max_stretch`, optional `_Watch`
 - Produces: same return tuple `(timed_out, limit, note, changed)`; same kill/stop/final-look semantics
 
-- [ ] **Step 1: Implement wake scheduling**
+- [x] **Step 1: Implement wake scheduling**
 
 In `_wait_stretched`:
 
@@ -131,7 +131,7 @@ def _wait_stretched(proc, timeout, max_stretch, watch=None):
     # ... unchanged final-look + note logic ...
 ```
 
-- [ ] **Step 2: Re-run guards**
+- [x] **Step 2: Re-run guards**
 
 Run:
 
@@ -143,7 +143,7 @@ python3 tests/test_load_timeouts.py
 
 Expected: all PASS (or only known flakes with solo re-run green).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add skills/ratchet-orchestrator/scripts/ratchet_engine.py tests/test_test_speed.py
@@ -161,11 +161,11 @@ git -c user.name="Rahil Pirani" -c user.email="rahil@piranifam.com" commit -m "p
 **Interfaces:**
 - Same stretch semantics as today when `max_stretch > 1`; when `max_stretch == 1`, wait without 0.25s busy polling for the whole timeout
 
-- [ ] **Step 1: Mirror engine wake logic in run_all**
+- [x] **Step 1: Mirror engine wake logic in run_all**
 
 Apply the same event-based `communicate`/`wait` slice: if stretch cannot grow, wait until deadline (or process exit); if it can, re-read at most every `POLL_SECONDS` but do not wake more often than needed for the deadline.
 
-- [ ] **Step 2: Run runner/load suites**
+- [x] **Step 2: Run runner/load suites**
 
 ```bash
 python3 tests/test_runner_load.py
@@ -176,7 +176,7 @@ python3 tests/test_load_timeouts_fixes.py
 
 Expected: PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/run_all.py tests/test_test_speed.py
@@ -194,7 +194,7 @@ git -c user.name="Rahil Pirani" -c user.email="rahil@piranifam.com" commit -m "p
 **Interfaces:**
 - Consumes: throwaway project via existing helpers (`test_gates` / trust helpers); `behavior` or `complete` with a short sleep fake command and `suite_watch_seconds` large enough that watch looks are rare
 
-- [ ] **Step 1: Record a small product-loop timing**
+- [x] **Step 1: Record a small product-loop timing**
 
 Script (inline in the suite or a one-off command in the PR notes):
 
@@ -203,7 +203,7 @@ Script (inline in the suite or a one-off command in the PR notes):
 3. Time one `behavior` (or equivalent `_run_cmd` path) wall-clock.
 4. Print before/after in suite output or PR body (informational only).
 
-- [ ] **Step 2: Commit any harness used for the measurement**
+- [x] **Step 2: Commit any harness used for the measurement**
 
 ```bash
 git add tests/test_test_speed.py
@@ -227,7 +227,7 @@ git -c user.name="Rahil Pirani" -c user.email="rahil@piranifam.com" commit -m "t
 **Interfaces:**
 - Same check ids and messages; use `RATCHET_RUN_ALL` dedupe where nested suites re-run covered children
 
-- [ ] **Step 1: Profile top offenders**
+- [x] **Step 1: Profile top offenders**
 
 ```bash
 python3 tests/run_all.py tests/test_merge_main.py tests/test_hooks_waiver.py tests/test_feedback_fixes.py tests/test_ui_gate_fidelity_docs.py
@@ -235,7 +235,7 @@ python3 tests/run_all.py tests/test_merge_main.py tests/test_hooks_waiver.py tes
 
 Note wall times. For each, find nested `run_all` / duplicate inits / sleep pads.
 
-- [ ] **Step 2: One suite at a time — optimize + keep check count**
+- [x] **Step 2: One suite at a time — optimize + keep check count**
 
 For each suite changed:
 
@@ -243,7 +243,7 @@ For each suite changed:
 2. Apply minimal change (dedupe nested runs, reuse fixture, remove accidental sleeps).
 3. Re-run solo; `N passed` must not drop; no check id removed.
 
-- [ ] **Step 3: Commit per suite (or small batch)**
+- [x] **Step 3: Commit per suite (or small batch)**
 
 ```bash
 git add tests/test_<name>.py
