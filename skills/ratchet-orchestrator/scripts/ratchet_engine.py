@@ -449,6 +449,8 @@ class Ctx:
             named("lane_start_command", _lanes_start_template)
         if merged.get("related_test_command") and "{files}" not in str(merged["related_test_command"]):
             bad("related_test_command", "a command containing the {files} placeholder")
+        if "ui_measure_mode" in merged and cfg["ui_measure_mode"] not in ("off", "report", "enforce"):
+            bad("ui_measure_mode", "one of off, report, or enforce")
         return user
 
     def user_config(self, project=None, glob=None, check_roles=True, strict=(), write_path=None):
@@ -2028,6 +2030,8 @@ def validate_plan(plan: dict) -> list[str]:
                 errs.append(f"{tag}: ui gate on requires 'ui_scope' (what the reviewer may judge)")
             if not cp.get("ui_states"):
                 errs.append(f"{tag}: ui gate on requires at least one entry in 'ui_states'")
+            if "ui_measure_mode" in cp and cp["ui_measure_mode"] not in ("off", "report", "enforce"):
+                errs.append(f"{tag}: ui_measure_mode must be off, report or enforce")
         if g.get("behavior"):
             t = cp.get("tests") or {}
             if not t.get("command"):
@@ -9705,6 +9709,14 @@ def cmd_behavior(args):
     build_viewer(ctx)
     ok(f"Gate 1 (behavior) PASSED for {args.cp}{' (flaky: passed on an immediate re-run)' if flaky else ''}. "
        f"Next step: {cps['step']}")
+
+
+def ui_measure_mode_for(cfg, cp=None) -> str:
+    """Resolved measured-UI mode: optional per-checkpoint override, else project config, default enforce."""
+    raw = (cp or {}).get("ui_measure_mode") if cp else None
+    if raw is None:
+        raw = cfg.get("ui_measure_mode", "enforce")
+    return raw if raw in ("off", "report", "enforce") else "enforce"
 
 
 def _ui_verdict(review: dict, cfg) -> tuple[str, list]:

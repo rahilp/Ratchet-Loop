@@ -17,6 +17,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 UIC = ROOT / "skills" / "ratchet-ui-compare" / "scripts"
+ORCH = ROOT / "skills" / "ratchet-orchestrator" / "scripts"
 
 sys.path.insert(0, str(HERE))
 import _tmp  # noqa: E402
@@ -47,6 +48,24 @@ def load_ui_measure():
     import ui_measure as um  # type: ignore
 
     return um
+
+
+def load_default_config():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("engine_utils_um", ORCH / "engine_utils.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.DEFAULT_CONFIG
+
+
+def load_engine():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("ratchet_engine_um", ORCH / "ratchet_engine.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # ------------------------------------------------------------------------------------------------ PNG fixtures
@@ -201,6 +220,39 @@ def u05_mode_orchestration_helpers():
           decide("enforce", "pass", None, False))
 
 
+def u07_default_mode_is_enforce():
+    print("U-T07: DEFAULT_CONFIG default + ui_measure_mode_for + plan/config validation")
+    cfg = load_default_config()
+    check("[U-T07] DEFAULT_CONFIG ui_measure_mode is enforce",
+          cfg.get("ui_measure_mode") == "enforce", cfg.get("ui_measure_mode"))
+    eng = load_engine()
+    mode_for = eng.ui_measure_mode_for
+    check("[U-T07] helper default enforce", mode_for({}, None) == "enforce", mode_for({}, None))
+    check("[U-T07] helper project report", mode_for({"ui_measure_mode": "report"}, None) == "report",
+          mode_for({"ui_measure_mode": "report"}, None))
+    check("[U-T07] helper checkpoint off overrides project",
+          mode_for({"ui_measure_mode": "enforce"}, {"ui_measure_mode": "off"}) == "off",
+          mode_for({"ui_measure_mode": "enforce"}, {"ui_measure_mode": "off"}))
+    check("[U-T07] helper garbage override → enforce fallback",
+          mode_for({"ui_measure_mode": "report"}, {"ui_measure_mode": "bogus"}) == "enforce",
+          mode_for({"ui_measure_mode": "report"}, {"ui_measure_mode": "bogus"}))
+    errs = eng.validate_plan({
+        "checkpoints": [{
+            "id": "CP1",
+            "title": "one step",
+            "summary": "s",
+            "done_when": ["done"],
+            "gates": {"adversarial": True, "ui": True, "behavior": False},
+            "ui_scope": "home",
+            "ui_states": ["home"],
+            "behavior_skip_reason": "no tests",
+            "ui_measure_mode": "maybe",
+        }],
+    })
+    check("[U-T07] plan validate refuses bad checkpoint ui_measure_mode when ui gate on",
+          any("ui_measure_mode" in e for e in errs), errs)
+
+
 def u06_accept_baseline_scoped():
     print("U-T06: wrong-state baseline refused; matching accept → later measure pass")
     um = load_ui_measure()
@@ -239,6 +291,7 @@ TESTS = [
     ("U-T04", u04_missing_geometry_inconclusive),
     ("U-T05", u05_mode_orchestration_helpers),
     ("U-T06", u06_accept_baseline_scoped),
+    ("U-T07", u07_default_mode_is_enforce),
 ]
 
 
