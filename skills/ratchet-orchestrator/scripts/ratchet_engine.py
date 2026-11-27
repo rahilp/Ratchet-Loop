@@ -8605,10 +8605,12 @@ def _restore_handlers(saved: list) -> None:
 
 
 def _wait_stretched(proc, timeout: float, max_stretch: float, watch: "_Watch | None" = None):
-    """Wait for a command, polling. The deadline is `timeout` times the highest stretch factor read while the
-    command runs (re-read every RUN_POLL_SECONDS, so a load spike while the command runs still extends it; a load
-    drop never shortens a limit already granted), never earlier than `timeout` and never later than `timeout` times
-    `max_stretch`. Stops the whole process group when the deadline passes. With a `watch`, every `watch.every`
+    """Wait for a command, waking on useful events. The deadline is `timeout` times the highest stretch factor
+    read while the command runs (when stretch can grow: re-read every RUN_POLL_SECONDS, so a load spike while the
+    command runs still extends it; a load drop never shortens a limit already granted), never earlier than
+    `timeout` and never later than `timeout` times `max_stretch`. When `max_stretch` is 1 (stretch cannot grow),
+    load is not re-read on a timer — the wait sleeps until the process exits, the next watch look, or the
+    deadline. Stops the whole process group when the deadline passes. With a `watch`, every `watch.every`
     seconds the code is compared with the tree the command started on, and once more when the command ends on its
     own, so a quick command that finishes before the next look still never counts (a command killed by the time
     limit gets no last look: it is a timeout even when the tree also changed); a change
@@ -8626,25 +8628,36 @@ def _wait_stretched(proc, timeout: float, max_stretch: float, watch: "_Watch | N
     limit = float(timeout)
     next_look = t0 + watch.every if watch else None
     changed = []
+    can_stretch = float(max_stretch) > 1.0
     while True:
-        factor, load, cpus = _stretch_factor(max_stretch)
-        if timeout * factor > limit:
-            limit = timeout * factor
-            peak = (factor, load, cpus)
-        elapsed = time.monotonic() - t0
+        if can_stretch:
+            factor, load, cpus = _stretch_factor(max_stretch)
+            if timeout * factor > limit:
+                limit = timeout * factor
+                peak = (factor, load, cpus)
+        now = time.monotonic()
+        elapsed = now - t0
         if elapsed >= limit:
             timed_out = True
             _kill_group(proc)
             break
-        if watch and time.monotonic() >= next_look:
+        if watch and now >= next_look:
             changed = watch.changed()
             if changed:
                 watch.found_at_end = False
                 _stop_group(proc)
                 break
             next_look = time.monotonic() + watch.every
+        # Sleep until the next useful event (process exit, watch look, stretch re-read, or deadline).
+        until_deadline = limit - (time.monotonic() - t0)
+        until_look = (next_look - time.monotonic()) if watch else float("inf")
+        if can_stretch:
+            slice_ = min(RUN_POLL_SECONDS, until_deadline, until_look)
+        else:
+            slice_ = min(until_deadline, until_look)
+        slice_ = max(0.0, slice_)
         try:
-            proc.wait(timeout=min(RUN_POLL_SECONDS, limit - elapsed))
+            proc.wait(timeout=slice_)
             break
         except subprocess.TimeoutExpired:
             continue
@@ -8654,7 +8667,7 @@ def _wait_stretched(proc, timeout: float, max_stretch: float, watch: "_Watch | N
         if changed:  # the leader has ended, but a helper it left in its group belongs to a run that no longer counts
             _stop_group(proc)
     ran_past = timed_out or time.monotonic() - t0 >= timeout
-    if ran_past and not timed_out:
+    if ran_past and not timed_out and can_stretch:
         fresh = _stretch_factor(max_stretch)  # ended within one poll of passing the configured limit
         if timeout * fresh[0] > limit:
             limit = timeout * fresh[0]

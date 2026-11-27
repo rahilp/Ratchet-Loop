@@ -592,8 +592,18 @@ def t17_existing_suites_still_pass():
     check("[CP6-T17] every guarded suite and this file are on the README list", unlisted == [], unlisted)
     absent = [n for n in GUARD_SUITES if not (HERE / f"{n}.py").is_file()]
     check("[CP6-T17] every guarded suite exists on disk", absent == [], absent)
+    # Nested-run dedup (same pattern as test_trust_cp5_regression / test_split_check via _tmp.run_all_covers):
+    # when tests/run_all.py already ran a guarded suite as its own top-level suite, synthesise the same pass
+    # instead of paying for a second full subprocess. Solo runs of this file still execute every suite.
+    # RATCHET_RUN_ALL_SUITES lists file names (`test_gates.py`); GUARD_SUITES are stems.
+    covered_files = _tmp.run_all_covers(tuple(f"{n}.py" for n in GUARD_SUITES))
+    covered = {Path(n).stem for n in covered_files}
+    to_run = [n for n in GUARD_SUITES if n not in covered]
+    for name in covered:
+        check(f"[CP6-T17] {name} passes (exit 0, no failed count)", True,
+              "synthesised: already covered by this run_all invocation")
     with cf.ThreadPoolExecutor(max_workers=6) as pool:
-        results = list(pool.map(run_suite, GUARD_SUITES))
+        results = list(pool.map(run_suite, to_run)) if to_run else []
     for name, verdict, tail in results:
         check(f"[CP6-T17] {name} passes (exit 0, no failed count)", verdict == "ok", f"{verdict}: {tail}")
 

@@ -30,13 +30,13 @@ module directly, can itself contain the pattern strings as embedded constants an
 match; this doc's counts were taken right after `rm -rf tests/__pycache__
 tests/shortcuts/__pycache__`.)
 
-60 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
+61 files match one or both live patterns today (Kind 1 + Kind 2 + Kind 3 below). Plus 2 more
 files the brief names explicitly (`test_quota_shared.py`, `test_discover_paid.py`, Kind 4 below)
-that carry the identical real obligation but don't literally match either regex today — **62
+that carry the identical real obligation but don't literally match either regex today — **63
 files total**, consistent with the brief's "43+".
 
 ## Kind 1 — module-load only (loads ratchet.py dynamically via `importlib.util.spec_from_file_location`,
-never inspects its on-disk text directly): 37 files
+never inspects its on-disk text directly): 38 files
 
 - `test_gates.py` — gate-integrity suite; the shared `ENGINE`/`g` module alias almost every other
   suite below imports instead of loading ratchet.py a second time itself. Module-load-only known
@@ -131,6 +131,9 @@ never inspects its on-disk text directly): 37 files
 - `test_schedule.py`: schedule awareness CP1: the projected-finish numbers and the stall check, as pure helpers in
   `status_text.py`; loads that module once via `spec_from_file_location` and calls them with an injected clock. Never
   inspects ratchet.py's on-disk text or tree shape.
+- `test_test_speed.py` — Lane T: wait/poll wakeups and stop-on-edit pins for faster product loops; loads
+  `ratchet_engine.py` once via `spec_from_file_location` (`ratchet_engine_tspeed`) to call `_wait_stretched` /
+  `_Watch` directly. Never inspects its on-disk text or tree shape.
 
 ## Kind 2 — source-text/AST only (reads ratchet.py's literal on-disk text and/or walks its parsed
 tree, never loads it as a module itself): 13 files
