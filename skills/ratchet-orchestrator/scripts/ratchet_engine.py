@@ -17649,12 +17649,6 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                    "still waiting, so this reply approves nothing, whatever it says. Answer what they "
                                    f"said; if you still need their answer, run {again} again and show them only that "
                                    "question.")
-                if _question_waiter(ctx) == "director" and p["action"] != "paid-provider":
-                    # Enrolled lane: chat replies approve nothing. Point at director-sign --apply; never lane cmds.
-                    return False, (f"[ratchet] Your waiting question (shall I {what}?) is waiting on the director: "
-                                   "this lane is director-enrolled, so a chat reply approves nothing. Do not run "
-                                   f"`{cmd}` on it. The director harness applies with "
-                                   f"`{eng} director-sign {p['action']} ... --apply`.")
                 if p["action"] == "choice":
                     letter = choice_letter(n["prompt"], p.get("options") or [])
                     if _question_waiter(ctx) == "director":  # read-only: never exits or writes from a hook
@@ -17666,6 +17660,12 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                                    + (f"It reads as option {letter}. " if letter else "It is NOT a clear pick of one option. ")
                                    + f"Run `{eng} choice` to record it, then continue. It does NOT approve the plan or a "
                                    "checkpoint.")
+                if _question_waiter(ctx) == "director" and p["action"] != "paid-provider":
+                    # Enrolled lane: chat replies approve nothing. Point at director-sign --apply; never lane cmds.
+                    return False, (f"[ratchet] Your waiting question (shall I {what}?) is waiting on the director: "
+                                   "this lane is director-enrolled, so a chat reply approves nothing. Do not run "
+                                   f"`{cmd}` on it. The director harness applies with "
+                                   f"`{eng} director-sign {p['action']} ... --apply`.")
                 try:
                     first = len(_replies(ctx, st, p.get("asked_at"), p)) <= 1
                 except (Exception, SystemExit):

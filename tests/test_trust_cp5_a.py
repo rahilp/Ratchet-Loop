@@ -228,7 +228,7 @@ def cp5_director_signed_approval_skips_chat_question():
           "pending" not in st_before, st_before)
     sg = trust_helpers.director_sign_apply(d, denv, home, "approve-plan")
     assert rk.returncode == 0 and en.returncode == 0 and sg.returncode == 0, (rk.stderr, en.stderr, sg.stderr)
-    check("[CP5-T09] director-sign approve-plan --apply advances the run with no ask step and no chat reply required",
+    check("[CP5-T09] the director-signed token approves the plan with no ask step and no chat reply required",
           cp3_state(d)["phase"] == "building", (sg.returncode, sg.stderr, cp3_state(d)["phase"]))
     r = rx(d, env, "approve-plan", "--director-token", "forged-token")
     check("[CP5-T09] approve-plan --director-token on the enrolled lane is refused",

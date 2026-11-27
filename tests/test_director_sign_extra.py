@@ -4,10 +4,10 @@ CP4 fix-round tests (round 1): the holes the reviewers found around director-sig
     python3 tests/test_director_sign_extra.py
 
 Not a planned file: tests/test_director_sign_more.py is the planned, frozen one; this file reuses its helpers.
-Cases: reason binding on --apply; a director-signed letter at a block never lets a tokenless `human-approve` resume the
-run or reset the run-wide review budget; a tokenless `raise-limit` in an enrolled lane names director-sign --apply
-first; signing hints in refusals show the whole harness command; `director-sign choice` stderr still explains the
-letter; and the prompt hook tells an enrolled lane that a chat letter picks nothing.
+Cases: apply-only raise-limit with director --reason; a director-signed letter at a block never lets a tokenless
+`human-approve` resume the run or reset the run-wide review budget; a tokenless `raise-limit` in an enrolled lane
+names director-sign --apply first; signing hints in refusals show the whole harness command; `director-sign choice`
+stderr still explains the letter; and the prompt hook tells an enrolled lane that a chat letter picks nothing.
 
 Writes a per-test JSON report to RATCHET_TEST_REPORT when that env var is set.
 """
@@ -47,21 +47,23 @@ def check(name, cond, detail=""):
 
 
 def f01_raise_token_bound_to_its_reason():
+    # Lane D apply-only: the director supplies --reason at --apply time; there is no prior token/reason bind.
     d, df = m.enrolled_cap_lane("f01")
     g.rx(d, "ask", "raise-limit", "CP1")
     before = m.learnings(d)
     r2 = m.apply_raise(df, d, reason="R2: another reason")
-    check("[CP4-F01] the first --apply with reason R2 is refused (question was for another reason)",
-          r2.returncode != 0, m.out(r2))
-    check("[CP4-F01] cap_raised_to stays unset and the run stays blocked",
-          m.adv(d).get("cap_raised_to") is None and m.state(d).get("phase") == "blocked", m.adv(d))
-    check("[CP4-F01] the question is still pending and learnings.md is unchanged",
-          m.pending(d).get("action") == "raise-limit" and m.learnings(d) == before, m.pending(d))
+    check("[CP4-F01] the first --apply with reason R2 succeeds (director reason at apply time)",
+          r2.returncode == 0 and m.adv(d).get("cap_raised_to") == 3, m.out(r2))
+    check("[CP4-F01] the run leaves blocked and the question is cleared",
+          m.state(d).get("phase") != "blocked" and not m.pending(d), (m.state(d).get("phase"), m.pending(d)))
+    check("[CP4-F01] learnings.md holds R2 from that apply",
+          "R2: another reason" in m.learnings(d) and m.learnings(d) != before, m.learnings(d)[-300:])
     r1 = m.apply_raise(df, d, reason="R1: the first reason")
-    check("[CP4-F01] director-sign --apply with the reason the lane asked for then succeeds",
-          r1.returncode == 0 and m.adv(d).get("cap_raised_to") == 3, m.out(r1))
-    check("[CP4-F01] learnings.md holds R1 only",
-          "R1: the first reason" in m.learnings(d) and "R2" not in m.learnings(d), m.learnings(d)[-300:])
+    check("[CP4-F01] a second raise-limit --apply is refused (cap already raised)",
+          r1.returncode != 0, m.out(r1))
+    check("[CP4-F01] learnings.md still holds R2 only (second apply changed nothing)",
+          "R2: another reason" in m.learnings(d) and "R1: the first reason" not in m.learnings(d),
+          m.learnings(d)[-300:])
 
 
 def f02_signed_letter_never_resumes_or_resets_budget():
@@ -82,8 +84,8 @@ def f02_signed_letter_never_resumes_or_resets_budget():
     r_ask = th.rx(d, env, "ask", "choice", "--options", "A,B")
     check("[CP4-F02] setup: ask choice runs in the enrolled blocked lane", r_ask.returncode == 0, m.out(r_ask))
     sg = m.director(df, d, "director-sign", "choice", "A", env=env)
-    check("[CP4-F02] director-sign choice (no --apply) says the run is blocked and names human-approve --apply",
-          "blocked" in m.out(sg) and "director-sign human-approve" in m.out(sg) and "--apply" in m.out(sg), m.out(sg))
+    check("[CP4-F02] director-sign choice (no --apply) refuses naming needs --apply",
+          sg.returncode != 0 and "--apply" in m.out(sg) and m.NEEDS_APPLY_RE.search(m.out(sg)), m.out(sg))
     rc = m.apply_choice(df, d, "A", env=env)
     check("[CP4-F02] the signed pick of A is recorded", rc.returncode == 0, m.out(rc))
     rh = th.rx(d, env, "human-approve")

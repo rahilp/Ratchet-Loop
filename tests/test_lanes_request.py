@@ -438,9 +438,11 @@ def t13_json_and_text_agree():
     cid = "CP8-T13"
     w = shared()
     d = doc_of(lanes_req(w), cid, "json form")
-    check(f"[{cid}] top-level keys are exactly request and lanes", sorted(d) == ["lanes", "request"] and d["request"] == REQ, sorted(d))
+    check(f"[{cid}] top-level keys are exactly request, lanes, and director_root",
+          sorted(d) == ["director_root", "lanes", "request"] and d["request"] == REQ
+          and isinstance(d.get("director_root"), str) and d["director_root"], sorted(d))
     keys = {"lane", "branch", "worktree", "worktree_missing", "phase", "done", "total", "waiting_on", "awaiting_since",
-            "merged", "next_director_action"}
+            "merged", "next_director_action", "own", "depends_on", "start_ok", "start_wait"}
     check(f"[{cid}] every lane has exactly the pinned keys", all(set(x) == keys for x in d["lanes"]),
           [sorted(set(x) ^ keys) for x in d["lanes"]])
     b = text_blocks(w, cid, [x["lane"] for x in d["lanes"]])

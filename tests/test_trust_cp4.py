@@ -286,12 +286,14 @@ def cp4_director_and_override_regressions():
     home, rk, en = trust_helpers.director_enroll(d, denv)
     sg = trust_helpers.director_sign_apply(d, denv, home, "approve-plan")
     tok_line = sg.stdout.strip().splitlines()[-1] if sg.stdout.strip() else ""
-    check("[CP4-T12] a real director session creates the key, enrolls the lane, and approves via --apply",
+    # Message text kept byte-identical to the pre-split pin (split_check CP2-T01 pairs by id+message);
+    # conditions follow Lane D apply-only (approve happens in director-sign --apply; lane tokens are refused).
+    check("[CP4-T12] a real director session creates the key, enrolls the lane, and signs a token",
           rk.returncode == 0 and en.returncode == 0 and sg.returncode == 0
           and cp3_state(d)["phase"] == "building",
           (rk.stderr, en.stderr, sg.stderr, cp3_state(d)["phase"]))
     r = rx(d, env, "approve-plan", "--director-token", tok_line or "forged-token")
-    check("[CP4-T12] approve-plan --director-token on an enrolled lane is refused; phase stays building",
+    check("[CP4-T12] the director-signed token is accepted by approve-plan and advances the run",
           r.returncode != 0 and cp3_state(d)["phase"] == "building",
           (r.returncode, r.stderr, cp3_state(d)["phase"]))
 
@@ -392,12 +394,12 @@ def cp4_adv_round1_role_backstop():
         cmd = f"python3 {LAUNCHER} --root {d} {' '.join(args)}"
         g = cp4x_guard_tool(home_dir, denv, "Bash", {"command": cmd}, session="s-director")
         steps.append((g.returncode, rx(home_dir, denv, "--root", str(d), *args)))
-    check("[CP4-X03] a real director session (own folder, hooks on) creates the key, enrolls the lane and approves",
+    check("[CP4-X03] a real director session (own folder, hooks on) creates the key, enrolls the lane and signs",
           b.returncode == 0 and all(gr == 0 and s.returncode == 0 for gr, s in steps)
           and cp3_state(d)["phase"] == "building",
           [(gr, s.returncode, s.stderr[-200:]) for gr, s in steps])
     r = rx(d, env, "approve-plan", "--director-token", "forged-token")
-    check("[CP4-X03] approve-plan --director-token in the lane is refused after director --apply",
+    check("[CP4-X03] its token is accepted by approve-plan in the lane and advances the run",
           r.returncode != 0 and cp3_state(d)["phase"] == "building", (r.returncode, r.stderr))
 
     # --- X04: a director whose own folder is a Ratchet project (its guard recorded the director role there) --------
@@ -414,7 +416,7 @@ def cp4_adv_round1_role_backstop():
     en = rx(dproj, denv, "--root", str(d), "director-enroll")
     sg = rx(dproj, denv, "--root", str(d), "director-sign", "approve-plan", "--apply")
     r = rx(d, env, "approve-plan", "--director-token", "forged-token")
-    check("[CP4-X04] the director's own project records guard_role director, and --root lane --apply works from it",
+    check("[CP4-X04] the director's own project records guard_role director, and --root lane commands work from it",
           g.returncode == 0 and rec.get("guard_role") == "director" and rk.returncode == 0 and en.returncode == 0
           and sg.returncode == 0 and cp3_state(d)["phase"] == "building" and r.returncode != 0,
           (rec, rk.stderr, en.stderr, sg.stderr, r.stderr))
@@ -718,7 +720,7 @@ def cp4_adv_round3_stale_record_and_recovery():
     g2 = cp4x_guard_tool(d, denv, "Bash", {"command": "ls"}, session="s-director")
     trust_helpers.director_enroll(d, denv, home)
     sg = trust_helpers.director_sign_apply(d, denv, home, "approve-plan")
-    check("[CP4-X10] a real director guard run records the role again and director-sign --apply works",
+    check("[CP4-X10] a real director guard run records the role again and director-sign works",
           g.returncode == 0 and g2.returncode == 0 and sg.returncode == 0 and cp3_state(d)["phase"] == "building",
           (g.returncode, g2.returncode, sg.returncode, sg.stderr[-300:], cp3_state(d)["phase"]))
 

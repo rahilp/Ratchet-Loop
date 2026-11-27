@@ -74,6 +74,8 @@ never inspects its on-disk text directly): 37 files
   scratch-copy/fast-forward safety rules.
 - `test_lanes_request.py` — CP8: `lanes --request` tracks a request's lanes through to merged;
   loads ratchet.py dynamically inside a generated snippet.
+- `test_director_redesign.py` — Lane D: director redesign (layout identity, apply-only, parallel
+  ownership); reads ratchet.py / SKILL.md source text for pin checks (`ENGINE.read_text`).
 - `test_lanes_start_extra.py` — CP7 fix-round: a failed `git worktree add` leaves nothing behind;
   loads ratchet.py dynamically (`eng`) to call the cleanup path directly.
 - `test_providers.py` — reviewer-choice and review-rules suite; loads ratchet.py dynamically
