@@ -854,9 +854,8 @@ def verify_integrity(ctx, st):
     if probs:
         if approval_mode(ctx) == "director":  # an enrolled lane: the director approves, nobody is asked in chat
             die("These changed after the user approved the plan: " + _problems_for_director(probs) + ". This lane is "
-                "director-enrolled, so either undo the change, or have the director approve it in one step with "
-                f"`{_director_apply_cmd(ctx, 'approve-changes')}` (or sign it for a token this lane applies with "
-                "`ratchet.py approve-changes --director-token <t>`). End your turn saying what you are waiting for.")
+                "director-enrolled, so either undo the change, or have the director harness approve it with "
+                f"`{_director_apply_cmd(ctx, 'approve-changes')}`. End your turn saying what you are waiting for.")
         die("These changed after the user approved the plan: " + "; ".join(probs) + ". "
             "Either undo the change, or show the user exactly what changed and — only after they confirm — "
             "run `ratchet.py approve-changes`.")

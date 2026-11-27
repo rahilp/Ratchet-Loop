@@ -3422,7 +3422,7 @@ def _consume_paid_ok(ctx, st, pv) -> str:
     if approval_mode(ctx) == "director":
         die(f"{model} (via {tool}) costs money per use (or its cost is unknown, treated the same way), and "
             "this lane is director-enrolled: a chat reply here never counts as the developer's own OK to "
-            "spend money (unlike every other approval, paid-provider takes no director token). Nothing was "
+            "spend money (unlike every other approval, paid-provider takes no director-sign --apply). Nothing was "
             "added and nothing was sent to it. The developer must give this OK themselves, in a lane that "
             "isn't director-enrolled.")
     p = st.get("pending") or {}
@@ -5574,8 +5574,9 @@ def _layout_is_builder(here: Path) -> bool:
                         return False  # standing in director home
                     return True
     # Enrolled lane with director.json but no request layout: treat as builder when not director home
+    # (cwd may be a subdirectory of the lane root).
     if (own / RATCHET_DIR / "director.json").is_file() and not _layout_director_home(here):
-        if approval_mode(Ctx(own)) == "director" and here == own:
+        if approval_mode(Ctx(own)) == "director":
             return True
     return False
 
@@ -5723,7 +5724,7 @@ def _enrolled_outside(ctx) -> str | None:
         key_here = True
     if key_here:
         _note_unreadable(p, why, "it holds which lanes a director enrolled, so Ratchet treats this project as "
-                         "enrolled (chat replies approve nothing; a director token still does) until it is "
+                         "enrolled (chat replies approve nothing; director-sign --apply still does) until it is "
                          "repaired. To repair it: " + _enrolled_repair(p))
         return "unreadable"
     _note_unreadable(p, why, "no director key exists on this machine, so Ratchet treats it as naming no enrolled "
@@ -6197,41 +6198,77 @@ def _lanes_start_run(args, main: Path):
     for x in lanes:
         x["own"] = list(own_map.get(x["name"], []))
         x["depends_on"] = list(dep_map.get(x["name"], []))
-    # Parallel readiness: start_ok when deps empty/satisfied among started set and ownership disjoint from others starting
+    # Parallel readiness (Lane D): at lanes-start time, every depends_on is unmet (nothing finished yet).
+    # Ownership must be valid relative prefixes; absolute / .. paths refuse parallel for that lane.
     def _norm_own(p):
-        p = str(p).strip().replace("\\", "/")
-        if not p or p.startswith("/") or ".." in Path(p).parts:
-            return None
-        n = str(Path(p))
-        return "." if n in (".", "") else n
+        raw = str(p).strip().replace("\\", "/")
+        if not raw:
+            return None, "empty ownership path"
+        if raw.startswith("/") or raw.startswith("~"):
+            return None, f"absolute ownership path {raw!r}"
+        parts = Path(raw).parts
+        if ".." in parts:
+            return None, f"ownership path escapes with .. ({raw!r})"
+        n = str(Path(*parts)) if parts else "."
+        return ("." if n in (".", "") else n), None
     def _paths_overlap(a, b):
-        aa = [x for x in (_norm_own(p) for p in a) if x]
-        bb = [x for x in (_norm_own(p) for p in b) if x]
-        if any(x == "." for x in aa + bb):
-            return True
-        for p in aa:
-            for q in bb:
-                if p == q or p.startswith(q.rstrip("/") + "/") or q.startswith(p.rstrip("/") + "/"):
+        for p in a:
+            for q in b:
+                if p == "." or q == "." or p == q or p.startswith(q.rstrip("/") + "/") or q.startswith(p.rstrip("/") + "/"):
                     return True
         return False
     multi = len(lanes) > 1
     for x in lanes:
-        reason = None
+        norms, bad = [], None
+        for raw in x["own"]:
+            n, err = _norm_own(raw)
+            if err:
+                bad = err
+                break
+            norms.append(n)
+        x["_own_norm"] = norms
+        x["_own_bad"] = bad
+    for x in lanes:
+        reasons = []
+        if x.get("_own_bad"):
+            reasons.append(x["_own_bad"])
         if multi and not x["own"]:
-            reason = "no --own paths; serialized (not parallel)"
-        elif any(d not in names for d in x["depends_on"]):
-            reason = "depends on unknown lane"
-        else:
+            reasons.append("no --own paths; serialized (not parallel)")
+        if any(d not in names for d in x["depends_on"]):
+            reasons.append("depends on unknown lane")
+        if x["depends_on"]:
+            reasons.append("waiting on " + ", ".join(x["depends_on"]))
+        if x["own"] and not x.get("_own_bad"):
             for y in lanes:
-                if y is x:
+                if y is x or not y.get("_own_norm") or y.get("_own_bad"):
                     continue
-                if y["name"] in x["depends_on"]:
-                    continue  # dependency is fine; readiness computed at start listing
-                if x["own"] and y["own"] and _paths_overlap(x["own"], y["own"]):
-                    reason = f"ownership overlaps lane '{y['name']}'"
+                if _paths_overlap(x["_own_norm"], y["_own_norm"]):
+                    reasons.append(f"ownership overlaps lane '{y['name']}'")
                     break
-        x["start_ok"] = reason is None
-        x["start_wait"] = reason
+        x["start_ok"] = not reasons
+        x["start_wait"] = "; ".join(dict.fromkeys(reasons)) if reasons else None
+    # Mutual ownership overlap only: keep the earlier lane start_ok when overlap was its only ownership issue.
+    for i, x in enumerate(lanes):
+        for y in lanes[i + 1:]:
+            xn, yn = x.get("_own_norm"), y.get("_own_norm")
+            if not xn or not yn or x.get("_own_bad") or y.get("_own_bad"):
+                continue
+            if not _paths_overlap(xn, yn):
+                continue
+            def _drop_overlap(lane, other):
+                parts = [p for p in (lane.get("start_wait") or "").split("; ") if p and f"'{other}'" not in p]
+                lane["start_wait"] = "; ".join(parts) if parts else None
+                lane["start_ok"] = lane["start_wait"] is None
+            _drop_overlap(x, y["name"])
+            if "ownership overlaps" not in (y.get("start_wait") or ""):
+                y["start_ok"] = False
+                y["start_wait"] = ((y.get("start_wait") + "; ") if y.get("start_wait") else "") + (
+                    f"ownership overlaps lane '{x['name']}' (serialized after it)")
+            else:
+                y["start_ok"] = False
+    for x in lanes:
+        x.pop("_own_norm", None)
+        x.pop("_own_bad", None)
     name = args.name if args.name is not None else slugify(request)
     if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name):
         die(f"The request name '{name}' must be lowercase letters, digits and hyphens. Pick another --name. "
@@ -6308,17 +6345,6 @@ def _lanes_start_run(args, main: Path):
                 f"{x['feature']}\n\nYou work only in {x['worktree']} (branch {x['branch']}). Run Ratchet's init "
                 "yourself there to plan this feature, and wait for the director harness to apply approvals with director-sign --apply. When the lane is finished, the director merges it with integrate.\n"), raw=True)
             x["brief"] = str(brief)
-        # Parallel: lanes with start_ok and no unmet depends_on among other start_ok lanes are clear to run together.
-        ready_names = {x["name"] for x in lanes if x.get("start_ok")}
-        for x in lanes:
-            unmet = [d for d in x.get("depends_on") or [] if d not in ready_names or d == x["name"]]
-            # depends_on must already be start_ok siblings; if dependency isn't start_ok, this lane waits
-            unmet = [d for d in (x.get("depends_on") or []) if not next((y for y in lanes if y["name"] == d and y.get("start_ok")), None)]
-            if unmet and x.get("start_ok"):
-                x["start_ok"] = False
-                x["start_wait"] = f"waiting on {', '.join(unmet)}"
-            elif unmet:
-                x["start_wait"] = (x.get("start_wait") or "") + (f"; waiting on {', '.join(unmet)}" if x.get("start_wait") else f"waiting on {', '.join(unmet)}")
         _write_record(rdir / f"{name}.json", {"request": request, "name": name, "created_at": now(),
                                               "director_root": str(main.resolve()),
                                               "lanes": [{k: x[k] for k in ("name", "feature", "branch", "worktree", "brief",
@@ -7701,8 +7727,9 @@ def _integrate_merge(main: Path, f: dict, info: dict, finish):
 # Lane D: every director-sign action is applied in one call (`director-sign <action> ... --apply`).
 # POLICY_ACTIONS is the subset the developer's director-policy file may cover (unchanged from pre-D routine set).
 DIRECTOR_APPLY_ACTIONS = ("approve-plan", "human-approve", "feedback", "approve-changes", "cancel", "set-review",
-                          "hooks-waive", "ui-respec", "guardrail", "accept-finding", "accept-line", "raise-limit",
+                          "hooks-waive", "ui-respec", "accept-finding", "accept-line", "raise-limit",
                           "choice")
+# guardrail is not director-sign --apply: unlock via choice, then run `guardrail` from the director home.
 POLICY_ACTIONS = ("approve-changes", "accept-finding", "raise-limit", "choice")
 
 
@@ -8083,8 +8110,9 @@ def cmd_director_sign(args):
     elif action == "feedback" and not reason:
         # feedback can take empty in some flows; keep optional
         pass
-    elif action == "set-review" and not target:
-        die("director-sign set-review needs the mode (e.g. every / final / off). Nothing was changed.")
+    elif action == "set-review":
+        if target not in ("end", "each", "none"):
+            die("director-sign set-review needs the mode: end | each | none. Nothing was changed.")
     elif action == "ui-respec" and not target:
         die("director-sign ui-respec needs the step (CPn). Nothing was changed.")
 
@@ -11369,9 +11397,12 @@ def _announce_repeats(ctx, st):
     director = approval_mode(ctx) == "director"
     for r in repeat_candidates(ctx, st):
         if director:
-            print(f"REPEAT: reviewers have now found '{r['kind']}' in {r['times']} places. This lane is "
-                  f"director-enrolled: tell the director, who can approve a guardrail with "
-                  f"`director-sign guardrail --kind {r['kind']}`; then run ratchet.py repeats --offered {r['kind']}.")
+            kind, times = r["kind"], r["times"]
+            print(
+                f"REPEAT: reviewers have now found '{kind}' in {times} places. This lane is "
+                "director-enrolled: tell the director, who can approve a guardrail with "
+                f"`ask choice --options … --guardrail \"A={kind}\"` then "
+                f"`director-sign choice <letter> --apply`; then run ratchet.py repeats --offered {kind}.")
             continue
         print(f"REPEAT: reviewers have now found '{r['kind']}' {r['times']} times (e.g. {r['example']}). Offer the user "
               f"a guardrail now: ratchet.py ask choice --options A,B,C --guardrail \"A={r['kind']}\" "
@@ -15280,9 +15311,9 @@ def cmd_accept_finding(args):
         # saved, means the SAME command with --reason added simply works.
         reason = (getattr(args, "reason", None) or "").strip()
         if not reason:
-            die(f"accept-finding needs --reason \"...\" when a director token approves it (there is no chat reply "
-                f"to read a reason from). Nothing was accepted, and the question is still waiting: run the same "
-                f"command again with --reason \"...\" added.")
+            die(f"accept-finding needs --reason \"...\" when the director harness applies it (there is no chat reply "
+                f"to read a reason from). Nothing was accepted, and the question is still waiting: run "
+                f"`director-sign accept-finding {cp} --ids {','.join(ids)} --reason \"...\" --apply`.")
         # Reuses _require_approval's own director check and token verification (standards #2/#19: don't re-implement
         # the same gate): dies here, exactly as every other approval does, when this lane is director-enrolled and
         # no (or a bad) director token was given; a chat "accept: ..." reply is never enough in that lane.
@@ -15622,7 +15653,7 @@ def cmd_accept_line(args):
         if token and not reason_flag:
             # checked BEFORE the token is verified or anything is cleared, as cmd_accept_finding does: the same
             # command with --reason added then simply works
-            die("accept-line needs --reason \"...\" when a director token accepts the line (there is no chat reply to "
+            die("accept-line needs --reason \"...\" when the director harness accepts the line (there is no chat reply to "
                 "read a reason from). Nothing was accepted, and the question is still waiting: run the same command "
                 "again with --reason \"...\" added.")
         # _require_approval's own checks: a token in a human lane, no (or a bad) token in a director lane
@@ -15630,7 +15661,7 @@ def cmd_accept_line(args):
         by, reason = appr["by"], reason_flag
     else:
         if reason_flag:
-            die("--reason is only for a director token in a director-enrolled lane. Here the reason must come from the "
+            die("--reason is only for director-sign --apply in a director-enrolled lane. Here the reason must come from the "
                 "user's own reply in the owning chat, exactly `accept: <reason>`, as their first reply after the "
                 "question; nothing else stands in for that reply. Nothing was accepted; the question is still waiting.")
         msgs = _replies(ctx, st, p.get("asked_at"), p)  # only the chat the question was asked in can answer it
@@ -16429,11 +16460,47 @@ def _lanes_request(args):
         if tip and ok_main and git(main, "merge-base", "--is-ancestor", tip, "HEAD").returncode == 0:
             made = git(main, "reflog", "show", "--format=%H", f"refs/heads/{branch}").stdout.split()
             merged = not made or made[-1] != tip
-        out.append({"lane": lane, "branch": branch, "worktree": wt, "worktree_missing": missing, "phase": phase,
-                    "done": done, "total": total, "waiting_on": waiting, "awaiting_since": since, "merged": merged,
-                    "next_director_action": "integrate" if phase == "done" and not merged and not missing else None})
+        row = {"lane": lane, "branch": branch, "worktree": wt, "worktree_missing": missing, "phase": phase,
+               "done": done, "total": total, "waiting_on": waiting, "awaiting_since": since, "merged": merged,
+               "next_director_action": "integrate" if phase == "done" and not merged and not missing else None}
+        if "own" in x:
+            row["own"] = x.get("own")
+        if "depends_on" in x:
+            row["depends_on"] = x.get("depends_on")
+        if "start_ok" in x or "start_wait" in x:
+            row["_rec_start_ok"] = x.get("start_ok")
+            row["_rec_start_wait"] = x.get("start_wait")
+        out.append(row)
+    # Recompute start_ok from live phases: depends_on unmet until that lane is done; keep ownership refusals.
+    by_name = {r["lane"]: r for r in out}
+    n_lanes = len([z for z in lanes_in if isinstance(z, dict)])
+    for r in out:
+        if "_rec_start_ok" not in r and "_rec_start_wait" not in r:
+            continue
+        wait_msg = r.pop("_rec_start_wait", None)
+        r.pop("_rec_start_ok", None)
+        stuck = wait_msg and any(k in str(wait_msg) for k in (
+            "ownership", "absolute", "escapes", "empty ownership", "invalid ownership", "unknown lane"))
+        deps = r.get("depends_on") or []
+        unmet = [d for d in deps if (by_name.get(d) or {}).get("phase") != "done"]
+        own = r.get("own") or []
+        if stuck:
+            r["start_ok"] = False
+            r["start_wait"] = wait_msg
+        elif unmet:
+            r["start_ok"] = False
+            r["start_wait"] = "waiting on " + ", ".join(unmet)
+        elif n_lanes > 1 and not own:
+            r["start_ok"] = False
+            r["start_wait"] = wait_msg or "no --own paths; serialized (not parallel)"
+        else:
+            r["start_ok"] = True
+            r["start_wait"] = None
     if args.json:
-        print(json.dumps({"request": name, "lanes": out}, indent=2))
+        payload = {"request": name, "lanes": out}
+        if isinstance(rec.get("director_root"), str):
+            payload["director_root"] = rec["director_root"]
+        print(json.dumps(payload, indent=2))
         return
     print(f"Request '{name}': {len(out)} lane(s)")
     for l in out:
@@ -17545,9 +17612,8 @@ def decide_prompt(n: dict) -> tuple[bool, str]:
                     if _question_waiter(ctx) == "director":  # read-only: never exits or writes from a hook
                         return False, (f"[ratchet] Your lettered question ({', '.join(p.get('options') or [])}) is "
                                        "waiting on the director: this lane is director-enrolled, so a letter typed "
-                                       "in chat picks nothing. Do not run `choice` on it. The director signs a "
-                                       f"letter with `director-sign choice <letter>`; apply it with `{eng} choice "
-                                       "<letter> director-sign … --apply`.")
+                                       "in chat picks nothing. Do not run `choice` on it. The director harness applies "
+                                       f"a letter with `{eng} director-sign choice <letter> --apply`.")
                     return False, (f"[ratchet] This reply answers your lettered question ({', '.join(p.get('options') or [])}). "
                                    + (f"It reads as option {letter}. " if letter else "It is NOT a clear pick of one option. ")
                                    + f"Run `{eng} choice` to record it, then continue. It does NOT approve the plan or a "

@@ -158,6 +158,17 @@ def d06_parallel_own():
           "no --own argparse")
     check("[D-T06] start_ok / parallel readiness recorded",
           "start_ok" in src, "no start_ok field")
+    # C1: depends_on is unmet at lanes-start (nothing finished yet)
+    pr = ""
+    i = src.find("# Parallel readiness")
+    if i >= 0:
+        pr = src[i:i + 3500]
+    check("[D-T06] depends_on leaves start_ok false at start time",
+          "waiting on" in pr and "depends_on" in pr and "ready_names" not in pr,
+          "deps still treated as met when sibling is start_ok")
+    check("[D-T06] absolute / .. ownership paths are refused (not dropped)",
+          "absolute ownership" in pr and ("escapes with .." in pr or ".." in pr),
+          "_norm_own still drops abs/.. silently")
 
 
 def d07_overlap():
@@ -165,6 +176,9 @@ def d07_overlap():
     check("[D-T07] overlapping ownership blocks parallel start",
           "overlap" in src.lower() or "overlapping" in src.lower(),
           "no overlap handling")
+    check("[D-T07] mutual overlap keeps earlier lane and serializes later",
+          "serialized after it" in src or "Mutual ownership overlap" in src,
+          "no earlier-lane-wins serialization")
 
 
 def d08_status_no_token():
