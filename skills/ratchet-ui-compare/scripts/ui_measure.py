@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import struct
+import uuid
 import zlib
+from datetime import datetime, timezone
 from pathlib import Path
 
 MEASURE_VERSION = 1
+BASELINES_FILENAME = "ui_baselines.json"
+MEASURE_LATEST_FILENAME = "ui_measure_latest.json"
+
+_LAST_MEASURE_DOC: dict | None = None
 
 
 def should_run_measure(mode: str) -> bool:
@@ -127,16 +134,157 @@ def measure_capture(
     if tool_error and verdict != "fail":
         verdict = "inconclusive"
 
-    return {
+    out = {
         "version": MEASURE_VERSION,
         "verdict": verdict,
         "states": states_out,
         "error": tool_error,
     }
+    if capture.get("checkpoint") is not None:
+        out["checkpoint"] = capture.get("checkpoint")
+    global _LAST_MEASURE_DOC
+    _LAST_MEASURE_DOC = out
+    return out
 
 
 class _MeasureIOError(Exception):
     pass
+
+
+def _baselines_path(root: Path) -> Path:
+    return Path(root) / ".ratchet" / BASELINES_FILENAME
+
+
+def _measure_latest_path(root: Path) -> Path:
+    return Path(root) / ".ratchet" / MEASURE_LATEST_FILENAME
+
+
+def load_baselines(root: Path) -> list[dict]:
+    path = _baselines_path(root)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    if isinstance(data, list):
+        return [b for b in data if isinstance(b, dict)]
+    if isinstance(data, dict):
+        items = data.get("baselines") or data.get("items")
+        if isinstance(items, list):
+            return [b for b in items if isinstance(b, dict)]
+    return []
+
+
+def save_baselines(root: Path, items: list[dict]) -> None:
+    path = _baselines_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(items, indent=2) + "\n", encoding="utf-8")
+
+
+def publish_latest_measure(root: Path, measure: dict) -> None:
+    """Persist the latest measure JSON for baseline accept (project Ratchet home)."""
+    path = _measure_latest_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(measure, indent=2) + "\n", encoding="utf-8")
+    global _LAST_MEASURE_DOC
+    _LAST_MEASURE_DOC = measure
+
+
+def _load_measure_doc(source) -> dict | None:
+    if source is None:
+        return None
+    if isinstance(source, dict):
+        return source
+    path = Path(source)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _resolve_measure_for_accept(root: Path, from_measure=None) -> dict | None:
+    doc = _load_measure_doc(from_measure)
+    if doc is not None:
+        return doc
+    doc = _load_measure_doc(_measure_latest_path(root))
+    if doc is not None:
+        return doc
+    return _LAST_MEASURE_DOC
+
+
+def _failing_states(measure: dict | None, checkpoint: str | None) -> list[str] | None:
+    if not measure:
+        return None
+    out: list[str] = []
+    for st in measure.get("states") or []:
+        if str(st.get("verdict", "")).lower() != "fail":
+            continue
+        name = st.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if checkpoint is not None:
+            mcp = measure.get("checkpoint")
+            if mcp is not None and mcp != checkpoint:
+                continue
+        out.append(name)
+    return out
+
+
+def accept_baseline(
+    root,
+    *,
+    checkpoint,
+    state,
+    region,
+    reason,
+    accepted_by,
+    from_measure=None,
+) -> dict:
+    root = Path(root)
+    if not isinstance(reason, str) or not reason.strip():
+        return {"ok": False, "error": "reason is required"}
+    if not isinstance(state, str) or not state.strip():
+        return {"ok": False, "error": "state is required"}
+    if not isinstance(region, dict):
+        return {"ok": False, "error": "region must be a dict with x,y,w,h"}
+    if not _region_positive(region):
+        return {"ok": False, "error": "region must have positive width and height"}
+
+    measure = _resolve_measure_for_accept(root, from_measure)
+    failing = _failing_states(measure, checkpoint)
+    if failing is None:
+        return {
+            "ok": False,
+            "error": "no measured diff context (run measure or pass --from-measure)",
+        }
+    if state not in failing:
+        return {
+            "ok": False,
+            "error": f"state {state!r} has no measured fail diff (failing states: {', '.join(failing) or 'none'})",
+        }
+
+    entry = {
+        "id": uuid.uuid4().hex[:12],
+        "checkpoint": checkpoint,
+        "state": state,
+        "region": {
+            "x": int(region["x"]),
+            "y": int(region["y"]),
+            "w": int(region["w"]),
+            "h": int(region["h"]),
+        },
+        "reason": reason.strip(),
+        "accepted_by": accepted_by,
+        "accepted_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+    items = load_baselines(root)
+    items.append(entry)
+    save_baselines(root, items)
+    return {"ok": True, "id": entry["id"], "baseline": entry}
 
 
 def _overall_verdict(states: list[dict]) -> str:

@@ -10377,6 +10377,57 @@ def cmd_ui_respec(args):
     ok(f"{args.cp}: the capture spec and scope may be changed once; the next recorded round becomes the new baseline.")
 
 
+def _parse_ui_baseline_region(text: str) -> dict:
+    parts = [p.strip() for p in str(text).split(",")]
+    if len(parts) != 4:
+        die("region must be four comma-separated integers: x,y,w,h")
+    try:
+        x, y, w, h = (int(p) for p in parts)
+    except ValueError:
+        die("region must be four comma-separated integers: x,y,w,h")
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def cmd_ui_baseline_accept(args):
+    """Record a lasting scoped UI baseline for an intentional pixel/geometry diff in one state."""
+    ctx = Ctx(find_root())
+    region = _parse_ui_baseline_region(args.region)
+    mod = _ui_measure_module()
+    from_measure = getattr(args, "from_measure", None)
+    if from_measure:
+        from_measure = Path(from_measure)
+        if not from_measure.is_file():
+            die(f"measure file not found: {from_measure}")
+    st = ctx.state()
+    who = "director" if getattr(args, "director_token", None) else "human"
+    if getattr(args, "director_token", None):
+        _director_token_first(ctx, st, "ui-baseline-accept", args.director_token)
+    result = mod.accept_baseline(
+        ctx.root,
+        checkpoint=args.cp,
+        state=args.state,
+        region=region,
+        reason=args.reason or "",
+        accepted_by=who,
+        from_measure=from_measure,
+    )
+    if not result.get("ok"):
+        die(str(result.get("error") or "baseline accept refused"))
+    ctx.log(
+        st,
+        "ui_baseline_accepted",
+        cp=args.cp,
+        state=args.state,
+        baseline_id=result.get("id"),
+        reason=(args.reason or "")[:200],
+    )
+    ctx.save_state(st)
+    ok(
+        f"Accepted UI baseline {result.get('id')} for {args.cp} state {args.state!r} "
+        f"({region['x']},{region['y']},{region['w']},{region['h']}): {args.reason.strip()}"
+    )
+
+
 def _dedupe_finding_ids(findings: list) -> list:
     """Gives every finding from ONE reviewer a usable, unique id before `reviewer` is stamped on it: a finding
     with no `id`, or one whose `id` repeats an earlier finding's from the SAME reviewer (two independent
@@ -21200,6 +21251,17 @@ def main(argv=None):
     a.set_defaults(fn=cmd_choice)
     a = sp.add_parser("ui-respec", help="after `ask ui-respec CPn` and the user's yes: allow one change to a frozen UI check")
     a.add_argument("cp"); a.add_argument("--director-token"); a.set_defaults(fn=cmd_ui_respec)
+    a = sp.add_parser(
+        "ui-baseline-accept",
+        help="accept an intentional UI diff in one state and region (lasting baseline for later measure)",
+    )
+    a.add_argument("cp")
+    a.add_argument("--state", required=True, help="capture state name")
+    a.add_argument("--region", required=True, help="ignored rectangle as x,y,w,h")
+    a.add_argument("--reason", required=True, help="why this diff is intentional")
+    a.add_argument("--from-measure", help="measure.json to validate the state against (default: latest measure)")
+    a.add_argument("--director-token")
+    a.set_defaults(fn=cmd_ui_baseline_accept)
     a = sp.add_parser("approve-changes", help="accept a user-confirmed change to the approved plan/tests/rules")
     a.add_argument("--director-token"); a.set_defaults(fn=cmd_approve_changes)
     a = sp.add_parser("providers", help="list, test (--check/--discover) and register (--add) other agent CLIs")

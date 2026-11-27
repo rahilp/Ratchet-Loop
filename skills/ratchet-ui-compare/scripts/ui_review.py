@@ -742,6 +742,11 @@ def cmd_review(a):
         )
         measure_doc["mode"] = ui_mode
         (out / "measure.json").write_text(json.dumps(measure_doc, indent=2))
+        if hasattr(_ui_measure, "publish_latest_measure"):
+            try:
+                _ui_measure.publish_latest_measure(Path(eng.find_root()), measure_doc)
+            except (OSError, ValueError, TypeError):
+                pass
     measure_verdict = (measure_doc or {}).get("verdict") if measure_doc else None
     run_visual = _ui_measure.should_run_visual(ui_mode, measure_verdict)
     staged = {role: stage(manifest, design, a.scope, cases if role == "behavior" else None, role)
