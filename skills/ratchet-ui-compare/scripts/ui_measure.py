@@ -9,6 +9,78 @@ from pathlib import Path
 MEASURE_VERSION = 1
 
 
+def should_run_measure(mode: str) -> bool:
+    """Whether deterministic measure runs before LLM reviewers."""
+    return mode in ("report", "enforce")
+
+
+def should_run_visual(mode: str, measure_verdict: str | None) -> bool:
+    """Whether the LLM visual reviewer runs (enforce skips on measured pass/fail)."""
+    if mode in ("off", "report"):
+        return True
+    if measure_verdict in (None, "inconclusive"):
+        return True
+    return False
+
+
+def ui_gate_decision(
+    mode: str,
+    measure_verdict: str | None,
+    visual_verdict: str | None,
+    behavior_ok: bool,
+) -> str:
+    """Return PASS|FAIL|INVALID. behavior_ok False → FAIL always (both lenses required at record)."""
+    if not behavior_ok:
+        return "FAIL"
+    if mode == "enforce":
+        if measure_verdict == "fail":
+            return "FAIL"
+        if measure_verdict == "pass" and visual_verdict is None:
+            return "PASS"
+    if visual_verdict is None:
+        return "FAIL"
+    v = str(visual_verdict).upper()
+    if v == "INVALID":
+        return "INVALID"
+    if v == "FAIL":
+        return "FAIL"
+    return "PASS"
+
+
+def measure_as_visual_review(measure: dict, *, scope: str = "") -> dict:
+    """Synthetic visual-slot review from measure JSON (reviewer \"measure\")."""
+    mv = str(measure.get("verdict") or "inconclusive").lower()
+    verdict = {"pass": "PASS", "fail": "FAIL"}.get(mv, "INVALID")
+    differences: list[dict] = []
+    if mv == "fail":
+        for st in measure.get("states") or []:
+            if str(st.get("verdict", "")).lower() != "fail":
+                continue
+            state_name = str(st.get("name") or "")
+            for i, diff in enumerate(st.get("diffs") or []):
+                differences.append(
+                    {
+                        "id": f"measure-{state_name}-{i}",
+                        "state": state_name,
+                        "severity": "blocker",
+                        "location": str(diff.get("region") or ""),
+                        "description": str(diff.get("detail") or diff.get("kind") or "measured mismatch"),
+                        "fixable_in_code": True,
+                    }
+                )
+    out: dict = {
+        "reviewer": "measure",
+        "verdict": verdict,
+        "differences": differences,
+        "invalid_reason": None,
+        "scope": scope,
+    }
+    if mv == "inconclusive":
+        err = measure.get("error")
+        out["invalid_reason"] = err if isinstance(err, str) and err.strip() else "measure inconclusive"
+    return out
+
+
 def measure_capture(
     capture: dict,
     *,

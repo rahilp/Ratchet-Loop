@@ -50,6 +50,10 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+import ui_measure as _ui_measure  # noqa: E402
+
 PLUGIN_ROOT = HERE.parents[2]  # .../ratchet-loop
 ENGINE = PLUGIN_ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet_engine.py"
 PROVIDER_VENDOR = {"claude": "anthropic", "codex": "openai", "gemini": "google"}
@@ -710,6 +714,36 @@ def cmd_review(a):
         manifest["fingerprint"] = fp_at_start       # host sub-agents' files inherit this via `combine --manifest`
         _stamp_manifest(eng, rnd, cp, manifest)     # signed: combine trusts only the manifest this round last stamped
     Path(a.manifest).write_text(json.dumps(manifest, indent=2))
+    cfg: dict = {}
+    cp_cfg = None
+    try:
+        cfg = eng.Ctx(eng.find_root()).config()
+    except SystemExit:
+        pass
+    if rnd:
+        try:
+            cp_cfg = json.loads((ctx.run_dir() / "states" / f"{cp}.json").read_text())
+        except (OSError, ValueError, AttributeError, TypeError):
+            cp_cfg = None
+    ui_mode = eng.ui_measure_mode_for(cfg, cp_cfg)
+    measure_doc = None
+    if _ui_measure.should_run_measure(ui_mode):
+        baselines = None
+        if hasattr(_ui_measure, "load_baselines"):
+            try:
+                baselines = _ui_measure.load_baselines(Path(eng.find_root()))
+            except (OSError, ValueError, TypeError):
+                baselines = None
+        measure_doc = _ui_measure.measure_capture(
+            manifest,
+            baselines=baselines,
+            pixel_threshold=float(cfg.get("ui_pixel_threshold", 0.02)),
+            geometry_tolerance_px=int(cfg.get("ui_geometry_tolerance_px", 2)),
+        )
+        measure_doc["mode"] = ui_mode
+        (out / "measure.json").write_text(json.dumps(measure_doc, indent=2))
+    measure_verdict = (measure_doc or {}).get("verdict") if measure_doc else None
+    run_visual = _ui_measure.should_run_visual(ui_mode, measure_verdict)
     staged = {role: stage(manifest, design, a.scope, cases if role == "behavior" else None, role)
               for role in ("visual", "behavior")}
 
@@ -730,8 +764,9 @@ def cmd_review(a):
                 tried.append(f"{prov}: {str(e).splitlines()[0][:160]}")
         return role, None, tried
 
+    roles = ("visual", "behavior") if run_visual else ("behavior",)
     with cf.ThreadPoolExecutor(max_workers=2) as ex:
-        done = list(ex.map(run_role, ("visual", "behavior")))
+        done = list(ex.map(run_role, roles))
     results, for_host = [], {}
     for role, r, tried in done:
         for t in set_aside[role]:
@@ -748,6 +783,18 @@ def cmd_review(a):
         (out / f"{role}.json").write_text(json.dumps(r, indent=2))
         results.append(r)
         print(f"✓ {role} [{r['provider']}]: {r.get('verdict')} ({len(r.get('differences', []))} differences)")
+    if not run_visual and measure_doc is not None:
+        synth = _ui_measure.measure_as_visual_review(measure_doc, scope=a.scope)
+        synth.update(checkpoint=cp, fingerprint=fp_at_start)
+        if rnd:
+            synth["manifest_stamp"] = manifest.get("stamp")
+            eng.sign_review(key, synth, f"{eng.ui_round_label(cp, n)}/measure", "ui_review.py")
+        else:
+            synth["unsigned"] = UNSIGNED
+        (out / "visual.json").write_text(json.dumps(synth, indent=2))
+        results.append(synth)
+        print(f"✓ measure (synthetic visual): {synth.get('verdict')} "
+              f"({len(synth.get('differences', []))} differences)")
     if for_host:
         print(json.dumps({"host_provider": host, "host_roles": {k: str(v) for k, v in for_host.items()}}, indent=2))
         print(f"\nNo other provider available for: {', '.join(for_host)}. Spawn the host's own reviewer sub-agent(s) "
@@ -763,6 +810,8 @@ def cmd_review(a):
     frozen = bool(rnd) and _ui_frozen(st, cp)
     comb = combine(results, cp, fp_at_start, _compared(manifest), check_fp=bool(rnd), stub_states=_stub_states(manifest),
                    block_on_nits=bool(ctx.config().get("ui_block_on_nits", True)) if rnd else True, spec_frozen=frozen)
+    if measure_doc is not None:
+        comb["measure"] = measure_doc
     if rnd:
         _write_signed(out / "combined.json", comb, rnd)
     else:

@@ -61,6 +61,15 @@ def check(name, cond, detail=""):
     print(f"  {'✓' if cond else '✗'} {name}" + ("" if cond else f"   {str(detail)[:400]}"))
 
 
+REVIEW_OUT_BASE = ["behavior.json", "combined.json", "visual.json"]
+
+
+def review_out_files_ok(files: list[str]) -> bool:
+    """Review output files: legacy three JSON files, or those plus measure.json when measure runs."""
+    s = sorted(files)
+    return s == sorted(REVIEW_OUT_BASE) or s == sorted(REVIEW_OUT_BASE + ["measure.json"])
+
+
 # ------------------------------------------------------------------------------------------------ fixtures
 
 # One tiny valid PNG (1x1), used for every screenshot.
@@ -440,7 +449,7 @@ def t06_unchanged_when_no_gaps():
     check("[CP4-T06] the reviewers got the same arguments as in the no --cases run",
           bool(base.starts) and start_args(base) == start_args(nocases), (start_args(base), start_args(nocases)))
     check("[CP4-T06] out/ holds visual.json, behavior.json and combined.json and nothing else",
-          base.out_files == ["behavior.json", "combined.json", "visual.json"], base.out_files)
+          review_out_files_ok(base.out_files), base.out_files)
     comb = combined(base)
     check("[CP4-T06] combined verdict PASS with 0 differences", comb.get("verdict") == "PASS"
           and comb.get("differences") == [], comb.get("verdict"))
@@ -615,7 +624,7 @@ def t14_no_plan_no_warning():
     for label, r in runs.items():
         check(f"[CP4-T14] {label}: no WARN line, exit 0, both reviewers once, no traceback, same output files",
               warns(r.all) == [] and finished_fine(r) and no_traceback(r)
-              and r.out_files == ["behavior.json", "combined.json", "visual.json"], (r.rc, warns(r.all), r.out_files, r.err[-200:]))
+              and review_out_files_ok(r.out_files), (r.rc, warns(r.all), r.out_files, r.err[-200:]))
 
     def refusal_run(rel, plan_text):
         """Run `review` with --cases REL; PLAN_TEXT (or None for a missing file) is written there first."""
