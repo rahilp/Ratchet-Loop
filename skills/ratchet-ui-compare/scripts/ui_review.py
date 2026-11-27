@@ -727,7 +727,7 @@ def cmd_review(a):
             cp_cfg = None
     ui_mode = eng.ui_measure_mode_for(cfg, cp_cfg)
     measure_doc = None
-    if _ui_measure.should_run_measure(ui_mode):
+    if rnd and _ui_measure.should_run_measure(ui_mode):
         baselines = None
         if hasattr(_ui_measure, "load_baselines"):
             try:
