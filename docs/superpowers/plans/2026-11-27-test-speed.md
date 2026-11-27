@@ -259,7 +259,7 @@ git -c user.name="Rahil Pirani" -c user.email="rahil@piranifam.com" commit -m "p
 - Modify: this plan checkboxes
 - Docs/schemas only if watch/timeout wording must change
 
-- [ ] **Step 1: Run full suite**
+- [x] **Step 1: Run full suite**
 
 ```bash
 PYTHONUNBUFFERED=1 python3 tests/run_all.py
@@ -267,13 +267,13 @@ PYTHONUNBUFFERED=1 python3 tests/run_all.py
 
 Expected: `N passed, 0 failed (suites)`.
 
-- [ ] **Step 2: Adversarial review**
+- [x] **Step 2: Adversarial review**
 
 Dispatch a different model. Brief: find any change that skips, softens, or reorders a required gate; misses an edit under test; or lengthens timeouts in a way that hides failures.
 
 Fix Critical/Important; re-run focused suites; re-review until clean.
 
-- [ ] **Step 3: Mark design implemented; final commit; push; update PR**
+- [x] **Step 3: Mark design implemented; final commit; push; update PR**
 
 ```bash
 git add docs/superpowers/specs/2026-11-27-test-speed-design.md docs/superpowers/plans/2026-11-27-test-speed.md
