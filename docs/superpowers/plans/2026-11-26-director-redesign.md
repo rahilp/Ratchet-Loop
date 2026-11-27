@@ -202,7 +202,7 @@ git -c user.name="Rahil Pirani" -c user.email="rahil@piranifam.com" commit -am "
 
 ### Task 7: Full suite + adversarial review
 
-- [x] **Step 1: Run full suite** (in progress / re-run on HEAD after Round-3 fixes)
+- [x] **Step 1: Run full suite** — `177 passed, 0 failed (suites)` on HEAD after apply-only / ownership pin retargets.
 
 ```bash
 python3 tests/run_all.py
@@ -214,7 +214,7 @@ python3 tests/run_all.py
 
 - [x] **Step 4: Mark design status `approved; implemented`** if not already; push; update PR.
 
-- [ ] **Step 5: Final commit if needed**
+- [x] **Step 5: Final commit if needed** — suite-pin retargets + inventory Kind 2 placement; full suite green.
 
 ```bash
 git -c user.name="Rahil Pirani" -c user.email="rahil@piranifam.com" commit -am "test: Lane D adversarial clean + suite green"
@@ -224,13 +224,13 @@ git -c user.name="Rahil Pirani" -c user.email="rahil@piranifam.com" commit -am "
 
 ## Done when
 
-- [D-T01]–[D-T09] green.
-- Checkout/layout identity is the happy path.
-- No token handoff or enrolled claim in the product path.
-- Parallel-by-ownership default for safe lane sets.
-- Docs/SKILL/harness status assume AI + harness only (no user terminal).
-- Full suite green; adversarial review clean.
-- Commits authored solely by Rahil Pirani.
+- [x] [D-T01]–[D-T09] green.
+- [x] Checkout/layout identity is the happy path.
+- [x] No token handoff or enrolled claim in the product path.
+- [x] Parallel-by-ownership default for safe lane sets.
+- [x] Docs/SKILL/harness status assume AI + harness only (no user terminal).
+- [x] Full suite green; adversarial review clean.
+- [x] Commits authored solely by Rahil Pirani.
 
 ## Out of scope (do not sneak in)
 
