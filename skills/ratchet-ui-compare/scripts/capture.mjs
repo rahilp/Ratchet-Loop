@@ -78,6 +78,116 @@ async function aria(page) {
   return "";
 }
 
+function _slugId(node, idx, seen) {
+  const role = String(node.role || "node").toLowerCase();
+  const name = String(node.name || "").trim();
+  let base = name ? `${role}:${name}` : `${role}#${idx}`;
+  base = base.replace(/[^a-z0-9_:.-]+/gi, "-").slice(0, 120) || `box-${idx}`;
+  if (seen.has(base)) {
+    let n = 2;
+    while (seen.has(`${base}~${n}`)) n++;
+    base = `${base}~${n}`;
+  }
+  seen.add(base);
+  return base;
+}
+
+export function normalizeGeometryBox(box, id) {
+  if (!box || id == null) return null;
+  const x = Math.round(Number(box.x ?? 0));
+  const y = Math.round(Number(box.y ?? 0));
+  const w = Math.round(Number(box.w ?? box.width ?? 0));
+  const h = Math.round(Number(box.h ?? box.height ?? 0));
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
+  return { id: String(id), x, y, w, h };
+}
+
+export function geometryFromAriaJson(root) {
+  const out = [];
+  const seen = new Set();
+  function walk(n, idx) {
+    if (!n || typeof n !== "object") return;
+    if (n.box) {
+      const id = _slugId(n, idx, seen);
+      const b = normalizeGeometryBox(n.box, id);
+      if (b) out.push(b);
+    }
+    const kids = n.children;
+    if (Array.isArray(kids)) kids.forEach((c, i) => walk(c, i));
+  }
+  walk(root, 0);
+  return out;
+}
+
+export function geometryFromAriaYaml(text) {
+  const out = [];
+  const seen = new Set();
+  const lineRe = /\[box=([0-9.-]+),([0-9.-]+),([0-9.-]+),([0-9.-]+)\]/;
+  let idx = 0;
+  for (const line of String(text).split("\n")) {
+    const m = line.match(lineRe);
+    if (!m) continue;
+    const rolePart = line.replace(lineRe, "").replace(/^[\s-]+/, "").trim();
+    const nameM = rolePart.match(/^(\S+)\s+"([^"]+)"/) || rolePart.match(/^(\S+)/);
+    const role = nameM ? nameM[1] : "node";
+    const name = nameM && nameM[2] ? nameM[2] : "";
+    const id = _slugId({ role, name }, idx++, seen);
+    const b = normalizeGeometryBox({ x: +m[1], y: +m[2], w: +m[3], h: +m[4] }, id);
+    if (b) out.push(b);
+  }
+  return out;
+}
+
+export function geometryFromAxSnapshot(node) {
+  const out = [];
+  const seen = new Set();
+  function walk(n, idx) {
+    if (!n || typeof n !== "object") return;
+    const bb = n.boundingBox || n.box;
+    if (bb) {
+      const id = _slugId(n, idx, seen);
+      const b = normalizeGeometryBox(bb, id);
+      if (b) out.push(b);
+    }
+    (n.children || []).forEach((c, i) => walk(c, i));
+  }
+  walk(node, 0);
+  return out;
+}
+
+async function geometryFromPage(page) {
+  const body = page.locator("body");
+  try {
+    if (typeof body.ariaSnapshotJSON === "function") {
+      const j = await body.ariaSnapshotJSON({ boxes: true });
+      const g = geometryFromAriaJson(j);
+      if (g.length) return g;
+    }
+  } catch {}
+  try {
+    if (typeof page.ariaSnapshot === "function") {
+      const t = await page.ariaSnapshot({ boxes: true });
+      const g = geometryFromAriaYaml(t);
+      if (g.length) return g;
+    }
+    if (typeof body.ariaSnapshot === "function") {
+      const t = await body.ariaSnapshot({ boxes: true });
+      const g = geometryFromAriaYaml(t);
+      if (g.length) return g;
+    }
+  } catch {}
+  try {
+    if (page.accessibility && typeof page.accessibility.snapshot === "function") {
+      const snap = await page.accessibility.snapshot();
+      if (snap) {
+        const g = geometryFromAxSnapshot(snap);
+        if (g.length) return g;
+      }
+    }
+  } catch {}
+  return null;
+}
+
 // A state's own width/height beat the spec's, which beat 1280x800; each side is merged on its own.
 export function stateViewport(spec, state) {
   const own = (state && state.viewport) || {};
@@ -116,6 +226,10 @@ async function captureTarget(browser, spec, state, target, outDir) {
     rec.screenshot = shot;
     const a = await aria(page);
     if (a) { rec.aria = path.join(outDir, `${target}.aria.txt`); fs.writeFileSync(rec.aria, a); }
+    try {
+      const geom = await geometryFromPage(page);
+      if (geom?.length) rec.geometry = geom;
+    } catch {}
     // behaviour journey: same steps on both sides, screenshot after each
     let i = 0;
     for (const s of state.journey || []) {

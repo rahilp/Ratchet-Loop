@@ -103,6 +103,52 @@ export const chromium = { async launch() { return browser; } };
 export default { chromium };
 """
 
+STUB_PLAYWRIGHT_GEOMETRY = r"""
+import fs from "node:fs";
+let ctxN = 0;
+const LOG = process.env.STUB_LOG;
+const log = (e) => fs.appendFileSync(LOG, JSON.stringify(e) + "\n");
+function locator() {
+  const l = {
+    first: () => l,
+    click: async () => {}, fill: async () => {}, hover: async () => {}, selectOption: async () => {},
+    check: async () => {}, uncheck: async () => {}, waitFor: async () => {}, scrollIntoViewIfNeeded: async () => {},
+    ariaSnapshot: async () => "- body",
+    ariaSnapshotJSON: async (opts) => (opts && opts.boxes ? {
+      role: "main", name: "Home",
+      box: { x: 10, y: 20, width: 100, height: 40 },
+      children: [{ role: "button", name: "Go", box: { x: 50, y: 24, width: 40, height: 32 } }],
+    } : { role: "body", name: "" }),
+    innerText: async () => "stub",
+  };
+  return l;
+}
+function page(id) {
+  let cur = "about:blank";
+  return {
+    on() {},
+    async goto(u) { cur = u; log({ ev: "goto", ctx: id, url: u }); },
+    locator: () => locator(),
+    keyboard: { press: async () => {} },
+    async waitForLoadState() {}, async evaluate() {}, async addStyleTag() {}, async waitForTimeout() {},
+    async screenshot(o) { fs.writeFileSync(o.path, "stub-png"); log({ ev: "shot", ctx: id, path: o.path }); },
+    url: () => cur,
+    async close() {},
+  };
+}
+const browser = {
+  async newContext(opts) {
+    const id = ++ctxN;
+    log({ ev: "ctx", id, viewport: opts && opts.viewport ? opts.viewport : null });
+    return { async newPage() { return page(id); }, async close() {} };
+  },
+  async newPage() { return page(0); },
+  async close() {},
+};
+export const chromium = { async launch() { return browser; } };
+export default { chromium };
+"""
+
 _STATE = {}
 
 
@@ -160,6 +206,21 @@ const { pathToFileURL } = await import("node:url");
 await import(pathToFileURL(process.env.CAP_PATH).href);
 """
 
+NODE_GEOMETRY = r"""
+const { pathToFileURL } = await import("node:url");
+const mod = await import(pathToFileURL(process.env.CAP_PATH).href);
+const cases = JSON.parse(process.env.GEO_CASES);
+const out = [];
+for (const c of cases) {
+  let g = [];
+  if (c.fn === "json") g = mod.geometryFromAriaJson(c.input);
+  else if (c.fn === "yaml") g = mod.geometryFromAriaYaml(c.input);
+  else if (c.fn === "ax") g = mod.geometryFromAxSnapshot(c.input);
+  out.push(g);
+}
+console.log(JSON.stringify({ results: out }));
+"""
+
 
 def node_import_only(path=CAPTURE, cwd=None):
     return subprocess.run(["node", "--input-type=module", "-e", NODE_IMPORT], cwd=str(cwd or workdir()),
@@ -193,14 +254,19 @@ def capture_spec(states, viewport=None):
     return spec
 
 
-def run_capture(spec, label, script=None, cwd=None):
+def run_capture(spec, label, script=None, cwd=None, *, playwright_stub=None):
     """Run the real capture.mjs against the stub Playwright. Returns (proc, manifest|None, ctxs, shots)."""
     d = fresh_dir(label)
     spec_path = d / "spec.json"
     spec_path.write_text(json.dumps(spec))
     out = d / "out"
     log = d / "stub.log"
-    env = base_env(PLAYWRIGHT_MODULE=str(_STATE["stub"]), STUB_LOG=str(log))
+    stub_path = _STATE["stub"]
+    if playwright_stub == "geometry":
+        geo = d / "stub-playwright-geometry.mjs"
+        geo.write_text(STUB_PLAYWRIGHT_GEOMETRY)
+        stub_path = geo
+    env = base_env(PLAYWRIGHT_MODULE=str(stub_path), STUB_LOG=str(log))
     p = subprocess.run(["node", str(script or CAPTURE), "--spec", str(spec_path), "--out", str(out)],
                        cwd=str(cwd or d), capture_output=True, text=True, timeout=120, env=env)
     manifest = None
@@ -586,6 +652,61 @@ def t10_old_manifest_still_staged():
 
 # ------------------------------------------------------------------------------------------------ T11
 
+def geometry_helpers(cases):
+    r = subprocess.run(["node", "--input-type=module", "-e", NODE_GEOMETRY], cwd=str(workdir()),
+                       capture_output=True, text=True, timeout=60,
+                       env=base_env(CAP_PATH=str(CAPTURE), GEO_CASES=json.dumps(cases)))
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])["results"], r
+    except (ValueError, IndexError, KeyError):
+        return None, r
+
+
+def t14_geometry_emitted_when_a11y_has_boxes():
+    print("CP1-T14: stub a11y boxes → manifest records geometry per target; parsers round-trip")
+    cases = [
+        {"fn": "json", "input": {"role": "main", "name": "X", "box": {"x": 1, "y": 2, "width": 30, "height": 40}}},
+        {"fn": "yaml", "input": '- button "OK" [box=5,6,70,80]\n'},
+        {"fn": "ax", "input": {"role": "button", "name": "OK", "boundingBox": {"x": 5, "y": 6, "width": 70, "height": 80}}},
+    ]
+    parsed, raw = geometry_helpers(cases)
+    check("[CP1-T14] geometry helper exports callable from capture.mjs", parsed is not None, tail(raw))
+    if parsed is not None:
+        check("[CP1-T14] geometryFromAriaJson normalizes width/height → w/h",
+              len(parsed[0]) == 1 and parsed[0][0] == {"id": "main:X", "x": 1, "y": 2, "w": 30, "h": 40}, parsed[0])
+        check("[CP1-T14] geometryFromAriaYaml parses [box=…] lines",
+              len(parsed[1]) == 1 and parsed[1][0]["w"] == 70 and parsed[1][0]["h"] == 80, parsed[1])
+        check("[CP1-T14] geometryFromAxSnapshot reads boundingBox",
+              len(parsed[2]) == 1 and parsed[2][0]["x"] == 5 and parsed[2][0]["id"].startswith("button:"), parsed[2])
+    states = [{"name": "home", "scope": "home page"}]
+    p, manifest, _ctxs, _shots = run_capture(capture_spec(states), "geom", playwright_stub="geometry")
+    check("[CP1-T14] capture with geometry stub exits 0", p.returncode == 0 and manifest is not None, tail(p))
+    if manifest is None:
+        return
+    st = (manifest.get("states") or [{}])[0]
+    for side in ("reference", "app"):
+        geom = (st.get(side) or {}).get("geometry")
+        check(f"[CP1-T14] manifest `{side}` has two geometry boxes",
+              isinstance(geom, list) and len(geom) == 2 and all(
+                  set(b) >= {"id", "x", "y", "w", "h"} for b in geom), geom)
+        if isinstance(geom, list) and geom:
+            main = next((b for b in geom if b.get("id") == "main:Home"), None)
+            check(f"[CP1-T14] `{side}` main:Home box matches stub",
+                  main == {"id": "main:Home", "x": 10, "y": 20, "w": 100, "h": 40}, main)
+
+
+def t15_geometry_absent_without_boxes():
+    print("CP1-T15: default stub (no a11y boxes) omits geometry on capture targets")
+    p, manifest, _ctxs, _shots = mixed_run()
+    check("[CP1-T15] mixed capture still succeeds", p.returncode == 0 and manifest is not None, tail(p))
+    if manifest is None:
+        return
+    for st in manifest.get("states") or []:
+        for side in ("reference", "app"):
+            check(f"[CP1-T15] state `{st.get('name')}` `{side}` has no geometry key",
+                  "geometry" not in (st.get(side) or {}), st.get(side))
+
+
 def t11_readme_and_inventory():
     print("CP1-T11: the test file is listed in the README and the inventory rule is respected")
     readme = README.read_text().splitlines()
@@ -618,6 +739,8 @@ TESTS = [
     ("CP1-T09", t09_reviewer_input_names_each_width), ("CP1-T10", t10_old_manifest_still_staged),
     ("CP1-T11", t11_readme_and_inventory), ("CP1-T12", t12_partial_widths),
     ("CP1-T13", t13_partial_widths_in_a_real_run),
+    ("CP1-T14", t14_geometry_emitted_when_a11y_has_boxes),
+    ("CP1-T15", t15_geometry_absent_without_boxes),
 ]
 
 
