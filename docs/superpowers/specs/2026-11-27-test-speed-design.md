@@ -1,7 +1,7 @@
 # Test speed (Lane T) — design
 
 Date: 2026-11-27  
-Status: draft (awaiting review)  
+Status: approved  
 Approach: execution-first (same gates; make required runs finish sooner)
 
 ## Who this is for
