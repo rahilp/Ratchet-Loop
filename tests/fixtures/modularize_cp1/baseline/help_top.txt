@@ -1,11 +1,11 @@
 usage: ratchet.py [-h] [--root ROOT]
-                  {init,plan-submit,approve-plan,tests-written,red,implemented,behavior,ui-record,adv-record,complete,merged,human-approve,feedback,plan-extend,learn,pause,wait,resume,ask,accept-state,accept-finding,accept-line,raise-limit,hooks-waive,cancel,set-review,choice,ui-respec,approve-changes,providers,models,guardrail,occurrences,repeats,spec,deferred,mark-fixed,shortcuts,receipt,next,status,changes,plan-summary,brief,reviewers,check-in,triage,reviewer-status,lanes,director-key,director-enroll,lanes-start,integrate,director-policy,director-sign,fingerprint,config,view,hook,hook-stop,hook-prompt,hook-guard,install-hooks,doctor,ci-export}
+                  {init,plan-submit,approve-plan,tests-written,red,implemented,behavior,ui-record,adv-record,complete,merged,human-approve,feedback,plan-extend,learn,pause,wait,resume,ask,accept-state,accept-finding,accept-line,raise-limit,hooks-waive,cancel,set-review,choice,ui-respec,ui-baseline-accept,approve-changes,providers,models,guardrail,occurrences,repeats,spec,deferred,mark-fixed,shortcuts,receipt,next,status,changes,plan-summary,brief,reviewers,check-in,triage,reviewer-status,lanes,director-key,director-enroll,lanes-start,integrate,director-policy,director-sign,fingerprint,config,view,hook,hook-stop,hook-prompt,hook-guard,install-hooks,doctor,ci-export}
                   ...
 
 Ratchet loop state engine
 
 positional arguments:
-  {init,plan-submit,approve-plan,tests-written,red,implemented,behavior,ui-record,adv-record,complete,merged,human-approve,feedback,plan-extend,learn,pause,wait,resume,ask,accept-state,accept-finding,accept-line,raise-limit,hooks-waive,cancel,set-review,choice,ui-respec,approve-changes,providers,models,guardrail,occurrences,repeats,spec,deferred,mark-fixed,shortcuts,receipt,next,status,changes,plan-summary,brief,reviewers,check-in,triage,reviewer-status,lanes,director-key,director-enroll,lanes-start,integrate,director-policy,director-sign,fingerprint,config,view,hook,hook-stop,hook-prompt,hook-guard,install-hooks,doctor,ci-export}
+  {init,plan-submit,approve-plan,tests-written,red,implemented,behavior,ui-record,adv-record,complete,merged,human-approve,feedback,plan-extend,learn,pause,wait,resume,ask,accept-state,accept-finding,accept-line,raise-limit,hooks-waive,cancel,set-review,choice,ui-respec,ui-baseline-accept,approve-changes,providers,models,guardrail,occurrences,repeats,spec,deferred,mark-fixed,shortcuts,receipt,next,status,changes,plan-summary,brief,reviewers,check-in,triage,reviewer-status,lanes,director-key,director-enroll,lanes-start,integrate,director-policy,director-sign,fingerprint,config,view,hook,hook-stop,hook-prompt,hook-guard,install-hooks,doctor,ci-export}
     merged              between steps, after merging main into the lane: re-
                         check earlier steps and accept the merge
     wait                end your turn while background reviewers or sub-agents
@@ -38,6 +38,8 @@ positional arguments:
                         director signed)
     ui-respec           after `ask ui-respec CPn` and the user's yes: allow
                         one change to a frozen UI check
+    ui-baseline-accept  accept an intentional UI diff in one state and region
+                        (lasting baseline for later measure)
     approve-changes     accept a user-confirmed change to the approved
                         plan/tests/rules
     providers           list, test (--check/--discover) and register (--add)
