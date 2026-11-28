@@ -475,7 +475,8 @@ def cp6_t11_human_only_rules_are_refused():
     check("[CP6-T11] setup: one valid rule is set", setrules(df, d, "choice=no-unlock"), "")
     snap = pfile().read_bytes() if pfile().exists() else b""
     bad = ["approve-plan=anything", "human-approve=anything", "feedback=anything", "cancel=anything",
-           "set-review=anything", "hooks-waive=anything", "ui-respec=anything", "paid-provider=anything",
+           "set-review=anything", "hooks-waive=anything", "ui-respec=anything", "ui-baseline-accept=anything",
+           "paid-provider=anything",
            "bogus-action=anything", "accept-finding=max:blocker", "raise-limit=max:0", "raise-limit=max:abc",
            "approve-changes=everything", "choice=any"]
     for spec in bad:

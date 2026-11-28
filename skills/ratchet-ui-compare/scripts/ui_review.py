@@ -940,14 +940,27 @@ def cmd_combine(a):
         comb["unconfirmed"] = unconfirmed
     # Host-fallback path: attach measure.json from the round folder so enforce cannot
     # silent-pass a measured fail when visual.json was replaced by a host visual PASS.
+    # Prefer a parseable fail over a later/earlier pass; skip corrupt files instead of
+    # stopping on the first unreadable one.
+    attached = None
     for src in list(a.inputs or []) + ([a.out] if a.out else []):
         mpath = Path(src).resolve().parent / "measure.json"
-        if mpath.is_file():
-            try:
-                comb["measure"] = json.loads(mpath.read_text())
-            except (OSError, ValueError):
-                pass
+        if not mpath.is_file():
+            continue
+        try:
+            doc = json.loads(mpath.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        verdict = str(doc.get("verdict") or "").lower()
+        if verdict == "fail":
+            attached = doc
             break
+        if attached is None:
+            attached = doc
+    if attached is not None:
+        comb["measure"] = attached
     _write_signed(Path(a.out), comb, (ctx, st, n, key))
     print(f"combined → {comb['verdict']} ({comb['summary']})")
     _print_unjudged(comb, frozen)

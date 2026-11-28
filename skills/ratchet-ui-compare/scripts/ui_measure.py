@@ -40,6 +40,10 @@ def ui_gate_decision(
     if not behavior_ok:
         return "FAIL"
     if mode == "enforce":
+        # Measure always runs under enforce; a missing/stripped measure must not silent-pass
+        # via a host visual PASS (host combine path / deleted measure.json).
+        if measure_verdict is None:
+            return "FAIL"
         if measure_verdict == "fail":
             return "FAIL"
         if measure_verdict == "pass" and visual_verdict is None:
@@ -234,6 +238,41 @@ def _failing_states(measure: dict | None, checkpoint: str | None) -> list[str] |
     return out
 
 
+def _regions_overlap(a: dict, b: dict) -> bool:
+    """Axis-aligned overlap (inclusive edges), for accepting a baseline that covers a real diff."""
+    try:
+        ax, ay, aw, ah = int(a["x"]), int(a["y"]), int(a["w"]), int(a["h"])
+        bx, by, bw, bh = int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        return False
+    return ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah
+
+
+def _failing_diff_regions(measure: dict, state: str) -> list[dict]:
+    """Regions named on failing diffs for one state (from measure JSON)."""
+    out: list[dict] = []
+    for st in measure.get("states") or []:
+        if st.get("name") != state or str(st.get("verdict", "")).lower() != "fail":
+            continue
+        for diff in st.get("diffs") or []:
+            reg = diff.get("region")
+            if isinstance(reg, dict) and _region_positive(reg):
+                out.append(reg)
+            elif isinstance(reg, str) and "," in reg:
+                parts = [p.strip() for p in reg.split(",")]
+                if len(parts) == 4:
+                    try:
+                        x, y, w, h = (int(p) for p in parts)
+                    except ValueError:
+                        continue
+                    cand = {"x": x, "y": y, "w": w, "h": h}
+                    if _region_positive(cand):
+                        out.append(cand)
+    return out
+
+
 def accept_baseline(
     root,
     *,
@@ -265,6 +304,17 @@ def accept_baseline(
         return {
             "ok": False,
             "error": f"state {state!r} has no measured fail diff (failing states: {', '.join(failing) or 'none'})",
+        }
+    diff_regions = _failing_diff_regions(measure, state)
+    if not diff_regions:
+        return {
+            "ok": False,
+            "error": f"state {state!r} has no region-bearing measured diffs to accept against",
+        }
+    if not any(_regions_overlap(region, d) for d in diff_regions):
+        return {
+            "ok": False,
+            "error": "region does not overlap any measured fail diff for that state",
         }
 
     entry = {
@@ -341,10 +391,16 @@ def _measure_state(
 
     if mismatches:
         for m in mismatches:
+            box = m.get("box") if isinstance(m.get("box"), dict) else None
+            if box and _region_positive(box):
+                region = {"x": int(box["x"]), "y": int(box["y"]),
+                          "w": int(box["w"]), "h": int(box["h"])}
+            else:
+                region = str(m.get("id") or "")
             diffs.append(
                 {
                     "kind": "geometry",
-                    "region": m.get("id", ""),
+                    "region": region,
                     "detail": m.get("detail", ""),
                 }
             )
@@ -399,7 +455,7 @@ def _measure_state(
 
     ref_colors = ref_px[2]
     app_colors = app_px[2]
-    changed, total = _pixel_diff(ref_colors, app_colors, w, h, ignore)
+    changed, total, bbox = _pixel_diff(ref_colors, app_colors, w, h, ignore)
 
     mismatch_ratio = (changed / total) if total else 0.0
     pixel_block = {
@@ -412,10 +468,11 @@ def _measure_state(
     # (sub-threshold ratios still fail if at least one pixel changed).
     pixel_fail = mismatch_ratio > pixel_threshold or changed > 0
     if pixel_fail:
+        region = bbox if bbox else {"x": 0, "y": 0, "w": w, "h": h}
         diffs.append(
             {
                 "kind": "pixel",
-                "region": f"0,0,{w},{h}",
+                "region": region,
                 "detail": f"mismatch_ratio={mismatch_ratio:.6f}",
             }
         )
@@ -480,9 +537,12 @@ def _pixel_diff(
     w: int,
     h: int,
     ignore: list[dict],
-) -> tuple[int, int]:
+) -> tuple[int, int, dict | None]:
+    """Return (changed, total, bbox). bbox is the tight x,y,w,h of changed pixels, or None."""
     changed = 0
     total = 0
+    min_x = min_y = None
+    max_x = max_y = None
     for y in range(h):
         for x in range(w):
             if any(_in_region(x, y, reg) for reg in ignore):
@@ -491,7 +551,18 @@ def _pixel_diff(
             idx = y * w + x
             if ref_colors[idx] != app_colors[idx]:
                 changed += 1
-    return changed, total
+                if min_x is None or x < min_x:
+                    min_x = x
+                if max_x is None or x > max_x:
+                    max_x = x
+                if min_y is None or y < min_y:
+                    min_y = y
+                if max_y is None or y > max_y:
+                    max_y = y
+    bbox = None
+    if min_x is not None and max_x is not None and min_y is not None and max_y is not None:
+        bbox = {"x": min_x, "y": min_y, "w": max_x - min_x + 1, "h": max_y - min_y + 1}
+    return changed, total, bbox
 
 
 def _compare_geometry(
@@ -510,9 +581,11 @@ def _compare_geometry(
         ref_box = ref_map.get(box_id)
         app_box = app_map.get(box_id)
         if ref_box is None or app_box is None:
+            box = app_box or ref_box
             mismatches.append(
                 {
                     "id": box_id,
+                    "box": box,
                     "detail": "missing on reference or app",
                 }
             )
@@ -527,6 +600,7 @@ def _compare_geometry(
                 mismatches.append(
                     {
                         "id": box_id,
+                        "box": app_box,
                         "detail": f"{key}: ref={rv} app={av} (tol={tolerance})",
                     }
                 )

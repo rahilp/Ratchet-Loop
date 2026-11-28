@@ -224,6 +224,9 @@ def u05_mode_orchestration_helpers():
     check("[U-T05] enforce: measure fail, visual PASS → gate FAIL",
           decide("enforce", "fail", "PASS", True) == "FAIL",
           decide("enforce", "fail", "PASS", True))
+    check("[U-T05] enforce: missing measure + visual PASS → gate FAIL (no silent-pass)",
+          decide("enforce", None, "PASS", True) == "FAIL",
+          decide("enforce", None, "PASS", True))
     check("[U-T05] enforce: measure pass, no visual JSON, behavior ok → PASS",
           decide("enforce", "pass", None, True) == "PASS",
           decide("enforce", "pass", None, True))
@@ -249,6 +252,9 @@ def u08_ui_record_gate_decision_pins():
     check("[U-T08] off: embedded measure fail ignored when visual PASS",
           decide("off", "fail", "PASS", True) == "PASS",
           decide("off", "fail", "PASS", True))
+    check("[U-T08] enforce: missing measure + visual PASS → FAIL",
+          decide("enforce", None, "PASS", True) == "FAIL",
+          decide("enforce", None, "PASS", True))
     check("[U-T08] enforce: inconclusive + visual PASS → PASS",
           decide("enforce", "inconclusive", "PASS", True) == "PASS",
           decide("enforce", "inconclusive", "PASS", True))
@@ -337,6 +343,13 @@ def u06_accept_baseline_scoped():
     check("[U-T06] wrong state refused",
           wrong.get("ok") is False or wrong.get("error"),
           wrong)
+    away = um.accept_baseline(
+        root, checkpoint="CP1", state="cart",
+        region={"x": 0, "y": 0, "w": 1, "h": 1}, reason="misses the pixel", accepted_by="director",
+    )
+    check("[U-T06] non-overlapping region refused",
+          away.get("ok") is False and "overlap" in str(away.get("error", "")).lower(),
+          away)
     good = um.accept_baseline(
         root, checkpoint="CP1", state="cart", region=region, reason="promo badge", accepted_by="director",
     )

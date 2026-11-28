@@ -15,8 +15,8 @@ positional arguments:
     ask                 record and print the question you're about to ask the
                         user (needed before approve-plan, human-approve,
                         cancel, set-review, approve-changes, hooks-waive,
-                        resume --claim, ui-respec, accept-finding, paid-
-                        provider, accept-line)
+                        resume --claim, ui-respec, ui-baseline-accept, accept-
+                        finding, paid-provider, accept-line)
     accept-state        ==SUPPRESS==
     accept-finding      record the open findings the user accepted (after `ask
                         accept-finding` and their 'accept: <reason>' reply, or
@@ -38,7 +38,8 @@ positional arguments:
                         director signed)
     ui-respec           after `ask ui-respec CPn` and the user's yes: allow
                         one change to a frozen UI check
-    ui-baseline-accept  accept an intentional UI diff in one state and region
+    ui-baseline-accept  after `ask ui-baseline-accept CPn` and the user's yes:
+                        accept an intentional UI diff in one state and region
                         (lasting baseline for later measure)
     approve-changes     accept a user-confirmed change to the approved
                         plan/tests/rules
