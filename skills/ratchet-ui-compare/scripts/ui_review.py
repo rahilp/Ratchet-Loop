@@ -793,7 +793,9 @@ def cmd_review(a):
         synth.update(checkpoint=cp, fingerprint=fp_at_start)
         if rnd:
             synth["manifest_stamp"] = manifest.get("stamp")
-            eng.sign_review(key, synth, f"{eng.ui_round_label(cp, n)}/measure", "ui_review.py")
+            # Sign under the visual lens label: combine/ui_input_origin check visual.json as
+            # .../visual even when the JSON reviewer field is "measure" (Lane U synthetic slot).
+            eng.sign_review(key, synth, f"{eng.ui_round_label(cp, n)}/visual", "ui_review.py")
         else:
             synth["unsigned"] = UNSIGNED
         (out / "visual.json").write_text(json.dumps(synth, indent=2))

@@ -10234,7 +10234,12 @@ def ui_input_origin(ctx, cfg, st: dict, key: dict | None, cp_id: str, n: int, pa
     role = r.get("reviewer")
     current = (key or {}).get("manifest_stamp")
     if signature_well_formed(r.get("signature")):
-        if role in UI_ROLES and review_signed(key, r, f"{ui_round_label(cp_id, n)}/{role}"):
+        label = f"{ui_round_label(cp_id, n)}/{role}"
+        # Lane U: synthetic measure-as-visual is signed as .../visual while reviewer stays "measure".
+        measure_as_visual = (role == "measure" and (
+            review_signed(key, r, f"{ui_round_label(cp_id, n)}/visual")
+            or review_signed(key, r, f"{ui_round_label(cp_id, n)}/measure")))
+        if (role in UI_ROLES and review_signed(key, r, label)) or measure_as_visual:
             return ("script-signed", "") if r.get("manifest_stamp") == current else ("refused", STALE_UI_INPUT)
         return "refused", ("its signature does not match this UI round: it was changed after ui_review.py signed it, or "
                            "it was signed for another round")
