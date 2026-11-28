@@ -2,6 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+## Pause / resume (2026-11-27)
+
+**Safe to pause here.** Branch `cursor/measured-ui-gate-design-4534` tip `83433a3` is pushed; PR [#6](https://github.com/rahilp/Ratchet-Loop/pull/6). Working tree clean.
+
+| Done | Remaining (Task 9) |
+|------|-------------------|
+| Tasks 1–8 implemented | Full suite green on tip (`python3 tests/run_all.py` → 0 failed) |
+| CRITICAL adversarial fixes (`ac8e83c`) + test helper measure attach (`83433a3`) | Re-confirm adversarial CLEAN after suite green (prior CLEAN subagent hit usage limits; local pin checklist was CLEAN) |
+| Local CRITICAL pins: enforce missing measure FAIL; ask/director baseline accept; region overlap; empty→inconclusive | Mark design `approved; implemented` only after suite green; then final docs commit |
+
+**Resume:** checkout branch tip, await or re-run suite, fix any failures, mark design implemented, push, update PR. Do not relaunch Grok-heavy review agents unless usage allows.
+
 **Goal:** Make the UI gate measured-first (geometry then pixel) with modes `off` / `report` / `enforce` (default `enforce`), lasting scoped baselines, and LLM visual only when measurement is inconclusive.
 
 **Architecture:** Add a pure measure module beside `ui_review.py`; wire mode-aware orchestration into `ui_review.py` and `cmd_ui_record`; store baselines under the project Ratchet home; keep behavior/adversarial gates unchanged.
@@ -444,7 +456,7 @@ git -c user.name="Rahil Pirani" -c user.email="rahil@piranifam.com" commit -m "d
 - Modify: `docs/superpowers/specs/2026-11-27-measured-ui-gate-design.md` (status → `approved; implemented`)
 - Modify: this plan checkboxes
 
-- [ ] **Step 1: Run full suite**
+- [ ] **Step 1: Run full suite** *(in progress / restart on tip `83433a3`)*
 
 ```bash
 PYTHONUNBUFFERED=1 python3 tests/run_all.py
@@ -452,7 +464,7 @@ PYTHONUNBUFFERED=1 python3 tests/run_all.py
 
 Expected: `N passed, 0 failed (suites)`.
 
-- [ ] **Step 2: Adversarial review**
+- [~] **Step 2: Adversarial review** *(CRITICAL fixes landed; CLEAN re-review subagent aborted on usage; local pin checklist CLEAN — re-confirm after suite green if usage allows)*
 
 Dispatch a different model. Brief: silent-pass measured fail? `report` enforcing? baseline waiving behavior? visual skipped incorrectly on inconclusive? inventory/docs drift?
 

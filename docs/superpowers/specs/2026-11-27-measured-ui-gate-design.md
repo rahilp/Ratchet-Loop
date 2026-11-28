@@ -1,7 +1,7 @@
 # Measured UI gate (Lane U) — design
 
 Date: 2026-11-27  
-Status: approved  
+Status: approved; implementation on branch (Task 9 suite green pending — see plan pause/resume)  
 Approach: measured compare as a first-class step inside the existing UI gate path (geometry then pixel; modes `off` / `report` / `enforce`)
 
 ## Who this is for
