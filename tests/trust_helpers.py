@@ -420,6 +420,8 @@ def cp3_signed_combined(d, env, fp, cp="CP1", n=1, diffs=None, spec_sha256="s1")
     visual.write_text(json.dumps({"reviewer": "visual", "verdict": "PASS" if not diffs else "FAIL",
                                   "differences": diffs or []}))
     behavior.write_text(json.dumps({"reviewer": "behavior", "verdict": "PASS", "differences": []}))
+    # Lane U enforce: ui-record fails when measure is missing from the combined review.
+    (round_dir / "measure.json").write_text(json.dumps({"verdict": "pass"}))
     out = round_dir / "combined.json"
     rp = ts.run_combine(d, env, [visual, behavior], out, cp, manifest)
     assert rp.returncode == 0, rp.stderr + rp.stdout

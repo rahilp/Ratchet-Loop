@@ -121,7 +121,13 @@ def run_external(d, env, rid, out, fixes=None):
     return subprocess.run(cmd, cwd=d, capture_output=True, text=True, env=env)
 
 
-def run_combine(d, env, inputs, out, checkpoint, manifest):
+def run_combine(d, env, inputs, out, checkpoint, manifest, measure=None):
+    """Host combine. Under Lane U enforce, ui-record fails when measure is missing: drop a measured-pass
+    measure.json beside the inputs unless the caller overrides (or measure=False to leave it absent)."""
+    if measure is not False:
+        parent = Path(inputs[0]).resolve().parent if inputs else Path(out).resolve().parent
+        parent.mkdir(parents=True, exist_ok=True)
+        (parent / "measure.json").write_text(json.dumps(measure or {"verdict": "pass"}))
     cmd = [sys.executable, str(UI_REVIEW), "combine", "--inputs", *[str(i) for i in inputs],
            "--out", str(out), "--checkpoint", checkpoint, "--manifest", str(manifest)]
     return subprocess.run(cmd, cwd=d, capture_output=True, text=True, env=env)

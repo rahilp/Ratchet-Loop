@@ -237,19 +237,31 @@ _COMBINE_HELPER.write_text(
     "import ui_review as ur\n"
     "data = json.load(open(sys.argv[1]))\n"
     "comb = ur.combine(data['reviews'], data['checkpoint'], data.get('fingerprint'), data.get('compared'))\n"
+    "if 'measure' in data:\n"
+    "    if data['measure'] is not None:\n"
+    "        comb['measure'] = data['measure']\n"
+    "else:\n"
+    "    comb['measure'] = {'verdict': 'pass'}\n"
     "ur._write_signed(ur.Path(data['out']), comb)\n"
 )
 
 
-def write_combined(d, cp, compared, diffs, reviewers=("visual", "behavior"), out=None, fp=None):
+def write_combined(d, cp, compared, diffs, reviewers=("visual", "behavior"), out=None, fp=None, measure=None):
     """Writes a combined UI review into the round's own folder, signed the way ui_review.py's `combine` step signs
     it (CP7: ui-record only accepts a script-signed combined review, never one written by hand). Calls `combine()`
     and `_write_signed()` directly (not the CLI) so the test keeps full control of `compared` and `differences`,
-    including deliberately malformed shapes some of these checks exercise."""
+    including deliberately malformed shapes some of these checks exercise.
+
+    Under enforce, a missing measure fails the gate: default is a measured pass so older visual/behavior fixtures
+    still record. Pass measure={"verdict": "..."} to override, or measure=False to strip the field."""
     path = out or (ui_round_dir(d, cp) / "combined.json")
     reviews = [{"reviewer": r, "differences": diffs if i == 0 else []} for i, r in enumerate(reviewers)]
     payload = {"reviews": reviews, "checkpoint": cp, "compared": compared,
                "fingerprint": fp or json.loads(rx(d, "fingerprint").stdout)["id"], "out": str(path)}
+    if measure is False:
+        payload["measure"] = None
+    elif measure is not None:
+        payload["measure"] = measure
     pf = Path(_tmp.mkdtemp(prefix="ratchet-combine-in-")) / "in.json"
     pf.write_text(json.dumps(payload))
     r = subprocess.run([sys.executable, str(_COMBINE_HELPER), str(pf)], cwd=d, capture_output=True, text=True,
