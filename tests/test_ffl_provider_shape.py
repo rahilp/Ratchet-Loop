@@ -633,6 +633,7 @@ EXEMPT_CMDS = {
     "set-review": "changes state and needs the user's confirmation",
     "choice": "changes state and needs the user's recorded answer",
     "ui-respec": "changes state and needs the user's recorded approval",
+    "ui-baseline-accept": "writes project baselines and needs the user's recorded approval plus a real measure context and reason",
     "approve-changes": "changes state and needs the user's recorded approval",
     "guardrail": "writes a new plan step and needs the user's recorded choice",
     "occurrences": "exits 1 with its own message when nothing was recorded for the kind it is asked about",

@@ -321,6 +321,8 @@ def ui_combine(d, env, visual, behavior, n=1, spec="s1", scope="checkout", state
         p.write_text(json.dumps(body))
         paths.append(p)
     res.out = rd / "combined.json"
+    # Lane U enforce: ui-record fails when measure is missing from the combined review.
+    (rd / "measure.json").write_text(json.dumps({"verdict": "pass"}))
     cmd = [sys.executable, str(UI_REVIEW), "combine", "--inputs", str(paths[0]), str(paths[1]), "--out", str(res.out),
            "--checkpoint", "CP1"] + (["--manifest", str(man)] if pass_manifest else [])
     res.proc = subprocess.run(cmd, cwd=d, capture_output=True, text=True, env=env)

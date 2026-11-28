@@ -50,6 +50,10 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+import ui_measure as _ui_measure  # noqa: E402
+
 PLUGIN_ROOT = HERE.parents[2]  # .../ratchet-loop
 ENGINE = PLUGIN_ROOT / "skills" / "ratchet-orchestrator" / "scripts" / "ratchet_engine.py"
 PROVIDER_VENDOR = {"claude": "anthropic", "codex": "openai", "gemini": "google"}
@@ -710,6 +714,52 @@ def cmd_review(a):
         manifest["fingerprint"] = fp_at_start       # host sub-agents' files inherit this via `combine --manifest`
         _stamp_manifest(eng, rnd, cp, manifest)     # signed: combine trusts only the manifest this round last stamped
     Path(a.manifest).write_text(json.dumps(manifest, indent=2))
+    cfg: dict = {}
+    cp_cfg = None
+    try:
+        cfg = eng.Ctx(eng.find_root()).config()
+    except SystemExit:
+        pass
+    if rnd:
+        # Same object ui-record uses: the plan checkpoint (optional ui_measure_mode),
+        # never the capture spec states/CPn.json (which has no mode field).
+        try:
+            ctx_mode = eng.Ctx(eng.find_root())
+            cp_cfg = eng.cp_by_id(ctx_mode.plan(), cp)
+        except (SystemExit, OSError, ValueError, KeyError, TypeError, AttributeError):
+            cp_cfg = None
+    ui_mode = eng.ui_measure_mode_for(cfg, cp_cfg)
+    measure_doc = None
+    if rnd and _ui_measure.should_run_measure(ui_mode):
+        baselines = None
+        if hasattr(_ui_measure, "load_baselines"):
+            try:
+                baselines = _ui_measure.load_baselines(Path(eng.find_root()))
+            except (OSError, ValueError, TypeError):
+                baselines = None
+        try:
+            measure_doc = _ui_measure.measure_capture(
+                manifest,
+                baselines=baselines,
+                pixel_threshold=float(cfg.get("ui_pixel_threshold", 0.02)),
+                geometry_tolerance_px=int(cfg.get("ui_geometry_tolerance_px", 2)),
+            )
+        except Exception as exc:  # noqa: BLE001 — any tool crash → inconclusive, then visual
+            measure_doc = {
+                "version": getattr(_ui_measure, "MEASURE_VERSION", 1),
+                "verdict": "inconclusive",
+                "states": [],
+                "error": f"measure crashed: {exc}",
+            }
+        measure_doc["mode"] = ui_mode
+        (out / "measure.json").write_text(json.dumps(measure_doc, indent=2))
+        if hasattr(_ui_measure, "publish_latest_measure"):
+            try:
+                _ui_measure.publish_latest_measure(Path(eng.find_root()), measure_doc)
+            except (OSError, ValueError, TypeError):
+                pass
+    measure_verdict = (measure_doc or {}).get("verdict") if measure_doc else None
+    run_visual = _ui_measure.should_run_visual(ui_mode, measure_verdict)
     staged = {role: stage(manifest, design, a.scope, cases if role == "behavior" else None, role)
               for role in ("visual", "behavior")}
 
@@ -730,8 +780,9 @@ def cmd_review(a):
                 tried.append(f"{prov}: {str(e).splitlines()[0][:160]}")
         return role, None, tried
 
+    roles = ("visual", "behavior") if run_visual else ("behavior",)
     with cf.ThreadPoolExecutor(max_workers=2) as ex:
-        done = list(ex.map(run_role, ("visual", "behavior")))
+        done = list(ex.map(run_role, roles))
     results, for_host = [], {}
     for role, r, tried in done:
         for t in set_aside[role]:
@@ -748,6 +799,20 @@ def cmd_review(a):
         (out / f"{role}.json").write_text(json.dumps(r, indent=2))
         results.append(r)
         print(f"✓ {role} [{r['provider']}]: {r.get('verdict')} ({len(r.get('differences', []))} differences)")
+    if not run_visual and measure_doc is not None:
+        synth = _ui_measure.measure_as_visual_review(measure_doc, scope=a.scope)
+        synth.update(checkpoint=cp, fingerprint=fp_at_start)
+        if rnd:
+            synth["manifest_stamp"] = manifest.get("stamp")
+            # Sign under the visual lens label: combine/ui_input_origin check visual.json as
+            # .../visual even when the JSON reviewer field is "measure" (Lane U synthetic slot).
+            eng.sign_review(key, synth, f"{eng.ui_round_label(cp, n)}/visual", "ui_review.py")
+        else:
+            synth["unsigned"] = UNSIGNED
+        (out / "visual.json").write_text(json.dumps(synth, indent=2))
+        results.append(synth)
+        print(f"✓ measure (synthetic visual): {synth.get('verdict')} "
+              f"({len(synth.get('differences', []))} differences)")
     if for_host:
         print(json.dumps({"host_provider": host, "host_roles": {k: str(v) for k, v in for_host.items()}}, indent=2))
         print(f"\nNo other provider available for: {', '.join(for_host)}. Spawn the host's own reviewer sub-agent(s) "
@@ -763,6 +828,8 @@ def cmd_review(a):
     frozen = bool(rnd) and _ui_frozen(st, cp)
     comb = combine(results, cp, fp_at_start, _compared(manifest), check_fp=bool(rnd), stub_states=_stub_states(manifest),
                    block_on_nits=bool(ctx.config().get("ui_block_on_nits", True)) if rnd else True, spec_frozen=frozen)
+    if measure_doc is not None:
+        comb["measure"] = measure_doc
     if rnd:
         _write_signed(out / "combined.json", comb, rnd)
     else:
@@ -871,6 +938,29 @@ def cmd_combine(a):
                    block_on_nits=bool(settings.get("ui_block_on_nits", True)), spec_frozen=frozen)
     if unconfirmed:
         comb["unconfirmed"] = unconfirmed
+    # Host-fallback path: attach measure.json from the round folder so enforce cannot
+    # silent-pass a measured fail when visual.json was replaced by a host visual PASS.
+    # Prefer a parseable fail over a later/earlier pass; skip corrupt files instead of
+    # stopping on the first unreadable one.
+    attached = None
+    for src in list(a.inputs or []) + ([a.out] if a.out else []):
+        mpath = Path(src).resolve().parent / "measure.json"
+        if not mpath.is_file():
+            continue
+        try:
+            doc = json.loads(mpath.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        verdict = str(doc.get("verdict") or "").lower()
+        if verdict == "fail":
+            attached = doc
+            break
+        if attached is None:
+            attached = doc
+    if attached is not None:
+        comb["measure"] = attached
     _write_signed(Path(a.out), comb, (ctx, st, n, key))
     print(f"combined → {comb['verdict']} ({comb['summary']})")
     _print_unjudged(comb, frozen)

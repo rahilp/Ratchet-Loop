@@ -179,6 +179,7 @@ QUESTION_WORDS = types.MappingProxyType({
     "approve-plan": "the plan", "human-approve": "an approval", "approve-changes": "changes to the approved plan files",
     "cancel": "cancelling the run", "set-review": "how often to review", "claim": "continuing the run in this chat",
     "hooks-waive": "building without the hooks", "ui-respec": "a change to the UI check",
+    "ui-baseline-accept": "accepting a lasting UI measure baseline",
     "choice": "a choice between options", "accept-finding": "accepting a review finding as a known limit",
     "raise-limit": "raising the review limit by one round",
     "accept-line": "accepting an unproven done-means line"})
@@ -189,7 +190,7 @@ ALWAYS_GATING_QUESTIONS = ("accept-finding", "raise-limit", "accept-line")  # a 
                                                                                # finish (CP5), waits on them
 GATING_PHASES = ("awaiting_plan_approval", "awaiting_checkpoint_review", "awaiting_final_review", "blocked",
                  "paused")
-CARRY_ON_QUESTIONS = ("cancel", "set-review", "claim", "hooks-waive", "ui-respec", "choice")
+CARRY_ON_QUESTIONS = ("cancel", "set-review", "claim", "hooks-waive", "ui-respec", "ui-baseline-accept", "choice")
 
 
 DM_NO_TESTS_NOTE = ("No tests are linked to any of these lines (an older plan, from before tests could be linked "
@@ -349,7 +350,8 @@ def waiting_question(ctx: Ctx, st):
     if waiting_on == "user" and _question_answered(ctx, st, p):
         return None
     _m, _t = _pq(p)
-    about = (_t or _m) if p["action"] in ("accept-finding", "raise-limit", "ui-respec") else None
+    about = (_t or _m) if p["action"] in ("accept-finding", "raise-limit", "ui-respec",
+                                         "ui-baseline-accept") else None
     if p["action"] == "accept-line":
         about = _lines_word([int(x) for x in str(_t or "").split(",") if x.strip().isdigit()]) or None
     stops = None

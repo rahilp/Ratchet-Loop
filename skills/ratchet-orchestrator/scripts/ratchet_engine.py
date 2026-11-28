@@ -449,6 +449,8 @@ class Ctx:
             named("lane_start_command", _lanes_start_template)
         if merged.get("related_test_command") and "{files}" not in str(merged["related_test_command"]):
             bad("related_test_command", "a command containing the {files} placeholder")
+        if "ui_measure_mode" in merged and cfg["ui_measure_mode"] not in ("off", "report", "enforce"):
+            bad("ui_measure_mode", "one of off, report, or enforce")
         return user
 
     def user_config(self, project=None, glob=None, check_roles=True, strict=(), write_path=None):
@@ -2028,6 +2030,8 @@ def validate_plan(plan: dict) -> list[str]:
                 errs.append(f"{tag}: ui gate on requires 'ui_scope' (what the reviewer may judge)")
             if not cp.get("ui_states"):
                 errs.append(f"{tag}: ui gate on requires at least one entry in 'ui_states'")
+            if "ui_measure_mode" in cp and cp["ui_measure_mode"] not in ("off", "report", "enforce"):
+                errs.append(f"{tag}: ui_measure_mode must be off, report or enforce")
         if g.get("behavior"):
             t = cp.get("tests") or {}
             if not t.get("command"):
@@ -5920,7 +5924,8 @@ def _require_approval(ctx, st, action, token=None, bind=(), *, director_apply=Fa
 # Approvals that answer a question Ratchet printed (`ratchet.py ask <action>`). The user's FIRST reply after that
 # question is the answer, and only a listed yes (APPROVAL_REPLIES) approves. hooks-waive has its own exact list,
 # feedback takes any text and a lettered choice takes a letter, so they are not in here.
-ASKED_APPROVALS = ("approve-plan", "human-approve", "cancel", "set-review", "approve-changes", "claim", "ui-respec")
+ASKED_APPROVALS = ("approve-plan", "human-approve", "cancel", "set-review", "approve-changes", "claim",
+                   "ui-respec", "ui-baseline-accept")
 
 
 def _pq(p):
@@ -7747,8 +7752,8 @@ def _integrate_merge(main: Path, f: dict, info: dict, finish):
 # Lane D: every director-sign action is applied in one call (`director-sign <action> ... --apply`).
 # POLICY_ACTIONS is the subset the developer's director-policy file may cover (unchanged from pre-D routine set).
 DIRECTOR_APPLY_ACTIONS = ("approve-plan", "human-approve", "feedback", "approve-changes", "cancel", "set-review",
-                          "hooks-waive", "ui-respec", "accept-finding", "accept-line", "raise-limit",
-                          "choice")
+                          "hooks-waive", "ui-respec", "ui-baseline-accept", "accept-finding", "accept-line",
+                          "raise-limit", "choice")
 # guardrail is not director-sign --apply: unlock via choice, then run `guardrail` from the director home.
 POLICY_ACTIONS = ("approve-changes", "accept-finding", "raise-limit", "choice")
 
@@ -7762,6 +7767,8 @@ def _director_apply_cmd(ctx, action, cp=None, eng="ratchet.py") -> str:
             "guardrail": " --kind <kind>",
             "set-review": " <mode>",
             "ui-respec": f" {cp or '<CPn>'}",
+            "ui-baseline-accept": (f" {cp or '<CPn>'} --state <name> --region <x,y,w,h> "
+                                  "--reason \"<why>\""),
             "feedback": " --reason \"<why>\""}.get(action, "")
     return f"{eng} --root {ctx.root} director-sign {action}{tail} --apply"
 
@@ -7795,7 +7802,7 @@ def _director_apply_ask(ctx, st, action, target, ids):
 POLICY_FILE = "director-policy.json"
 POLICY_SEVERITIES = {"major": 1, "minor": 2}
 POLICY_NEVER = ("approve-plan", "human-approve", "feedback", "cancel", "set-review", "hooks-waive", "ui-respec",
-                "guardrail", "paid-provider")
+                "ui-baseline-accept", "guardrail", "paid-provider")
 POLICY_MENU = ("approve-changes=test-files, raise-limit=max:<N> (N of 1 or more signed raises per run), "
                "choice=no-unlock, accept-finding=max:<minor|major>")
 
@@ -8029,6 +8036,7 @@ def cmd_director_sign(args):
             "feedback": ["awaiting_checkpoint_review", "awaiting_final_review", "done"],
             "approve-changes": ["building", "blocked", "paused", "awaiting_checkpoint_review", "awaiting_final_review"],
             "ui-respec": ["building", "blocked"],
+            "ui-baseline-accept": ["building", "blocked"],
             "guardrail": ["building", "blocked"],
             "accept-finding": ["building", "blocked"],
             "accept-line": ["awaiting_final_review", "awaiting_checkpoint_review"],
@@ -8135,6 +8143,15 @@ def cmd_director_sign(args):
             die("director-sign set-review needs the mode: end | each | none. Nothing was changed.")
     elif action == "ui-respec" and not target:
         die("director-sign ui-respec needs the step (CPn). Nothing was changed.")
+    elif action == "ui-baseline-accept":
+        if not target:
+            die("director-sign ui-baseline-accept needs the step (CPn). Nothing was changed.")
+        if not getattr(args, "state", None):
+            die("director-sign ui-baseline-accept needs --state <name>. Nothing was changed.")
+        if not getattr(args, "region", None):
+            die("director-sign ui-baseline-accept needs --region x,y,w,h. Nothing was changed.")
+        if not reason:
+            die("director-sign ui-baseline-accept needs --reason \"...\". Nothing was changed.")
 
     rule = _policy_rule_for(ctx, st, action_key if action != "guardrail" else action, target, ids) if action in POLICY_ACTIONS else None
     _director_key()  # refuse early if key missing
@@ -8153,7 +8170,8 @@ def cmd_director_sign(args):
             _director_apply_ask(ctx, st, action, target, ",".join(ids))
             st = ctx.state()
         elif action in ("approve-plan", "human-approve", "cancel", "set-review", "hooks-waive", "ui-respec",
-                        "accept-line", "feedback") and (st.get("pending") or {}).get("action") != action:
+                        "ui-baseline-accept", "accept-line", "feedback") and (
+                st.get("pending") or {}).get("action") != action:
             # Mint a pending question so lane cmds that expect ask still see one, without chat text
             overtook = _overtake(ctx, st, action, target or None)
             asked = now()
@@ -8171,6 +8189,8 @@ def cmd_director_sign(args):
             letter=(target.upper() if target else None), policy_rule=rule, policy_checked=True,
             kind=kind, mode=target or None, ids=",".join(ids) if ids else None,
             text=reason or None, learning=None, source=None,
+            state=getattr(args, "state", None), region=getattr(args, "region", None),
+            from_measure=getattr(args, "from_measure", None),
         )
         if args.action == "guardrail":
             die("director-sign guardrail --apply is not used: from the director home, run "
@@ -8185,6 +8205,7 @@ def cmd_director_sign(args):
             "set-review": cmd_set_review,
             "hooks-waive": cmd_hooks_waive,
             "ui-respec": cmd_ui_respec,
+            "ui-baseline-accept": cmd_ui_baseline_accept,
             "accept-finding": cmd_accept_finding,
             "accept-line": cmd_accept_line,
             "raise-limit": cmd_raise_limit,
@@ -9707,6 +9728,14 @@ def cmd_behavior(args):
        f"Next step: {cps['step']}")
 
 
+def ui_measure_mode_for(cfg, cp=None) -> str:
+    """Resolved measured-UI mode: optional per-checkpoint override, else project config, default report."""
+    raw = (cp or {}).get("ui_measure_mode") if cp else None
+    if raw is None:
+        raw = cfg.get("ui_measure_mode", "report")
+    return raw if raw in ("off", "report", "enforce") else "report"
+
+
 def _ui_verdict(review: dict, cfg) -> tuple[str, list]:
     """Recompute the UI verdict from the differences list (don't trust a self-reported PASS)."""
     if str(review.get("verdict", "")).upper() == "INVALID":
@@ -9721,6 +9750,64 @@ def _ui_verdict(review: dict, cfg) -> tuple[str, list]:
             continue
         blockers.append(d)
     return ("PASS" if not blockers else "FAIL"), blockers
+
+
+_UI_MEASURE_MOD = None
+
+
+def _ui_measure_module():
+    """ui_measure.py — gate decision and measure helpers (loaded once, by path)."""
+    global _UI_MEASURE_MOD
+    if _UI_MEASURE_MOD is not None:
+        return _UI_MEASURE_MOD
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / "ratchet-ui-compare" / "scripts" / "ui_measure.py"
+    spec = importlib.util.spec_from_file_location("ratchet_ui_measure", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _UI_MEASURE_MOD = mod
+    return mod
+
+
+def _ui_lens_ok(reviewers: list) -> bool:
+    """Whether the combined review includes the visual lens (LLM visual or synthetic measure)."""
+    return "visual" in reviewers or "measure" in reviewers
+
+
+def _ui_reviewer_verdict(review: dict, role: str, cfg) -> str | None:
+    """PASS|FAIL from one reviewer's differences only; None if that reviewer did not run."""
+    if role not in (review.get("reviewers") or []):
+        return None
+    diffs = [d for d in (review.get("differences") or []) if d.get("reviewer") == role]
+    v, _ = _ui_verdict({"differences": diffs}, cfg)
+    return v
+
+
+def _ui_record_decision(review: dict, cfg, cp) -> tuple[str, list]:
+    """UI gate outcome honoring ui_measure_mode (measure vs visual lenses + behavior)."""
+    if str(review.get("verdict", "")).upper() == "INVALID":
+        return "INVALID", []
+    mode = ui_measure_mode_for(cfg, cp)
+    measure_raw = (review.get("measure") or {}).get("verdict")
+    measure_verdict = str(measure_raw).lower() if measure_raw is not None else None
+    behavior_v = _ui_reviewer_verdict(review, "behavior", cfg)
+    behavior_ok = behavior_v != "FAIL" if behavior_v is not None else True
+    visual_verdict = None
+    if "visual" in (review.get("reviewers") or []):
+        visual_verdict = _ui_reviewer_verdict(review, "visual", cfg)
+    elif "measure" in (review.get("reviewers") or []):
+        visual_verdict = _ui_reviewer_verdict(review, "measure", cfg)
+    verdict = _ui_measure_module().ui_gate_decision(mode, measure_verdict, visual_verdict, behavior_ok)
+    if verdict != "FAIL":
+        return verdict, []
+    _, blockers = _ui_verdict(review, cfg)
+    if blockers:
+        return verdict, blockers
+    if mode == "enforce" and measure_verdict == "fail":
+        mdiffs = [d for d in (review.get("differences") or []) if d.get("reviewer") == "measure"]
+        _, blockers = _ui_verdict({"differences": mdiffs}, cfg)
+    return verdict, blockers
 
 
 MAX_REVIEW_BYTES = 8 * 1024 * 1024  # a reviewer's output or combined UI review larger than this is refused outright
@@ -10164,7 +10251,12 @@ def ui_input_origin(ctx, cfg, st: dict, key: dict | None, cp_id: str, n: int, pa
     role = r.get("reviewer")
     current = (key or {}).get("manifest_stamp")
     if signature_well_formed(r.get("signature")):
-        if role in UI_ROLES and review_signed(key, r, f"{ui_round_label(cp_id, n)}/{role}"):
+        label = f"{ui_round_label(cp_id, n)}/{role}"
+        # Lane U: synthetic measure-as-visual is signed as .../visual while reviewer stays "measure".
+        measure_as_visual = (role == "measure" and (
+            review_signed(key, r, f"{ui_round_label(cp_id, n)}/visual")
+            or review_signed(key, r, f"{ui_round_label(cp_id, n)}/measure")))
+        if (role in UI_ROLES and review_signed(key, r, label)) or measure_as_visual:
             return ("script-signed", "") if r.get("manifest_stamp") == current else ("refused", STALE_UI_INPUT)
         return "refused", ("its signature does not match this UI round: it was changed after ui_review.py signed it, or "
                            "it was signed for another round")
@@ -10179,8 +10271,9 @@ def ui_input_origin(ctx, cfg, st: dict, key: dict | None, cp_id: str, n: int, pa
     if not hit or hit[0] != "ui":
         return "refused", (f"it is not signed by `ui_review.py review`, and it is not a reviewer's visual.json or "
                            f"behavior.json in this round's folder ({folder})")
-    if role != real.stem.lower():
-        return "refused", f"its reviewer field says {role!r}, but {real.name} is the {real.stem.lower()} reviewer's file"
+    stem = real.stem.lower()
+    if role != stem and not (role == "measure" and stem == "visual"):
+        return "refused", f"its reviewer field says {role!r}, but {real.name} is the {stem} reviewer's file"
     w = ((key or {}).get("writers") or {}).get(real.name)
     if w and w.get("manifest_stamp") != current:
         return "refused", STALE_UI_INPUT
@@ -10204,8 +10297,11 @@ def cmd_ui_record(args):
     for key in ("reviewers", "differences"):
         if key not in review:
             die(f"combined review must contain '{key}' (see ratchet-ui-compare skill)")
-    if len(review.get("reviewers", [])) < 2 and not cfg.get("ui_single_reviewer_ok"):
-        die("UI gate needs both a visual and a behaviour reviewer in the combined review.")
+    reviewers = [r for r in (review.get("reviewers") or []) if isinstance(r, str)]
+    if not cfg.get("ui_single_reviewer_ok"):
+        if len(reviewers) < 2 or "behavior" not in reviewers or not _ui_lens_ok(reviewers):
+            die("UI gate needs both a visual and a behaviour reviewer in the combined review "
+                "(measure counts as the visual lens when the LLM visual reviewer did not run).")
     if review.get("checkpoint") not in (None, args.cp):
         die(f"combined review is for {review.get('checkpoint')}, not {args.cp}.")
     cur_fp = fingerprint(ctx.root)["id"]
@@ -10246,7 +10342,7 @@ def cmd_ui_record(args):
         g["unconfirmed"] = unconfirmed
     else:
         g.pop("unconfirmed", None)
-    verdict, blockers = _ui_verdict(review, cfg)
+    verdict, blockers = _ui_record_decision(review, cfg, cp)
     dest = ctx.evidence(args.cp) / "ui" / f"round-{g['attempts']:02d}"
     dest.mkdir(parents=True, exist_ok=True)
     if review_path.parent != dest:
@@ -10301,6 +10397,61 @@ def cmd_ui_respec(args):
     ctx.log(st, "ui_respec_approved", cp=args.cp, by=msg["by"], note=msg.get("prompt", "")[:200])
     ctx.save_state(st)
     ok(f"{args.cp}: the capture spec and scope may be changed once; the next recorded round becomes the new baseline.")
+
+
+def _parse_ui_baseline_region(text: str) -> dict:
+    parts = [p.strip() for p in str(text).split(",")]
+    if len(parts) != 4:
+        die("region must be four comma-separated integers: x,y,w,h")
+    try:
+        x, y, w, h = (int(p) for p in parts)
+    except ValueError:
+        die("region must be four comma-separated integers: x,y,w,h")
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def cmd_ui_baseline_accept(args):
+    """Record a lasting scoped UI baseline for an intentional pixel/geometry diff in one state."""
+    ctx = Ctx(find_root())
+    region = _parse_ui_baseline_region(args.region)
+    mod = _ui_measure_module()
+    from_measure = getattr(args, "from_measure", None)
+    if from_measure:
+        from_measure = Path(from_measure)
+        if not from_measure.is_file():
+            die(f"measure file not found: {from_measure}")
+    st = ctx.state()
+    tok = getattr(args, "director_token", None)
+    _director_token_first(ctx, st, "ui-baseline-accept", tok)
+    _require_pending(st, "ui-baseline-accept", args.cp, ctx=ctx)
+    msg = _require_human(ctx, st, "ui-baseline-accept", tok)
+    result = mod.accept_baseline(
+        ctx.root,
+        checkpoint=args.cp,
+        state=args.state,
+        region=region,
+        reason=args.reason or "",
+        accepted_by=msg["by"],
+        from_measure=from_measure,
+    )
+    if not result.get("ok"):
+        die(str(result.get("error") or "baseline accept refused"))
+    _clear_pending(st)
+    ctx.log(
+        st,
+        "ui_baseline_accepted",
+        cp=args.cp,
+        state=args.state,
+        baseline_id=result.get("id"),
+        reason=(args.reason or "")[:200],
+        by=msg["by"],
+        note=msg.get("prompt", "")[:200],
+    )
+    ctx.save_state(st)
+    ok(
+        f"Accepted UI baseline {result.get('id')} for {args.cp} state {args.state!r} "
+        f"({region['x']},{region['y']},{region['w']},{region['h']}): {(args.reason or '').strip()}"
+    )
 
 
 def _dedupe_finding_ids(findings: list) -> list:
@@ -14343,6 +14494,8 @@ ASKABLE = {"approve-plan": "start building the plan as it is",
            "claim": "continue this Ratchet run in THIS chat",
            "hooks-waive": "build without the Ratchet hooks (the checks then only advise; nothing enforces them)",
            "ui-respec": "change what the UI check compares for this step (its capture steps or scope), as explained above",
+           "ui-baseline-accept": "accept an intentional measured UI diff in one state and region as a lasting baseline, "
+                                 "as explained above",
            "choice": "go with one of the lettered options you listed",
            "accept-finding": "accept the open finding(s) named above as a known limit, with your own reason, instead "
                              "of running another review round",
@@ -14354,7 +14507,8 @@ ASKABLE = {"approve-plan": "start building the plan as it is",
                             "same way) for reviews, named above, instead of only flat-rate ones"}
 # the command that carries out a "yes" to each question
 PENDING_COMMAND = {"approve-plan": "approve-plan", "human-approve": "human-approve", "approve-changes": "approve-changes", "cancel": "cancel", "set-review": "set-review",
-                   "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec", "choice": "choice",
+                   "claim": "resume --claim", "hooks-waive": "hooks-waive", "ui-respec": "ui-respec",
+                   "ui-baseline-accept": "ui-baseline-accept", "choice": "choice",
                    "accept-finding": "accept-finding", "raise-limit": "raise-limit", "accept-line": "accept-line"}
 REVIEW_MODE_WORDS = {"end": "only at the end", "each": "after every step", "none": "never (fully autonomous)"}
 
@@ -14396,6 +14550,8 @@ def cmd_ask(args):
         die("ask set-review needs the mode: end | each | none")
     if args.action == "ui-respec" and not (args.mode and args.mode in (st.get("checkpoints") or {})):
         die("ask ui-respec needs the checkpoint id, e.g. `ratchet.py ask ui-respec CP2`")
+    if args.action == "ui-baseline-accept" and not (args.mode and args.mode in (st.get("checkpoints") or {})):
+        die("ask ui-baseline-accept needs the checkpoint id, e.g. `ratchet.py ask ui-baseline-accept CP2`")
     if args.action == "accept-finding" and not (args.mode and args.mode in (st.get("checkpoints") or {})):
         die("ask accept-finding needs the checkpoint id, e.g. `ratchet.py ask accept-finding CP2 F1,F2`")
     if args.action == "accept-finding" and not getattr(args, "ids", None):
@@ -14405,8 +14561,8 @@ def cmd_ask(args):
     if args.action == "paid-provider" and not (args.mode and getattr(args, "ids", None)):
         die("ask paid-provider needs the tool and model, e.g. `ratchet.py ask paid-provider opencode "
             "openrouter/z-ai/glm-5`")
-    if args.action not in ("set-review", "ui-respec", "accept-finding", "raise-limit", "paid-provider",
-                           "accept-line") and args.mode:
+    if args.action not in ("set-review", "ui-respec", "ui-baseline-accept", "accept-finding", "raise-limit",
+                           "paid-provider", "accept-line") and args.mode:
         die(f"ask {args.action} takes no extra value")
     _bind_owner(ctx, st, args.action, asker)
     if args.action == "raise-limit":
@@ -20343,13 +20499,13 @@ def hooks_warning(ctx, hs=None) -> str | None:
 STATE_LOCKED_CMDS = ("init", "plan-submit", "approve-plan", "tests-written", "red", "implemented", "behavior",
                      "ui-record", "adv-record", "complete", "human-approve", "feedback", "plan-extend", "pause",
                      "resume", "ask", "accept-state", "hooks-waive", "cancel", "set-review", "choice", "ui-respec",
-                     "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait", "accept-finding",
-                     "raise-limit", "check-in", "triage", "merged", "accept-line", "shortcuts")
+                     "ui-baseline-accept", "approve-changes", "guardrail", "reviewers", "repeats", "spec", "wait",
+                     "accept-finding", "raise-limit", "check-in", "triage", "merged", "accept-line", "shortcuts")
 LONG_LOCKED_CMDS = ("red", "behavior", "complete", "reviewers", "providers", "merged", "shortcuts")  # tests, checks, a regression
                                                                                           # suite, provider probes (--add included)
 # The commands that may take a person's RATCHET_HUMAN_OVERRIDE code: asked BEFORE the lock, so nothing waits on them.
 OVERRIDE_CMDS = ("approve-plan", "human-approve", "approve-changes", "cancel", "set-review", "resume", "hooks-waive",
-                 "ui-respec", "choice", "feedback", "accept-state", "init")
+                 "ui-respec", "ui-baseline-accept", "choice", "feedback", "accept-state", "init")
 STATE_LOCK_WAIT_SECONDS = 30
 STATE_LOCK_BUSY_WAIT_SECONDS = 2
 STATE_LOCK_STALE_MARGIN_SECONDS = 300
@@ -21080,11 +21236,11 @@ def main(argv=None):
     a.add_argument("--claim", action="store_true"); a.set_defaults(fn=cmd_resume)
     a = sp.add_parser("ask", help="record and print the question you're about to ask the user (needed before approve-plan, "
                                   "human-approve, cancel, set-review, approve-changes, hooks-waive, resume --claim, "
-                                  "ui-respec, accept-finding, paid-provider, accept-line)")
+                                  "ui-respec, ui-baseline-accept, accept-finding, paid-provider, accept-line)")
     a.add_argument("action", choices=list(ASKABLE) + ["withdraw"])
-    a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec/accept-finding: the checkpoint "
-                                           "id; paid-provider: the tool (preset); accept-line: the done-means line "
-                                           "numbers, comma-separated (e.g. 2 or 2,3)")
+    a.add_argument("mode", nargs="?", help="set-review: end | each | none; ui-respec/ui-baseline-accept/accept-finding: "
+                                           "the checkpoint id; paid-provider: the tool (preset); accept-line: the "
+                                           "done-means line numbers, comma-separated (e.g. 2 or 2,3)")
     a.add_argument("ids", nargs="?", help="accept-finding: the finding ids to accept, comma-separated (e.g. F1,F2); "
                                           "paid-provider: the exact model name")
     a.add_argument("--options", help="choice: the option letters, e.g. A,B,C")
@@ -21126,6 +21282,18 @@ def main(argv=None):
     a.set_defaults(fn=cmd_choice)
     a = sp.add_parser("ui-respec", help="after `ask ui-respec CPn` and the user's yes: allow one change to a frozen UI check")
     a.add_argument("cp"); a.add_argument("--director-token"); a.set_defaults(fn=cmd_ui_respec)
+    a = sp.add_parser(
+        "ui-baseline-accept",
+        help="after `ask ui-baseline-accept CPn` and the user's yes: accept an intentional UI diff in one state and "
+             "region (lasting baseline for later measure)",
+    )
+    a.add_argument("cp")
+    a.add_argument("--state", required=True, help="capture state name")
+    a.add_argument("--region", required=True, help="ignored rectangle as x,y,w,h (must overlap a measured fail diff)")
+    a.add_argument("--reason", required=True, help="why this diff is intentional")
+    a.add_argument("--from-measure", help="measure.json to validate the state against (default: latest measure)")
+    a.add_argument("--director-token")
+    a.set_defaults(fn=cmd_ui_baseline_accept)
     a = sp.add_parser("approve-changes", help="accept a user-confirmed change to the approved plan/tests/rules")
     a.add_argument("--director-token"); a.set_defaults(fn=cmd_approve_changes)
     a = sp.add_parser("providers", help="list, test (--check/--discover) and register (--add) other agent CLIs")
@@ -21234,14 +21402,18 @@ def main(argv=None):
     a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_director_policy)
     a = sp.add_parser("director-sign"); a.add_argument("action", choices=["approve-plan", "human-approve", "feedback",
                                                                           "approve-changes", "cancel", "set-review",
-                                                                          "hooks-waive", "ui-respec", "guardrail",
+                                                                          "hooks-waive", "ui-respec",
+                                                                          "ui-baseline-accept", "guardrail",
                                                                           "accept-finding", "accept-line",
                                                                           "raise-limit", "choice"])
-    a.add_argument("target", nargs="?", help="raise-limit: the step (CPn); choice: the letter")
+    a.add_argument("target", nargs="?", help="raise-limit/ui-baseline-accept/ui-respec: the step (CPn); choice: the letter")
     a.add_argument("--kind", help="guardrail: the kind of finding it covers")
-    a.add_argument("--reason", help="raise-limit, accept-finding: the reason (required; without --apply the lane "
-                                    "repeats it to raise-limit --reason)")
+    a.add_argument("--reason", help="raise-limit, accept-finding, ui-baseline-accept: the reason (required; without "
+                                    "--apply the lane repeats it to raise-limit --reason)")
     a.add_argument("--ids", help="accept-finding with --apply: the finding ids to accept, comma-separated (e.g. F1,F2)")
+    a.add_argument("--state", help="ui-baseline-accept: capture state name")
+    a.add_argument("--region", help="ui-baseline-accept: ignored rectangle as x,y,w,h")
+    a.add_argument("--from-measure", help="ui-baseline-accept: measure.json path (optional)")
     a.add_argument("--apply", action="store_true",
                    help="required: apply this director approval against the lane in one call (no pasteable tokens)")
     a.set_defaults(fn=cmd_director_sign)
