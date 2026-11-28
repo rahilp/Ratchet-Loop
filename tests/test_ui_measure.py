@@ -182,6 +182,11 @@ def u04_missing_geometry_inconclusive():
     out = um.measure_capture(_capture([st]))
     check("[U-T04] not pass", out.get("verdict") != "pass", out)
     check("[U-T04] inconclusive", out.get("verdict") == "inconclusive", out)
+    empty = um.measure_capture({"checkpoint": "CP1", "states": []})
+    check("[U-T04] empty states → inconclusive (not silent pass)",
+          empty.get("verdict") == "inconclusive", empty)
+    check("[U-T04] empty states → visual still required under enforce",
+          um.should_run_visual("enforce", empty.get("verdict")) is True)
 
 
 def u05_mode_orchestration_helpers():

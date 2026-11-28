@@ -721,9 +721,12 @@ def cmd_review(a):
     except SystemExit:
         pass
     if rnd:
+        # Same object ui-record uses: the plan checkpoint (optional ui_measure_mode),
+        # never the capture spec states/CPn.json (which has no mode field).
         try:
-            cp_cfg = json.loads((ctx.run_dir() / "states" / f"{cp}.json").read_text())
-        except (OSError, ValueError, AttributeError, TypeError):
+            ctx_mode = eng.Ctx(eng.find_root())
+            cp_cfg = eng.cp_by_id(ctx_mode.plan(), cp)
+        except (SystemExit, OSError, ValueError, KeyError, TypeError, AttributeError):
             cp_cfg = None
     ui_mode = eng.ui_measure_mode_for(cfg, cp_cfg)
     measure_doc = None
@@ -734,12 +737,20 @@ def cmd_review(a):
                 baselines = _ui_measure.load_baselines(Path(eng.find_root()))
             except (OSError, ValueError, TypeError):
                 baselines = None
-        measure_doc = _ui_measure.measure_capture(
-            manifest,
-            baselines=baselines,
-            pixel_threshold=float(cfg.get("ui_pixel_threshold", 0.02)),
-            geometry_tolerance_px=int(cfg.get("ui_geometry_tolerance_px", 2)),
-        )
+        try:
+            measure_doc = _ui_measure.measure_capture(
+                manifest,
+                baselines=baselines,
+                pixel_threshold=float(cfg.get("ui_pixel_threshold", 0.02)),
+                geometry_tolerance_px=int(cfg.get("ui_geometry_tolerance_px", 2)),
+            )
+        except Exception as exc:  # noqa: BLE001 — any tool crash → inconclusive, then visual
+            measure_doc = {
+                "version": getattr(_ui_measure, "MEASURE_VERSION", 1),
+                "verdict": "inconclusive",
+                "states": [],
+                "error": f"measure crashed: {exc}",
+            }
         measure_doc["mode"] = ui_mode
         (out / "measure.json").write_text(json.dumps(measure_doc, indent=2))
         if hasattr(_ui_measure, "publish_latest_measure"):
@@ -927,6 +938,16 @@ def cmd_combine(a):
                    block_on_nits=bool(settings.get("ui_block_on_nits", True)), spec_frozen=frozen)
     if unconfirmed:
         comb["unconfirmed"] = unconfirmed
+    # Host-fallback path: attach measure.json from the round folder so enforce cannot
+    # silent-pass a measured fail when visual.json was replaced by a host visual PASS.
+    for src in list(a.inputs or []) + ([a.out] if a.out else []):
+        mpath = Path(src).resolve().parent / "measure.json"
+        if mpath.is_file():
+            try:
+                comb["measure"] = json.loads(mpath.read_text())
+            except (OSError, ValueError):
+                pass
+            break
     _write_signed(Path(a.out), comb, (ctx, st, n, key))
     print(f"combined → {comb['verdict']} ({comb['summary']})")
     _print_unjudged(comb, frozen)

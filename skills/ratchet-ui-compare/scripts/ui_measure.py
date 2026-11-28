@@ -114,7 +114,7 @@ def measure_capture(
                     geometry_tolerance_px=geometry_tolerance_px,
                 )
             )
-        except _MeasureIOError as exc:
+        except Exception as exc:  # noqa: BLE001 — IO, zlib, bad boxes → inconclusive (never crash the gate)
             tool_error = str(exc)
             states_out.append(
                 {
@@ -288,6 +288,9 @@ def accept_baseline(
 
 
 def _overall_verdict(states: list[dict]) -> str:
+    # Empty capture: never silent-pass (would skip LLM visual under enforce).
+    if not states:
+        return "inconclusive"
     if any(s.get("verdict") == "fail" for s in states):
         return "fail"
     if any(s.get("verdict") == "inconclusive" for s in states):
