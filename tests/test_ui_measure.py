@@ -291,22 +291,22 @@ def u08_ui_record_gate_decision_pins():
           v == "PASS", v)
 
 
-def u07_default_mode_is_enforce():
+def u07_default_mode_is_report():
     print("U-T07: DEFAULT_CONFIG default + ui_measure_mode_for + plan/config validation")
     cfg = load_default_config()
-    check("[U-T07] DEFAULT_CONFIG ui_measure_mode is enforce",
-          cfg.get("ui_measure_mode") == "enforce", cfg.get("ui_measure_mode"))
+    check("[U-T07] DEFAULT_CONFIG ui_measure_mode is report",
+          cfg.get("ui_measure_mode") == "report", cfg.get("ui_measure_mode"))
     eng = load_engine()
     mode_for = eng.ui_measure_mode_for
-    check("[U-T07] helper default enforce", mode_for({}, None) == "enforce", mode_for({}, None))
-    check("[U-T07] helper project report", mode_for({"ui_measure_mode": "report"}, None) == "report",
-          mode_for({"ui_measure_mode": "report"}, None))
+    check("[U-T07] helper default report", mode_for({}, None) == "report", mode_for({}, None))
+    check("[U-T07] helper project enforce", mode_for({"ui_measure_mode": "enforce"}, None) == "enforce",
+          mode_for({"ui_measure_mode": "enforce"}, None))
     check("[U-T07] helper checkpoint off overrides project",
           mode_for({"ui_measure_mode": "enforce"}, {"ui_measure_mode": "off"}) == "off",
           mode_for({"ui_measure_mode": "enforce"}, {"ui_measure_mode": "off"}))
-    check("[U-T07] helper garbage override → enforce fallback",
-          mode_for({"ui_measure_mode": "report"}, {"ui_measure_mode": "bogus"}) == "enforce",
-          mode_for({"ui_measure_mode": "report"}, {"ui_measure_mode": "bogus"}))
+    check("[U-T07] helper garbage override → report fallback",
+          mode_for({"ui_measure_mode": "enforce"}, {"ui_measure_mode": "bogus"}) == "report",
+          mode_for({"ui_measure_mode": "enforce"}, {"ui_measure_mode": "bogus"}))
     errs = eng.validate_plan({
         "checkpoints": [{
             "id": "CP1",
@@ -369,7 +369,7 @@ TESTS = [
     ("U-T04", u04_missing_geometry_inconclusive),
     ("U-T05", u05_mode_orchestration_helpers),
     ("U-T06", u06_accept_baseline_scoped),
-    ("U-T07", u07_default_mode_is_enforce),
+    ("U-T07", u07_default_mode_is_report),
     ("U-T08", u08_ui_record_gate_decision_pins),
 ]
 

@@ -148,7 +148,7 @@ def _default_config_literals():
             # sub-agents in isolated folders) is always the final fallback.
             "ui_reviewers": {"visual": ["gemini", "claude", "codex"], "behavior": ["claude", "gemini", "codex"]},
             "ui_block_on_nits": True,       # every code-fixable difference is a blocker
-            "ui_measure_mode": "enforce",  # off | report | enforce — measured UI gate (Lane U)
+            "ui_measure_mode": "report",  # off | report | enforce — measured UI gate (Lane U); report = soft rollout default
             "ui_globs": [
                 "*.tsx", "*.jsx", "*.vue", "*.svelte", "*.astro", "*.html", "*.css", "*.scss",
                 "*.sass", "*.less", "*.styl", "*.swift", "*.kt", "*.xml", "*.dart", "*.erb",

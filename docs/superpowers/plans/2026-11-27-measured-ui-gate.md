@@ -4,17 +4,18 @@
 
 ## Pause / resume (2026-11-27)
 
-**Safe to pause here.** Branch `cursor/measured-ui-gate-design-4534` tip `83433a3` is pushed; PR [#6](https://github.com/rahilp/Ratchet-Loop/pull/6). Working tree clean.
+**Safe to pause here.** Branch `cursor/measured-ui-gate-design-4534` (see tip); PR [#6](https://github.com/rahilp/Ratchet-Loop/pull/6).
 
 | Done | Remaining (Task 9) |
 |------|-------------------|
 | Tasks 1–8 implemented | Full suite green on tip (`python3 tests/run_all.py` → 0 failed) |
-| CRITICAL adversarial fixes (`ac8e83c`) + test helper measure attach (`83433a3`) | Re-confirm adversarial CLEAN after suite green (prior CLEAN subagent hit usage limits; local pin checklist was CLEAN) |
-| Local CRITICAL pins: enforce missing measure FAIL; ask/director baseline accept; region overlap; empty→inconclusive | Mark design `approved; implemented` only after suite green; then final docs commit |
+| CRITICAL adversarial fixes + test helper measure attach | Re-confirm adversarial CLEAN after suite green if usage allows |
+| Default mode flipped to **`report`** (soft rollout; `enforce` opt-in) | Mark design `approved; implemented` only after suite green; then final docs commit |
+| Local CRITICAL pins: enforce missing measure FAIL; ask/director baseline accept; region overlap; empty→inconclusive | |
 
 **Resume:** checkout branch tip, await or re-run suite, fix any failures, mark design implemented, push, update PR. Do not relaunch Grok-heavy review agents unless usage allows.
 
-**Goal:** Make the UI gate measured-first (geometry then pixel) with modes `off` / `report` / `enforce` (default `enforce`), lasting scoped baselines, and LLM visual only when measurement is inconclusive.
+**Goal:** Make the UI gate measured-first (geometry then pixel) with modes `off` / `report` / `enforce` (default `report` soft rollout; `enforce` opt-in), lasting scoped baselines, and LLM visual only when measurement is inconclusive under `enforce`.
 
 **Architecture:** Add a pure measure module beside `ui_review.py`; wire mode-aware orchestration into `ui_review.py` and `cmd_ui_record`; store baselines under the project Ratchet home; keep behavior/adversarial gates unchanged.
 
@@ -24,7 +25,7 @@
 
 - Preserve USP: checkpoint/gate model unchanged; insufficient-evidence still routes to capture-spec.
 - Behavior and adversarial gates untouched; baselines never waive them.
-- Default `ui_measure_mode` is `enforce`; projects may set `report` or `off`.
+- Default `ui_measure_mode` is `report`; projects may set `enforce` or `off`.
 - In `enforce`, LLM visual runs only on measured `inconclusive` (or measure cannot run).
 - Emitted runnable paths still name `ratchet.py` (Lane S).
 - AI/harness-only copy; commits as Rahil Pirani (`rahil@piranifam.com`).
@@ -37,7 +38,7 @@
 | `tests/test_ui_measure.py` | Lane U guards: measure verdicts, modes, baselines, ui-record wiring |
 | `skills/ratchet-ui-compare/scripts/ui_measure.py` | Pure measure: masks/baselines → geometry → pixel → `{verdict, states, diffs}` |
 | `skills/ratchet-ui-compare/scripts/ui_review.py` | Mode-aware: when to run measure / skip or call LLM visual |
-| `skills/ratchet-orchestrator/scripts/engine_utils.py` | `DEFAULT_CONFIG["ui_measure_mode"] = "enforce"` |
+| `skills/ratchet-orchestrator/scripts/engine_utils.py` | `DEFAULT_CONFIG["ui_measure_mode"] = "report"` |
 | `skills/ratchet-orchestrator/scripts/ratchet_engine.py` | Config validation; `ui-record` honors measure; `ui-baseline-accept` command |
 | `skills/ratchet-ui-compare/scripts/capture.mjs` | Optional: emit per-state geometry boxes (a11y) into capture result |
 | `docs/reference.md` / schemas / how-it-works | Mode + accept command wording when user-visible |
@@ -486,7 +487,7 @@ git push -u origin HEAD
 | Spec item | Task |
 |-----------|------|
 | Measured-first geometry then pixel | Tasks 1–2, 7 |
-| Modes off/report/enforce, default enforce | Tasks 3–5 |
+| Modes off/report/enforce, default report | Tasks 3–5 |
 | LLM visual only on inconclusive in enforce | Task 4–5 |
 | Behavior reviewer unchanged | Task 4 (never skipped) |
 | Lasting scoped baselines + accept | Task 6 |

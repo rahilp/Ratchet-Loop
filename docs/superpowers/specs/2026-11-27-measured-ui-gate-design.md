@@ -1,7 +1,7 @@
 # Measured UI gate (Lane U) — design
 
 Date: 2026-11-27  
-Status: approved; implementation on branch (Task 9 suite green pending — see plan pause/resume)  
+Status: approved; implementation on branch (Task 9 suite green pending — see plan pause/resume). Rollout default is **`report`** (soft); projects opt into `enforce`.  
 Approach: measured compare as a first-class step inside the existing UI gate path (geometry then pixel; modes `off` / `report` / `enforce`)
 
 ## Who this is for
@@ -27,7 +27,7 @@ Lane U does **not** reopen director identity, tokens, ownership, or test-speed p
 ## Goals (plain language)
 
 1. **Measured-first UI gate.** Geometry compare, then pixel/image compare, against the paired reference capture (masks + tolerance).
-2. **Modes with enforce default.** Config `ui_measure_mode`: `off` | `report` | `enforce`, default **`enforce`** when a step has a UI gate. Optional per-checkpoint override.
+2. **Modes with report default (soft rollout).** Config `ui_measure_mode`: `off` | `report` | `enforce`, default **`report`** when a step has a UI gate. Optional per-checkpoint override; projects opt into `enforce`.
 3. **LLM visual only when needed (enforce).** Clear measured `pass` / `fail` skip LLM visual; measured `inconclusive` (or measure cannot run) escalates to LLM visual. Behavior reviewer stays as today.
 4. **Lasting scoped baselines.** Human/director accepts intentional drift (state + region/mask + reason) via an explicit accept path; later rounds treat that scope as expected.
 5. **Keep USP.** Same gates/checkpoints; capture fidelity and insufficient-evidence → capture-spec routing stay.
@@ -52,7 +52,7 @@ Lane U stays inside the existing UI gate; no new gate type.
 
 | Piece | Role |
 |-------|------|
-| Config `ui_measure_mode` (`off` / `report` / `enforce`, default **`enforce`**) | Per-project; optional per-checkpoint override |
+| Config `ui_measure_mode` (`off` / `report` / `enforce`, default **`report`**) | Per-project; optional per-checkpoint override |
 | Capture (`capture.mjs` + manifest) | Unchanged journeys; may emit richer geometry hooks (a11y/DOM boxes) alongside screenshots |
 | **Measure module** (new, beside `ui_review.py` / capture) | Per state: apply masks + baselines → geometry → pixel/image → machine JSON (`pass` / `fail` / `inconclusive` + diffs) |
 | `ui_review.py` | Mode-aware orchestration (see Modes below) |
@@ -69,8 +69,8 @@ Lane U stays inside the existing UI gate; no new gate type.
 | Mode | Measure runs? | LLM visual | Gate blocks on |
 |------|---------------|------------|----------------|
 | `off` | No | Always (today) | Today’s visual + behavior rules |
-| `report` | Yes (evidence only) | Always | Today’s visual + behavior rules (measure never alone fails the gate) |
-| `enforce` (default) | Yes | Only if measure is `inconclusive` (or measure cannot run) | Measured `fail`; or visual FAIL when visual ran; behavior FAIL as today |
+| `report` (default) | Yes (evidence only) | Always | Today’s visual + behavior rules (measure never alone fails the gate) |
+| `enforce` | Yes | Only if measure is `inconclusive` (or measure cannot run) | Measured `fail`; or visual FAIL when visual ran; behavior FAIL as today |
 
 ### Measured verdicts
 
@@ -111,7 +111,7 @@ Lane U stays inside the existing UI gate; no new gate type.
 
 ## Done when
 
-- Modes work as specified; default `enforce`.
+- Modes work as specified; default `report` (soft rollout); `enforce` opt-in.
 - Geometry-then-pixel measure + lasting scoped baselines + accept path land.
 - In `enforce`, LLM visual only on `inconclusive` (or measure cannot run).
 - Focused + full suite green; adversarial clean on “did we weaken the UI gate?”

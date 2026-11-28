@@ -9729,11 +9729,11 @@ def cmd_behavior(args):
 
 
 def ui_measure_mode_for(cfg, cp=None) -> str:
-    """Resolved measured-UI mode: optional per-checkpoint override, else project config, default enforce."""
+    """Resolved measured-UI mode: optional per-checkpoint override, else project config, default report."""
     raw = (cp or {}).get("ui_measure_mode") if cp else None
     if raw is None:
-        raw = cfg.get("ui_measure_mode", "enforce")
-    return raw if raw in ("off", "report", "enforce") else "enforce"
+        raw = cfg.get("ui_measure_mode", "report")
+    return raw if raw in ("off", "report", "enforce") else "report"
 
 
 def _ui_verdict(review: dict, cfg) -> tuple[str, list]:
